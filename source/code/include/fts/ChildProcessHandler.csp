@@ -1,0 +1,197 @@
+<?php
+
+namespace grn\fts;
+
+use grn\cydec\mq\JobNameConstants;
+
+class ChildProcessHandler
+{
+    /** @var string */
+    private $phpPath;
+    /** @var int */
+    private $retry = 0;
+    /** @var \grn\fts\IndexerLoggerInterface */
+    private $logger;
+    /** @var \grn\fts\FullIndexerArgValue */
+    private $ftsValue;
+    /** @var \CB_DatabaseConnection */
+    private $db;
+    /** @var int */
+    private $startTime;
+    /** @var int */
+    private $stopTime;
+
+    const CHILD_PROCESS_PATH = 'code/command/fts/child_process_runner.csp';
+
+    /**
+     * @param IndexerLoggerInterface $logger
+     * @param FullIndexerArgValue    $value
+     */
+    public function __construct(
+        IndexerLoggerInterface $logger,
+        FullIndexerArgValue $value
+    ) {
+        $this->phpPath = cb_get_cli_path();
+        $this->logger = $logger;
+        $this->ftsValue = $value;
+        $this->startTime = $value->getStartTime();
+        $this->stopTime = $value->getStopTime();
+        $this->db = cb_get_app_db("job");
+    }
+
+    /**
+     *
+     */
+    public function handle(
+        $command,
+        FullIndexTarget $indexTarget,
+        $userTableNum = null
+    ) {
+        $progressInfo = $this->ftsValue->getProgressInfo();
+        $progressInfo->updateCommandInfo($command);
+        $progressInfo->setUserTableNum($userTableNum);
+
+        $indexTarget->initializeTargetRange($progressInfo->getStartId(),
+            $this->ftsValue->getNumber());
+        while ($indexTarget->isWithinLoop()) {
+            $progressInfo->setStartId($indexTarget->getStartId());
+            $this->ftsValue->exportResumeInfoFile($this->logger);
+            while ($this->isPausingTime()) {
+                $this->logger->log('It is in the pause time. full_index.csp is paused every one hour until startTime.');
+                sleep(3600);
+                $this->db->reconnect(); // avoiding the connection timeout caused by mysql long sleep
+            }
+            // GTM-559
+            if ($this->ftsValue->getMaxJobNum() > 0) {
+                while ($this->isOverJobCount($this->ftsValue->getMaxJobNum())) {
+                    usleep($this->ftsValue->getSleep() * 1000);
+                }
+            }
+            $process = cb_get_fopen_execute_path($this->phpPath,
+                    self::CHILD_PROCESS_PATH)
+                       . " command={$command} forward={$this->ftsValue->getForward()} startId={$indexTarget->getStartId()} endId={$indexTarget->getEndId()}";
+            $process .= (is_null($userTableNum)) ? ""
+                : " userTableNum={$userTableNum}";
+            $process .= " searchEngine={$this->ftsValue->getSearchEngine()}";
+            $process .= " 2>&1"; // redirect STDERR to STDOUT
+            $processHandler = popen($process,
+                "r");                         // 子プロセス起動
+            if ($processHandler
+                === false
+            )                                // 起動失敗処理
+            {
+                $this->logger->log("Failed to open process :{$process}");
+                if ($this->retryCheck())                                  // 5回未満のリトライであれば
+                {
+                    continue;
+                } else                                                        // 5回目が失敗したら
+                {
+                    // On-premise only
+                    $this->retry
+                        = 0;                                       // リトライ数を初期化
+                    $indexTarget->updateTargetRange($this->ftsValue->getNumber());
+                    usleep($this->ftsValue->getSleep()
+                           * 1000);             // 規定秒数sleepする
+                    continue;
+                }
+            }
+            $this->logger->log("execute: {$process}");
+            $out = '';
+            while ( ! feof($processHandler))                               // 処理が終わるまで待機
+            {
+                $out .= fread($processHandler, 2048);
+            }
+            $ret
+                = pclose($processHandler);                                 // プロセスハンドラを閉じる
+            if ($ret
+                !== 0
+            )                                               // インデックス作成が異常終了の時
+            {
+                $this->logger->log($out);
+                $this->logger->log("Failed to create indexes :{$process}");
+                if ($this->retryCheck())                                  // 5回未満のリトライであれば
+                {
+                    continue;                                               // リトライ
+                }
+            } else                                                            // 問題なければ
+            {
+                if (strlen($out) > 0) {
+                    $this->logger->log($out);                               // ログを出して
+                }
+            }
+            $this->retry = 0;
+            $indexTarget->updateTargetRange($this->ftsValue->getNumber());
+        }
+
+        $progressInfo->setStartId($progressInfo::INITIAL_START_ID);
+    }
+
+    /**
+     * @return bool
+     */
+    private function retryCheck()
+    {
+        if ($this->retry < 5) {
+            $this->retry++;
+            $this->logger->log("retry: {$this->retry}");
+
+            return true;
+        } else {
+            if (defined('ON_FOREST')) {
+                $this->logger->log("Failed 5 times retry");
+                $this->logger->log("[ERROR] Quit the full-indexing");
+                exit(1); // GTM-558 https://bozuman.cybozu.com/k/5095/show#record=558
+            } else {
+                $this->logger->log("Failed 5 times retry");
+                $this->logger->log("Skip this process");
+
+                return false;
+            }
+        }
+    }
+
+    /**
+     * @param int $maxJobNum
+     *
+     * @return bool
+     */
+    private function isOverJobCount($maxJobNum)
+    {
+        $job_name = JobNameConstants::FTS_BULK_INDEXER;
+        if ($this->ftsValue->getSearchEngine() == 'es') {
+            $job_name = JobNameConstants::ES_INDEXER;
+        }
+
+        $query
+            = $this->db->format("SELECT COUNT(*) AS count FROM _queue WHERE jobName = '@S'",
+            [$job_name]);
+        $result = $this->db->query($query);
+        assert('$result');
+        $row = $this->db->fetch_assoc($result);
+        assert('isset($row["count"])');
+
+        return $row['count'] >= $maxJobNum;
+    }
+
+    /**
+     * @return bool
+     */
+    private function isPausingTime()
+    {
+        if (is_null($this->stopTime) || is_null($this->stopTime)) {
+            return false;
+        }
+        $currentTime = time();
+        // If startTime is bigger than stopTime, stopTime is tomorrow time.
+        if ($this->startTime < $this->stopTime) {
+            return mktime(0, 0, 0) <= $currentTime
+                   && $currentTime < mktime($this->startTime, 0, 0)
+                   || mktime($this->stopTime, 0, 0) <= $currentTime
+                      && $currentTime < mktime(0, 0, 0, date('n'),
+                    date('j') + 1, date('Y'));
+        } else {
+            return mktime($this->stopTime, 0, 0) <= $currentTime
+                   && $currentTime < mktime($this->startTime, 0, 0);
+        }
+    }
+}

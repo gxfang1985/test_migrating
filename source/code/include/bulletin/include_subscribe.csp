@@ -1,0 +1,583 @@
+<?php
+
+/**
+ * @author  Tanaka, Yoshiaki        2005/01
+ * @package grn.bulletin
+ */
+
+use grn\bulletin\logic\BulletinAdjustSubscribeLogic;
+
+require_once('bulletin/table.csp');
+require_once('grn/application.csp');
+require_once("bulletin/BulletinFacade.csp");
+require_once("bulletin/notification.csp");
+
+define('GRN_BULLETIN_MAX_SUBSCRIBE_USERS', 1);
+
+
+/**
+ * @package grn.bulletin
+ */
+class GRN_Bulletin_SubscribeCategories
+{
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Bulletin_SubscribeCategories
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * @access private
+     */
+    var $_cache = [];
+
+
+    function __construct()
+    {
+    }
+
+    /**
+     * @access private
+     */
+    function &get(& $user)
+    {
+        if ( ! $user) {
+            assert('FALSE');
+            $ret = [];
+
+            return $ret;
+        }
+
+        $uid = $user->getOID();
+
+        if (array_key_exists($uid, $this->_cache)) {
+            return $this->_cache[$uid];
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+
+        $query = cb_queryf($db,
+            "SELECT col_category FROM tab_grn_bulletin_subscribecategory WHERE col_user = '@S';",
+            $uid);
+        $result = $db->query($query);
+
+        $category_ids = [];
+        if (cb_is_db_result($result)) {
+            $n = $db->num_rows($result);
+            for ($i = 0; $i < $n; $i++) {
+                $row = $db->fetch_row($result);
+                $category_ids[$row[0]] = 1;
+            }
+            $db->free_result($result);
+        }
+
+        $unsubscribe_category_ids = $this->getUnSubscribedCategoryIds($user);
+        $category_ids = BulletinAdjustSubscribeLogic::getInstance()
+                                                    ->evaluateSubscribeCategoryIds($uid,
+                                                        $category_ids,
+                                                        $unsubscribe_category_ids);
+
+        require_once('bulletin/access.csp');
+        $acc = GRN_Bulletin_AccessManager::getInstance();
+
+        $accessible = $acc->evaluateCategories($user, $category_ids,
+            GRN_BULLETIN_ACCESS_R);
+
+        if (count($this->_cache) >= GRN_BULLETIN_MAX_SUBSCRIBE_USERS) {
+            $cache_keys = array_keys($this->_cache);
+            $idx = array_shift($cache_keys);
+            unset($this->_cache[$idx]);
+        }
+
+        $this->_cache[$uid] = $accessible;
+
+        return $accessible;
+    }
+
+    function exists(& $user, & $category)
+    {
+        if ( ! $user || ! $category) {
+            assert('FALSE');
+
+            return false;
+        }
+
+        $cache = $this->get($user);
+
+        if (is_object($category)) {
+            return array_key_exists($category->getOID(), $cache);
+        }
+
+        return array_key_exists($category, $cache);
+    }
+
+    function set(& $user, & $category, $onoff)
+    {
+        if ( ! $user || ! $category) {
+            assert('FALSE');
+
+            return false;
+        }
+
+        $table = cb_class2table("GRN_Bulletin_SubscribeCategory");
+        $rowset = new CB_RowSet($table);
+        $rowset->addCondition($rowset->queryf("col_user = '@S' AND col_category = '@S'",
+            $user->getOID(), $category->getOID()));
+        $rowset->limit(0, 1);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        $uid = $user->getOID();
+        $cid = $category->getOID();
+
+        if ($row) {
+            if ( ! $onoff) {
+                $row->delete();
+
+                if (array_key_exists($uid, $this->_cache)) {
+                    if (array_key_exists($cid, $this->_cache[$uid])) {
+                        unset($this->_cache[$uid][$cid]);
+                    }
+                }
+            }
+        } else {
+            if ($onoff) {
+                $row = $table->newRow();
+                $row->set('user', $user);
+
+                if (is_a($category, 'cb_persistentbase')) {
+                    $row->set('category', $category);
+                } else {
+                    $row->set('category', $category->_getRow());
+                }
+
+                $row->registerNow();
+
+                if (array_key_exists($uid, $this->_cache)) {
+                    require_once('bulletin/category.csp');
+                    $factory = GRN_Bulletin_CategoryFactory::getInstance();
+                    $this->_cache[$uid][$cid]
+                        = $factory->row2object($row->get('category'));
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Get list of subscribe users。
+     *
+     * @param $category_id
+     *
+     * @return array
+     */
+    public function getCategorySubscribeUsers($category_id)
+    {
+        if ( ! $category_id) {
+            assert('FALSE');
+            $ret = [];
+
+            return $ret;
+        }
+
+        $db = cb_get_app_db('bulletin');
+
+        $query = cb_queryf($db,
+            "SELECT col_user AS id FROM tab_grn_bulletin_subscribecategory AS bs, tab_cb_user AS u"
+            .
+            " WHERE bs.col_user = u._id AND u.col_deleted IS NULL AND bs.col_category = '@S' "
+            .
+            " ORDER BY u.col_position, u._id; ", $category_id);
+
+        $result = $db->query($query);
+
+        $user_ids = [];
+        if (cb_is_db_result($result)) {
+            $n = $db->num_rows($result);
+            for ($i = 0; $i < $n; $i++) {
+                $row = $db->fetch_row($result);
+                $user_ids[$row[0]] = $row[0];
+            }
+        }
+        $db->free_result($result);
+
+        return $user_ids;
+    }
+
+    /**
+     * @param CB_User $user
+     *
+     * @return array
+     */
+    function getUnSubscribedCategoryIds(CB_User $user)
+    {
+        $user_id = $user->getOID();
+        $dao = new BulletinFacade();
+        $unsubscribe_category_ids
+            = $dao->selectUnSubscribeCategoryByUserId($user_id);
+
+        require_once("bulletin/access.csp");
+        $acc = GRN_Bulletin_AccessManager::getInstance();
+        $accessible = $acc->evaluateCategories($user, $unsubscribe_category_ids,
+            GRN_BULLETIN_ACCESS_R);
+
+        return $accessible;
+    }
+
+    /**
+     * @param CB_User               $user
+     * @param GRN_Bulletin_Category $category
+     * @param boolean               $onoff
+     *
+     * @return boolean
+     */
+    function setUnSubscribedCategory(CB_User $user, $category, $onoff)
+    {
+        $user_id = $user->getOID();
+        $category_id = $category->getOID();
+        $dao = new BulletinFacade();
+
+        $unsubscribe_user_category = $dao->selectUnscribeUserCategory($user_id,
+            $category_id);
+        if (count($unsubscribe_user_category) > 0) {
+            if ( ! $onoff) {
+                $dao->deleteUnscribeUserCategory($user_id, $category_id);
+            }
+        } else {
+            if ($onoff) {
+                $dao->insertUnscribeUserCategory($user_id, $category_id);
+            }
+        }
+        unset($this->_cache[$user_id][$category_id]);
+        $notify_category = GRN_Bulletin_NotifyCategory::getInstance();
+        $notify_category->clearCache($user_id);
+
+        return true;
+    }
+}
+
+/**
+ * @package grn.bulletin
+ */
+class GRN_Bulletin_SubscribeArticles
+{
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Bulletin_SubscribeArticles
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+
+    function __construct()
+    {
+    }
+
+    /**
+     * @access private
+     */
+    var $_table = null;
+
+    function _getTable()
+    {
+        if (is_null($this->_table)) {
+            $this->_table = cb_class2table('GRN_Bulletin_UnsubscribeArticle');
+        }
+
+        return $this->_table;
+    }
+
+    function _getRow(& $user, & $article)
+    {
+        $table = $this->_getTable();
+        $rowset = new CB_RowSet($table);
+        $rowset->addCondition($rowset->queryf("col_user = '@S' AND col_article = '@S'",
+            $user->getOID(), $article->getOID()));
+        $rowset->limit(0, 1);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return $row;
+    }
+
+    function exists(& $user, & $article)
+    {
+        if ( ! $user || ! $article) {
+            assert('FALSE');
+
+            return false;
+        }
+
+        if (is_object($article)) {
+            $aid = $article->getOID();
+        } else {
+            $aid = $article;
+        }
+
+        $uid = $user->getOID();
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+
+        $uid = $db->escape($uid);
+        $aid = $db->escape($aid);
+        $result
+            = $db->query("SELECT _id FROM tab_grn_bulletin_unsubscribearticle WHERE col_user = '$uid' AND col_article = '$aid';");
+
+        if ( ! cb_is_db_result($result)) {
+            return true;
+        }
+
+        $n = $db->num_rows($result);
+        $db->free_result($result);
+
+        return $n < 1;
+    }
+
+    function set(& $user, & $article, $onoff)
+    {
+        if ( ! $user || ! $article) {
+            assert('FALSE');
+
+            return false;
+        }
+
+        $row =& $this->_getRow($user, $article);
+
+        $uid = $user->getOID();
+
+        if ($row) {
+            if ($onoff) {
+                $row->delete();
+            }
+        } else {
+            if ( ! $onoff) {
+                $table =& $this->_getTable();
+                $row =& $table->newRow();
+                $row->set('user', $user);
+
+                if (is_a($article, 'cb_persistentbase')) {
+                    $row->set('article', $article);
+                } else {
+                    $row->set('article', $article->_getRow());
+                }
+
+                $row->registerNow();
+            }
+        }
+
+        return true;
+    }
+
+    function getUnsubscribeIds(& $user, $categories = null)
+    {
+        if ( ! $user) {
+            assert('FALSE');
+
+            return [];
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db =& $app_locator->getConnection('bulletin');
+
+        $join = "tab_grn_bulletin_unsubscribearticle AS u";
+
+        $conditions = [];
+        $conditions[] = cb_queryf($db, "u.col_user = '@S'", $user->getOID());
+
+        $now = time();
+
+        $join = "(" . $join
+                . " LEFT JOIN tab_grn_bulletin_articleentity AS a ON u.col_article = a._id)";
+        $conditions[]
+            = "(a.col_start_timestamp IS NULL OR a.col_start_timestamp <= $now)";
+
+        if ($categories && is_array($categories)) {
+            $escape_cids = [];
+            foreach (array_keys($categories) as $cid) {
+                $cid = cb_queryf($db, "'@S'", $cid);
+                $escape_cids[$cid] = $cid;
+            }
+            $join = "(" . $join
+                    . " LEFT JOIN tab_grn_bulletin_categoryentity AS c ON a.col_category = c._id)";
+            $conditions[] = "c._id IN (" . implode(',',
+                    array_keys($escape_cids)) . ")";
+        }
+
+        $result = $db->query("SELECT a._id,c._id FROM $join WHERE ("
+                             . implode(' AND ', $conditions) . ");");
+
+        if ( ! cb_is_db_result($result)) {
+            return [];
+        }
+
+        $n = $db->num_rows($result);
+        $articles = [];
+        for ($i = 0; $i < $n; $i++) {
+            $row = $db->fetch_row($result);
+            $articles[$row[0]] = $row[1];
+        }
+        $db->free_result($result);
+
+        return $articles;
+    }
+
+    function getUnsubscribe(& $user, $categories = null)
+    {
+        if ( ! $user) {
+            assert('FALSE');
+
+            return [];
+        }
+
+        $table =& $this->_getTable();
+        $rowset = new CB_RowSet($table, 'u');
+        $rowset->addCondition($rowset->queryf("u.col_user = '@S'",
+            $user->getOID()));
+
+        if ($categories && is_array($categories)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $tm =& $app_locator->getTableManager('bulletin');
+
+            $tab_article =& $tm->getTableInfo('grn_bulletin_articleentity');
+
+            $rowset->addJoin($tab_article,
+                'u.col_article = a._id',
+                CB_DATABASE_LEFT_JOIN, 'a');
+
+            $tab_category =& $tm->getTableInfo('grn_bulletin_categoryentity');
+
+            $rowset->addJoin($tab_category,
+                'a.col_category = c._id',
+                CB_DATABASE_LEFT_JOIN, 'c');
+
+            $escape_cids = [];
+            foreach (array_keys($categories) as $key) {
+                $cid = $rowset->queryf("'@S'", $key);
+                $escape_cids[$cid] = $cid;
+            }
+            $rowset->addCondition('c._id IN (' . implode(',',
+                    array_keys($escape_cids)) . ')');
+        }
+
+        require_once('bulletin/article.csp');
+        $factory = GRN_Bulletin_ArticleFactory::getInstance();
+
+        $articles = [];
+        while ( ! is_null(($row = $rowset->iterate()))) {
+            $article_row = $row->get('article');
+            $article = $factory->row2object($article_row);
+
+            // 公開されている記事に限定
+            if ( ! $article->isPublished()) {
+                continue;
+            }
+            // 記事のアクセス権をチェック
+            /**
+             * if( ! $article->access( $user, GRN_BULLETIN_ACCESS_R, FALSE ) )
+             * {
+             * continue;
+             * }
+             **/
+
+            $articles[$article->getOID()] = $article;
+        }
+        $rowset->destroy();
+
+        return $articles;
+    }
+
+    /**
+     * @param GRN_Bulletin_Article $article
+     *
+     * @return array
+     */
+    public function getUnsubscribeUsers($article)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+
+        $query = cb_queryf($db,
+            "SELECT col_user FROM tab_grn_bulletin_unsubscribearticle WHERE col_article = '@S';",
+            $article->getOID());
+        $result = $db->query($query);
+
+        $user_ids = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $user_ids[] = $row['col_user'];
+        }
+        $db->free_result($result);
+
+        return $user_ids;
+    }
+
+    /**
+     * Get list of unsubscribe users。
+     *
+     * @param $category_id
+     * @param $article_id
+     *
+     * @return array
+     */
+    public function getCategoryUnsubscribeUsers($category_id, $article_id)
+    {
+        if ( ! $category_id) {
+            assert('FALSE');
+            $ret = [];
+
+            return $ret;
+        }
+
+        // get unsubscribe users of category.
+        $dao = new BulletinFacade();
+        $user_ids
+            = $dao->selectUnSubscribeCategoryUserByCategoryId($category_id);
+
+        if ($article_id != '') {
+            $db = cb_get_app_db('bulletin');
+
+            // get unsubscribe users of article
+            $query = cb_queryf($db,
+                "SELECT col_user AS id FROM tab_grn_bulletin_unsubscribearticle AS bs, tab_cb_user AS u"
+                .
+                " WHERE bs.col_user = u._id AND u.col_deleted IS NULL AND bs.col_article = '@S' "
+                .
+                " ORDER BY u.col_position, u._id; ", $article_id);
+
+            $result = $db->query($query);
+            if (cb_is_db_result($result)) {
+                $n = $db->num_rows($result);
+                for ($i = 0; $i < $n; $i++) {
+                    $row = $db->fetch_row($result);
+                    $user_ids[$row[0]] = $row[0];
+                }
+            }
+            $db->free_result($result);
+        }
+
+        return $user_ids;
+    }
+}
+
+

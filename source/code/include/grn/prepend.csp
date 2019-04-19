@@ -1,0 +1,614 @@
+<?php
+
+use grn\api\RestApiAuthentication;
+use grn\grn\access\service\AppAccess;
+
+/*
+ * Garoon基本設定
+ */
+global $G_container_base;
+global $G_config_grn;
+global $G_container_grn;
+
+//  Print CBAPI headers.
+header('X-Cybozu-Forward: 1');
+/** @see https://bozuman.cybozu.com/k/5095/show#record=1171 */
+if (defined('ON_FOREST') && cb_is_remote_access()) {
+    cb_throw_error(E_COMMON_REMOTE_SERVICE_NOT_SUPPORTED);
+}
+/*
+ * アプリケーション用プラグイン軽量コンテナの作成
+ */
+global $G_container_app;
+$dir = $G_config_grn->get('System', 'lwc_dir');
+$G_container_app = new CB_LWContainer($G_container_grn,
+    new CB_LWContainerDirectoryConfig($dir));
+unset($dir);
+
+require_once('fw/error_handler.csp');
+set_exception_handler(
+    create_function('$exception',
+        '$handler = CB_ErrorHandler::getInstance();
+$handler->handlerForException($exception);'
+    ));
+
+global $G_INPUT;
+global $G_config_common;
+if (( ! array_key_exists(CB_MAGIC_ENV, $_ENV))
+    && array_key_exists('REQUEST_METHOD', $_SERVER)
+) {
+    // csrf validation
+    $page = cb_get_pagename();
+    $parts = explode('/', $page);
+    $directory = $parts[0];
+    $page_name = array_pop($parts);
+
+    require_once('fw/csrf.csp');
+    require('fw/csrf_list.csp');
+
+    if ( ! $G_config_common->get('Global', 'csrf_check_disable')) {
+        $cellular_page = "";
+        $cellular_page_parts = "";
+        if ($page === 'cellular/app' && is_array($G_INPUT)
+            && array_key_exists('p', $G_INPUT)
+        ) {
+            $cellular_page = str_replace('-', '/', $G_INPUT['p']);
+            $cellular_page_parts = explode('/', $cellular_page);
+            $page_name = array_pop($cellular_page_parts);
+        }
+
+        if (in_array($page, $G_csrf_black_list)
+            || (preg_match('/^command_/', $page_name)
+                &&
+                ! in_array($page, $G_csrf_white_list)
+                &&
+                ! in_array($directory, $G_csrf_white_directories)
+                &&
+                ! (strcasecmp(@$_SERVER['REQUEST_METHOD'], 'GET') == 0
+                   && in_array($cellular_page, $G_csrf_white_list_for_GET))
+            )
+        ) {
+            $csrf_ticket = "";
+            if (is_array($G_INPUT)
+                && array_key_exists('csrf_ticket', $G_INPUT)
+            ) {
+                $csrf_ticket = $G_INPUT['csrf_ticket'];
+            }
+            require_once('fw/csrf.csp');
+            cb_csrf_validate_token($csrf_ticket);
+        }
+        unset($cellular_page, $cellular_page_parts);
+    }
+    unset($page, $parts, $directory, $page_name);
+
+    // Unset csrf_ticket, because sometimes re-use $G_INPUT.
+    // e.g. cb_redirect('workflow/system/access_list', $G_INPUT);
+    if (array_key_exists('csrf_ticket', $G_INPUT)) {
+        global $G_INPUT_HIDDEN;
+        $G_INPUT_HIDDEN['csrf_ticket'] = $G_INPUT['csrf_ticket'];
+    }
+    unset($G_INPUT['csrf_ticket']);
+}
+
+global $G_state_set;
+if ( ! $G_state_set->get('command_line')) {
+    // against IE compatibility setting
+    require_once('fw/miscFunctions.csp');
+    cb_set_ua_compatible();
+
+    // X-XSS-Protection setting
+    grn\grn\security\XXssProtectionHttpHeader::setHeaderIfNeeded();
+}
+
+/*
+ * 基本的な認証
+ */
+
+//Get Authentication Target Application ID
+$page_path = strtolower(cb_get_pagename());
+$page_parts = explode('/', $page_path);
+$app_id = $page_parts[0];
+
+//Get Force Authentication Driver from Application Hooks
+require_once('grn/authentication.csp');
+global $G_authentication_force_driver;
+$G_authentication_force_driver = null;
+$loader = new GRN_Authentication_Application_Loader();
+$G_authentication_force_driver
+    = $loader->getAuthenticationForceDriverName($app_id,
+    $page_parts);
+
+if (cb_is_rest_api() && ! cb_is_develop_rest_api()) {
+    RestApiAuthentication::authenticate();
+}
+
+/*
+ * ===============================================================
+ * Table manager instance initialize.
+ * ===============================================================
+ */
+$config_list = $G_container_base->_config->listConfigs();
+
+foreach ($config_list as $section) {
+    $config = $G_container_base->_config->getConfig($section);
+    $class = $config['class'];
+
+    if ( ! is_null($class) && strcasecmp($class, 'GRN_TableManager') === 0) {
+        $instance = $G_container_base->getInstance($section);
+        unset($instance);
+    }
+}
+
+if ( ! cb_is_init_process()) {
+    //  Print CBAPI headers.
+    require_once('cbapi/logic.csp');
+    grn_cbapi_print_x_cybozu_user();
+
+    $app_id = $page_parts[0];
+    require_once('grn/application.csp');
+    $locator = GRN_ApplicationLocator::instance();
+
+    $app_ids = $locator->getApplicationIds();
+
+    $is_application = true;
+    if ( ! in_array($app_id, $app_ids) && $app_id !== 'fts'
+         && $app_id !== 'kunai'
+    ) {
+        $app_id = 'common';
+        $is_application = false;
+    }
+
+    require_once('fw/error_trace_log.csp');
+    if ($G_config_common->get('Global', 'debug') & ERROR_TRACE_LOG_FLAG_213) {
+        require_once('fw/logger.csp');
+        $lm = CB_LoggerManager::getInstance();
+        $l = $lm->getLogger('grn.' . $app_id);
+        if ($l->isDebugEnabled()) {
+            $message = sprintf('[%ld] PROCSTART [%s]', getmypid(),
+                strtolower(cb_get_pagename()));
+            $l->debug($message);
+        }
+    }
+
+    /** @var GRN_Uum $uum */
+    $uum = $G_container_base->getInstance('uum');
+
+    if ((strcmp('system', $page_parts[0]) === 0)) {
+        // version check.
+        grn_check_version();
+
+        cb_require_role('LoginUser');
+        if (count($page_parts) > 2) {
+            $excludes = ['information' => 1, 'user' => 1];
+            $component = $page_parts[1];
+            if ( ! array_key_exists($component, $excludes)) {
+                require_once('grn/system_logic.csp');
+                $system = GRN_System::getInstance();
+                $logged_in_user = $uum->getLoginUser();
+                if ( ! $system->adminSubSystem($page_parts[1],
+                    $logged_in_user)
+                ) {
+                    cb_throw_error(E_GRN_NO_SYSTEM_PRIVILEGE);
+                }
+            }
+        }
+
+    } elseif (strcmp('personal', $page_parts[0]) === 0) {
+        grn_check_version();
+        cb_require_role('LoginUser');
+
+    } else {
+
+        if ($is_application && $app = $locator->getInstance($app_id)) {
+            $is_personal = false;
+            $is_system = false;
+            $is_item = false;
+            if (count($page_parts) > 1) {
+                $component = $page_parts[1];
+                if (strcmp($component, 'personal') === 0) {
+                    $is_personal = true;
+                }
+                if (strcmp($component, 'system') === 0) {
+                    $is_system = true;
+                }
+                if (strcmp($component, 'item') === 0) {
+                    $is_item = true;
+                }
+            }
+
+            if ($is_item && strpos(@$G_INPUT['display'], '-system')) {
+                $is_system = true;
+            }
+            // version check.
+            grn_check_version();
+
+            // login authentication
+            if ($app->getConfig('login')) {
+                cb_require_role('LoginUser');
+            }
+
+            if (count($page_parts) > 1) {
+                if ($is_personal) {
+                    cb_require_role('LoginUser');
+                } elseif ($is_system) {
+                    cb_require_role('LoginUser');
+                    require_once('grn/system_logic.csp');
+                    $system = GRN_System::getInstance();
+                    $logged_in_user = $uum->getLoginUser();
+                    if ( ! $system->adminApplication($page_parts[0],
+                        $logged_in_user)
+                    ) {
+                        cb_throw_error(E_GRN_NO_SYSTEM_PRIVILEGE);
+                    }
+                }
+            }
+
+            // Check application license.
+            require_once('grn/license.csp');
+            $lm = GRN_LicenseManager::getInstance();
+            $license = $lm->getLicense(GRN_LICENSE_BASESYSTEM);
+            $isDemo = $lm->isDemoLicense(@$license['type']);
+            if ($isDemo
+                && ($redirect = $app->forceRedirect($page_parts)) !== false
+            ) {
+                cb_switch_page($redirect, CB_EXIT_LICENSE_REDIRECT);
+            }
+
+            if ( ! $is_system
+                 && (( ! $app->isLicensed())
+                     || ( ! $is_system && count($page_parts) > 1
+                          && 0 === strcmp($page_parts[1], 'mobile')
+                          && ( ! grn\grn\mobile\MobileLicense::isLicensed()))
+                 )
+            ) {
+                cb_throw_error(E_GRN_LICENSE_EXPIRED);
+            }
+            if ( ! $is_system && ( ! $locator->isActive($app_id))) {
+                cb_throw_error(E_GRN_APPLICATION_NOT_ACTIVE);
+            }
+
+            // When app_id is KUNAI, check whether kunai controlled Apps are active.
+            if ($app_id === 'kunai'
+                && count($app->getActiveControlledApps()) == 0
+            ) {
+                cb_throw_error(E_GRN_APPLICATION_NOT_ACTIVE);
+            }
+
+            if ($app_id === 'cellular') {
+                assert('$app instanceof GRN_Cellular');
+                if (array_key_exists("token_id_cellular", $_COOKIE)
+                    && $app->isAutoLogin()
+                ) {
+                    $app->updateAutoLoginExpiration($_COOKIE['token_id_cellular']);
+                }
+            }
+
+            if ( ! $is_system) {
+                AppAccess::checkAccess($app_id);
+            }
+
+        } else {
+            // Check License for mobile
+            if ((0 === strcmp($page_parts[0], 'mobile')
+                 || (count($page_parts) > 1
+                     && 0 === strcmp($page_parts[1], 'mobile')))
+                && ( ! grn\grn\mobile\MobileLicense::isLicensed())
+            ) {
+                cb_throw_error(E_GRN_LICENSE_EXPIRED);
+            }
+
+            // activity check
+            if (in_array($page_parts[0], $locator->getApplicationIds())) {
+                require_once('grn/error_code.csp');
+                cb_throw_error(E_GRN_APPLICATION_NOT_ACTIVE);
+            }
+
+            return;
+        }
+    }
+
+    // reload plugin.
+    if (isset($G_INPUT['_reload']) && 1 == $G_INPUT['_reload']) {
+        // get available applications.
+        $logged_in_user = cb_get_login_user()->getOID();
+        $app_ids
+            = AppAccess::getAvailableAppIdsInternalByUserId($logged_in_user);
+        $plugin = new CB_PluginLoader('grn.common.reload');
+
+        foreach ($app_ids as $id) {
+            $funcs = $plugin->loadHooks($id);
+            foreach ($funcs as $func) {
+                $func($page_parts[0]);
+            }
+        }
+        $plugin->loadHooks('common');
+
+        // clear session
+        $modules = [
+            'grn.common.ui',
+            'grn.common.calendar'
+        ];
+
+        require_once('fw/session_manager.csp');
+        $sm = CB_SessionManager::getInstance();
+        foreach ($modules as $module) {
+            $sm->destroy($module);
+        }
+        unset($sm, $modules, $module);
+    }
+    unset($plugin, $app_ids, $id, $funcs, $func);
+    unset($page_parts, $locator, $app);
+    // STGRN-73
+    // redirect after authentication for any _POST form, exception command process pages start with "command_"
+    // this behaviour process in case access direct from browser ex: http://hostname/cgi-bin/cbgrn/grn.exe/message/send?cid=2
+    $G_specials_redirect_list = ['system/license/confirm'];
+    $page_name = cb_get_pagename();
+    $page_parts = explode('/', $page_name);
+    $page_name_last = end($page_parts);
+    if (strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST') == 0) {
+        if (in_array($page_name, $G_specials_redirect_list)) {
+            //Get Session
+            require_once('fw/session_manager.csp');
+            $session_manager = CB_SessionManager::getInstance();
+            $session_key = array_key_exists('HTTP_REFERER', $_SERVER)
+                ? $_SERVER['HTTP_REFERER'] . ' _redirect'
+                : $page_name . '_redirect';
+            $session = $session_manager->getSession($session_key);
+            //Save array parameters of $G_INPUT into Session.
+            $session->set('G_INPUT_Session', $G_INPUT);
+            cb_redirect($page_name,
+                ['_redirect' => str_replace('/', '_', $page_name)]);
+        }
+        $exist_tpl_file = grn_template_exists($page_name . '.tpl');
+        // if $page_name_last begins "command_", without redirect.
+        if ($exist_tpl_file && substr($page_name_last, 0, 8) !== "command_"
+            && ! is_ajax()
+        ) {
+            foreach ($G_INPUT as $key => $value) {
+                if (is_array($value) || strpos($value, ' ')) {
+                    //Get Session
+                    require_once('fw/session_manager.csp');
+                    $session_manager = CB_SessionManager::getInstance();
+                    $session_key = array_key_exists('HTTP_REFERER',
+                        $_SERVER) ? $_SERVER['HTTP_REFERER'] . ' _redirect'
+                        : $page_name . '_redirect';
+                    $session
+                        = $session_manager->getSession($session_key);
+                    $session->set('G_INPUT_Session', $G_INPUT);
+                    //Save array parameters of $G_INPUT into Session.
+                    if ((strcmp('system', $page_parts[0]) == 0
+                         && strcmp('user', $page_parts[1]) == 0)
+                    ) {
+                        $prepend = cb_basedir() . '/code/doc_root/'
+                                   . dirname($page_name) . '/_prepend.csp';
+                        if (file_exists($prepend)) {
+                            include_once($prepend);
+                        }
+                        unset($prepend);
+                        if (isset($page_parts[2])
+                            && (strcmp('org_user_assign', $page_parts[2]) == 0
+                                || strcmp('org_user_belong', $page_parts[2])
+                                   == 0
+                                || strcmp('org_privilege_add', $page_parts[2])
+                                   == 0
+                                || strcmp('org_user_belong_add', $page_parts[2])
+                                   == 0
+                                || strcmp('org_privilege_delete_multi',
+                                    $page_parts[2]) == 0
+                            )
+                        ) {
+                            _grn_get_privilege_logic();
+                        }
+                    }
+                    cb_redirect($page_name,
+                        ['_redirect' => str_replace('/', '_', $page_name)]);
+                }
+            }
+
+            $ignore_redirect_link = false;
+            if (strcmp($page_parts[0], 'sysapi') == 0
+                || strcmp($page_parts[0], 'util_api') == 0
+                || strcmp($page_parts[0], 'cbpapi') == 0
+                || strcmp($page_parts[0], 'cbapi') == 0
+                || (strcmp($page_parts[0], 'cbwebsrv') == 0
+                    && strcmp($page_parts[1], 'system') != 0)
+                || (strcmp($page_parts[0], 'dezielink') == 0
+                    && strcmp($page_parts[1], 'system') != 0)
+                || (strcmp($page_parts[0], 'schedule') == 0
+                    && strcmp($page_parts[1], 'extension') == 0)
+            ) {
+                $ignore_redirect_link = true;
+            }
+
+            if ( ! $ignore_redirect_link) {
+                if ((strcmp('system', $page_parts[0]) == 0
+                     && strcmp('user', $page_parts[1]) == 0)
+                ) {
+                    $prepend = cb_basedir() . '/code/doc_root/'
+                               . dirname($page_name) . '/_prepend.csp';
+                    if (file_exists($prepend)) {
+                        include_once($prepend);
+                    }
+                    unset($prepend);
+                    if (isset($page_parts[2])
+                        && (strcmp('org_user_assign', $page_parts[2]) == 0
+                            || strcmp('org_user_belong', $page_parts[2]) == 0
+                            || strcmp('org_privilege_add', $page_parts[2]) == 0
+                            || strcmp('org_user_belong_add', $page_parts[2])
+                               == 0
+                            || strcmp('org_privilege_delete_multi',
+                                $page_parts[2]) == 0
+                        )
+                    ) {
+                        _grn_get_privilege_logic();
+                    }
+                }
+                cb_redirect($page_name, $G_INPUT);
+            }
+        }
+    } else {
+        if (array_key_exists('sf', $G_INPUT) && $G_INPUT['sf']) {
+            return;
+        } else {
+            if (array_key_exists('_redirect', $G_INPUT)
+                && $G_INPUT['_redirect'] == str_replace('/', '_', $page_name)
+            ) {
+                require_once('fw/session_manager.csp');
+                $session_manager = CB_SessionManager::getInstance();
+                $session_key = array_key_exists('HTTP_REFERER', $_SERVER)
+                    ? $_SERVER['HTTP_REFERER'] . ' _redirect'
+                    : $page_name . '_redirect';
+                $session = $session_manager->getSession($session_key);
+                $G_INPUT_session = $session->get('G_INPUT_Session');
+                if (is_array($G_INPUT_session)) {
+                    foreach ($G_INPUT_session as $key => $value) {
+                        $G_INPUT[$key] = $value;
+                    }
+                }
+            }
+        }
+    }
+}
+
+function grn_check_version()
+{
+    if (defined('ON_FOREST')) {
+        return;
+    }
+    global $G_config_grn;
+    require_once('grn/system_logic.csp');
+    $system = GRN_System::getInstance();
+    $installed_version = $system->getVersion();
+    $now_version = $G_config_grn->get('System', 'version');
+    if ($installed_version != $now_version) {
+        cb_throw_error(E_GRN_INVALID_VERSION);
+    }
+}
+
+/**
+ * check XMLHttpRequest in header.
+ *
+ * @return bool
+ */
+function is_ajax()
+{
+    return (isset($_SERVER['HTTP_X_REQUESTED_WITH'])
+            && $_SERVER['HTTP_X_REQUESTED_WITH'] == "XMLHttpRequest");
+}
+
+/**
+ * @see GRN_Smarty::_cb_resolve_template
+ *
+ * @param $template_file
+ *
+ * @return bool
+ */
+function grn_template_exists($template_file)
+{
+    // Determine which locale the template is expected to be found in.
+    global $G_config_common;
+    $is_develop = $G_config_common->get('Global', 'develop');
+
+    if ($is_develop) {
+        // In develop mode, fetch raw templates from the "master"
+        // directory for use in dynamic generation.
+        $container = 'master';
+    } else {
+        // When not in develop mode, retrieve pre-generated templates
+        // according to the current locale.
+        require_once('fw/i18n.csp');
+        $i18n = CB_I18N::getInstance();
+        $container = $i18n->getCurrentLanguage();
+    }
+
+    $targetdir = cb_basedir() . '/page/' . $container;
+    if (is_dir($targetdir) == false) {
+        return false;
+    }
+    // Test our calculated path to the template
+    $resolved_path = $container . '/' . $template_file;
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty();
+    if ( ! $t->template_exists($resolved_path)) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * get page's display name
+ *
+ * @param string     $page_name
+ * @param array|null $args
+ *
+ * @return string
+ */
+function grn_get_page_display_name($page_name, $args = null)
+{
+    require_once('fw/i18n.csp');
+    $page_parts = explode('/', $page_name);
+
+    //-- create id for message
+    $message_id = 'grn';
+    $page_parts_count = count($page_parts);
+    for ($i = 0; $i < $page_parts_count - 1; $i++) {
+        if ( ! preg_match('/mobile/i', $page_parts[$i])) {
+            $message_id .= '.' . $page_parts[$i];
+        }
+    }
+    $page_name_last = end($page_parts);
+    // if $page_name_last begins "command_", remove that pre sting.
+    if (substr($page_name_last, 0, 8) == "command_") {
+        $page_name_last = substr($page_name_last, 8);
+    }
+
+    if ($page_parts_count > 0
+        && ($page_parts[0] == 'system'
+            || $page_parts[1] == 'system')
+        && (is_null($args) || ! array_key_exists('application_name', $args))
+    ) {
+        require_once('grn/application.csp');
+        $locator = GRN_ApplicationLocator::instance();
+        $instance = $locator->getInstance($page_parts[0]);
+
+        if ($instance) {
+            if (is_null($args)) {
+                $args = [];
+            }
+            $args['application_name'] = $instance->getDefaultName();
+        }
+    } // set application name to $args
+    elseif ($page_parts_count > 0
+            && (is_null($args)
+                || ! array_key_exists('application_name', $args))
+    ) {
+        require_once('grn/application.csp');
+        $locator = GRN_ApplicationLocator::instance();
+        $instance = $locator->getInstance($page_parts[0]);
+
+        if ($instance) {
+            if (is_null($args)) {
+                $args = [];
+            }
+            $args['application_name'] = $instance->getName();
+        }
+    }
+
+    return cb_plain_msg($message_id, $page_name_last, $args);
+}
+
+/**
+ * get the display name of the current page
+ *
+ * @param array|null $args
+ *
+ * @return string
+ */
+function grn_get_current_page_display_name($args = null)
+{
+    //-- get the current page name
+    $page_name = cb_get_pagename();
+
+    return grn_get_page_display_name($page_name, $args);
+}

@@ -1,0 +1,16 @@
+{include file='grn/error_handler.tpl'}
+{include file='grn/common.tpl'}
+{include file='schedule/_prepare_data.tpl'}
+{grn_load_css file='grn/html/page/portal/setting.css'}
+{grn_load_css file='grn/html/schedule.css'}
+{grn_load_css file='grn/html/component/toggle_button/toggle_button.css'}
+{grn_load_javascript file='fw/jquery/jquery-ui-1.12.1.custom.min.js'}
+{grn_load_javascript file='grn/html/page/portal/setting.js'}
+{grn_load_javascript file='grn/html/component/toggle_button/toggle_button.js'}
+{grn_load_javascript file='grn/html/page/mail/mail.js'}
+{grn_load_javascript file='grn/html/schedule_display_event.js'}
+{grn_load_javascript file='grn/html/schedule_display_options.js'}
+{grn_load_javascript file='grn/html/schedule_display_options_manager.js'}
+{grn_load_javascript file='grn/html/schedule_gw.js'}
+{grn_load_javascript file='grn/html/schedule_um.js'}
+{grn_load_javascript file='grn/html/star.js'}

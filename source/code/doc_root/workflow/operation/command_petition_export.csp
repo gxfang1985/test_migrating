@@ -1,0 +1,377 @@
+<?php
+
+if (strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST') == 0) {
+    global $G_INPUT;
+
+    // Get Parameter
+    $category_id = $G_INPUT['cid'];
+
+    // ログインユーザーが運用管理権限を持つか確認
+    require_once('workflow/controller_util.csp');
+    $category_util = GRN_Workflow_Category_Controller_Utility::getInstance();
+    if ( ! $category_util->evaluateManage()) {
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_MANAGE_DENY);
+    }
+
+    // 未分類カテゴリか確認
+    if (GRN_WORKFLOW_CATEGORY_NONPARTY_ID == $category_id) {
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_MANAGE_DENY_NONPARTY_CATEGORY);
+    }
+
+    // 未分類カテゴリ以外は運用管理権限とアクセス権を確認
+    $category_util->checkManage($category_id, true, CB_DATABASE_NO_LOCK);
+    $category_util->checkAccess($category_id, true, CB_DATABASE_NO_LOCK);
+
+    // Create Parameter Translation Map from $G_INPUT
+    $translation_info_properties_map = [
+        'cid'     => 'cid',
+        // Category ID       :Use to get form information
+        'fid'     => 'fid',
+        // Form ID           :form._id, petition.col_form
+        'charset' => 'charset',
+        'skip'    => 'skip',
+    ];
+
+    $translation_search_properties_map = [
+        'petition_number'      => '',
+        // 申請番号(書式付き):petition.col_petition_number
+        'subject'              => '',
+        // 標題              :petition.col_name
+        'creator_name'         => '',
+        // 申請者(ユーザー名):petition.col_creator_name
+        'status'               => [],
+        // 状況              :petition.col_status
+        'start_term_timestamp' => null,
+        // 申請日 開始       :petition.ctime
+        'end_term_timestamp'   => null,
+        // 申請日 終了       :petition.ctime
+    ];
+
+    $export_list = [
+        'no'                 => 'no',                  // 申請番号
+        'creator'            => 'creator',             // 申請者
+        'creator_login_name' => 'creator_login_name',  // 申請者のログイン名
+        'creat_date'         => 'creat_date',          // 申請日時
+        'form_name'          => 'form_name',           // 申請フォーム名
+        'status'             => 'status',              // 状況
+        'items_data'         => [],               // カスタマイズ項目
+        'path_step'          => 'path_step',           // 経路
+    ];
+
+    // Get MUST Parameter,required at all times
+    $info_properties = [];
+    foreach (array_keys($translation_info_properties_map) as $condition_name) {
+        $info_properties[$condition_name] = @ $G_INPUT[$condition_name];
+    }
+
+    if ( ! $G_INPUT['charset']) {
+        global $G_config_common;
+        $info_properties['charset'] = $G_config_common->get('I18N',
+            'default_external_encoding');
+    }
+
+    // Get Parameter Used to Search from Petition Data
+
+    // -- Error Check
+    if ( ! array_key_exists('status', $G_INPUT)
+         || 0 === count($G_INPUT['status'])
+    ) {
+        // 'status' required to select greater or equal 1
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_PETITION_NOT_SELECT_STATUS);
+    }
+
+    // Create Suffix String of Date Variable
+    $date_suffix = [
+        'year'  => '_term_year',
+        'month' => '_term_month',
+        'day'   => '_term_day'
+    ];
+    // Get DateTime Instance
+    require_once('fw/date.csp');
+    $date = new CB_DateTime();
+
+    $search_properties = [];
+    foreach (array_keys($translation_search_properties_map) as $condition_name) {
+        if ('start_term_timestamp' == $condition_name
+            || 'end_term_timestamp' == $condition_name
+        ) {
+            //-- Timestamp : Start Date or End Date --
+
+            // Set Name of $G_INPUT Parameter 
+            $prefix = substr($condition_name, 0,
+                (strpos($condition_name, '_')));
+
+            // Get Date
+            $date->year = $G_INPUT[$prefix . $date_suffix['year']];
+            $date->month = $G_INPUT[$prefix . $date_suffix['month']];
+            $date->day = $G_INPUT[$prefix . $date_suffix['day']];
+
+            if (0 == $date->year && 0 == $date->month && 0 == $date->day) {
+                // Not Use to Search
+                continue;
+            } elseif (0 == $date->year || 0 == $date->month
+                      || 0 == $date->day
+            ) {
+                // Error Check:Validate Date
+                require_once('workflow/error_code.csp');
+                if ('start_term_timestamp' == $condition_name) {
+                    // start_term_timestamp
+                    cb_throw_error(E_GRN_WRKF_PETITION_INVALID_START_DATE);
+                } else {
+                    // end_term_timestamp
+                    cb_throw_error(E_GRN_WRKF_PETITION_INVALID_END_DATE);
+                }
+            }
+
+            if ('end_term_timestamp' == $condition_name) {
+                $date->hour = 23;
+                $date->minute = 59;
+                $date->second = 59;
+            }
+
+            // Transform Date into Timestamp
+            $search_properties[$condition_name]
+                = cb_date_convert2timestamp($date);
+        } elseif ('status' === $condition_name) {
+            $condition_status_value = $G_INPUT[$condition_name] ?? [];
+            if ( ! is_array($condition_status_value)
+                 || $condition_status_value === []
+            ) {
+                continue;
+            }
+            $search_properties[$condition_name] = $condition_status_value;
+        } else {
+            $condition_name_value = $G_INPUT[$condition_name] ?? "";
+            if ( ! is_string($condition_name_value)
+                 || $condition_name_value === ""
+            ) {
+                // Not Use to Search, If POST Data is Empty or 0 size
+                continue;
+            }
+            $search_properties[$condition_name] = $condition_name_value;
+        }
+    }
+
+    // Error Check:Compare Start and End Date by Timestamp
+    if (array_key_exists('start_term_timestamp', $search_properties)
+        && array_key_exists('end_term_timestamp', $search_properties)
+    ) {
+        if ($search_properties['start_term_timestamp']
+            > $search_properties['end_term_timestamp']
+        ) {
+            require_once('workflow/error_code.csp');
+            cb_throw_error(E_GRN_WRKF_PETITION_INVALID_DATE_TERM);
+        }
+    }
+
+    // get export base item
+    $export_base_options = [];
+    if (array_key_exists('selected_export_base', $G_INPUT)
+        and strlen($G_INPUT['selected_export_base']) > 0
+    ) {
+        $export_base_options = explode(':',
+            cb_at($G_INPUT, 'selected_export_base'));
+    }
+
+    // get export customize item
+    $export_item_options = [];
+    if (array_key_exists('selected_export_item', $G_INPUT)
+        and strlen($G_INPUT['selected_export_item']) > 0
+    ) {
+        $export_item_options = explode(':',
+            cb_at($G_INPUT, 'selected_export_item'));
+    }
+
+    if (count($export_base_options) == 0 && count($export_item_options) == 0) {
+        // not export item
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_CSV_NOT_SELECT_ITEM);
+    }
+
+    foreach (array_keys($export_list) as $export) {
+        if ($export == 'items_data') {
+            continue;
+        }
+
+        if ( ! in_array($export, $export_base_options)) {
+            unset($export_list[$export]);
+        }
+    }
+
+    if (count($export_item_options) > 0) {
+        require_once('workflow/controller_util.csp');
+        $item_util = GRN_Workflow_Item_Controller_Utility::getInstance();
+        $item_list = $item_util->getSimpleListView(cb_at($G_INPUT, 'fid'));
+
+        $available_item = [];
+        foreach ($item_list as $item) {
+            $available_item[] = $item['iid'];
+        }
+        foreach ($export_item_options as $key => $export_item) {
+            if ( ! in_array($export_item, $available_item)) {
+                unset($export_item_options[$key]);
+            }
+        }
+
+        $export_list['items_data'] = $export_item_options;
+    } else {
+        unset($export_list['items_data']);
+    }
+
+    // Create Tmporary File
+    $tempdir = cb_tmpdir();
+    $temp_file_name = tempnam($tempdir, 'workflow_');
+
+    // Get CSV Writer
+    require_once('fw/csv.csp');
+    $csv_writer = new CB_CSVWriter($info_properties['charset'],
+        $temp_file_name);
+
+    //Create Additional Information of Petitions to Export
+
+    // -- Set Condition
+    //
+    //      $condition_list[] = array( 'column'   => '',
+    //                                 'value'    => '',
+    //                                 'operator' => '' );
+    //      $option['condition'] = $condition_list;
+    //
+    $condition_list = [];
+    foreach (array_keys($search_properties) as $column_name) {
+        if ('subject' == $column_name) {
+            $condition_list[] = [
+                'column'   => 'p.col_name',
+                'value'    => $search_properties[$column_name],
+                'operator' => 'LIKE'
+            ];
+        } elseif ('status' == $column_name) {
+            // -- Status
+            $status_list = [];
+            foreach (
+                array_keys($search_properties['status']) as $view_status_name
+            ) {
+                switch ($view_status_name) {
+                    case '0':   // 進行中   :未処理,進行中,差し戻し
+                        $status_list = array_merge($status_list, [0, 1, 4]);
+                        break;
+                    case '1':   // 承認     :承認
+                        $status_list[] = 2;
+                        break;
+                    case '2':   // 却下     :却下
+                        $status_list[] = 3;
+                        break;
+                    case '3':   // 取り消し :取り消し
+                        $status_list[] = 6;
+                        break;
+                    case '4':   // 完了     :完了
+                        $status_list[] = 7;
+                        break;
+                    default:    // 下書き(-1)、取り戻し(5)
+                        break;
+                }
+            }
+
+            $condition_list[] = [
+                'column'   => 'p.col_status',
+                'value'    => $status_list,
+                'operator' => 'IN'
+            ];
+        } elseif ('start_term_timestamp' == $column_name) {
+            // -- Start date
+            $condition_list[] = [
+                'column'   => 'p.col_ctime',
+                'value'    => $search_properties['start_term_timestamp'],
+                'operator' => '>='
+            ];
+        } elseif ('end_term_timestamp' == $column_name) {
+            // -- End date
+            $condition_list[] = [
+                'column'   => 'p.col_ctime',
+                'value'    => $search_properties['end_term_timestamp'],
+                'operator' => '<='
+            ];
+        } else {
+            // -- Like Condition
+            if ($search_properties[$column_name] !== "") {
+                $condition_list[] = [
+                    'column'   => 'p.col_' . $column_name,
+                    'value'    => $search_properties[$column_name],
+                    'operator' => 'LIKE'
+                ];
+            }
+        }
+    }
+
+    // Item BlankLine (Type = 2) isn't Exported
+    $condition_list[] = [
+        'column'   => 'd.col_type',
+        'value'    => [0, 1],
+        'operator' => 'IN'
+    ];
+    // -- Set Sort List
+    //
+    //    Petition List_Index > Petition ID > Item List_Index > Item ID
+    //
+    //    $option['sort'][] = array('column'=>'', 'order'=>'')
+    $sort_list = [];
+    $sort_list[] = [
+        'column' => 'p.col_list_index',
+        'order'  => ''
+    ];
+    $sort_list[] = [
+        'column' => 'p._id',
+        'order'  => ''
+    ];
+    $sort_list[] = [
+        'column' => 'd.col_list_index',
+        'order'  => ''
+    ];
+    $sort_list[] = [
+        'column' => 'd._id',
+        'order'  => ''
+    ];
+
+    // -- Set Condition and Sort to $option
+    $option = [
+        'condition' => [],
+        'sort'      => []
+    ];
+    $option['condition'] = $condition_list;
+    $option['sort'] = $sort_list;
+
+    // Write Petitions Data
+    require_once('workflow/controller_util.csp');
+    $petition_controller_util
+        = GRN_Workflow_Petition_Controller_Utility::getInstance();
+    $petition_controller_util->exportPetition($csv_writer,
+        $info_properties['skip'], $info_properties['cid'],
+        $info_properties['fid'], $option, $export_list);
+
+    // Close CSV Writer
+    $csv_writer->close();
+
+    //監査する
+    require_once('workflow/inspection.csp');
+    $inspection = GRN_Workflow_Petition_Inspection::getInstance();
+    if ($inspection->isEnabled()) {
+        $message_type = 'petition_export';
+
+        //Record Inspection
+        $inspection->record($message_type, []);
+    }
+
+    // File Download
+    cb_prepare_download('workflow.csv', 'application/csv', false);
+    $fp = fopen($temp_file_name, 'rb');
+    $file_size = filesize($temp_file_name);
+    if (0 < $file_size) {
+        echo fread($fp, $file_size);
+    }
+    fclose($fp);
+
+    // Remove Temporary File
+    unlink($temp_file_name);
+}

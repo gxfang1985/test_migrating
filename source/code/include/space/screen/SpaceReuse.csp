@@ -1,0 +1,403 @@
+<?php
+
+namespace grn\space\screen;
+
+use grn\space\data\bean\Folder;
+use grn\space\data\bean\SpaceMemo;
+use grn\space\data\bean\Space;
+use grn\space\data\collection\FolderCollection;
+use grn\space\data\collection\ThreadCollection;
+use grn\space\common\exception\GrnInvalidPermissionException;
+use grn\space\common\data\bean\Application;
+use grn\space\data\condition\FolderSearchCondition;
+use grn\space\logic\SpaceLogic;
+use grn\space\service\DiscussionService;
+use grn\space\data\condition\ThreadSearchCondition;
+use grn\space\common\data\condition\IconSearchCondition;
+use grn\space\common\data\bean\Authority;
+use grn\space\common\utility\IconUtility;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\exception\GrnDataNotFoundException;
+use grn\space\service\SpaceService;
+use grn\space\utility\SpaceUtility;
+
+/**
+ * Class SpaceReuse
+ *
+ */
+class SpaceReuse extends SpaceBase
+{
+    const URL_SPACE_REUSE = "space/reuse";
+    const SESSION_KEY = "grn.space.reuse.category_tree";
+    CONST MINUTE_INTERVAL = 5;
+
+    private $memo;
+
+    /**
+     * @return mixed|string|void
+     * @throws GrnDataNotFoundException
+     * @throws GrnInvalidArgumentException
+     * @throws GrnInvalidPermissionException
+     * @throws \Exception
+     */
+    public function fetch()
+    {
+        $spaceService = SpaceService::getInstance();
+        if ( ! $this->checkSpaceReuseAuth($spaceService, $this->getSpace())) {
+            throw new GrnInvalidPermissionException(ErrorCode::GRN_INVALID_SPACE_ID);
+        }
+        $spaceUserCollection
+            = $spaceService->getSpaceUserCollection($this->getSpace()->getId(),
+            $this->getLoginUserId());
+        $spaceService->addUserInfo(
+            $spaceUserCollection,
+            $this->getLoginUserId(),
+            $this->isSystemUseEnglish(),
+            $this->isEnglishDisplayAfterName(),
+            $this->isOrganizationDisplayAfterName(),
+            $this->getLanguageCode());
+        $operatorCollection
+            = $spaceService->getSpaceUserCollectionAccordingToAuthorityCode($spaceUserCollection,
+            Authority::AUTHORITY_CODE_OPERATION_PRIVILEGE,
+            $this->getSpace()->getId());
+        $this->setSelectedUserArray($this->getDisplayInfoByUserCollection($spaceUserCollection));
+        $this->setOpenStatus($operatorCollection->count() > 0);
+        $this->setSelectedOperatorArray($this->getDisplayInfoByUserCollection($operatorCollection));
+
+        $iconSearchCondition = new IconSearchCondition();
+        $iconCollection
+            = $spaceService->searchIconBySearchCondition($iconSearchCondition,
+            $this->getLoginUserId());
+        IconUtility::constructIconCollectionIconPath($iconCollection);
+        $this->setIconCollection($iconCollection);
+
+        $spaceLocalCollection
+            = $spaceService->getSpaceLocalCollection($this->getSpace()
+                                                          ->getId());
+        $availableLocalSpaceCollection
+            = $spaceLocalCollection->getAvailableLocalLanguage();
+        $this->setMultilingualSpaceNameArray($this->makeMultilingualSpaceNameArray($this->getSpace(),
+            $availableLocalSpaceCollection));
+
+        $this->setCategoryDataJson($spaceService, self::SESSION_KEY);
+
+        $this->setSpaceMemo($spaceService);
+
+        require_once('grn/smarty.csp');
+        $t = new \GRN_Smarty();
+        $t->assign('this', $this);
+        $t->assign('space_name_arr', $this->getMultilingualSpaceNameArray());
+        $t->assign('category_id', $this->getSpace()->getCategoryId());
+        $dataCollection = $this->getDataCollectionForReuse();
+        $folderCollection = $dataCollection[self::ARG_FOLDER];
+        $isUsedFolder = false;
+
+        /** @var \grn\space\data\collection\FolderCollection $folderCollection */
+        if ($folderCollection->count() > 0
+            && $folderCollection->getBean(0)->getId()
+               != SpaceService::UNCATEGORIED
+        ) {
+            $isUsedFolder = true;
+        }
+
+        $t->assign('isUsedFolder', $isUsedFolder);
+        $t->assign('folderCollection', $folderCollection);
+
+        $t->assign('memo', $this->getSpaceMemo());
+        $t->assign('is_public', $this->getSpace()->isPublic());
+        $t->assign('form_name', cb_get_pagename());
+        $t->assign('page_title', $this->getTitle());
+
+        $t->assign('plugin', [
+            'name'   => 'common',
+            'params' => [
+                'action'       => null,
+                'session_name' => cb_get_pagename(),
+                'app_id'       => 'space'
+            ]
+        ]);
+
+        $spaceLogic = new SpaceLogic();
+        $is_allowed_unlimited
+            = $spaceLogic->isAllowedToUseUnlimitedExpirationDate();
+        $is_used_unlimited = $this->getSpace()->getIsUnlimitedExpirationDate();
+        if ( ! $is_used_unlimited) {
+            $expiration_date_time_stamp = new \CB_TimeStamp();
+            $expiration_date_time_stamp->unix_ts = $this->getSpace()
+                                                        ->getExpirationDateTimestamp();
+            $time_stamp_ex
+                = new \CB_TimeStampEx($expiration_date_time_stamp);
+            $default_expiration_date = $time_stamp_ex->getDate();
+            if ($this->getSpace()->getIsExpirationDateSpecifiedTime()) {
+                $default_expiration_time = $time_stamp_ex->getTime();
+            }
+        } else {
+            $default_expiration_date
+                = $spaceLogic->getDefaultDateExpirationDate()->getDate();
+        }
+
+        $t->assign("is_allowed_unlimited", $is_allowed_unlimited);
+        $t->assign("is_used_unlimited", $is_used_unlimited);
+        $t->assign("is_used_limited", ! $is_used_unlimited);
+        $t->assign("default_date_expiration", $default_expiration_date);
+        $t->assign("default_time_expiration", $default_expiration_time);
+        $t->assign("minute_interval", self::MINUTE_INTERVAL);
+
+        return $t->fetch('space/reuse.tpl');
+    }
+
+    /**
+     * @param $input
+     *
+     * @return Space
+     * @throws GrnDataNotFoundException
+     * @throws GrnInvalidArgumentException
+     * @throws GrnInvalidPermissionException
+     * @throws \Exception
+     * @throws \grn\space\common\exception\GrnInvalidArgumentException
+     * @throws \grn\space\common\exception\GrnRequiredDataIsNotException
+     */
+    public function post($input)
+    {
+        $input = $this->getInput();
+        $this->checkArgFromInput([
+            self::ARG_SPACE_ID,
+            self::ARG_SPACE_CATEGORY_ID,
+            self::ARG_SPACE_EXPIRATION_DATE
+        ],
+            $input);
+        $spaceService = SpaceService::getInstance();
+        if ( ! $this->checkSpaceReuseAuth($spaceService, $this->getSpace())) {
+            throw new GrnInvalidPermissionException(ErrorCode::GRN_INVALID_SPACE_ID);
+        }
+        //set space name
+        $this->setCommonNameFromInput($input);
+        $this->setSpaceLocalCollectionFromInput($input);
+        //set user collection
+        $this->setSpaceUserCollectionFromInput($input);
+        //set operator collection
+        $this->setSpaceOperatorCollectionFromInput($input);
+        //set discussion collection
+        $arrayDataCollection = $this->getDataCollectionForReuse();
+
+        $this->setFolderAndDiscussionCollectionFromInput($input,
+            $arrayDataCollection);
+        //set memo
+        $spaceMemo = new SpaceMemo();
+        $this->setEditorFromInput($input);
+        $this->setMemoDataFromInput($input);
+        $spaceMemo->setRichText($this->getEditorFromInput());
+        if ($spaceMemo->isRichText()) {
+            require_once('grn/controller.csp');
+            $spaceMemo->setMemo(grn_wash_script_without_style_attribute($this->getMemoDataFromInput()));
+        } else {
+            $spaceMemo->setMemo($this->getMemoDataFromInput());
+        }
+
+        $this->setIsUnlimitedExpirationDate($input);
+        if ( ! $this->isUnlimitedExpirationDate()) {
+            $this->setExpirationDateTimestamp($input);
+        }
+        // set creator and modifier
+        $memo_reuse_user = $this->makeLoginUserSpaceMember();
+        $spaceMemo->setCreator($memo_reuse_user);
+        $spaceMemo->setModifier($memo_reuse_user);
+        $memo_reuse_time = time();
+        $spaceMemo->setCreateTimestamp($memo_reuse_time);
+        $spaceMemo->setModifyTimestamp($memo_reuse_time);
+
+        //set icon id
+        $this->setIconIdFromInput($input);
+        //set visibility
+        $this->setIsPublicFromInput($input);
+        $this->setAllowJoinLeave($input);
+
+        $newSpace = new Space();
+        $newSpace->setSpaceName($this->getCommonName());
+        $newSpace->setCategoryId($this->getSpaceCategoryId());
+        $newSpace->isBuiltinIcon(true);
+        $newSpace->setBuiltinIconId($this->getIconId());
+        $newSpace->setPublic($this->isPublic());
+        $newSpace->setCreator($this->makeLoginUserSpaceMember());
+        $newSpace->setCreateTimestamp(time());
+        $newSpace->setAllowJoinLeave($this->isAllowJoinLeave());
+        $newSpace->setIsUnlimitedExpirationDate($this->isUnlimitedExpirationDate());
+        if ( ! $newSpace->getIsUnlimitedExpirationDate()) {
+            $newSpace->setExpirationDateTimestamp($this->getExpirationDateTimestamp());
+            $newSpace->setIsExpirationDateSpecifiedTime($this->getExpirationDateSpecifiedTime());
+        }
+
+        return $spaceService->reuseSpace(
+            $newSpace,
+            $this->getSpaceLocalCollection(),
+            $this->getSpaceUserCollectionFromInput(),
+            $this->getSpaceOperatorCollectionFromInput(),
+            $this->getFolderCollectionFromInput(),
+            $this->getDiscCollectionFromInput(),
+            $spaceMemo,
+            $this->getLoginUserId(),
+            $this->getLanguageCode()
+        );
+    }
+
+    /**
+     * @param $input
+     *
+     * @throws \grn\space\common\exception\GrnInvalidArgumentException
+     */
+    protected function setInput($input)
+    {
+        parent::setInput($input);
+        $this->checkArgFromInput([self::ARG_SPACE_ID], $input);
+        $this->setFrom(array_key_exists(self::ARG_FROM, $input)
+                       && $input[self::ARG_FROM] == self::ARG_FROM_PARAM ?
+            $this->_from = $input[self::ARG_FROM] : '');
+        $spaceService = SpaceService::getInstance();
+        try {
+            $space = $spaceService->getSpace($this->getSpaceId(),
+                $this->getLoginUserId());
+        } catch (GrnDataNotFoundException $e) {
+            $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+        }
+        global $G_config_common;
+        IconUtility::constructionSpaceIconPath($space,
+            $G_config_common->get('Global', 'app_path'));
+        $this->setSpace($space);
+    }
+
+    /**
+     * @return array
+     * @throws GrnDataNotFoundException
+     * @throws GrnInvalidArgumentException
+     * @throws \Exception
+     * @throws \grn\space\common\exception\GrnArgumentOutOfRangeException
+     */
+    private function getDataCollectionForReuse()
+    {
+        $discussionService = DiscussionService::getInstance();
+        $spaceService = new SpaceService();
+        $folderCondition = new FolderSearchCondition();
+
+        try {
+            $rootCategory
+                = $discussionService->getApplicationRootCategory($this->getSpaceId(),
+                Application::APPLICATION_CODE_DISCUSSION,
+                $this->getLanguageCode());
+        } catch (GrnDataNotFoundException $e) {
+            $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+            throw $e;
+        }
+        $searchCondition = new ThreadSearchCondition();
+        $searchCondition->setSearchCategoryId($rootCategory->getId());
+        $searchCondition->setSearchScopeType(ThreadSearchCondition::SEARCH_SCOPE_CATEGORY_TARGET_ONLY);
+        $searchCondition->setOrderSortArray([
+            ThreadSearchCondition::SORT_COMPONENT_MODIFY_TIME_DESC,
+            ThreadSearchCondition::SORT_TITLE_ASC
+        ]);
+        try {
+            $allDiscCollection
+                = $discussionService->searchThreadBySearchConditionWithAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+                $searchCondition, $this->getLoginUserId());
+        } catch (GrnInvalidArgumentException $e) {
+            throw $e;
+        }
+
+        $folderCondition->setSpaceId($this->getSpaceId());
+        $messageUnFolder = cb_msg('grn.space.folder', 'uncategoried');
+
+        $unCategoryFolder = new Folder();
+        $unCategoryFolder->setId(spaceService::UNCATEGORIED);
+        $unCategoryFolder->setFolderName($messageUnFolder);
+
+        $folderCollection
+            = $spaceService->getFolderListByCondition($folderCondition);
+        $folderCollection->appendBean($unCategoryFolder);
+
+        /** @var \grn\space\data\bean\Folder $folder */
+        foreach ($folderCollection as $folder) {
+            /** @var \grn\space\data\bean\Thread $discussion */
+            foreach ($allDiscCollection as $discussion) {
+                if ($discussion->isSystemUse()) {
+                    continue;
+                }
+
+                $folderId = $discussion->getFolderId();
+                if ($folderId == $folder->getId()) {
+                    $folder->ThreadCollection()->appendBean($discussion);
+                }
+            }
+        }
+
+        if ($folderCollection->getBean($folderCollection->count() - 1)
+                             ->ThreadCollection()->count() == 0
+        ) {
+            $folderCollection->remove($folderCollection->count() - 1);
+        }
+
+        return [
+            self::ARG_FOLDER     => $folderCollection,
+            self::ARG_DISCUSSION => $allDiscCollection
+        ];
+    }
+
+    /**
+     * @return mixed
+     */
+    public function getMomo()
+    {
+        return $this->memo;
+    }
+
+    /**
+     * @param SpaceService $spaceService
+     */
+    private function setMemo(SpaceService $spaceService)
+    {
+        $spaceMemo = $spaceService->getSpaceMemo($this->getSpaceId(),
+            $this->getLoginUserId());
+        $spaceService->addInspectionUserInfo($spaceMemo,
+            $this->getLoginUserId(), $this->isSystemUseEnglish(),
+            $this->isEnglishDisplayAfterName(),
+            $this->isOrganizationDisplayAfterName(), $this->getLanguageCode());
+    }
+
+    /**
+     * @return array
+     */
+    public function getSitePosition()
+    {
+        $sitePosition = $this->createCategorySitePosition($this->getSpace()
+                                                               ->getCategoryId());
+        $sitePosition[] = [
+            "name"     => $this->getSpace()->getSpaceName(),
+            "page"     => self::URL_TOP,
+            "spid"     => $this->getSpaceId(),
+            "icon"     => [
+                "image"  => $this->getSpace()->getDisplayIconPath(),
+                "direct" => true,
+                "class"  => "breadcrumb-icon",
+            ],
+            "isHidden" => ! $this->getSpace()->isPublic(),
+        ];
+        if ( ! $this->getFrom()) {
+            $sitePosition[] = [
+                "name" => grn_get_page_display_name(self::URL_CONFIG_VIEW),
+                "page" => self::URL_CONFIG_VIEW,
+                "spid" => $this->getSpaceId(),
+            ];
+        }
+        $sitePosition[] = [
+            "name" => grn_get_page_display_name(self::URL_SPACE_REUSE),
+        ];
+
+        return $sitePosition;
+    }
+
+    /**
+     * @return string
+     */
+    public function getTitle()
+    {
+        return grn_get_page_display_name(self::URL_SPACE_REUSE);
+    }
+}

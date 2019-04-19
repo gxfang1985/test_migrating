@@ -1,0 +1,163 @@
+<?php
+
+namespace grn\mail\tnef;
+
+/**
+ * Decoder class of the TNEF file.
+ *
+ * [MS-OXTNEF]: Transport Neutral Encapsulation Format (TNEF) Data Algorithm
+ * https://msdn.microsoft.com/en-us/library/cc425498(v=exchg.80).aspx
+ */
+class Decoder
+{
+    /** @var Tnef */
+    private $tnef;
+
+    /** @var Reader */
+    private $reader;
+
+    /** @var Attachment|null */
+    private $attachment = null;
+
+    const TNEF_SIGNATURE = 0x223E9F78;
+    const ATTR_LEVEL_MESSAGE = 0x01;
+    const ATTR_LEVEL_ATTACHMENT = 0x02;
+
+    /**
+     * @param string $buffer
+     */
+    public function __construct($buffer)
+    {
+        $this->tnef = new Tnef();
+        $this->reader = new Reader($buffer);
+    }
+
+    /**
+     * @return Tnef
+     * @throws TnefFormatException
+     */
+    public function decode()
+    {
+        $this->readHeader();
+
+        $this->readAttribute(); // read TNEFVersion attribute
+
+        list($attr_level, $attr_id, $attr_data) = $this->readAttribute();
+        $this->decodeCodePage($attr_level, $attr_id, $attr_data);
+
+        while ($this->reader->hasNext()) {
+            list($attr_level, $attr_id, $attr_data) = $this->readAttribute();
+
+            if ($attr_level === self::ATTR_LEVEL_MESSAGE) {
+                $this->decodeMessageAttribute($attr_id, $attr_data);
+            } elseif ($attr_level === self::ATTR_LEVEL_ATTACHMENT) {
+                $this->decodeAttachmentAttribute($attr_id, $attr_data);
+            } else {
+                throw new TnefFormatException("level must be 1 or 2.");
+            }
+        }
+
+        return $this->tnef;
+    }
+
+    /**
+     */
+    private function readHeader()
+    {
+        // TNEFSignature
+        if ($this->reader->readUint32() !== self::TNEF_SIGNATURE) {
+            throw new TnefFormatException('Signature is not matched.');
+        }
+
+        $this->reader->readUint16(); // LegacyKey
+    }
+
+    /**
+     * @return array
+     * @throws TnefFormatException
+     */
+    private function readAttribute()
+    {
+        $attr_level = $this->reader->readUint8();
+        $attr_id = $this->reader->readUint32();
+        $attr_length = $this->reader->readInt32();
+        $attr_data = $this->reader->read($attr_length);
+        $this->reader->readUint16(); // Checksum
+
+        return [$attr_level, $attr_id, $attr_data];
+    }
+
+    /**
+     * @param int    $attr_level
+     * @param int    $attr_id
+     * @param string $attr_data
+     *
+     * @throws TnefFormatException
+     */
+    private function decodeCodePage($attr_level, $attr_id, $attr_data)
+    {
+        if ($attr_level !== self::ATTR_LEVEL_MESSAGE
+            || $attr_id !== AttributeId::MsgOemCodePage
+        ) {
+            throw new TnefFormatException('Expected OEMCodePage attribute, but got other one.');
+        }
+
+        $reader = new Reader($attr_data);
+        $this->tnef->setCodePage($reader->readUint32());
+    }
+
+    /**
+     * @param int    $attr_id
+     * @param string $attr_data
+     */
+    private function decodeMessageAttribute($attr_id, $attr_data)
+    {
+        switch ($attr_id) {
+            case AttributeId::MsgProps:
+                $properties_reader = new PropertiesDecoder($attr_data,
+                    $this->tnef->getCharacterEncoding());
+                $this->tnef->setProperties($properties_reader->decode());
+                break;
+            default:
+                break;
+        }
+    }
+
+    /**
+     * @param int    $attr_id
+     * @param string $attr_data
+     *
+     * @throws TnefFormatException
+     */
+    private function decodeAttachmentAttribute($attr_id, $attr_data)
+    {
+        if ($attr_id == AttributeId::AttachRendData) {
+            // https://msdn.microsoft.com/en-us/library/ee202973(v=exchg.80).aspx
+            $this->attachment = new Attachment();
+            $this->tnef->addAttachment($this->attachment);
+        } else {
+            if (is_null($this->attachment)) {
+                throw new TnefFormatException("attachment must start with attrAttachRendData.");
+            }
+
+            switch ($attr_id) {
+                case AttributeId::AttachData;
+                    $this->attachment->setData($attr_data);
+                    break;
+                case AttributeId::AttachTitle;
+                    $data = substr($attr_data, 0, strlen($attr_data) - 1);
+                    $this->attachment->setFilename83(mb_convert_encoding($data,
+                        mb_internal_encoding(),
+                        $this->tnef->getCharacterEncoding()));
+                    break;
+                case AttributeId::Attachment;
+                    $properties_reader = new PropertiesDecoder($attr_data,
+                        $this->tnef->getCharacterEncoding());
+                    $this->attachment->setProperties($properties_reader->decode());
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+}

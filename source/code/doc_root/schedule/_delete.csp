@@ -1,0 +1,284 @@
+<?php
+
+//------------------
+
+$event_id = array_key_exists('event', $G_INPUT) ? $G_INPUT['event'] : null;
+$user_id = array_key_exists('uid', $G_INPUT) ? $G_INPUT['uid'] : null;
+$group_id = array_key_exists('gid', $G_INPUT) ? $G_INPUT['gid'] : null;
+$str_date = array_key_exists('bdate', $G_INPUT) ? $G_INPUT['bdate'] : null;
+
+require_once('schedule/application.csp');
+$app = GRN_Schedule_Application::getInstance();
+require_once('schedule/view_util.csp');
+$util = GRN_Schedule_View_Util::getInstance();
+
+global $G_container_base;
+$uum = $G_container_base->getInstance('uum');
+
+$login = $uum->getLoginUser();
+$login_id = $login->getOID();
+
+$date = new CB_Date();
+if ( ! $date->parse($str_date)) {
+    $date = null;
+}
+
+$event = $app->getEvent($login, $event_id, $date);
+if ( ! $event) {
+    cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+}
+
+// アクセス権のチェック
+require_once('schedule/access_logic.csp');
+$acc_logic = GRN_Schedule_Access_Logic::getInstance();
+$dynamic_role = $uum->listGrantedRoles();
+$access = $acc_logic->getEventAccess($login, $event, ['read', 'delete'],
+    $dynamic_role);
+if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+    cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+}
+if ($access['delete'] == GRN_SCHD_ACCESS_DENY) {
+    cb_throw_error(E_GRN_SCHD_ACCESSDENY_DELETE);
+}
+
+require_once('schedule/facility_system_logic.csp');
+$facility_logic = GRN_Facility_SystemLogic::getInstance();
+if (is_array($event->facilities) && count($event->facilities) > 0) {
+    $f_settings
+        = $facility_logic->getFacilitySetting(array_keys($event->facilities));
+    foreach (array_keys($event->facilities) as $key) {
+        $object = &$event->facilities[$key];
+        $faid = $object->getOID();
+        $modify_user = $facility_logic->getModifyUserByPriority($f_settings,
+            $faid);
+        // 登録者にのみ変更を許可する
+        if ($modify_user === 'creator') {
+            // 施設で登録者しか変更を許していない場合
+            if ((is_array($event->facilities) && count($event->facilities) > 0)
+                || (is_a($event, 'GRN_Schedule_TemporaryEvent')
+                    && $event->isORSearch())
+            ) {
+                require_once('schedule/facility_privilege.csp');
+                $privilege_logic = GRN_Facility_Privilege_Logic::getInstance();
+                if ( ! $privilege_logic->hasPrivilegeOfFacilities($login,
+                        $event->facilities, 'OR')
+                     && ((is_a($event->creator, 'CB_User')
+                          && $login_id != $event->creator->getOID())
+                         || is_string($event->creator))
+                ) {
+                    cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+                }
+            }
+        } // 登録者と共有メンバーに変更を許可する
+        elseif ($modify_user === 'member') {
+            // 施設で登録者と共有メンバーしか変更を許していない場合
+            if ((is_array($event->facilities) && count($event->facilities) > 0)
+                || (is_a($event, 'GRN_Schedule_TemporaryEvent')
+                    && $event->isORSearch())
+            ) {
+                require_once('schedule/facility_privilege.csp');
+                $privilege_logic = GRN_Facility_Privilege_Logic::getInstance();
+                if ( ! $privilege_logic->hasPrivilegeOfFacilities($login,
+                        $event->facilities, 'OR')
+                     && (
+                         (is_array($event->users)
+                          && ! array_key_exists($login_id, $event->users))
+                         || is_null($event->users)
+                     )
+                     && ((is_a($event->creator, 'CB_User')
+                          && $login_id !== $event->creator->getOID())
+                         || is_string($event->creator))
+                ) {
+                    cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+                }
+            }
+        }
+    }
+}
+
+$participation = '0';
+if ($event->users && count($event->users) > 0) {
+    foreach (array_keys($event->users) as $key) {
+        $_user = &$event->users[$key];
+        if ($_user->getOID() == $login_id) {
+            $participation = $login_id;
+            break;
+        }
+    }
+}
+
+$apply = array_key_exists('apply', $G_INPUT) ? $G_INPUT['apply'] : null;
+$member_all = 0;
+$member_own = 0;
+$member_type = array_key_exists('member', $G_INPUT) ? $G_INPUT['member'] : null;
+if ($member_type === '0') {
+    $member_all = 1;
+} elseif ($member_type === '1') {
+    $member_own = 1;
+}
+
+$schedule_event = [
+    'user_id'     => $participation,
+    //ユーザーID
+    'event_id'    => $event->id,
+    //予定のID
+    'type'        => $util->getViewEventType($event->getEventType(),
+        $event->isShared()),
+    //予定の種類
+    'date'        => $date ? $date->format() : null,
+    //予定の日付
+    'str_date'    => $date ? cb_date_format('DateFull_YMDW', $date) : null,
+    //予定の日付
+    'data'        => html_entity_decode($event->getTitle()),
+    //予定のタイトル
+    'apply_this'  => $apply == 'this' ? 1 : 0,
+    'apply_after' => $apply == 'after' ? 1 : 0,
+    'apply_all'   => $apply == 'all' ? 1 : 0,
+    'member_all'  => $member_all,
+    'member_own'  => $member_own,
+];
+
+if (is_a($event, 'GRN_Schedule_TemporaryEvent')) {
+    $temporary = [];
+    if ($event->isORSearch()) {
+        $schedule_event['temporary_type'] = 'or';
+        foreach ($event->setdates as $facility_data) {
+            $facility_temp = [];
+            foreach ($facility_data['dates'] as $tp_id => $temp_date) {
+                $str_date = cb_msg('grn.schedule',
+                    'event_date_YMDW_HM_HM',
+                    [
+                        'setdate' => cb_date_format('DateFull_YMDW',
+                            $temp_date['setdatetime']),
+                        'settime' => cb_date_format('TimeLong_HM',
+                            $temp_date['setdatetime']),
+                        'endtime' => cb_date_format('TimeLong_HM',
+                            $temp_date['enddatetime'])
+                    ]);
+                $facility_temp[] = [
+                    'temporary_id' => $tp_id,
+                    'str_date'     => $str_date
+                ];
+            }
+            $temporary[] = [
+                'facility_name' => $facility_data['facility']->get('name'),
+                'dates'         => $facility_temp
+            ];
+        }
+    } else {
+        foreach ($event->setdates as $tp_id => $temp_date) {
+            $str_date = cb_msg('grn.schedule', 'event_date_YMDW_HM_HM',
+                [
+                    'setdate' => cb_date_format('DateFull_YMDW',
+                        $temp_date['setdatetime']),
+                    'settime' => cb_date_format('TimeLong_HM',
+                        $temp_date['setdatetime']),
+                    'endtime' => cb_date_format('TimeLong_HM',
+                        $temp_date['enddatetime'])
+                ]);
+            $temporary[] = ['temporary_id' => $tp_id, 'str_date' => $str_date];
+        }
+        $schedule_event['temporary_type'] = 'normal';
+    }
+
+    $schedule_event['temporary'] = $temporary;
+}
+
+/* -------------- VCBSCH0010 START ----------------- */
+require_once('schedule/netmeeting_event_logic.csp');
+$vcb_event_logic = GRN_Netmeeting_EventLogic::getInstance();
+
+// NETMEETING連携あり
+if ($vcb_event_logic->isNetmeetingAvailable($event)) {
+    // 選択されている施設がある場合
+    $vcb_facility = $vcb_event_logic->getNetmeetingFacilityById($event);
+    if (isset($vcb_facility)) {
+        // 連携データ取得
+        $coop_data
+            = $vcb_event_logic->getNetmeetingCoopDataByEventId($event_id);
+
+        // 連携データあり
+        if (isset($coop_data)) {
+            // 予約データがある場合
+            if (isset($coop_data->reservation_id)
+                && strlen($coop_data->reservation_id) > 0
+            ) {
+                // 時間のチェック
+                $event_status
+                    = $vcb_event_logic->getEventStatus($event->setdatetime,
+                    $event->enddatetime);
+
+                if ($event_status !== GRN_NETMEETING_MEETING_STATUS_END) {
+                    $schedule_event['netmeeting'] = true;
+                }
+                if ($event_status === GRN_NETMEETING_MEETING_STATUS_NOW) {
+                    $schedule_event['netmeeting_msg'] = true;
+                }
+            }
+        }
+    }
+}
+/* -------------- VCBSCH0010 END   ----------------- */
+
+$t->assign('schedule_event', $schedule_event);
+
+
+$t->assign('user_id', $user_id);
+$t->assign('group_id', $group_id);
+$t->assign('bdate', $date);
+
+$referer_key = array_key_exists('referer_key', $G_INPUT)
+    ? $G_INPUT['referer_key'] : null;
+$referer_exists = false;
+if ($referer_key) {
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session = $session_manager->getSession('schedule.referer');
+    $referer = $session->get($referer_key);
+    if (is_array($referer)) {
+        // page title
+        $page_title = grn_get_current_page_display_name();
+        $t->assign('page_title', $page_title);
+        // site position 
+        $t->assign(
+            'site_position', [
+                $referer,
+                [
+                    'page'        => "schedule/view",
+                    'name'        => grn_get_page_display_name('schedule/view'),
+                    'event'       => $event_id,
+                    'bdate'       => $str_date,
+                    'referer_key' => $referer_key
+                ],
+                ['page' => "", 'name' => $page_title]
+            ]
+        );
+        $referer_exists = true;
+    }
+}
+
+if ($referer_exists === false) {
+    // page title
+    $page_title = grn_get_current_page_display_name();
+    $t->assign('page_title', $page_title);
+    // site position 
+    $t->assign(
+        'site_position', [
+            [
+                'page' => 'schedule/index',
+                'name' => grn_get_page_display_name('schedule/schedule_index')
+            ],
+            [
+                'page'  => "schedule/view",
+                'name'  => grn_get_page_display_name('schedule/view'),
+                'event' => $event_id,
+                'bdate' => $str_date
+            ],
+            ['page' => '', 'name' => $page_title]
+        ]
+    );
+}
+
+$t->assign('referer_key', $referer_key);
+
+

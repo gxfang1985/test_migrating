@@ -1,0 +1,289 @@
+<?php
+
+namespace grn\grn\access\logic;
+
+use grn\grn\access\bean\Availability;
+use grn\grn\access\exception\AppNotAvailableForExternalException;
+use grn\grn\access\utility\AppAvailabilityUtil;
+use grn\grn\access\utility\IpUtil;
+
+class AppAvailabilityExternalLogic
+{
+    private static $internalIpRangeList = null;
+    private static $isInternalIpCached = null;
+
+    /**
+     * Supporting check the Ipv4 and Ipv6
+     *
+     * @param string $ip_address
+     *
+     * @return bool
+     */
+    public static function isInternalIp($ip_address)
+    {
+        if (isset(self::$isInternalIpCached)) {
+            return self::$isInternalIpCached;
+        }
+        $ip_address_version = IpUtil::validateIp($ip_address);
+        if ( ! $ip_address_version) {
+            self::$isInternalIpCached = false;
+
+            return self::$isInternalIpCached;
+        }
+
+        if ( ! isset(self::$internalIpRangeList)) {
+            $setting_logic = new InternalIpAddressLogic();
+            self::$internalIpRangeList = $setting_logic->getAll();
+        }
+
+        foreach (self::$internalIpRangeList as $internal_ip_range) {
+            $ip_range = $internal_ip_range->getIpAddress();
+            $ip_range_version = IpUtil::validateIp($ip_range);
+            $ip_range_cidr = $internal_ip_range->getCidr();
+            if ($ip_address_version !== $ip_range_version) {
+                continue;
+            }
+
+            if ( ! IpUtil::isValidCIDR($ip_range_cidr, $ip_range_version)) {
+                $ip_range_cidr = IpUtil::MAX_CIDR_IPV4;
+                if ($ip_range_version === IpUtil::IPV6) {
+                    $ip_range_cidr = IpUtil::MAX_CIDR_IPV6;
+                }
+            }
+
+            if ($ip_address_version === IpUtil::IPV4) {
+                if (IpUtil::isIpInRange($ip_address, $ip_range,
+                    $ip_range_cidr)
+                ) {
+                    self::$isInternalIpCached = true;
+
+                    return self::$isInternalIpCached;
+                }
+            } elseif (IpUtil::isIpInRangeIpv6($ip_address, $ip_range,
+                $ip_range_cidr)
+            ) {
+                self::$isInternalIpCached = true;
+
+                return self::$isInternalIpCached;
+            }
+        }
+        self::$isInternalIpCached = false;
+
+        return self::$isInternalIpCached;
+    }
+
+    /**
+     * @param string      $app_id
+     * @param null|string $user_id
+     * @param null|string $ip_client
+     *
+     * @return bool
+     */
+    public static function isAppAvailableForUser(
+        $app_id,
+        $user_id = null,
+        $ip_client = null
+    ) {
+        if ( ! isset($user_id)) {
+            $login_user = cb_get_login_user();
+            if ( ! $login_user) {
+                return false;
+            }
+            $user_id = $login_user->getOID();
+        }
+        $availability_app_ids = self::getAvailabilityAppIdsByUserId($user_id,
+            [$app_id], $ip_client);
+        $is_available = (bool)cb_at($availability_app_ids, $app_id,
+            false);
+
+        return $is_available;
+    }
+
+    /**
+     * @param string      $app_id
+     * @param null|int    $user_id
+     * @param null|string $ip_address
+     *
+     * @throws AppNotAvailableForExternalException
+     */
+    public static function checkForUserAccess(
+        $app_id,
+        $user_id = null,
+        $ip_address = null
+    ) {
+        if ( ! self::isAppAvailableForUser($app_id, $user_id, $ip_address)) {
+            throw new AppNotAvailableForExternalException();
+        }
+    }
+
+    /**
+     * @param int         $user_id
+     * @param null|array  $app_ids_to_evaluate
+     * @param null|string $ip_client
+     *
+     * @return array
+     *  E.g array( 'schedule' => 0, 'message' => 1, .., 'cellular' => 1, 'job' => 1)
+     * The value of the 'cellular' is always 1
+     */
+    public static function getAvailabilityAppIdsByUserId(
+        $user_id,
+        array $app_ids_to_evaluate = null,
+        $ip_client = null
+    ) {
+        $active_app_ids = AppAvailabilityUtil::getActiveAppIds();
+
+        if ( ! isset($app_ids_to_evaluate)) {
+            $app_ids_to_evaluate = $active_app_ids;
+        }
+
+        $app_ids_allow_default = array_diff($app_ids_to_evaluate,
+            $active_app_ids);
+        $app_ids_to_evaluate = array_diff($app_ids_to_evaluate,
+            $app_ids_allow_default);
+        $app_ids_allow_default = array_fill_keys($app_ids_allow_default,
+            AppAvailabilityUtil::ACCESS_ALLOWED);
+        $access_type
+            = AvailabilitySettingLogic::getExternalAccessSetting();
+
+        $is_unrestricted = $access_type
+                           === AvailabilitySettingLogic::ACCESS_TYPE_UNRESTRICTED;
+        $is_rsm_access = ($access_type
+                          === AvailabilitySettingLogic::ACCESS_TYPE_REMOTE_SERVICE
+                          && false === cb_is_remote_access());
+        if ($is_unrestricted || $is_rsm_access) {
+            return array_fill_keys($app_ids_to_evaluate,
+                    AppAvailabilityUtil::ACCESS_ALLOWED)
+                   + $app_ids_allow_default;
+        }
+
+        if ( ! isset($ip_client)) {
+            $ip_client = IpUtil::getClientIp();
+        }
+        $is_ip_internal_access = ($access_type
+                                  === AvailabilitySettingLogic::ACCESS_TYPE_INTERNAL
+                                  && self::isInternalIp($ip_client));
+        if ($is_ip_internal_access) {
+            return array_fill_keys($app_ids_to_evaluate,
+                    AppAvailabilityUtil::ACCESS_ALLOWED)
+                   + $app_ids_allow_default;
+        }
+
+        $app_ids_available = array_fill_keys($app_ids_to_evaluate,
+            AppAvailabilityUtil::ACCESS_DENIED);
+        $availability_logic = new AvailabilitySettingLogic();
+
+        $type_map = [
+            Availability::DYNAMIC_ROLE,
+            Availability::STATIC_ROLE,
+            Availability::GROUP,
+            Availability::USER
+        ];
+
+        $external_apps = [];
+        foreach ($type_map as $type) {
+            switch ($type) {
+                case Availability::STATIC_ROLE:
+                case Availability::GROUP:
+                    $availability_list
+                        = cb_at($availability_logic->getByUserIds([$user_id],
+                        $type), $user_id, []);
+                    break;
+                case Availability::USER:
+                    $availability_list
+                        = [$availability_logic->getByTargetId($user_id, $type)];
+                    break;
+                default: /* Availability::DYNAMIC_ROLE */
+                    $availability_list = $availability_logic->getAll($type);
+                    break;
+            }
+
+            $external_apps = array_merge($external_apps,
+                self::getExternalApps($availability_list, $active_app_ids,
+                    $app_ids_to_evaluate));
+            if (count(array_diff($app_ids_to_evaluate, $external_apps)) === 0) {
+                break;
+            }
+        }
+        $external_apps = array_merge($app_ids_available,
+                array_fill_keys($external_apps,
+                    AppAvailabilityUtil::ACCESS_ALLOWED))
+                         + $app_ids_allow_default;
+        if (array_key_exists('cellular', $external_apps)) {
+            $external_apps['cellular'] = AppAvailabilityUtil::ACCESS_ALLOWED;
+        }
+
+        return $external_apps;
+    }
+
+    /**
+     * @param Availability[] $availability_targets
+     * @param array          $active_app_ids
+     * @param array          $app_ids_to_evaluate
+     *  E.g array( 'space', 'schedule', 'link', ... )
+     *
+     * @return array E.g array( 'space', 'schedule', 'link', ... )
+     * E.g array( 'space', 'schedule', 'link', ... )
+     */
+    private static function getExternalApps(
+        $availability_targets,
+        array $active_app_ids,
+        array $app_ids_to_evaluate = null
+    ) {
+        if ( ! isset($app_ids_to_evaluate)) {
+            return [];
+        }
+
+        $has_active_apps = count($active_app_ids) > 0;
+        if ( ! $has_active_apps) {
+            return [];
+        }
+
+        $external_allow_apps = [];
+        foreach ($availability_targets as $availability) {
+            $allow_apps = array_filter(
+                $availability->getAppsAvailability(),
+                function ($value) {
+                    return $value['external']
+                           === AppAvailabilityUtil::ACCESS_ALLOWED;
+                }
+            );
+            $has_allow_apps = count($allow_apps) > 0;
+            if ( ! $has_allow_apps) {
+                continue;
+            }
+
+            $external_allow_apps
+                = array_unique(array_merge($external_allow_apps,
+                array_keys($allow_apps)));
+            $external_allow_apps = array_intersect($external_allow_apps,
+                $active_app_ids);
+            if (count(array_diff($app_ids_to_evaluate, $external_allow_apps))
+                === 0
+            ) {
+                return $external_allow_apps;
+            }
+        }
+
+        return $external_allow_apps;
+    }
+
+    /**
+     * @param            $user_id
+     * @param array|NULL $app_ids_evaluate
+     * @param null       $ip_client
+     *
+     * @return array
+     * array("space", "link", "schedule", "message",...)
+     */
+    public function getAvailableAppIdsByUserId(
+        $user_id,
+        array $app_ids_evaluate = null,
+        $ip_client = null
+    ) {
+        $availability_app_ids = $this->getAvailabilityAppIdsByUserId($user_id,
+            $app_ids_evaluate, $ip_client);
+        $available_app_ids = array_filter($availability_app_ids);
+
+        return array_keys($available_app_ids);
+    }
+}

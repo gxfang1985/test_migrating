@@ -1,0 +1,162 @@
+<?php
+
+use grn\grn\JSONResponse;
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    global $G_INPUT;
+    $json = JSONResponse::create();
+
+    //Instantiate Smarty Object
+    require_once("grn/smarty.csp");
+    $t = new GRN_Smarty;
+
+    //Get Parameter
+    $folder_id = @ $G_INPUT['fid'];    //Folder ID
+    $petition_id = @ $G_INPUT['pid'];    //Petition ID
+    $command = @ $G_INPUT['cmd'];    //Command
+    $mode = @ $G_INPUT['mode'];   //Mode Parameter
+    $simple = @ $G_INPUT['simple'];
+
+    //Get Session Key
+    require_once('workflow/controller_util.csp');
+    require_once('grn/controller.csp');
+    $tmp_key = grn_get_temporary_key();
+
+    //Create Parameter Translation Map for Petition
+    $translation_map_petition = [
+        'ptid' => '_id',  //Petition ID
+        'user' => 'user', //User
+    ];
+
+    $petition_util = GRN_Workflow_Petition_Controller_Utility::getInstance();
+    $petition = $petition_util->getView($petition_id,
+        $translation_map_petition);
+
+    //Check Petition Owner
+    global $G_workflow_login_user;
+    if ($petition['user'] != $G_workflow_login_user->getOID()) {
+        //Petition Not Found
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_PETITION_NOT_FOUND);
+    }
+
+    //Check Command Parameter
+    switch ($command) {
+        case 'back':
+            //Redirect Back Page
+            if (defined('AJAX_REQUEST')) {
+                $json->response([
+                    'link' => cb_get_full_url('workflow/send_form_reuse', [
+                        'fid'     => $folder_id,
+                        'pid'     => $petition_id,
+                        'mode'    => $mode,
+                        'simple'  => $simple,
+                        'sf'      => 1,
+                        'tmp_key' => $tmp_key
+                    ])
+                ]);
+                cb_safe_exit();
+            }
+            cb_redirect('workflow/send_form_reuse', [
+                'fid'     => $folder_id,
+                'pid'     => $petition_id,
+                'mode'    => $mode,
+                'simple'  => $simple,
+                'sf'      => 1,
+                'tmp_key' => $tmp_key
+            ]);
+            break;
+        default:
+            break;
+    }
+
+    //Get Session
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session_send_form
+        =& $session_manager->getSession('workflow/send_form_reuse'
+                                        . $tmp_key);
+
+    //Load Send Form Session (for Design)
+    $form_for_view = $session_send_form->get('form');
+    if ( ! is_array($form_for_view) || 0 == count($form_for_view)) {
+        // フォームがない
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_DENY_REQUEST_DATA);
+    }
+    $item_list_for_view = $session_send_form->get('item_list');
+    $properties_for_view = $session_send_form->get('properties');
+
+    //Load Send Form Session (for Data)
+    $send_form_data_list = $session_send_form->get('send_form_data_list');
+
+    // 未分類でないカテゴリのアクセス権をチェック
+    $category_id = $form_for_view['category'];
+    if (0 == strlen($category_id)) {
+        $category_id = GRN_WORKFLOW_CATEGORY_NONPARTY_ID;
+    }
+    if (GRN_WORKFLOW_CATEGORY_NONPARTY_ID != $category_id) {
+        $category_util
+            = GRN_Workflow_Category_Controller_Utility::getInstance();
+        $category_util->checkAccess($category_id, true, CB_DATABASE_NO_LOCK);
+    }
+
+    //Create Petition
+    require_once('workflow/petition_logic.csp');
+    $petition_logic = GRN_Workflow_Petition_Logic::getInstance();
+    $petition_id = $petition_logic->add($form_for_view,
+        $properties_for_view);
+    $form_for_view['petition'] = $petition_id;
+
+    //監査する
+    require_once('workflow/inspection.csp');
+    $inspection = GRN_Workflow_Petition_Inspection::getInstance();
+    if ($inspection->isEnabled()) {
+        $message_type = 'petition_reuse_draft';
+
+        $message_args['pid'] = $petition_id;
+        $message_args['fid'] = $form_for_view['fid'];
+        $message_args['name'] = $form_for_view['name'];
+        $message_args['icon_type'] = $form_for_view['icon_type'];
+        $message_args['icon_id'] = $form_for_view['icon_id'];
+        $message_args['icon_url'] = $form_for_view['icon_url'];
+        $message_args['serial_type'] = $form_for_view['serial_type'];
+        $message_args['serial_format'] = $form_for_view['serial_format'];
+        $message_args['serial_number'] = $form_for_view['serial_number'];
+        $message_args['subject'] = $form_for_view['subject'];
+
+        //Record Inspection
+        $inspection->record($message_type, $message_args);
+    }
+
+    //Create Item Data
+    require_once('workflow/itemdata_logic.csp');
+    $itemdata_logic = GRN_Workflow_ItemData_Logic::getInstance();
+    $item_data_id_list = $itemdata_logic->addMulti($petition_id,
+        $item_list_for_view, false);
+
+    //Save Petition to Tempolary Folder
+
+    //Modify Status to Temporary
+    $petition_logic->modifyStatus($petition_id, GRN_WORKFLOW_STATUS_TEMPORARY);
+
+    //Attach Folder List (Draft)
+    global $G_workflow_login_user;
+    $petition_logic->attachFolderList($petition_id,
+        [$G_workflow_login_user->getOID()], 'TEMP_FOLDER_FOREIGN_KEY',
+        false);          //Out Folder
+
+    grn_workflow_cleanup_session($t, 'reuse', $tmp_key);
+
+    //Redirect Next Page
+    if (defined('AJAX_REQUEST')) {
+        $json->response([
+            'link' => cb_get_full_url('workflow/index',
+                ['fid' => $folder_id, 'sf' => 1])
+        ]);
+        cb_safe_exit();
+    }
+    cb_redirect('workflow/index', ['fid' => $folder_id, 'sf' => 1]);
+}
+
+

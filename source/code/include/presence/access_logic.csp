@@ -1,0 +1,2610 @@
+<?php
+require_once('grn/application.csp');
+require_once('grn/org_tree.csp');
+require_once('presence/resources.csp');
+require_once('presence/error_code.csp');
+
+/*
+ * Presence access logic
+ */
+
+class GRN_Presence_Access_Logic
+{
+    function __construct()
+    {
+        $this->_deny_users_list = [];
+        $this->_deny_roles_list = [];
+        $this->_deny_groups_list = [];
+
+        $this->_permit_users_list = [];
+        $this->_permit_roles_list = [];
+        $this->_permit_groups_list = [];
+
+        $this->_evaluate_users_list = [];
+        $this->_evaluate_groups_list = [];
+        $this->_evaluate_roles_list = [];
+
+        $this->_have_setting_user_list = [];
+        $this->_have_setting_group_list = [];
+        $this->_have_setting_role_list = [];
+    }
+
+    /** @var GRN_Presence_Access_Logic */
+    private static $_instance = null;
+
+    /**
+     * @return GRN_Presence_Access_Logic
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * アクセス権がかかるもの
+     *
+     * @access private
+     */
+    var $_target_tables
+        = [
+            GRN_PRESENCE_TARGET_TYPE_DYNAMIC_ROLE => null,
+            GRN_PRESENCE_TARGET_TYPE_STATIC_ROLE  => 'cb_role',
+            GRN_PRESENCE_TARGET_TYPE_GROUP        => 'cb_group',
+            GRN_PRESENCE_TARGET_TYPE_USER         => 'cb_user',
+        ];
+
+    /**
+     * アクセス権の種類
+     *
+     * @access private
+     */
+    var $_access_type = ['browse', 'modify'];
+
+    /**
+     * @access private
+     */
+    var $_user_securitymodels = null;
+    /**
+     * @access private
+     */
+    var $_group_securitymodels = null;
+    /**
+     * @access private
+     */
+    var $_role_securitymodels = null;
+    /**
+     * @access private
+     */
+    var $_deny_users_list = null;
+    /**
+     * @access private
+     */
+    var $_deny_groups_list = null;
+    /**
+     * @access private
+     */
+    var $_deny_roles_list = null;
+    /**
+     * @access private
+     */
+    var $_permit_users_list = null;
+    /**
+     * @access private
+     */
+    var $_permit_groups_list = null;
+    /**
+     * @access private
+     */
+    var $_permit_roles_list = null;
+    /**
+     * @access private
+     */
+    var $_evaluate_users_list = null;
+    /**
+     * @access private
+     */
+    var $_evaluate_groups_list = null;
+    /**
+     * @access private
+     */
+    var $_evaluate_roles_list = null;
+    /**
+     * @access private
+     */
+    var $_user_groups = null;
+    /**
+     * @access private
+     */
+    var $_user_roles = null;
+
+    /**
+     * @access private
+     */
+    var $_have_setting_user_list = null;
+    /**
+     * @access private
+     */
+    var $_have_setting_group_list = null;
+    /**
+     * @access private
+     */
+    var $_have_setting_role_list = null;
+    /**
+     * @access private
+     */
+    var $_db = null;
+
+    var $_access_caches
+        = [
+            'user_user'   => [],
+            'user_group'  => [],
+            'group_user'  => [],
+            'group_group' => []
+        ];
+
+    /**
+     * @access private
+     */
+    function _getDBConnection()
+    {
+        // 初期化されいなければ初期化
+        if (is_null($this->_db)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->_db = $app_locator->getConnection('presence');
+        }
+
+        return $this->_db;
+    }
+
+    /**
+     * @access private
+     */
+    function _initilize(& $user)
+    {
+        // 初期化済みの場合
+        if ( ! is_null($this->_user_groups)) {
+            return;
+        }
+
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+        // CB_Userからuidを取得しているので、第2引数にTRUEを渡して削除フラグチェックを行わないようにする
+        $this->_user_groups = $uum->getUserGroupsInfo($user->getOID(), true);
+        $this->_user_roles = $uum->getUserRolesInfo($user->getOID(), true);
+    }
+
+    /**
+     * アクセス権の種類を取得する
+     */
+    function getAccessType()
+    {
+        return $this->_access_type;
+    }
+
+    /**
+     * テーブル情報を取得する
+     *
+     * @param   string $table_name テーブル名
+     *
+     * @return  object CB_TableInfo
+     * @access private
+     */
+    function _getTableInfo($table_name)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $table_manager = $app_locator->getTableManager('presence');
+        $table_info = $table_manager->getTableInfo($table_name);
+
+        return $table_info;
+    }
+
+    /**
+     * 権限名の一覧を取得する
+     *
+     * @param object CB_TableInfo   $table_info     テーブル情報オブジェクト
+     *
+     * @return array
+     * @access private
+     */
+    function _getAuthorityNames(& $table_info)
+    {
+        $column_infos = $table_info->getColumnInfo();
+        $column_names = [];
+
+        foreach (array_keys($column_infos) as $column_name) {
+            if (false !== strpos($column_name, 'authority_')) {
+                $column_names[] = mb_substr($column_name, 10);
+            }
+        }
+
+        return $column_names;
+    }
+
+    /**
+     * テーブル名を取得する
+     *
+     * @param mixed $object
+     * @param mixed $target
+     * @param       $is_force boolean
+     *
+     * @return string
+     * @access private
+     */
+    function _getTableName(& $object, & $target, $is_force = false)
+    {
+        if (is_object($object)) {
+            $object_id = strtolower(get_class($object));
+            $index = mb_strrpos($object_id, '_') + 1;
+            $object_id = 'presence_access_' . mb_substr($object_id, $index);
+        } elseif (is_string($object)) {
+            $object_id = $object;
+        } else {
+            assert('FALSE');
+        }
+
+        if ($is_force) {
+            $target_id = $target;
+        } elseif (is_object($target)) {
+            if (is_a($target, 'cb_role')) {
+                $target_id = GRN_PRESENCE_TARGET_TYPE_STATIC_ROLE;
+            } else {
+                $target_id = strtolower(get_class($target));
+                $index = mb_strrpos(strtolower(get_class($target)), '_')
+                         + 1;
+                $target_id = mb_substr($target_id, $index);
+            }
+        } elseif (is_string($target)) {
+            $target_id = GRN_PRESENCE_TARGET_TYPE_DYNAMIC_ROLE;
+        } else {
+            assert('FALSE');
+        }
+
+        return 'grn_' . $object_id . '_' . $target_id;
+    }
+
+    /**
+     * アクセス権テーブルを生成する
+     *
+     * @param   array $table_data           下記をキーに持つ連想配列
+     *                                      to_table string  アクセス制御するオブジェクトのクラス名
+     *                                      object   string  オブジェクト
+     *                                      authority array  権限名の配列
+     */
+    function createAccessTable($table_data, $dbconn_alt = null)
+    {
+        if ( ! is_array($table_data)) {
+            assert('FALSE');
+        }
+
+        $target_tables =& $this->_target_tables;
+
+        $table_prefix = mb_substr($table_data['to_table'], 4);
+
+        $dbconn_tmp = null;
+
+        foreach ($target_tables as $target_id => $target_table) {
+            $table_name = $this->_getTableName($table_prefix, $target_id, true);
+
+            $table_info =& $this->_getTableInfo($table_name);
+            if ($dbconn_alt) {
+                $dbconn_tmp =& $table_info->getDBConnection();
+                $table_info->_table_manager->_dbconn =& $dbconn_alt;
+            }
+            $table_info->addColumn('object',
+                ['type' => 'relation', 'to' => $table_data['object']]);
+            if (is_null($target_table)) {
+                $table_info->addColumn('target',
+                    ['type' => 'char', 'length' => 100]);
+            } else {
+                $table_info->addColumn('target',
+                    ['type' => 'relation', 'to' => $target_table]);
+            }
+            $authorities =& $table_data['authority'];
+            foreach ($authorities as $authority) {
+                $table_info->addColumn('authority_' . $authority,
+                    ['type' => 'int']);
+            }
+            $table_info->addIndex('access',
+                ['cols' => ['object', 'target'], 'unique' => true]);
+            $table_info->createTable();
+            if ($dbconn_tmp) {
+                $table_info->_table_manager->_dbconn =& $dbconn_tmp;
+            }
+        }
+    }
+
+    /**
+     * アクセス権テーブルを削除する
+     *
+     * @param   array $table_data           下記をキーに持つ連想配列
+     *                                      to_table string  アクセス制御するオブジェクトのクラス名
+     *                                      authority array  権限名の配列
+     */
+    function dropAccessTable($table_data, $dbconn_alt = null)
+    {
+        if ( ! is_array($table_data)) {
+            assert('FALSE');
+        }
+
+        $target_tables =& $this->_target_tables;
+
+        $object_id = mb_substr($table_data['to_table'], 4);
+
+        $dbconn_tmp = null;
+
+        foreach ($target_tables as $target_id => $target_table) {
+            $table_name = $this->_getTableName($object_id, $target_id, true);
+            $table_info =& $this->_getTableInfo($table_name);
+            if ($dbconn_alt) {
+                $dbconn_tmp =& $table_info->getDBConnection();
+                $table_info->_table_manager->_dbconn =& $dbconn_alt;
+            }
+            $table_info->dropTable();
+            if ($dbconn_tmp) {
+                $table_info->_table_manager->_dbconn =& $dbconn_tmp;
+            }
+        }
+    }
+
+    /**
+     * アクセス権テーブル行を取得する
+     *
+     * @param   mixed $object
+     * @param   mixed $target
+     *
+     * @return  object GRN_Access_Base
+     * @access  private
+     */
+    function _getRow(& $object, & $target)
+    {
+        $table_name = $this->_getTableName($object, $target);
+        $table_info = $this->_getTableInfo($table_name);
+        if ( ! $table_info->exists()) {
+            {
+                $___ret = null;
+
+                return $___ret;
+            }
+        }
+
+        $rowset = new CB_RowSet($table_info);
+
+        $query = $rowset->queryf("col_object = '@S' AND col_target = ",
+            $object->getOID());
+
+        if (is_object($target)) {
+            $query .= $rowset->queryf("'@S'", $target->getOID());
+        } elseif (is_string($target)) {
+            // $target が文字列で渡された場合のみ、targetの削除フラグチェックを行う必要がある。
+            // $object 及び $target がオブジェクトで渡ってきた場合は、削除フラグチェックを行う必要がない。
+            if (strcasecmp('user', $target) == 0) {
+                $user_table =& $this->_getTableInfo('CB_User');
+                $table_name = CB_DATABASE_TABLE_PREFIX .
+                              $this->_getTableName($object, $target, $is_force);
+                $on = $table_name
+                      . '.col_target = tu._id AND tu.col_deleted IS NULL';
+                $rowset->addJoin($user_table, $on, CB_DATABASE_INNER_JOIN,
+                    'tu');
+            }
+            $query .= $rowset->queryf("'@S'", $target);
+        } else {
+            assert('FALSE');
+        }
+
+        $rowset->addCondition($query);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return $row;
+    }
+
+    /**
+     * @access private
+     */
+
+    function &_getTarget($target_type, $target_id)
+    {
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+
+        // ターゲットを取得する
+        switch ($target_type) {
+            case GRN_PRESENCE_TARGET_TYPE_USER:
+                $target =& $uum->getUser($target_id);
+                break;
+            case GRN_PRESENCE_TARGET_TYPE_GROUP:
+                $target =& $uum->getGroup($target_id);
+                break;
+            case GRN_PRESENCE_TARGET_TYPE_STATIC_ROLE:
+                $target =& $uum->getStaticRole($target_id);
+                break;
+            case GRN_PRESENCE_TARGET_TYPE_DYNAMIC_ROLE:
+                $target = $target_id;
+                break;
+            default:
+                assert('FALSE');
+        }
+
+        return $target;
+    }
+
+    /**
+     * アクセス権を設定する
+     *
+     * @param   mixed  $object      アクセス制御するオブジェクトID
+     * @param   string $target_type アクセス制御するターゲットの種類
+     * @param   string $target_id   アクセス制御するターゲットID
+     * @param   array  $authorities キーに権限名、値に権限値を持つ連想配列
+     */
+    function setAccess(& $object, $target_type, $target_id, $authorities)
+    {
+        // オブジェクトテーブル行を取得する
+        $target =& $this->_getTarget($target_type, $target_id);
+        $table_name = $this->_getTableName($object, $target);
+
+        $table_info =& $this->_getTableInfo($table_name);
+        if ( ! $table_info->exists()) {
+            return;
+        }
+
+        $row = $this->_getRow($object, $target);
+        // まだ追加されていない場合は新規に追加
+        if ( ! $row) {
+            $row = $table_info->newRow();
+        }
+        $row->set('object', $object);
+        $row->set('target', $target);
+        foreach ($authorities as $key => $value) {
+            $row->set('authority_' . $key, intval($value));
+        }
+        $row->registerNow();
+    }
+
+    /**
+     * アクセス権を削除する
+     *
+     * @param mixed  $object アクセス制御するオブジェクト
+     * @param string $target_type
+     * @param string $target_id
+     *
+     * @return boolean  TRUEのときは正常終了、FALSEのときは失敗
+     */
+    function deleteAccess(& $object, $target_type, $target_id)
+    {
+
+        // オブジェクトテーブル行を取得する
+        $target =& $this->_getTarget($target_type, $target_id);
+
+        $row = $this->_getRow($object, $target);
+        if ( ! is_null($row)) {
+            $row->delete();
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * アクセス権情報を取得する
+     *
+     * @access private
+     */
+    function _getAccess(& $row, $object_id)
+    {
+        $target =& $row->get('target');
+        $target_type = gettype($target);
+
+        $access = [];
+        if ('object' == $target_type) {
+            if (is_a($target, 'cb_user')) {
+                $access['tid'] = $target->getOID();
+                $access['type'] = GRN_PRESENCE_TARGET_TYPE_USER;
+                $access['target_name'] = $target->get('display_name');;
+            } elseif (is_a($target, 'cb_group')) {
+                global $G_container_base;
+                $uum = $G_container_base->getInstance('uum');
+                $groupObj = $uum->getGroup($target->getOID());
+
+                $access['tid'] = $target->getOID();
+                $access['type'] = GRN_PRESENCE_TARGET_TYPE_GROUP;
+                $access['target_name'] = $groupObj->get('name');
+            }
+        } else {
+            assert('FALSE');
+        }
+        $access['id'] = $row->getOID();
+        $access['oid'] = $object_id;
+
+        $access['data'] = [];
+        $table_info = &$row->getTableInfo();
+        $authorities = $this->_getAuthorityNames($table_info);
+        foreach ($authorities as $authority) {
+            $access['data'][$authority] = $row->get('authority_' . $authority);
+        }
+
+        return $access;
+    }
+
+    /**
+     * アクセス権テーブル行の集合の一覧を取得する
+     *
+     * @access private
+     */
+    function _getRowSetList(& $object)
+    {
+        $target_tables = [
+            GRN_PRESENCE_TARGET_TYPE_GROUP => 'cb_group',
+            GRN_PRESENCE_TARGET_TYPE_USER  => 'cb_user',
+        ];
+        $object_id = strtolower(get_class($object));
+        $index = mb_strrpos($object_id, '_') + 1;
+        $object_id = 'presence_access_' . mb_substr($object_id, $index);
+
+        $rowset_list = [];
+        foreach ($target_tables as $target_id => $target_table) {
+            $table_name = $this->_getTableName($object_id, $target_id, true);
+            $table_info =& $this->_getTableInfo($table_name);
+            if ( ! $table_info->exists()) {
+                continue;
+            }
+            $rowset = new CB_RowSet($table_info);
+
+            // object はオブジェクトからidを取得しているので、削除フラグチェックを行う必要がない。
+            // target のみ削除フラグチェックを行う。
+            if (strcasecmp('user', $target_id) == 0) {
+                $user_table =& $this->_getTableInfo('CB_User');
+                $on = 'tab_' . $table_name
+                      . '.col_target = tu._id AND tu.col_deleted IS NULL';
+                $rowset->addJoin($user_table, $on, CB_DATABASE_INNER_JOIN,
+                    'tu');
+            }
+
+            $query = $rowset->queryf("col_object = '@S'", $object->getOID());
+
+            $rowset->addCondition($query);
+            $rowset_list[$target_id] =& $rowset;
+            unset($rowset);
+        }
+
+        return $rowset_list;
+    }
+
+    /**
+     * アクセス権情報の一覧を取得する
+     *
+     * @param   mixed $object      アクセス制御するオブジェクト
+     * @param   array $access_keys アクセス権キーの一覧
+     *                             アクセス権キーは下記の通り
+     *                             {アクセス制御するターゲットの種類}.':'.{アクセス権ID}を持つ配列
+     *
+     * @return array  下記をキーに持つ連想配列
+     *  id int  アクセス権ID
+     *  oid int  アクセス制御するオブジェクトID
+     *  tid mixed  アクセス制御するターゲットID
+     *  type string  アクセス制御するターゲットの種類
+     *  data int  権限の値
+     */
+    function getAccesses($object, $access_keys = null)
+    {
+
+        // アクセス権テーブル行の集合の一覧を取得する
+        $rowset_list = $this->_getRowSetList($object);
+
+        $object_id = $object->getOID();
+
+        // アクセス権の一覧を生成する
+        $accesses = [];
+        foreach (array_keys($rowset_list) as $list_id) {
+            $rowset = $rowset_list[$list_id];
+            while ( ! is_null($row = $rowset->iterate())) {
+                $accesses[] = $this->_getAccess($row, $object_id);
+            }
+        }
+
+        if ( ! is_null($access_keys)) {
+            foreach (array_keys($accesses) as $key) {
+                $access =& $accesses[$key];
+                if (false === array_search($access['type'] . ':'
+                                           . $access['id'], $access_keys)
+                ) {
+                    unset($accesses[$key]);
+                }
+            }
+        }
+
+        return $accesses;
+    }
+
+    /**
+     * アクセス権の一覧を削除する
+     *
+     * @param   mixed $object   アクセス制御するオブジェクト
+     * @param   array $accesses 下記をキーに持つ連想配列を持つ配列
+     *                          id int  アクセス権ID
+     *                          type string  アクセス制御するターゲットの種類
+     */
+    function deleteAccesses($object, $accesses)
+    {
+
+        if (0 == count($accesses)) {
+            return;
+        }
+
+        // アクセス権のデータ構造を変換する
+        $accesses_list = [];
+        foreach ($accesses as $access) {
+
+            $target_type = $access['type'];
+            $access_id = $access['id'];
+
+            if ( ! array_key_exists($target_type, $accesses_list)) {
+                $accesses_list[$target_type] = [];
+            }
+            $accesses_list[$target_type][] = $access_id;
+        }
+
+        $target_tables =& $this->_target_tables;
+
+        $object_id = strtolower(get_class($object));
+        $index = mb_strrpos($object_id, '_') + 1;
+        $object_id = 'presence_access_' . mb_substr($object_id, $index);
+
+        $rowset_list = [];
+        foreach (array_keys($accesses_list) as $target_type) {
+            $table_name = $this->_getTableName($object_id, $target_type, true);
+            $table_info =& $this->_getTableInfo($table_name);
+            if ( ! $table_info->exists()) {
+                continue;
+            }
+
+            $query = '';
+            $rowset = new CB_RowSet($table_info);
+            foreach ($accesses_list[$target_type] as $access_id) {
+                $query .= $rowset->queryf("_id = '@S' OR ", $access_id);
+            }
+            $query = mb_substr($query, 0, -4);
+
+            $rowset->addCondition($query);
+            $rowset->deleteAllMatched();
+        }
+    }
+
+    /**
+     * スケジュールのデフォルトのセキュリティモデルを取得する
+     */
+    function _getDefaultSecurityModel()
+    {
+        static $presence_default_mode = null;
+
+        if (is_null($presence_default_mode)) {
+            global $G_container_app;
+            $policy =& $G_container_app->getInstance('common_policy');
+
+            if ('revoke' == $policy->getPolicy('grn.common',
+                    'security_model')
+            ) {
+                $presence_default_mode
+                    = GRN_PRESENCE_SECURITY_MODEL_TYPE_REVOKE;
+            } else {
+                $presence_default_mode = GRN_PRESENCE_SECURITY_MODEL_TYPE_GRANT;
+            }
+        }
+
+        return $presence_default_mode;
+    }
+
+    /**
+     * @access private
+     */
+    function _getSecurityModelTable()
+    {
+        require_once('presence/table.csp');
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('presence');
+        $security_model_table = $tm->getTableInfo(GRN_PRESENCE_SECURITYMODEL);
+
+        return $security_model_table;
+    }
+
+    /**
+     * @access private
+     */
+    function _getSecurityModelRow(& $object)
+    {
+        $table = $this->_getSecurityModelTable();
+        $rowset = new CB_RowSet($table);
+        if (is_a($object, 'CB_User')) {
+            // オブジェクトからidを取得しているので、削除フラグチェックは行わない。
+            $rowset->addCondition("col_user = " . $rowset->queryf("'@S'",
+                    $object->getOID()));
+        } elseif (is_a($object, 'CB_Group')) {
+            $rowset->addCondition("col_group = " . $rowset->queryf("'@S'",
+                    $object->getOID()));
+        } elseif (is_a($object, 'CB_Role')) {
+            $rowset->addCondition("col_role = " . $rowset->queryf("'@S'",
+                    $object->getOID()));
+        }
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return $row;
+    }
+
+    /**
+     * @access private
+     */
+    function _getSecurityModelById($object_id, $object_type)
+    {
+        $db = &$this->_getDBConnection();
+
+        $query
+            = 'SELECT col_security_model FROM tab_grn_presence_securitymodel';
+        if (strcmp($object_type, 'user') == 0) {
+            $query .= ' INNER JOIN tab_cb_user AS u ON tab_grn_presence_securitymodel.col_user = u._id';
+            $query .= ' AND u.col_deleted IS NULL';
+        }
+        $query .= ' WHERE ';
+
+        $list = null;
+        // 一度評価してあればそれを利用する
+        switch ($object_type) {
+            case 'user':
+                if (is_array($this->_user_securitymodels)
+                    && array_key_exists($object_id, $this->_user_securitymodels)
+                ) {
+                    return $this->_user_securitymodels[$object_id];
+                } elseif ( ! is_array($this->_user_securitymodels)) {
+                    $this->_user_securitymodels = [];
+                }
+                $list = &$this->_user_securitymodels;
+
+                $query .= cb_queryf($db, "col_user = '@S'", $object_id);
+
+                break;
+            case 'group':
+                if (is_array($this->_group_securitymodels)
+                    && array_key_exists($object_id,
+                        $this->_group_securitymodels)
+                ) {
+                    return $this->_group_securitymodels[$object_id];
+                } elseif ( ! is_array($this->_group_securitymodels)) {
+                    $this->_group_securitymodels = [];
+                }
+                $list = &$this->_group_securitymodels;
+
+                $query .= cb_queryf($db, "col_group = '@S'", $object_id);
+                break;
+            case 'role':
+                if (is_array($this->_role_securitymodels)
+                    && array_key_exists($object_id, $this->_role_securitymodels)
+                ) {
+                    return $this->_role_securitymodels[$object_id];
+                } elseif ( ! is_array($this->_role_securitymodels)) {
+                    $this->_role_securitymodels = [];
+                }
+                $list = &$this->_role_securitymodels;
+
+                $query .= cb_queryf($db, "col_role = '@S'", $object_id);
+                break;
+            default:
+                return false;
+        }
+
+        // セキュリティモデルのテーブルから持ってくる
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $security_model = null;
+        while ($row = $db->fetch_assoc($result)) {
+            $security_model = $row['col_security_model'];
+        }
+        // 結果の開放
+        $db->free_result($result);
+
+        if (is_null($security_model)) {
+            $list[$object_id] = $this->_getDefaultSecurityModel();
+        } else {
+            $list[$object_id] = $security_model;
+        }
+
+        return $list[$object_id];
+    }
+
+    /**
+     * @access private
+     */
+    function _getSecurityModel(& $object)
+    {
+        if (is_a($object, 'CB_User')) {
+            return $this->_getSecurityModelById($object->getOID(), 'user');
+        } elseif (is_a($object, 'CB_Group')) {
+            return $this->_getSecurityModelById($object->getOID(), 'group');
+        } elseif (is_a($object, 'CB_Role')) {
+            return $this->_getSecurityModelById($object->getOID(), 'role');
+        }
+
+        return false;
+    }
+
+    /**
+     * セキュリティ・モデルを取得する
+     *
+     * @param   mixed $object アクセス制御するオブジェクト
+     *
+     * @return  string      セキュリティモデル
+     */
+    function getSecurityModel($object)
+    {
+
+        $security_model = $this->_getSecurityModel($object);
+
+        return (GRN_PRESENCE_SECURITY_MODEL_TYPE_REVOKE == $security_model)
+            ? 'revoke' : 'grant';
+    }
+
+    /**
+     * 一括してセキュリティモデルの取得を行う関数
+     *
+     * @access private
+     */
+    function _getSecurityModels($members, $member_type)
+    {
+        if ( ! is_array($members) || count($members) === 0) {
+            return false;
+        }
+
+        $member_target = '';
+        switch ($member_type) {
+            case 'user':
+                $member_target = 'col_user';
+                if ( ! is_array($this->_user_securitymodels)) {
+                    $this->_user_securitymodels = [];
+                }
+                $list = &$this->_user_securitymodels;
+                break;
+            case 'group':
+                $member_target = 'col_group';
+                if ( ! is_array($this->_group_securitymodels)) {
+                    $this->_group_securitymodels = [];
+                }
+                $list = &$this->_group_securitymodels;
+                break;
+            case 'role':
+                $member_target = 'col_Role';
+                if ( ! is_array($this->_role_securitymodels)) {
+                    $this->_role_securitymodels = [];
+                }
+                $list = &$this->_role_securitymodels;
+                break;
+            default:
+                return false;
+        }
+
+        $db = &$this->_getDBConnection();
+
+        $retval = [];
+        $object_array = [];
+        foreach (array_keys($members) as $key) {
+            // 評価済みは取得しない
+            if (array_key_exists($key, $list)) {
+                $retval[$key] = $list[$key];
+                continue;
+            }
+            $object_array[] = cb_queryf($db, "'@S'", $key);
+        }
+
+        // 取得するものがない場合は、既にあるリストを返す
+        if (count($object_array) === 0) {
+            return $retval;
+        }
+
+        $objects_str = implode(',', $object_array);
+
+        $join = '';
+        if (strcmp($member_type, 'user') == 0) {
+            $join .= 'INNER JOIN tab_cb_user AS u ON tab_grn_presence_securitymodel.col_user = u._id';
+            $join .= ' AND u.col_deleted IS NULL';
+        }
+
+        if (count($object_array) === 1) {
+            $query = 'SELECT col_security_model, ' . $member_target
+                     . ' FROM tab_grn_presence_securitymodel ' . $join
+                     . ' WHERE ( ' . $member_target . ' = ' . $objects_str
+                     . ' )';
+        } else {
+            $query = 'SELECT col_security_model, ' . $member_target
+                     . ' FROM tab_grn_presence_securitymodel ' . $join
+                     . ' WHERE ( ' . $member_target . ' IN (' . $objects_str
+                     . ') )';
+        }
+
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $default_model = $this->_getDefaultSecurityModel();
+        while ($row = $db->fetch_assoc($result)) {
+            $retval[$row[$member_target]] = $row['col_security_model'];
+            $list[$row[$member_target]] = $row['col_security_model'];
+        }
+        $db->free_result($result);
+
+        // DBに設定されていないデータの設定
+        foreach (array_keys($members) as $key) {
+            if (array_key_exists($key, $retval)) {
+                continue;
+            }
+
+            $retval[$key] = $default_model;
+            $list[$key] = $default_model;
+        }
+
+        return $retval;
+    }
+
+    /**
+     * セキュリティ・モデルを変更する
+     * アクセス権はすべて削除する
+     *
+     * @param   mixed  $object         アクセス制御するオブジェクト
+     * @param   string $seciruty_model セキュリティ・モデル
+     */
+    function setSecurityModel($object, $security_model)
+    {
+
+        if ( ! is_string($security_model) || 0 == strlen($security_model)) {
+            cb_throw_error(E_GRN_PRESENCE_ACCESS_INVALID_SECURITY_MODEL);
+        }
+
+        $old_security_model = $this->getSecurityModel($object);
+        if ($old_security_model != $security_model) {
+            // まだ登録されていない
+            $model_row = &$this->_getSecurityModelRow($object);
+            if (is_null($model_row)) {
+                $table = &$this->_getSecurityModelTable();
+                $model_row = &$table->newRow();
+                $target = '';
+                if (is_a($object, 'CB_User')) {
+                    $target = 'user';
+                } elseif (is_a($object, 'CB_Group')) {
+                    $target = 'group';
+                } elseif (is_a($object, 'CB_Role')) {
+                    $target = 'role';
+                }
+                $model_row->set($target, $object);
+            }
+
+            if ('grant' == $security_model) {
+                $security_model = GRN_PRESENCE_SECURITY_MODEL_TYPE_GRANT;
+            } elseif ('revoke' == $security_model) {
+                $security_model = GRN_PRESENCE_SECURITY_MODEL_TYPE_REVOKE;
+            } else {
+                cb_throw_error(E_GRN_PRESENCE_ACCESS_INVALID_SECURITY_MODEL);
+            }
+
+            $model_row->set('security_model', intval($security_model));
+
+            // 登録されているアクセス権をすべて取得
+            $accesses = $this->getAccesses($object);
+
+            // 現在の設定をすべてクリアする
+            $this->deleteAccesses($object, $accesses);
+
+            if (is_a($object, 'CB_User')) {
+                $this->_user_securitymodels[$object->getOID()]
+                    = $security_model;
+            } elseif (is_a($object, 'CB_Group')) {
+                $this->_group_securitymodels[$object->getOID()]
+                    = $security_model;
+            } elseif (is_a($object, 'CB_Role')) {
+                $this->_role_securitymodels[$object->getOID()]
+                    = $security_model;
+            }
+        }
+    }
+
+    /**
+     * 単体オブジェクトのアクセス権評価値を計算する
+     *
+     * @access      private
+     */
+    function _evaluateAccess(
+        & $user,
+        & $object,
+        $authorities,
+        $dynamic_roles,
+        $user_groups,
+        $user_roles
+    ) {
+        $user_id = $user->getOID();
+        $targets_list = [];
+
+        $db = &$this->_getDBConnection();
+
+        // ダイナミックロールを取得する
+        if (is_array($dynamic_roles) && count($dynamic_roles) > 0) {
+            $target_array = [];
+            foreach (array_keys($dynamic_roles) as $key) {
+                $target_array[] = cb_queryf($db, "'@S'", $key);
+            }
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_DYNAMIC_ROLE] = implode(',',
+                $target_array);
+        } else {
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_DYNAMIC_ROLE] = null;
+        }
+
+        // スタティックロールを取得する
+        if (false === $user_roles) {
+            return false;
+        }
+        if (is_array($user_roles) && count($user_roles) > 0) {
+            $target_array = [];
+            foreach (array_keys($user_roles) as $key) {
+                $target_array[] = cb_queryf($db, "'@S'", $key);
+            }
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_STATIC_ROLE] = implode(',',
+                $target_array);
+        } else {
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_STATIC_ROLE] = null;
+        }
+
+        // 組織を取得する
+        if (false === $user_groups) {
+            return false;
+        }
+        if (is_array($user_groups) && count($user_groups) > 0) {
+            $target_array = [];
+            foreach (array_keys($user_groups) as $key) {
+                $target_array[] = cb_queryf($db, "'@S'", $key);
+            }
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_GROUP] = implode(',',
+                $target_array);
+        } else {
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_GROUP] = null;
+        }
+
+        $temp_array = [];
+        foreach ($authorities as $authority) {
+            $temp_array[] = "col_authority_" . $authority . " = '1'";
+        }
+        $authorities_str = implode(' OR ', $temp_array);
+
+        // ユーザーを取得する
+        $targets_list[GRN_PRESENCE_TARGET_TYPE_USER] = (string)$user_id;
+
+        $object_id = strtolower(get_class($object));
+        $index = mb_strrpos($object_id, '_') + 1;
+        $object_id = 'presence_access_' . mb_substr($object_id, $index);
+
+        $target_tables =& $this->_target_tables;
+
+        $values = [];
+        foreach ($authorities as $authority) {
+            $values[$authority] = 0;
+        }
+
+        foreach ($target_tables as $target_id => $target_table) {
+            if (is_null($targets_list[$target_id])
+                || 0 === count($targets_list[$target_id])
+            ) {
+                continue;
+            }
+
+            $table_name = $this->_getTableName($object_id, $target_id, true);
+
+            // object はオブジェクトからidを取得しているので、削除フラグチェックを行わない
+            // $targets_list['user'] もオブジェクトから取得したidしか入らないので、削除フラグチェックを
+            // 行う必要はない。
+            $query = "SELECT * FROM tab_" . $table_name
+                     . " WHERE ( ( col_object = ";
+            $query .= cb_queryf($db, "'@S'", $object->getOID());
+            $query .= " ) AND ( col_target IN (" . $targets_list[$target_id]
+                      . ") ) AND ( " . $authorities_str . " ) )";
+
+            $query = $db->select_format($query);
+
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError([
+                    'query' => 'failed query on SELECT: ' . $query
+                ]);
+            }
+
+            while ($row = $db->fetch_assoc($result)) {
+                $_object_id = $row['col_object'];
+                $values[$_object_id] = [];
+                $evalval = 1;
+                foreach ($authorities as $authority) {
+                    $value = $row['col_authority_' . $authority];
+                    $value = is_null($value) ? 0 : intval($value);
+                    $values[$authority] = max($values[$authority], $value);
+                    $evalval = $evalval & $values[$authority];
+                }
+                if (1 === $evalval) {
+                    break;
+                }
+            }
+
+            // 結果の開放
+            $db->free_result($result);
+        }
+
+        return $values;
+    }
+
+    /**
+     * アクセス権の評価を行う
+     *  $authoritiesで与えられたすべての操作ができるかどうかをチェックする
+     *
+     * @param   object CB_User  $user           ユーザー
+     * @param   mixed $object        評価対象
+     * @param   array $authorities   操作
+     * @param   array $dynamic_roles ダイナミックロール
+     *
+     * @return  mixed   成功した場合は評価したアクセス
+     */
+    function evaluateAccess(& $user, & $object, $authorities, $dynamic_roles)
+    {
+        $this->_initilize($user);
+
+        // ログインユーザーはOK
+        if (is_a($object, 'CB_User') && $user->getOID() == $object->getOID()) {
+            return true;
+        }
+
+        // どういった値がDBに設定されているかを取得
+        $list = $this->_evaluateAccess($user, $object, $authorities,
+            $dynamic_roles, $this->_user_groups, $this->_user_roles);
+
+        $return_value = null;
+        // ひとつしかない場合
+        if (count($authorities) == 1) {
+            switch ($this->_getSecurityModel($object)) {
+                case GRN_PRESENCE_SECURITY_MODEL_TYPE_GRANT:
+                    $retval_true = true;
+                    $retval_false = false;
+                    break;
+                case GRN_PRESENCE_SECURITY_MODEL_TYPE_REVOKE:
+                    $retval_true = false;
+                    $retval_false = true;
+                    break;
+            }
+
+            if (intval(reset($list)) == 1) {
+                $return_value = $retval_true;
+            } else {
+                $return_value = $retval_false;
+            }
+        } else {
+            $access = 1;
+            $old_access = null;
+            $b_first = true;
+            foreach ($authorities as $authority) {
+                $value = array_key_exists($authority, $list) ? $list[$authority]
+                    : 0;
+                $value = intval($value);
+                if ($b_first) {
+                    $b_first = false;
+                    $access &= $value;
+                    $old_access = $value;
+                    continue;
+                }
+
+                // 値が違っている場合は、どのケースでもアクセスできない
+                if ($old_access != $value) {
+                    return false;
+                }
+
+                $access &= $value;
+            }
+
+            switch ($this->_getSecurityModel($object)) {
+                case GRN_PRESENCE_SECURITY_MODEL_TYPE_GRANT:
+                    $retval_true = true;
+                    $retval_false = false;
+                    break;
+                case GRN_PRESENCE_SECURITY_MODEL_TYPE_REVOKE:
+                    $retval_true = false;
+                    $retval_false = true;
+                    break;
+            }
+            $return_value = $access ? $retval_true : $retval_false;
+        }
+        if ( ! is_a($object, 'CB_User') || $return_value === false) {
+            return $return_value;
+        }
+
+        $target_object = [$object->getOID() => $object];
+        $have_access_setting = $this->getHaveAccessSettingList($user,
+            $target_object, 'user', $dynamic_roles);
+        if (is_array($have_access_setting) && count($have_access_setting) > 0) {
+            return $return_value;
+        }
+
+        $no_group = false;
+        $no_roles = false;
+
+        // ユーザーの場合は組織とロールについて判断する
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+
+        // CB_Userからuidを取得しているので、第2引数にTRUEを渡して削除フラグチェックを行わない
+        $groups = $uum->getUserGroupsInfo($object->getOID(), true);
+        $groups = $this->getHaveAccessSettingList($user, $groups, 'group',
+            $dynamic_roles);
+        if (count($groups) > 0) {
+            $retval = $this->evaluateAccessesById($user, $groups, $authorities,
+                $dynamic_roles, 'group');
+            if (count($retval) > 0) {
+                return true;
+            }
+
+        } else {
+            $no_group = true;
+        }
+
+        // CB_Userからuidを取得しているので、第2引数にTRUEを渡して削除フラグチェックを行わない
+        $roles = $uum->getUserRolesInfo($object->getOID(), true);
+        $roles = $this->getHaveAccessSettingList($user, $roles, 'role',
+            $dynamic_roles);
+        if (count($roles) > 0) {
+            $retval = $this->evaluateAccessesById($user, $roles, $authorities,
+                $dynamic_roles, 'role');
+            if (count($retval) > 0) {
+                return true;
+            }
+
+        } else {
+            $no_roles = true;
+        }
+
+        if ($no_group && $no_roles) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /*
+     * @user            CB_User
+     * @object_user     CB_User
+     */
+    function evaluateAccessForPresence(& $user, & $object_user)
+    {
+        global $G_container_base;
+        /** @var GRN_Uum $uum */
+        $uum = $G_container_base->getInstance('uum');
+
+        $has_authority = false;
+        // modify myself
+        if ($user->getOID() === $object_user->getOID()) {
+            $has_authority = true;
+        }
+
+        // get access of object_user
+        if ( ! $has_authority) {
+            $has_authority = $this->_evaluateAccessForPresence($user,
+                $object_user);
+        }
+
+        // get access of group contain object_user
+        if ( ! $has_authority) {
+            $groups_object_user
+                = $uum->getUserGroupsInfo($object_user->getOID());
+            foreach (array_keys($groups_object_user) as $group_object_id) {
+                $group_object_user = $uum->getGroup($group_object_id);
+                $has_authority = $this->_evaluateAccessForPresence($user,
+                    $group_object_user);
+                if ($has_authority) {
+                    break;
+                }
+            }
+        }
+
+        return $has_authority;
+    }
+
+    function loadAndCacheAccessForPresence($user_id_list, $targetID)
+    {
+        if ( ! is_array($user_id_list) || count($user_id_list) == 0) {
+            return;
+        }
+
+        $db = $this->_getDBConnection();
+
+        //user_user
+        $query = cb_queryf($db,
+            "SELECT col_object,COUNT(_id) AS total FROM tab_grn_presence_access_user_user WHERE col_object IN (@A) AND col_target='@S' GROUP BY col_object",
+            $user_id_list, $targetID);
+        $result = $db->query($query);
+        $rows = [];
+        while (($row = $db->fetch_assoc($result))) {
+            $rows[$row['col_object']] = $row;
+        }
+        foreach ($user_id_list as $uid) {
+            if (array_key_exists($uid, $rows)) {
+                $this->_access_caches['user_user'][$targetID . "-" . $uid]
+                    = ($rows[$uid]['total'] > 0);
+            } else {
+                $this->_access_caches['user_user'][$targetID . "-" . $uid]
+                    = null;
+            }
+        }
+
+        //user_group
+        $query = cb_queryf($db,
+            "SELECT col_object,COUNT(p._id) AS total FROM tab_grn_presence_access_user_group p INNER JOIN tab_cb_usergrouprelation g ON p.col_target=g.col_group  WHERE p.col_object IN (@A) AND g.col_user='@S' GROUP BY col_object",
+            $user_id_list, $targetID);
+        $result = $db->query($query);
+
+        $rows = [];
+        while (($row = $db->fetch_assoc($result))) {
+            $rows[$row['col_object']] = $row;
+        }
+        foreach ($user_id_list as $uid) {
+            if (array_key_exists($uid, $rows)) {
+                $this->_access_caches['user_group'][$targetID . "-" . $uid]
+                    = ($rows[$uid]['total'] > 0);
+            } else {
+                $this->_access_caches['user_group'][$targetID . "-" . $uid]
+                    = null;
+            }
+        }
+
+        //get group id list
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $groups = $uum->getGroupListByUserIds($user_id_list);
+        $group_id_list = [];
+        foreach ($groups as $group) {
+            $group_id_list[$group->getId()] = 1;
+        }
+        $group_id_list = array_keys($group_id_list);
+
+        if (count($group_id_list) == 0) {
+            return;
+        }
+
+        //group_user
+        $query = cb_queryf($db,
+            "SELECT col_object,COUNT(_id) AS total FROM tab_grn_presence_access_group_user WHERE col_object IN (@A) AND col_target='@S' GROUP BY col_object",
+            $group_id_list, $targetID);
+        $result = $db->query($query);
+
+        $rows = [];
+        while (($row = $db->fetch_assoc($result))) {
+            $rows[$row['col_object']] = $row;
+        }
+        foreach ($group_id_list as $gid) {
+            if (array_key_exists($gid, $rows)) {
+                $this->_access_caches['group_user'][$targetID . "-" . $gid]
+                    = ($rows[$gid]['total'] > 0);
+            } else {
+                $this->_access_caches['group_user'][$targetID . "-" . $gid]
+                    = null;
+            }
+        }
+
+        //group_group
+        $query = cb_queryf($db,
+            "SELECT col_object,COUNT(p._id) AS total FROM tab_grn_presence_access_group_group p INNER JOIN tab_cb_usergrouprelation g ON p.col_target=g.col_group  WHERE p.col_object IN (@A) AND g.col_user='@S' GROUP BY col_object",
+            $group_id_list, $targetID);
+        $result = $db->query($query);
+
+        $rows = [];
+        while (($row = $db->fetch_assoc($result))) {
+            $rows[$row['col_object']] = $row;
+        }
+
+        foreach ($group_id_list as $gid) {
+            if (array_key_exists($gid, $rows)) {
+                $this->_access_caches['group_group'][$targetID . "-" . $gid]
+                    = ($rows[$gid]['total'] > 0);
+            } else {
+                $this->_access_caches['group_group'][$targetID . "-" . $gid]
+                    = null;
+            }
+        }
+    }
+
+    /*
+     * @user CB_User
+     * @object CB_Group or CB_User
+     */
+    function _evaluateAccessForPresence(& $user, & $object)
+    {
+        $has_authority = false;
+        $db = $this->_getDBConnection();
+        $type = 'group';
+        if (is_a($object, 'CB_User')) {
+            $type = 'user';
+        }
+
+        $cacheKey = $user->getOID() . "-" . $object->getOID();
+        if (array_key_exists($cacheKey,
+            $this->_access_caches[$type . '_user'])
+        ) {
+            $has_authority = $this->_access_caches[$type . '_user'][$cacheKey];
+        } else {
+            // user
+            $query
+                = sprintf("SELECT COUNT(_id) AS total FROM tab_grn_presence_access_${type}_user "
+                          . " WHERE col_object='%s' AND col_target='%s'",
+                $object->getOID(), $user->getOID());
+            $ret = $db->query($query);
+            $row = $db->fetch_assoc($ret);
+            $db->free_result($ret);
+
+            $has_authority = ($row['total'] > 0);
+
+            //cache
+            $this->_access_caches[$type . '_user'][$cacheKey] = $has_authority;
+        }
+
+        // group
+        if ( ! $has_authority) {
+            if (array_key_exists($cacheKey,
+                $this->_access_caches[$type . '_group'])
+            ) {
+                $has_authority = $this->_access_caches[$type
+                                                       . '_group'][$cacheKey];
+            } else {
+                $query
+                    = sprintf("SELECT COUNT(p._id) AS total FROM tab_grn_presence_access_${type}_group p "
+                              . " INNER JOIN tab_cb_usergrouprelation g ON p.col_target=g.col_group "
+                              . " WHERE p.col_object='%s' AND g.col_user='%s'",
+                    $object->getOID(), $user->getOID());
+
+                $ret = $db->query($query);
+                $row = $db->fetch_assoc($ret);
+                $db->free_result($ret);
+
+                $has_authority = ($row['total'] > 0);
+
+                //cache
+                $this->_access_caches[$type . '_group'][$cacheKey]
+                    = $has_authority;
+            }
+        }
+
+        return $has_authority;
+    }
+
+    /**
+     * アクセスが許可された複数オブジェクトを取得する
+     *
+     * @access private
+     *
+     * @param $objects
+     * @param $object_table
+     * @param $authorities
+     * @param $is_grant
+     *
+     * @return array
+     */
+    function _getAllowSingleObjects(
+        $objects,
+        $targets_list,
+        $object_table,
+        $authorities,
+        $is_grant,
+        &$deny_cache_list,
+        &$permit_cache_list
+    ) {
+        if (0 === count($objects)) {
+            return [];
+        }
+
+        $db = &$this->_getDBConnection();
+
+        $target_tables =& $this->_target_tables;
+
+        $values_list = [];
+
+        $objects_str = "";
+        foreach (array_keys($objects) as $object) {
+            $objects_str .= cb_queryf($db, "'@S',", $object);
+        }
+        $objects_str = substr($objects_str, 0, strlen($objects_str) - 1);
+
+        $temp_str = [];
+        foreach ($authorities as $authority) {
+            $temp_str[] = 'col_authority_' . $authority;
+        }
+        $authorities_str = implode(' OR ', $temp_str);
+
+
+        foreach ($target_tables as $target_id => $target_table) {
+            if (is_null($targets_list[$target_id])
+                || 0 === count($targets_list[$target_id])
+            ) {
+                continue;
+            }
+            $targets =& $targets_list[$target_id];
+
+            $table_name = $this->_getTableName($object_table, $target_id, true);
+
+            // ユーザー削除フラグを確認
+            $join = '';
+            if (strcmp($target_id, 'user') == 0) {
+                $join .= ' INNER JOIN tab_cb_user AS tu ON tab_' . $table_name
+                         . '.col_target = tu._id AND tu.col_deleted IS NULL';
+            }
+
+            $query = 'SELECT * FROM tab_' . $table_name . $join
+                     . ' WHERE ( ( col_object IN (' . $objects_str
+                     . ') ) AND ( col_target IN (' . $targets_list[$target_id]
+                     . ') ) AND ( ' . $authorities_str . ' ) )';
+
+            $query = $db->select_format($query);
+
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError([
+                    'query' => 'failed query on SELECT: ' . $query
+                ]);
+            }
+
+            while ($row = $db->fetch_assoc($result)) {
+                $object_id = $row['col_object'];
+
+                // アクセス権の権限値の一覧を取得する
+                if (array_key_exists($object_id, $values_list)) {
+                    $values =& $values_list[$object_id];
+                } else {
+                    $values_list[$object_id] = [];
+                    $values =& $values_list[$object_id];
+                    foreach ($authorities as $authority) {
+                        $values[$authority] = 0;
+                    }
+                }
+                // アクセス権を評価する
+                foreach ($authorities as $authority) {
+                    $value = $row['col_authority_' . $authority];
+                    $value = is_null($value) ? 0 : intval($value);
+                    $value = max($values[$authority], $value);
+                    $values[$authority] = $value;
+                }
+            }
+            // 結果の開放
+            $db->free_result($result);
+        }
+        $retval = [];
+        $authorities_count = count($authorities);
+        foreach (array_keys($values_list) as $object_id) {
+            $values = &$values_list[$object_id];
+            $evalval = 1;
+            $sum_authorities = array_sum($values);
+            if ($sum_authorities != 0
+                && $authorities_count != $sum_authorities
+            ) {
+                // だめなリストにオブジェクトを追加
+                $deny_cache_list[$object_id] = $object_id;
+                unset($objects[$object_id]);
+                continue;
+            }
+
+            if ($is_grant && $sum_authorities != 0) {
+                $retval[$object_id] =& $objects[$object_id];
+                $permit_cache_list[$object_id] = $object_id;
+            } else {
+                // だめなリストにオブジェクトを追加
+                $deny_cache_list[$object_id] = $object_id;
+                unset($objects[$object_id]);
+            }
+        }
+
+        $object_keys = array_keys($objects);
+        $value_keys = array_keys($values_list);
+        $no_records = array_diff($object_keys, $value_keys);
+
+        if ($is_grant) {
+            // GRANTでアクセス権設定の無いものは拒否としてキャッシュ
+            foreach ($no_records as $no_record) {
+                $deny_cache_list[$no_record] = $no_record;
+            }
+
+            return $retval;
+        } else {
+            // REVOKEでアクセス権設定の無いものは許可としてキャッシュ
+            foreach ($no_records as $no_record) {
+                $permit_cache_list[$no_record] = $no_record;
+            }
+
+            return $objects;
+        }
+
+    }
+
+    /**
+     * アクセスが許可された複数オブジェクトを取得する
+     *
+     * @access private
+     *
+     * @param   object CB_User  $user
+     * @param   array $dynamic_roles
+     * @param   array $objects
+     * @param   array $authorities
+     *
+     * @return array
+     */
+    function _getAllowMultiObjects(
+        & $user,
+        $objects,
+        $object_type,
+        $authorities,
+        & $dynamic_roles,
+        & $user_groups,
+        & $user_roles,
+        & $deny_cache_list,
+        & $permit_cache_list
+    ) {
+        $user_id = $user->getOID();
+        $targets_list = [];
+
+        $dbconn =& $this->_getDBConnection();
+
+        // ダイナミックロールを取得する
+        if (is_array($dynamic_roles) && count($dynamic_roles) > 0) {
+            $target_array = [];
+            foreach (array_keys($dynamic_roles) as $key) {
+                $target_array[] = '\'' . $dbconn->escape($key) . '\'';
+            }
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_DYNAMIC_ROLE] = implode(',',
+                $target_array);
+        } else {
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_DYNAMIC_ROLE] = null;
+        }
+
+        // スタティックロールを取得する
+        $targets_list[GRN_PRESENCE_TARGET_TYPE_STATIC_ROLE] = $user_roles;
+        if (false === $user_roles) {
+            return false;
+        }
+        if (is_array($user_roles) && count($user_roles) > 0) {
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_STATIC_ROLE] = implode(',',
+                array_keys($user_roles));
+        } else {
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_STATIC_ROLE] = null;
+        }
+
+        // 組織を取得する
+        $targets_list[GRN_PRESENCE_TARGET_TYPE_GROUP] = $user_groups;
+        if (false === $user_groups) {
+            return false;
+        }
+        if (is_array($user_groups) && count($user_groups) > 0) {
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_GROUP] = implode(',',
+                array_keys($user_groups));
+        } else {
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_GROUP] = null;
+        }
+
+        // ユーザーを取得する
+        $targets_list[GRN_PRESENCE_TARGET_TYPE_USER] = $user->getOID();
+
+        $alreadys = [];    // 既に評価済み
+        $temporary_ids = [];
+        $object = null;
+        foreach (array_keys($objects) as $object_Id) {
+            // だめなもの
+            if (array_key_exists($object_Id, $deny_cache_list)) {
+                continue;
+            }
+
+            // いいもの
+            if (array_key_exists($object_Id, $permit_cache_list)) {
+                $alreadys[$object_Id] = $object_Id;
+                continue;
+            }
+
+            $temporary_ids[$object_Id] = $object_Id;
+        }
+
+        $grants = [];
+        $revokes = [];
+        if (count($temporary_ids) > 0) {
+            $security_list = $this->_getSecurityModels($temporary_ids,
+                $object_type);
+            foreach ($security_list as $key => $value) {
+                switch ($value) {
+                    case GRN_PRESENCE_SECURITY_MODEL_TYPE_GRANT:
+                        $grants[$key] = $key;
+                        break;
+                    case GRN_PRESENCE_SECURITY_MODEL_TYPE_REVOKE:
+                        $revokes[$key] = $key;
+                        break;
+                }
+            }
+        }
+
+        $table_type = 'presence_access_' . $object_type;
+
+        $grants = $this->_getAllowSingleObjects($grants, $targets_list,
+            $table_type, $authorities, true, $deny_cache_list,
+            $permit_cache_list);
+        $revokes = $this->_getAllowSingleObjects($revokes, $targets_list,
+            $table_type, $authorities, false, $deny_cache_list,
+            $permit_cache_list);
+
+        $retval = $grants + $revokes;
+        $ids_list = array_keys($retval);
+        // ここに組織とロールのアクセス権のチェックを追加
+        if ($object_type == 'user') {
+            global $G_container_base;
+            $uum =& $G_container_base->getInstance('uum');
+            // CB_Userからuidを取得しているので、第2引数にTRUEを渡して削除フラグチェックを行わない
+            $groups_list = $uum->getUsersGroupsInfo($ids_list, true);
+            $roles_list = $uum->getUsersRolesInfo($ids_list, true);
+
+            $have_access_setting = $this->getHaveAccessSettingList($user,
+                $objects, 'user', $dynamic_roles);
+
+            $group_user_map = [];
+            $role_user_map = [];
+            $authorities_type = implode('_', $authorities);
+            foreach ($ids_list as $key) {
+                // ユーザーにアクセス権設定があったら最優先
+                if (array_key_exists($key, $have_access_setting) === true) {
+                    continue;
+                }
+
+                $groups = array_key_exists($key, $groups_list)
+                    ? $groups_list[$key] : [];
+
+                // アクセス権設定の有無をキャッシュから取得
+                $cache_list = null;
+                if (array_key_exists($user_id,
+                    $this->_have_setting_group_list)
+                ) {
+                    $cache_list = $this->_have_setting_group_list[$user_id];
+                }
+
+                $have_setting_count = 0;
+                if ( ! is_null($cache_list)) {
+                    foreach (array_keys($groups) as $group_id) {
+                        if ( ! array_key_exists($group_id, $cache_list)) {
+                            continue;
+                        }
+
+                        // アクセス権設定無しでキャッシュされている
+                        if ($cache_list[$group_id] === false) {
+                            unset($groups[$group_id]);
+                        } // アクセス権設定有りでキャッシュされている
+                        else {
+                            $have_setting_count++;
+                        }
+                    }
+                }
+                // アクセス権設定がキャッシュされている組織はgetHaveAccessSettingListを呼ばない
+                $groups_count = count($groups);
+                if ($groups_count > 0
+                    && $groups_count !== $have_setting_count
+                ) {
+                    $groups = $this->getHaveAccessSettingList($user, $groups,
+                        'group', $dynamic_roles);
+                }
+
+                $groups_count = count($groups);
+                if ($groups_count > 0) {
+                    if ( ! array_key_exists($authorities_type,
+                        $this->_deny_groups_list)
+                    ) {
+                        $this->_deny_groups_list[$authorities_type] = [];
+                        $this->_permit_groups_list[$authorities_type] = [];
+                    }
+
+                    $b_found = false;
+                    foreach (array_keys($groups) as $key2) {
+                        if (array_key_exists($key2,
+                            $this->_permit_groups_list[$authorities_type])
+                        ) {
+                            $b_found = true;
+                            continue;
+                        }
+
+                        // ループの外で所属組織の評価を行うため配列に溜めておく
+                        if ( ! array_key_exists($key2, $group_user_map)) {
+                            $group_user_map[$key2] = [];
+                        }
+                        $group_user_map[$key2][$key] = $key;
+                    }
+                    if ($b_found) {
+                        // いい人リストにユーザーを追加
+                        $permit_cache_list[$key] = $key;
+                        $alreadys[$key] = $key;
+                        continue;
+                    }
+                }
+
+                $roles = array_key_exists($key, $roles_list) ? $roles_list[$key]
+                    : [];
+
+                // アクセス権設定の有無をキャッシュから取得
+                $cache_list = null;
+                if (array_key_exists($user_id,
+                    $this->_have_setting_role_list)
+                ) {
+                    $cache_list = $this->_have_setting_role_list[$user_id];
+                }
+                $have_setting_count = 0;
+                if ( ! is_null($cache_list)) {
+                    foreach (array_keys($roles) as $role_id) {
+                        if ( ! array_key_exists($role_id, $cache_list)) {
+                            continue;
+                        }
+
+                        // アクセス権設定無しでキャッシュされている
+                        if ($cache_list[$role_id] === false) {
+                            unset($roles[$role_id]);
+                        } // アクセス権設定有りでキャッシュされている
+                        else {
+                            $have_setting_count++;
+                        }
+                    }
+                }
+                // アクセス権設定の有無がキャッシュされているロールはgetHaveAccessSettingListを呼ばない
+                $roles_count = count($roles);
+                if ($roles_count > 0 && $roles_count !== $have_setting_count) {
+                    $roles = $this->getHaveAccessSettingList($user, $roles,
+                        'role', $dynamic_roles);
+                }
+
+                $roles_count = count($roles);
+                if ($roles_count > 0) {
+                    if ( ! array_key_exists($authorities_type,
+                        $this->_deny_roles_list)
+                    ) {
+                        $this->_deny_roles_list[$authorities_type] = [];
+                        $this->_permit_roles_list[$authorities_type] = [];
+                    }
+
+                    $b_found = false;
+                    foreach (array_keys($roles) as $key2) {
+                        if (array_key_exists($key2,
+                            $this->_permit_roles_list[$authorities_type])
+                        ) {
+                            $b_found = true;
+                            continue;
+                        }
+
+                        // ループの外で所持ロールの評価を行うため配列に溜めておく
+                        if ( ! array_key_exists($key2, $role_user_map)) {
+                            $role_user_map[$key2] = [];
+                        }
+                        $role_user_map[$key2][$key] = $key;
+                    }
+                    if ($b_found) {
+                        // いい人リストにユーザーを追加
+                        $permit_cache_list[$key] = $key;
+                        $alreadys[$key] = $key;
+                        continue;
+                    }
+                }
+            }
+
+            // ユーザー毎の所属組織,所持ロールの評価はループの外でまとめて行う
+            $permit_users = [];
+            $deny_group_keys = [];
+            $deny_role_keys = [];
+
+            // 各ユーザーの所属組織の評価
+            $group_count = count($group_user_map);
+            if ($group_count > 0) {
+                $permit_groups = $this->_getAllowMultiObjects($user,
+                    $group_user_map, 'group', $authorities, $dynamic_roles,
+                    $user_groups, $user_roles,
+                    $this->_deny_groups_list[$authorities_type],
+                    $this->_permit_groups_list[$authorities_type]);
+                // 許可された組織に所属するユーザーは許可(許可優先)
+                foreach ($group_user_map as $group_id => $group_users) {
+                    if (array_key_exists($group_id, $permit_groups)) {
+                        foreach ($group_users as $permit_user_id) {
+                            $permit_cache_list[$permit_user_id]
+                                = $permit_user_id;
+                            $permit_users[$permit_user_id] = $permit_user_id;
+                        }
+                    }
+                }
+
+                // 拒否された組織のリストを作る
+                $permit_keys = array_keys($permit_groups);
+                $group_keys = array_keys($group_user_map);
+                $deny_group_keys = array_diff($group_keys, $permit_keys);
+            }
+
+            // 各ユーザーの所持ロールの評価
+            $role_count = count($role_user_map);
+            if ($role_count > 0) {
+                $permit_roles = $this->_getAllowMultiObjects($user,
+                    $role_user_map, 'role', $authorities, $dynamic_roles,
+                    $user_groups, $user_roles,
+                    $this->_deny_roles_list[$authorities_type],
+                    $this->_permit_roles_list[$authorities_type]);
+
+                // 許可されたロールを所持するユーザーは許可(許可優先)
+                foreach ($role_user_map as $role_id => $role_users) {
+                    if (array_key_exists($role_id, $permit_roles)) {
+                        foreach ($role_users as $permit_user_id) {
+                            $permit_cache_list[$permit_user_id]
+                                = $permit_user_id;
+                            $permit_users[$permit_user_id] = $permit_user_id;
+                        }
+                    }
+                }
+
+                // 拒否されたロールのリストを作る
+                $permit_keys = array_keys($permit_roles);
+                $role_keys = array_keys($role_user_map);
+                $deny_role_keys = array_diff($role_keys, $permit_keys);
+            }
+
+            // 拒否された組織の評価
+            $deny_group_count = count($deny_group_keys);
+            if ($deny_group_count > 0) {
+                // 拒否された組織に所属するユーザーで、他の許可された組織、ロールに所属していないユーザーは拒否
+                foreach ($deny_group_keys as $deny_group_id) {
+                    $deny_group_users = $group_user_map[$deny_group_id];
+                    foreach ($deny_group_users as $deny_group_user_id) {
+                        if ( ! array_key_exists($deny_group_user_id,
+                            $permit_users)
+                        ) {
+                            $deny_cache_list[$deny_group_user_id]
+                                = $deny_group_user_id;
+                            unset($retval[$deny_group_user_id]);
+                        }
+                    }
+                }
+            }
+
+            // 拒否されたロールの評価
+            $deny_role_count = count($deny_role_keys);
+            if ($deny_role_count > 0) {
+                // 拒否されたロールを所持するユーザーで、他の許可された組織、ロールに所属していないユーザーは拒否
+                foreach ($deny_role_keys as $deny_role_id) {
+                    $deny_role_users = $role_user_map[$deny_role_id];
+                    foreach ($deny_role_users as $deny_role_user_id) {
+                        if ( ! array_key_exists($deny_role_user_id,
+                            $permit_users)
+                        ) {
+                            $deny_cache_list[$deny_role_user_id]
+                                = $deny_role_user_id;
+                            unset($retval[$deny_role_user_id]);
+                        }
+                    }
+                }
+            }
+        }
+
+        $retval = $retval + $alreadys;
+
+        return $retval;
+    }
+
+    /**
+     * アクセス権が許可されたオブジェクトを返す
+     *  $authorities の操作をできるオブジェクトだけを返す
+     *
+     * @param   object CB_User  $user           ユーザー
+     * @param   mixed  $objects       評価対象
+     * @param   array  $authorities   操作
+     * @param   array  $dynamic_roles ダイナミックロール
+     * @param   string $object_type   評価対象の種類
+     *
+     * @return  array
+     */
+    function evaluateAccessesById(
+        & $user,
+        $objects,
+        $authorities,
+        $dynamic_roles,
+        $object_type
+    ) {
+        if (0 === count($objects)) {
+            return [];
+        }
+
+        // 利用するキャッシュの準備
+        $authorities_type = implode('_', $authorities);
+        $deny_cache_list = null;
+        $permit_cache_list = null;
+        switch ($object_type) {
+            case 'user':
+                if ( ! array_key_exists($authorities_type,
+                    $this->_deny_users_list)
+                ) {
+                    $this->_deny_users_list[$authorities_type] = [];
+                    $this->_permit_users_list[$authorities_type] = [];
+                    // ログインユーザーをデフォルトONにしておく
+                    if (is_object($user)) {
+                        $this->_permit_users_list[$authorities_type][$user->getOID()]
+                            = &$user;
+                    }
+                }
+                $deny_cache_list = &$this->_deny_users_list[$authorities_type];
+                $permit_cache_list
+                    = &$this->_permit_users_list[$authorities_type];
+                break;
+            case 'group':
+                if ( ! array_key_exists($authorities_type,
+                    $this->_deny_groups_list)
+                ) {
+                    $this->_deny_groups_list[$authorities_type] = [];
+                    $this->_permit_groups_list[$authorities_type] = [];
+                }
+                $deny_cache_list = &$this->_deny_groups_list[$authorities_type];
+                $permit_cache_list
+                    = &$this->_permit_groups_list[$authorities_type];
+                break;
+            case 'role':
+                if ( ! array_key_exists($authorities_type,
+                    $this->_deny_roles_list)
+                ) {
+                    $this->_deny_roles_list[$authorities_type] = [];
+                    $this->_permit_roles_list[$authorities_type] = [];
+                }
+                $deny_cache_list = &$this->_deny_roles_list[$authorities_type];
+                $permit_cache_list
+                    = &$this->_permit_roles_list[$authorities_type];
+                break;
+        }
+
+        $this->_initilize($user);
+
+        $rows = [];
+        foreach (array_keys($objects) as $key) {
+            $object_id = $key;
+
+            // 既に評価しているアクセス権のチェックリストからアクセスできないものを除く
+            if (array_key_exists($object_id, $deny_cache_list)) {
+                continue;
+            }
+
+            $rows[$object_id] = $object_id;
+        }
+
+        $rows = $this->_getAllowMultiObjects($user, $rows, $object_type,
+            $authorities, $dynamic_roles, $this->_user_groups,
+            $this->_user_roles, $deny_cache_list, $permit_cache_list);
+
+        foreach (array_keys($objects) as $key) {
+            if ( ! array_key_exists($key, $rows)) {
+                unset($objects[$key]);
+            }
+        }
+
+        return $objects;
+    }
+
+    /**
+     * 指定されたObjectsの中でアクセス権が設定されているものだけ返す
+     * アクセス権が設定されているというのは以下のどちらかの状態を指す
+     *
+     * 1. セキュリティモデルがデフォルトのREVOKEでない(GRANT)
+     * 2. 1つ以上のアクセス権設定レコードが存在する
+     *
+     * @param CB_User $user        評価対象ユーザー
+     * @param array   $objects     対象のオブジェクトリスト
+     * @param string  $object_type 対象オブジェクトタイプ
+     *
+     * @return array アクセス権設定のあるオブジェクトリスト
+     */
+    function getHaveAccessSettingList(
+        & $user,
+        & $objects,
+        $object_type,
+        $dynamic_roles
+    ) {
+        if ( ! is_array($objects) || count($objects) == 0) {
+            return [];
+        }
+
+        $user_id = $user->getOID();
+
+        // キャッシュを取得
+        $cache_list = [];
+        switch ($object_type) {
+            case 'user':
+                if (array_key_exists($user_id, $this->_have_setting_user_list)
+                    === false
+                ) {
+                    $this->_have_setting_user_list[$user_id] = [];
+                }
+                $cache_list = &$this->_have_setting_user_list[$user_id];
+                break;
+            case 'group':
+                if (array_key_exists($user_id, $this->_have_setting_group_list)
+                    === false
+                ) {
+                    $this->_have_setting_group_list[$user_id] = [];
+                }
+                $cache_list = &$this->_have_setting_group_list[$user_id];
+                break;
+            case 'role':
+                if (array_key_exists($user_id, $this->_have_setting_role_list)
+                    === false
+                ) {
+                    $this->_have_setting_role_list[$user_id] = [];
+                }
+                $cache_list = &$this->_have_setting_role_list[$user_id];
+                break;
+        }
+
+        $have_setting_objects = [];
+
+        // キャッシュから検索済みのオブジェクトを取得
+        $nocache_objects = [];
+        foreach (array_keys($objects) as $key) {
+            if (array_key_exists($key, $cache_list)) {
+                if ($cache_list[$key] !== false) {
+                    $have_setting_objects[$key] = &$cache_list[$key];
+                }
+                continue;
+            }
+            $nocache_objects[$key] = &$objects[$key];
+        }
+
+        // 全てキャッシュされていたらそのまま返す
+        if (count($nocache_objects) <= 0) {
+            return $have_setting_objects;
+        }
+
+        // 1. セキュリティモデルがGRANTならアクセス権設定されている
+        $security_models = $this->_getSecurityModels($nocache_objects,
+            $object_type);
+        foreach ($security_models as $key => $security_model) {
+            if ($security_model == GRN_PRESENCE_SECURITY_MODEL_TYPE_GRANT) {
+                $cache_list[$key] = $nocache_objects[$key];
+                $have_setting_objects[$key] = &$cache_list[$key];
+                unset($nocache_objects[$key]);
+            }
+        }
+
+        // キャッシュされていないオブジェクトが全てGRANTならそのまま返す
+        if (count($nocache_objects) <= 0) {
+            return $have_setting_objects;
+        }
+
+        // 2. アクセス権レコードが存在したらアクセス権が設定されている
+        $targets_list = [];
+        $db = &$this->_getDBConnection();
+
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+
+        // CB_Userからuidを取得しているので、第2引数にTRUEを渡して削除フラグチェックを行わない
+        $user_groups = $uum->getUserGroupsInfo($user_id, true);
+        $user_roles = $uum->getUserRolesInfo($user_id, true);
+
+        // ダイナミックロールを取得する
+        if (is_array($dynamic_roles) && count($dynamic_roles) > 0) {
+            $target_array = [];
+            foreach (array_keys($dynamic_roles) as $key) {
+                $target_array[] = cb_queryf($db, "'@S'", $key);
+            }
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_DYNAMIC_ROLE] = implode(',',
+                $target_array);
+        } else {
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_DYNAMIC_ROLE] = null;
+        }
+
+        // スタティックロールを取得する
+        if (false === $user_roles) {
+            return false;
+        }
+        if (is_array($user_roles) && count($user_roles) > 0) {
+            $target_array = [];
+            foreach (array_keys($user_roles) as $key) {
+                $target_array[] = cb_queryf($db, "'@S'", $key);
+            }
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_STATIC_ROLE] = implode(',',
+                $target_array);
+        } else {
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_STATIC_ROLE] = null;
+        }
+
+        // 組織を取得する
+        if (false === $user_groups) {
+            return false;
+        }
+        if (is_array($user_groups) && count($user_groups) > 0) {
+            $target_array = [];
+            foreach (array_keys($user_groups) as $key) {
+                $target_array[] = cb_queryf($db, "'@S'", $key);
+            }
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_GROUP] = implode(',',
+                $target_array);
+        } else {
+            $targets_list[GRN_PRESENCE_TARGET_TYPE_GROUP] = null;
+        }
+
+        // ユーザーを取得する
+        $targets_list[GRN_PRESENCE_TARGET_TYPE_USER] = (string)$user_id;
+
+        $object_id = 'presence_access_' . $object_type;
+        $target_tables =& $this->_target_tables;
+
+        $object_str = "";
+        foreach (array_keys($nocache_objects) as $key) {
+            $object_str .= cb_queryf($db, "'@S',", $key);
+        }
+        $object_str = substr($object_str, 0, strlen($object_str) - 1);
+
+        // アクセス権レコードを探す
+        foreach ($target_tables as $target_id => $target_table) {
+            if (is_null($targets_list[$target_id])
+                || 0 === count($targets_list[$target_id])
+            ) {
+                continue;
+            }
+
+            $targets = &$targets_list[$target_id];
+
+            $table_name = $this->_getTableName($object_id, $target_id, true);
+
+            // $targets_list['user'] には、CB_Userから取得した値しか入らないので、削除フラグチェックを
+            // 行う必要はない。
+            // なので、objectの削除フラグチェックだけを行う。
+            $join = '';
+            if (strcmp($object_type, 'user') == 0) {
+                $join .= ' INNER JOIN tab_cb_user AS ou ON tab_' . $table_name
+                         . '.col_object = ou._id AND ou.col_deleted IS NULL';
+            }
+            $query = 'SELECT col_object FROM tab_' . $table_name . $join
+                     . ' WHERE ( ' .
+                     '( col_object IN (' . $object_str . ') )' .
+                     ' AND ' .
+                     '( col_target IN ( ' . $targets_list[$target_id]
+                     . ' ) ) )';
+
+            $query = $db->select_format($query);
+
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError([
+                    'query' => 'failed query on SELECT: ' . $query
+                ]);
+            }
+
+            // 設定が見つかったオブジェクトを取得する
+            while ($row = $db->fetch_assoc($result)) {
+                $_object_id = $row['col_object'];
+                if (array_key_exists($_object_id, $have_setting_objects)
+                    === true
+                ) {
+                    continue;
+                }
+
+                $cache_list[$_object_id] = $nocache_objects[$_object_id];
+                $have_setting_objects[$_object_id] = &$cache_list[$_object_id];
+                unset($nocache_objects[$_object_id]);
+
+                // 途中で全てのオブジェクトに設定があるとわかったら返す
+                if (count($nocache_objects) <= 0) {
+                    return $have_setting_objects;
+                }
+
+                // 設定があることがわかったオブジェクトを除いて条件文を再構築する
+                $object_str = "";
+                foreach (array_keys($nocache_objects) as $key) {
+                    $object_str .= cb_queryf($db, "'@S',", $key);
+                }
+                $object_str = substr($object_str, 0, strlen($object_str) - 1);
+            }
+            // 結果の開放
+            $db->free_result($result);
+
+        }
+
+        // 設定が見つからなかったオブジェクトはFALSEでキャッシュする
+        foreach (array_keys($nocache_objects) as $key) {
+            $cache_list[$key] = false;
+        }
+
+        return $have_setting_objects;
+    }
+
+    function _addUserJoin(& $rowset, & $object, & $target, $alias = '')
+    {
+        $user_table = &$this->_getTableInfo('CB_User');
+        $is_force = false;
+        if (is_string($target)
+            && array_key_exists($target, $this->_target_tables)
+        ) {
+            $is_force = true;
+        }
+
+        // 対象のテーブル名にエイリアスを貼っていたらそれを使えるようにする
+        if (is_string($alias) && strlen($alias) > 0) {
+            $real_table_name = $alias;
+        } else {
+            $real_table_name = CB_DATABASE_TABLE_PREFIX .
+                               $this->_getTableName($object, $target,
+                                   $is_force);
+        }
+
+        if (is_object($object) && is_a($object, 'CB_User')) {
+            $on = $real_table_name
+                  . '.col_object = ou._id AND ou.col_deleted IS NULL';
+            $rowset->addJoin($user_table, $on, CB_DATABASE_INNER_JOIN, 'ou');
+        } elseif (is_string($object)
+                  && strcasecmp('presence_access_user', $object) == 0
+        ) {
+            $on = $real_table_name
+                  . '.col_object = ou._id AND ou.col_deleted IS NULL';
+            $rowset->addJoin($user_table, $on, CB_DATABASE_INNER_JOIN, 'ou');
+        }
+
+        if (is_object($target) && is_a($target, 'CB_User')) {
+            $on = $real_table_name
+                  . '.col_target = tu._id AND tu.col_deleted IS NULL';
+            $rowset->addJoin($user_table, $on, CB_DATABASE_INNER_JOIN, 'tu');
+        } elseif (is_string($target) && strcasecmp('user', $target) == 0) {
+            $on = $real_table_name
+                  . '.col_target = tu._id AND tu.col_deleted IS NULL';
+            $rowset->addJoin($user_table, $on, CB_DATABASE_INNER_JOIN, 'tu');
+        }
+    }
+
+    /**
+     * アクセス権のCSVの書き出し
+     *
+     * @param   object CB_CSVWriter     $writer
+     */
+    function exportAccessToCSV(& $writer)
+    {
+        $access_objects = ['user', 'role', 'group'];
+
+        $users_list = [];
+        $groups_list = [];
+        $roles_list = [];
+
+        // 設定されているオブジェクトの一覧を作成
+        foreach ($access_objects as $object_type) {
+            switch ($object_type) {
+                case 'user':
+                    $list = &$users_list;
+                    break;
+                case 'role':
+                    $list = &$roles_list;
+                    break;
+                case 'group':
+                    $list = &$groups_list;
+                    break;
+            }
+
+            $object_name = 'presence_access_' . $object_type;
+            foreach (array_keys($this->_target_tables) as $target_name) {
+                $table_name = $this->_getTableName($object_name,
+                    $target_name, true);
+                $real_table_name = CB_DATABASE_TABLE_PREFIX . $table_name;
+                $table_info = &$this->_getTableInfo($table_name);
+                $rowset = new CB_RowSet($table_info);
+                $this->_addUserJoin($rowset, $object_name, $target_name);
+
+                $rowset->addOrderColumn('col_object', true);
+                $rowset->applyGroupFunctions([
+                    'id' => $real_table_name . '._id'
+                ],
+                    ['object' => 'col_object']);
+
+                while ( ! is_null($row = &$rowset->iterate())) {
+                    $object_id = $row['object'];
+                    if ( ! array_key_exists($object_id, $list)) {
+                        $list[$object_id] = [];
+                    }
+
+                    $list[$object_id][] = $table_name;
+                }
+            }
+        }
+
+        // アクセス権の書き出し
+        if (count($users_list) > 0) {
+            $this->_exportAccessToCSV($writer, $users_list);
+        }
+
+        if (count($groups_list) > 0) {
+            $this->_exportAccessToCSV($writer, $groups_list);
+        }
+
+        if (count($roles_list) > 0) {
+            $this->_exportAccessToCSV($writer, $roles_list);
+        }
+
+    }
+
+    /**
+     * @access private
+     */
+    function _exportAccessToCSV(& $writer, & $list)
+    {
+        foreach ($list as $id => $table_names) {
+            $object_id = '';
+            $name = '';
+            $foreign_key = '';
+            foreach ($table_names as $table_name) {
+                $table_info = &$this->_getTableInfo($table_name);
+                $rowset = new CB_RowSet($table_info);
+
+                // grn_presence_access_OBJECT_TARGETという形式でくるので、
+                // 文字列操作でobjectとtargetに分割
+                // ただしobjectはpresence_access_OBJECTという形で渡す必要がある
+                $object_target = substr($table_name,
+                    strlen('grn_presence_access_'));
+                $object_index = strpos($object_target, '_');
+                $object = substr($object_target, 0, $object_index);
+                $target = substr($object_target, strlen($object) + 1);
+                $object = 'presence_access_' . $object;
+                $this->_addUserJoin($rowset, $object, $target);
+
+                $rowset->addCondition($rowset->queryf("col_object = '@S'",
+                    $id));
+                $rowset->addOrderColumn('col_target');
+
+                while ( ! is_null($row = &$rowset->iterate())) {
+                    $line = [];
+                    $object = &$row->get('object');
+                    $target = &$row->get('target');
+
+                    // 最初だけセキュリティモデルの出力
+                    if ($object_id != $id) {
+                        $object_id = $id;
+                        $security_model = $this->getSecurityModel($object);
+
+                        $foreign_key = $object->get('foreign_key');
+                        if (is_a($object, 'CB_User')) {
+                            $object_type = 'user';
+                        } elseif (is_a($object, 'CB_Role')) {
+                            $object_type = 'role';
+                        } elseif (is_a($object, 'CB_Group')) {
+                            $object_type = 'group';
+                        } else {
+                            continue;
+                        }
+
+                        $line[] = $object_type;
+                        $line[] = $foreign_key;
+                        $line[] = 'security_model';
+                        $line[] = $security_model;
+                        $line[] = '';
+
+                        $line = [];
+                    }
+                    $line[] = $object_type;
+                    $line[] = $foreign_key;
+
+                    $target_type = '';
+                    // 設定項目
+                    if (is_a($target, 'CB_User')) {
+                        $target_name = $target->get('foreign_key');
+                        $target_type = 'user';
+                    } elseif (is_a($target, 'CB_Role')) {
+                        $target_name = $target->get('foreign_key');
+                        $target_type = 'role';
+                    } elseif (is_a($target, 'CB_Group')) {
+                        $target_name = $target->get('foreign_key');
+                        $target_type = 'group';
+                    } else {
+                        $target_name = $target;
+                        $target_type = 'dynamic_role';
+                    }
+                    $line[] = $target_type;
+
+                    $access = '';
+
+                    $authority = $row->get('authority_modify');
+                    if ($security_model == 'grant' && $authority) {
+                        $access .= 'M';
+                    } elseif ($security_model == 'revoke' && $authority == 0) {
+                        $access .= 'M';
+                    }
+
+                    $line[] = $access;
+
+                    // 設定対象
+                    $line[] = $target_name;
+                    $writer->writeLine($line);
+                }
+            }
+        }
+    }
+
+}
+
+class GRN_Presence_Access_Group_Base extends CB_PersistentBase
+{
+    var $col_authority_browse = ['type' => 'int'];
+    var $col_authority_modify = ['type' => 'int'];
+    var $col_object = ['type' => 'relation', 'to' => 'cb_group'];
+}
+
+class GRN_Presence_Access_Group_User extends GRN_Presence_Access_Group_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_user'];
+}
+
+class GRN_Presence_Access_Group_Group extends GRN_Presence_Access_Group_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_group'];
+}
+
+class GRN_Presence_Access_Group_Dynamic_Role
+    extends GRN_Presence_Access_Group_Base
+{
+    var $col_target = ['type' => 'char', 'length' => 100];
+}
+
+class GRN_Presence_Access_Group_Static_Role
+    extends GRN_Presence_Access_Group_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_role'];
+}
+
+class GRN_Presence_Access_Role_Base extends CB_PersistentBase
+{
+    var $col_authority_browse = ['type' => 'int'];
+    var $col_authority_modify = ['type' => 'int'];
+    var $col_object = ['type' => 'relation', 'to' => 'cb_role'];
+}
+
+class GRN_Presence_Access_Role_User extends GRN_Presence_Access_Role_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_user'];
+}
+
+class GRN_Presence_Access_Role_Group extends GRN_Presence_Access_Role_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_group'];
+}
+
+class GRN_Presence_Access_Role_Dynamic_Role
+    extends GRN_Presence_Access_Role_Base
+{
+    var $col_target = ['type' => 'char', 'length' => 100];
+}
+
+class GRN_Presence_Access_Role_Static_Role extends GRN_Presence_Access_Role_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_role'];
+}
+
+class GRN_Presence_Access_User_Base extends CB_PersistentBase
+{
+    var $col_authority_browse = ['type' => 'int'];
+    var $col_authority_modify = ['type' => 'int'];
+    var $col_object = ['type' => 'relation', 'to' => 'cb_user'];
+}
+
+class GRN_Presence_Access_User_User extends GRN_Presence_Access_User_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_user'];
+}
+
+class GRN_Presence_Access_User_Group extends GRN_Presence_Access_User_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_group'];
+}
+
+class GRN_Presence_Access_User_Dynamic_Role
+    extends GRN_Presence_Access_User_Base
+{
+    var $col_target = ['type' => 'char', 'length' => 100];
+}
+
+class GRN_Presence_Access_User_Static_Role extends GRN_Presence_Access_User_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_role'];
+}

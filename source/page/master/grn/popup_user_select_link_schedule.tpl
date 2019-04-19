@@ -1,0 +1,1 @@
+<a href="#" onClick="javascript:popupWin('{grn_pageurl page='grn/popup_user_select_schedule' params=$url_params}','html','','',0,0,1,1,0,1);" title="{$caption}">{grn_image image='image-common/blankB16.png' class="selectPulldownSub-grn"}</a>

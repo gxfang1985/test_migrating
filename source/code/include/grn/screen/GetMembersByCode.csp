@@ -1,0 +1,337 @@
+<?php
+
+namespace grn\grn\screen;
+
+use grn\grn\MemberLogic;
+use grn\grn\JSONResponse;
+use grn\schedule\api\model\Member;
+use grn\schedule\ScheduleMemberLogic;
+
+class GetMembersByCode
+{
+    public function fetch()
+    {
+        cb_require_role('LoginUser');
+        global $G_INPUT;
+
+        $app_id = $G_INPUT['app_id'] ?? '';
+        $members = $G_INPUT['members'] ? json_decode($G_INPUT['members'], true)
+            : [];
+        $members = is_array($members) ? $members : [];
+        $event_id = $G_INPUT['event_id'] ?? null;
+        $event = null;
+        if ($event_id) {
+            /**
+             * @var \CB_User $logged_user
+             */
+            $logged_user = cb_get_login_user();
+            require_once('schedule/application.csp');
+            $app = \GRN_Schedule_Application::getInstance();
+            /** @var \GRN_Schedule_EventBase $event */
+            $event = $app->getEvent($logged_user, $event_id);
+        }
+        $is_candidate = $G_INPUT['is_candidate'] ?? null;
+        $is_watchers = $G_INPUT['is_watchers'] ?? 'false';
+
+        $plugin_data_name = $G_INPUT['plugin_data_name'] ?? '';
+        $plugin_session_name = $G_INPUT['plugin_session_name'] ?? '';
+
+        $member_logic = MemberLogic::getInstance();
+
+        $members = $this->filterMembers($members, $app_id, $event,
+            $is_watchers === 'true', $is_candidate);
+        $members = $this->convertApiMemberTypesToMemberTypes($members);
+        $members
+            = $member_logic->getMemberTypeIdArrayByMembersArray($members);
+        $member_ids = $member_logic->convertTypeIdArrayToMemberIds($members);
+
+        $plugin = null;
+        require_once('fw/session_manager.csp');
+        $sm = \CB_SessionManager::getInstance();
+        $plugin_param = [];
+        $plugin_session = $sm->getSession($plugin_session_name);
+        if ($plugin_session) {
+            $plugin_data = $plugin_session->get($plugin_data_name);
+            if (is_array($plugin_data)
+                && array_key_exists('name', $plugin_data)
+            ) {
+                $loader = new \CB_PluginLoader('grn.common.user.select');
+                $plugin = $loader->loadDriver($plugin_data['name']);
+                $plugin_param = cb_at($plugin_data, 'params');
+            }
+        }
+        if ($plugin) {
+            $member_ids[$member_logic::TYPE_USER]
+                = $plugin->evalUsers($member_ids[$member_logic::TYPE_USER],
+                $plugin_param);
+            $member_ids[$member_logic::TYPE_ORGANIZATION]
+                = $plugin->evalGroups($member_ids[$member_logic::TYPE_ORGANIZATION],
+                $plugin_param);
+            $member_ids[$member_logic::TYPE_STATIC_ROLE]
+                = $plugin->evalRoles($member_ids[$member_logic::TYPE_STATIC_ROLE],
+                $plugin_param);
+        }
+
+        $eval_members = [];
+        foreach ($members as $member) {
+            switch ($member[$member_logic::MEMBER_TYPE]) {
+                case $member_logic::TYPE_USER:
+                    if (array_search($member[$member_logic::MEMBER_ID],
+                            $member_ids[$member_logic::TYPE_USER])
+                        !== false
+                    ) {
+                        $eval_members[] = $member;
+                    }
+                    break;
+                case $member_logic::TYPE_ORGANIZATION:
+                    if (array_search($member[$member_logic::MEMBER_ID],
+                            $member_ids[$member_logic::TYPE_ORGANIZATION])
+                        !== false
+                    ) {
+                        $eval_members[] = $member;
+                    }
+                    break;
+                case $member_logic::TYPE_STATIC_ROLE:
+                    if (array_search($member[$member_logic::MEMBER_ID],
+                            $member_ids[$member_logic::TYPE_STATIC_ROLE])
+                        !== false
+                    ) {
+                        $eval_members[] = $member;
+                    }
+                    break;
+            }
+        }
+
+        $members_info = $member_logic->getDisplayMemberList($eval_members, $app_id, false, false, true,  true);
+        $attendee_info_list = [];
+        if ($is_candidate === 'false' && $event_id) {
+            $attendees_info_list
+                = Member::getAttendeesResponseList([$event_id]);
+            $attendee_info_list = $attendees_info_list[$event_id] ?? [];
+        }
+        $member_data = [];
+        foreach ($members_info as $member) {
+            if ($member['type'] == $member_logic::TYPE_USER
+                && isset($attendee_info_list[$member['id']])
+            ) {
+                $member['attendanceResponse']
+                    = $attendee_info_list[$member['id']]->toArray();
+            }
+            $member_data[] = $member;
+        }
+        $json = JSONResponse::create();
+        $json->response(['members_info' => $member_data]);
+    }
+
+    /**
+     * Filter out unnecessary elements from inputted members data
+     *
+     * @param array                   $members
+     * @param string                  $app_id
+     * @param bool                    $is_watcher
+     * @param bool                    $is_candidate is candidate or not
+     * @param \GRN_Schedule_EventBase $event        schedule event
+     *
+     * @return array
+     */
+    private function filterMembers(
+        array $members,
+        string $app_id,
+        $event,
+        bool $is_watcher,
+        $is_candidate
+    ): array {
+        if ($app_id !== 'schedule') {
+            // Only the schedule app is supported for now
+            return [];
+        }
+        if ( ! is_array($members)) {
+            return [];
+        }
+        $filtered_members = [];
+
+        foreach ($members as $member) {
+            if (isset($member[MemberLogic::MEMBER_TYPE])) {
+                if ($is_watcher) {
+                    if ($this->_canAddWatcher($event, $member, $is_candidate)) {
+                        $filtered_members[] = $member;
+                    }
+                } elseif ($this->_canAddAttendee($event, $member,
+                    $is_candidate)
+                ) {
+                    $filtered_members[] = $member;
+                }
+
+            }
+        }
+
+        return $filtered_members;
+    }
+
+    /**
+     * Check is allow member by type
+     *
+     * @param Member $member
+     * @param bool   $is_watcher
+     *
+     * @return bool TRUE if is allow add member by type, otherwise return FALSE
+     */
+    private function _isAllowMemberByType($member, $is_watcher)
+    {
+        $available_member_types = $this->getAvailableMemberTypes($is_watcher);
+        if (in_array($member[MemberLogic::MEMBER_TYPE],
+            $available_member_types)
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Check can add attendee, attendee candidate to schedule
+     *
+     * @param \GRN_Schedule_EventBase $event
+     * @param Member                  $member
+     * @param bool                    $is_candidate is candidate or not
+     *
+     * @return bool TRUE if can add attendee, otherwise return FALSE
+     */
+    private function _canAddAttendee($event, $member, $is_candidate)
+    {
+        if ($is_candidate == 'true') {
+            return $this->_isAllowMemberByType($member, false);
+        }
+        // if event exist, check input member is existed
+        if ($event
+            && $member[MemberLogic::MEMBER_TYPE]
+               == Member::MEMBER_TYPE_ORGANIZATION
+            && is_array($event->groups)
+        ) {
+            $member_code = $member['code'];
+            /** @var \CB_Group $group */
+            foreach ($event->groups as $group) {
+                $class_instance = get_class($group);
+                if ($class_instance == 'CB_Group'
+                    && $member_code == $group->get('foreign_key')
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        return $this->_isAllowMemberByType($member, false);
+    }
+
+    /**
+     * Check can add watcher, watcher candidate to schedule
+     *
+     * @param \GRN_Schedule_EventBase $event
+     * @param Member                  $member
+     * @param bool                    $is_candidate is candidate or not
+     *
+     * @return bool TRUE if can add watcher, otherwise return FALSE
+     */
+    private function _canAddWatcher($event, $member, $is_candidate)
+    {
+        if ($is_candidate == 'true') {
+            return $this->_isAllowMemberByType($member, true);
+        }
+        // if event exist, check input member is existed
+        if ($event && is_array($event->notify_address)) {
+            $member_code = $member['code'] ?? '';
+            $member_type = $member[MemberLogic::MEMBER_TYPE];
+            foreach ($event->notify_address as $watcher) {
+                if (empty($member_code)) {
+                    continue;
+                }
+                if ($member_code == $watcher->get('foreign_key')) {
+                    $class_instance = get_class($watcher);
+                    if ($member_type == Member::MEMBER_TYPE_ORGANIZATION
+                        && $class_instance == 'CB_Group'
+                    ) {
+                        return true;
+                    } elseif ($member_type == Member::MEMBER_TYPE_ROLE
+                              && $class_instance == 'CB_Role'
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return $this->_isAllowMemberByType($member, true);
+    }
+
+    /**
+     * @param bool $is_watcher
+     *
+     * @return string[]
+     */
+    private function getAvailableMemberTypes(bool $is_watcher)
+    {
+        require_once('schedule/system_logic.csp');
+        $available_member_types = [Member::MEMBER_TYPE_USER];
+        if ( ! $is_watcher) {
+            if (\GRN_Schedule_SystemLogic::getInstance()->getShowOrganize()
+                == '1'
+            ) {
+                $available_member_types[] = Member::MEMBER_TYPE_ORGANIZATION;
+            }
+        } else {
+            if (ScheduleMemberLogic::getInstance()
+                                   ->isAllowSettingGroupRoleToWatchers()
+            ) {
+                $available_member_types[] = Member::MEMBER_TYPE_ORGANIZATION;
+                if (\GRN_System::getInstance()->getPermissionToSelectRole()
+                    == '1'
+                ) {
+                    $available_member_types[] = Member::MEMBER_TYPE_ROLE;
+                }
+            }
+        }
+
+        return $available_member_types;
+    }
+
+    /**
+     * @param array $members
+     *      For example:
+     *      $members = [
+     *      ['type'=>'USER', ...],
+     *      ['type'=>'ORGANIZATION', ...],
+     *      ['type'=>'ROLE', ...],
+     *      ...
+     *      ]
+     *
+     * @return array
+     * For example:
+     * [
+     *      ['type'=>'user', ...],
+     *      ['type'=>'group', ...],
+     *      ['type'=>'static_role', ...],
+     *      ...
+     * ]
+     */
+    private function convertApiMemberTypesToMemberTypes(array $members)
+    {
+        $type_name_maps = [
+            Member::MEMBER_TYPE_USER         => MemberLogic::TYPE_USER,
+            Member::MEMBER_TYPE_ORGANIZATION => MemberLogic::TYPE_ORGANIZATION,
+            Member::MEMBER_TYPE_ROLE         => MemberLogic::TYPE_STATIC_ROLE,
+        ];
+        $converted_members = [];
+        foreach ($members as $member) {
+            $has_key_item = (isset($member[MemberLogic::MEMBER_CODE]) || isset($member[MemberLogic::MEMBER_ID]));
+            if (isset($member[MemberLogic::MEMBER_TYPE]) && $has_key_item) {
+                $member_type = $member[MemberLogic::MEMBER_TYPE];
+                $member[MemberLogic::MEMBER_TYPE]
+                    = $type_name_maps[$member_type];
+                $converted_members[] = $member;
+            }
+
+        }
+
+        return $converted_members;
+    }
+}

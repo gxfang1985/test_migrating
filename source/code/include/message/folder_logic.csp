@@ -1,0 +1,1558 @@
+<?php
+
+use \grn\message\dao\GrnMessageFoldersDAO;
+
+/**
+ * メッセージフォルダロジック
+ *
+ * @author   Eiji TAEN
+ * @date     2005.01.05
+ * @package  grn.message
+ */
+
+require_once('fw/i18n.csp');
+require_once('message/resources.csp');
+require_once('message/table.csp');
+require_once('grn/application.csp');
+require_once('message/dao/GrnMessageFilterDAO.csp');
+require_once('message/dao/GrnMessageFoldersDAO.csp');
+
+/**
+ * メッセージフォルダロジッククラス
+ *
+ * @package  grn.message
+ */
+class GRN_Message_FolderLogic
+{
+    /**
+     * フォルダテーブル
+     *
+     * @access   private
+     */
+    private $_folders;
+
+    /**
+     * Uumインスタンス
+     */
+    private $_uum;
+
+    /**
+     * キャッシュ管理
+     */
+    private $_cache = null;
+
+    /**
+     * テーブルマネージャ
+     */
+    private $_manager;
+
+    /**
+     * コンストラクタ
+     */
+    function __construct()
+    {
+        global $G_container_base;
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $this->_manager = $app_locator->getTableManager('message');
+
+        $this->_folders = $this->_manager->getTableInfo(GRN_MESSAGE_FOLDERS);
+
+        $this->_uum = $G_container_base->getInstance('uum');
+
+        $this->_cache = GRN_Message_FolderLogic_Cache::getInstance();
+
+        $this->foldersDao = new GrnMessageFoldersDAO();
+    }
+
+    /**
+     * フォルダ初期化
+     *
+     * @param   object $user ユーザー CB_User オブジェクト
+     */
+    function initialize($user)
+    {
+        if ($user) {
+            // 確認済みのユーザ
+            if ($this->_cache->is_initialize($user->getOID()) !== false) {
+                return;
+            }
+
+            $app_locator = GRN_ApplicationLocator::instance();
+            $db = $app_locator->getConnection('message');
+
+            //  $user は CB_User なので、UUMが削除フラグチェック済み。
+            $query = cb_queryf(
+                $db,
+                "SELECT 1 FROM tab_grn_message_folders WHERE (col_user = '@S')",
+                $user->getOID()
+            );
+            //escape!
+            $query = $db->select_format($query, 0, 1, CB_DATABASE_SHARED_LOCK);
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError([
+                    'query' => 'failed query on SELECT: ' . $query
+                ]);
+            }
+
+            $row = $db->fetch_assoc($result);
+            $db->free_result($result);
+
+            // 既にフォルダが存在する場合
+            if ($row !== false) {
+                $this->_cache->initialize($user->getOID(), $row);
+
+                return;
+            }
+
+            // Create new message
+            $time = new CB_TimeStamp();
+            $time->unix_ts = time();
+
+            // root folder
+            $row0 = $this->_folders->newRow();
+            $row0->set('user', $user);
+            $row0->set('folder_type', GRN_MESSAGE_ROOTFOLDER);
+            $row0->set('folder_name', 'root_folder');
+            $row0->set('ctime', $time);
+            $row0->set('mtime', $time);
+            $row0->set('view_order', 0);
+            $row0->set('subscription_flag', 0);
+            $row0->set('level', 0);
+
+            // inbox
+            $row1 = $this->_folders->newRow();
+            $row1->set('user', $user);
+            $row1->set('folder_type', GRN_MESSAGE_RECEIVINGFOLDER);
+            $row1->set('folder_name', 'inbox');
+            $row1->set('ctime', $time);
+            $row1->set('mtime', $time);
+            $row1->set('view_order', 1);
+            $row1->set('parent_folder', $row0);
+            $row1->set('subscription_flag', 1);
+            $row1->set('level', 1);
+
+            // outbox
+            $row2 = $this->_folders->newRow();
+            $row2->set('user', $user);
+            $row2->set('folder_type', GRN_MESSAGE_SENDINGFOLDER);
+            $row2->set('folder_name', 'outbox');
+            $row2->set('ctime', $time);
+            $row2->set('mtime', $time);
+            $row2->set('view_order', 2);
+            $row2->set('parent_folder', $row0);
+            $row2->set('subscription_flag', 1);
+            $row2->set('level', 1);
+
+            // draft box
+            $row3 = $this->_folders->newRow();
+            $row3->set('user', $user);
+            $row3->set('folder_type', GRN_MESSAGE_DRAFTFOLDER);
+            $row3->set('folder_name', 'draftbox');
+            $row3->set('ctime', $time);
+            $row3->set('mtime', $time);
+            $row3->set('view_order', 3);
+            $row3->set('parent_folder', $row0);
+            $row3->set('subscription_flag', 0);
+            $row3->set('level', 1);
+
+            // garbage box
+            $row4 = $this->_folders->newRow();
+            $row4->set('user', $user);
+            $row4->set('folder_type', GRN_MESSAGE_GARBAGEFOLDER);
+            $row4->set('folder_name', 'garbagebox');
+            $row4->set('ctime', $time);
+            $row4->set('mtime', $time);
+            $row4->set('view_order', 0x7FFFFFFF);
+            $row4->set('parent_folder', $row0);
+            $row4->set('subscription_flag', 0);
+            $row4->set('level', 1);
+
+            $row0->registerNow();
+            $row1->registerNow();
+            $row2->registerNow();
+            $row3->registerNow();
+            $row4->registerNow();
+
+            $this->_cache->initialize($user->getOID(), $row);
+        }
+
+    }
+
+    /**
+     * フォルダツリーを取得
+     *
+     * @param    object $user        ユーザー CB_User オブジェクト
+     * @param    string $parent_id   親フォルダID (ルートフォルダは0)
+     * @param    array  $folder_tree フォルダツリー
+     *
+     * @return   boolean   if a parent folder doesn't exist, return FALSE
+     *
+     * $folder_tree[フォルダID]['folder_name']       フォルダ名
+     *                         ['folder_type']       フォルダタイプ
+     *                         ['subscription_flag'] 購読フラグ
+     *                         ['children_num']      下位層フォルダ数
+     *                         ['children']          下位層フォルダ
+     */
+    function getFolderTree($user, $parent_id, & $folder_tree)
+    {
+        // *****
+        // 権限チェック
+        // *****
+
+        $this->initialize($user);
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('message');
+        //  $user は CB_User なので、UUMが削除フラグチェック済み。 
+        $query = cb_queryf(
+            $db,
+            "SELECT f._id _id, col_folder_type, col_folder_name, col_subscription_flag FROM tab_grn_message_folders AS f WHERE f.col_user = '@S' AND ",
+            $user->getOID()
+        );
+
+        // ルートフォルダ配下のツリーの場合
+        if ($parent_id == 0) {
+            //escape! 
+            $query .= 'f.col_folder_type = \''
+                      . $db->escape(GRN_MESSAGE_ROOTFOLDER) . '\'';
+        } else {
+            $query .= 'f._id = \'' . $db->escape($parent_id) . '\'';
+        }
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $row = $db->fetch_assoc($result);
+        $db->free_result($result);
+        if ( ! $row) {
+            return false;
+        }
+
+        //  ユーザー削除フラグは、$row を取りだす段階で所有者のチェックをしているので見ない
+        $this->_getFolderTreeBranch($row, $folder_tree, true);
+
+        return true;
+    }
+
+    /**
+     * 指定されたフォルダ配下のツリーを取得
+     *
+     * @access   private
+     *
+     * @param    object $row         フォルダ行オブジェクト
+     * @param    array  $folder_tree フォルダツリー
+     * @param bool      $include_deleted
+     */
+    function _getFolderTreeBranch(
+        $row,
+        & $folder_tree,
+        $include_deleted = false
+    ) {
+        $id = $row['_id'];
+        $folder_tree[$id] = [];
+        $folder_tree[$id]['folder_type'] = $row['col_folder_type'];
+        if ($folder_tree[$id]['folder_type'] == GRN_MESSAGE_GENERALFOLDER) {
+            $folder_tree[$id]['folder_name'] = $row['col_folder_name'];
+        } else {
+            $folder_tree[$id]['folder_name'] = cb_msg(GRN_MESSAGE_MODULEID,
+                $row['col_folder_name']);
+        }
+        $folder_tree[$id]['subscription_flag'] = $row['col_subscription_flag'];
+
+        if ($folder_tree[$id]['folder_type'] == GRN_MESSAGE_GENERALFOLDER
+            || $folder_tree[$id]['folder_type'] == GRN_MESSAGE_ROOTFOLDER
+        ) {
+            // 下位層探索
+            $app_locator = GRN_ApplicationLocator::instance();
+            $db = $app_locator->getConnection('message');
+            //escape!
+            //  ユーザー削除フラグ引数によってチェックする/しないを切り替える
+            $query
+                = 'SELECT f._id _id, col_folder_type, col_folder_name, col_subscription_flag FROM tab_grn_message_folders AS f ';
+            if ( ! $include_deleted) {
+                $query .= 'INNER JOIN tab_cb_user AS u ON f.col_user = u._id AND u.col_deleted IS NULL ';
+            }
+            $query .= 'WHERE col_parent_folder = \'' . $db->escape($id)
+                      . '\' ORDER BY col_view_order ';
+
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError([
+                    'query' => 'failed query on SELECT: ' . $query
+                ]);
+            }
+
+            $count = $db->num_rows($result);
+
+            $folder_tree[$id]['children_num'] = $count;
+            if ($count > 0) {
+                $folder_tree[$id]['children'] = [];
+                while ($row = $db->fetch_assoc($result)) {
+                    $this->_getFolderTreeBranch($row,
+                        $folder_tree[$id]['children'], $include_deleted);
+                }
+            }
+        } else // 受信箱、送信箱、下書き、ごみ箱は子フォルダを持たない
+        {
+            $folder_tree[$id]['children_num'] = 0;
+        }
+    }
+
+    /**
+     * Huy add @ 2009/11
+     * functions use for tree view - from GRN 2.6
+     *
+     * @param $user
+     *
+     * @return array
+     */
+    function getRootFolders($user)
+    {
+        $folders = [];
+
+        $this->initialize($user);
+
+        // --- get root folder
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('message');
+        //  $user は CB_User なので、UUMが削除フラグチェック済み。 
+        $query
+            = 'SELECT f._id _id, col_folder_type, col_folder_name, col_subscription_flag FROM tab_grn_message_folders AS f '
+              . 'WHERE f.col_user = \'' . $db->escape($user->getOID())
+              . '\' AND '
+              . 'f.col_folder_type = \'' . $db->escape(GRN_MESSAGE_ROOTFOLDER)
+              . '\'';
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $root = $db->fetch_assoc($result);
+
+        $db->free_result($result);
+        if ( ! $root) {
+            return $folders;
+        }
+
+        //--- get root folders
+
+        $folders = $this->getChildren($user, $root['_id']);
+
+        return $folders;
+    }
+
+    /**
+     * @param CB_User $user
+     * @param         $parent_id
+     *
+     * @return array
+     */
+    function getChildren($user, $parent_id)
+    {
+        $children = [];
+
+        $dao = new GrnMessageFoldersDAO();
+        $children_folders = $dao->getChildren($user->getOID(), $parent_id);
+
+        require_once('message/message_logic.csp');
+        $message_logic = new GRN_Message_Logic();
+        if (strpos(cb_get_pagename(), 'mobile')) {
+            $unread_mesg_info
+                = $message_logic->getUnreadMessageNumForMobile($user);
+        } else {
+            $unread_mesg_info = $message_logic->getUnreadMessageNum($user);
+        }
+
+        foreach ($children_folders as $id => $folder) {
+            if ($folder['col_folder_type'] == GRN_MESSAGE_GENERALFOLDER) {
+                $folder_name = $folder['col_folder_name'];
+            } else {
+                $folder_name = cb_msg(GRN_MESSAGE_MODULEID,
+                    $folder['col_folder_name']);
+            }
+            // get unread message
+            $unread = array_key_exists($folder['_id'], $unread_mesg_info)
+                ? $unread_mesg_info[$folder['_id']] : 0;
+
+            $row_for_view = [
+                'id'        => $folder['_id'],
+                'type'      => $folder['col_folder_type'],
+                'name'      => $folder_name,
+                'subscribe' => $folder['col_subscription_flag'],
+                'unread'    => $unread,
+            ];
+            $children[$folder['_id']] = $row_for_view;
+        }
+
+        return $children;
+    }
+
+    /**
+     * @param $parent_id
+     *
+     * @return int
+     */
+    function childrenCount($parent_id)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('message');
+
+        $query = 'SELECT count(*) as result FROM tab_grn_message_folders ';
+        $query .= 'WHERE col_parent_folder = \'' . $db->escape($parent_id)
+                  . '\'';
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $row = $db->fetch_assoc($result);
+        $db->free_result($result);
+
+        $count = ($row['result'] > 0) ? $row['result'] : 0;
+
+        return $count;
+    }
+
+    /**
+     * @param $folder_id
+     *
+     * @return array
+     */
+    function &getAncestors($folder_id)
+    {
+        $ret = [];
+
+        $this->_folders->setLock(CB_DATABASE_NO_LOCK);
+        $row = $this->_folders->getRow($folder_id);
+
+        while ($row) {
+            $fid = $row->getOID();
+            $ret[$fid] = $row;
+            $row = $row->get('parent_folder');
+        }
+
+        $this->_folders->setLock(CB_DATABASE_DEFAULT_LOCK);
+
+        $ret = array_reverse($ret, true);
+
+        return $ret;
+    }
+    // end: Huy add @ 2009/11
+
+    /**
+     * フォルダ追加
+     *
+     * @param    object $user        ユーザー CB_User オブジェクト
+     * @param    string $parent_id   親フォルダID
+     * @param    string $folder_name フォルダ名
+     * @param    string $memo        メモ
+     *
+     * @return   mixed    CB_Row         new folder row
+     *                                   if can't create a folder, return FALSE.
+     */
+    function addFolder($user, $parent_id, $folder_name, $memo)
+    {
+        // 親フォルダチェック
+        $parent_row = $this->_folders->getRow($parent_id);
+        if ( ! $parent_row) {
+            {
+                $___ret = false;
+
+                return $___ret;
+            }
+        }
+
+        // check access privilege
+        $folder_owner = $parent_row->get('user');
+        if ( ! is_null($folder_owner)) {
+            if ($folder_owner->getOID() != $user->getOID()) {
+                {
+                    $___ret = false;
+
+                    return $___ret;
+                }
+            }
+        } else {
+            {
+                $___ret = false;
+
+                return $___ret;
+            }
+        }
+
+        // 親フォルダが特殊フォルダでないか
+        if ($this->_is_specialFolder($parent_row, false)) {
+            {
+                $___ret = false;
+
+                return $___ret;
+            }
+        }
+        // フォルダ階層が制限を超える
+        $level = $parent_row->get('level') + 1;
+        if ($level > GRN_MESSAGE_FOLDER_LIMIT) {
+            require_once('message/error_code.csp');
+            cb_throw_error(E_GRN_MESSAGE_FOLDER_NOT_CREATED_LIMIT, null,
+                ['limit' => GRN_MESSAGE_FOLDER_LIMIT]);
+        }
+
+        $view_order = $this->_getViewOrder($user, $parent_id);
+
+        // Create new message
+        $time = new CB_TimeStamp();
+        $time->unix_ts = time();
+
+        $row = $this->_folders->newRow();
+        $row->set('user', $user);
+        $row->set('folder_type', GRN_MESSAGE_GENERALFOLDER);
+        $row->set('folder_name', $folder_name);
+        $row->set('memo', $memo);
+        $row->set('ctime', $time);
+        $row->set('mtime', $time);
+        $row->set('view_order', $view_order);
+        $row->set('parent_folder', $parent_row);
+        $row->set('subscription_flag', 1);
+        $row->set('level', $level);
+
+        //Logging
+        require_once('message/inspection.csp');
+        $logger = GRN_Message_Logger_25::getInstance();
+        $params = [
+            'folder_id'        => $row->getOID(),
+            'folder_name'      => $folder_name,
+            'parent_folder_id' => $parent_id,
+        ];
+        $logger->notice('create', 'folder', $params);
+
+        //End Logging
+
+        return $row;
+    }
+
+    /**
+     * modify a folder properties
+     *
+     * @param    object $user        ユーザー CB_User オブジェクト
+     * @param    string $folder_id   フォルダID
+     * @param    string $parent_id   親フォルダID
+     * @param    string $folder_name フォルダ名
+     * @param    string $memo        メモ
+     *
+     * @return   boolean   TRUE: success modifing specified folder
+     */
+    function modifyFolder($user, $folder_id, $parent_id, $folder_name, $memo)
+    {
+        // *****
+        // 権限チェック
+        // *****
+
+        $row = $this->_folders->getRow($folder_id);
+        if ( ! $row) {
+            return false;
+        }
+        if ($row->get('folder_type') == GRN_MESSAGE_GARBAGEFOLDER) {
+            return false;
+        }
+        $folder_owner = $row->get('user');
+        if ($user->getOID() != $folder_owner->getOID()) {
+            return false;
+        }
+
+        // only general folder can be modified folder name and parent folder
+        if ( ! $this->_is_specialFolder($row, true)) {
+            $parent_row = $row->get('parent_folder');
+
+            // 親フォルダが変更された場合
+            if ($parent_row->getOID() != $parent_id) {
+                $parent_row = $this->_folders->getRow($parent_id);
+                if ( ! $parent_row) {
+                    return false;
+                }
+                if ($this->_is_specialFolder($parent_row, false)) {
+                    return false;
+                }
+                if ($user->getOID() != $parent_row->getId('user')) {
+                    return false;
+                }
+                if ($row->getOID() == $parent_row->getOID()) {
+                    return false;
+                }
+                $parent = $parent_row->get('parent_folder');
+                while ( ! is_null($parent)) {
+                    if ($row->getOID() == $parent->getOID()) {
+                        return false;
+                    }
+                    $parent = $parent->get('parent_folder');
+                }
+                // 表示順序を移動先のフォルダの最下位とする
+                $row->set('view_order',
+                    $this->_getViewOrder($user, $parent_id));
+                $row->set('parent_folder', $parent_row);
+
+                // 階層レベル再設定
+                $parent_level = $parent_row->get('level');
+                // 階層レベルが変わる
+                if ($parent_level + 1 != $row->get('level')) {
+                    $this->_modifyFolderLevel($row, $parent_level + 1);
+                }
+            }
+
+            $row->set('folder_name', $folder_name);
+        }
+
+        // update message time
+        $time = new CB_TimeStamp();
+        $time->unix_ts = time();
+        $row->set('mtime', $time);
+
+        $row->set('memo', $memo);
+
+        $row->updateNow();
+
+        //Logging for modify folder
+        require_once('message/inspection.csp');
+        $logger = GRN_Message_Logger_25::getInstance();
+        $params = [
+            'folder_id'   => $folder_id,
+            'folder_name' => $folder_name,
+        ];
+        $logger->notice('modify', 'folder', $params);
+
+        //End Logging
+
+        return true;
+    }
+
+    /**
+     * modify folder level
+     *
+     * @access   private
+     *
+     * @param    object    folder CB_Row object
+     * @param    int       folder level
+     */
+    function _modifyFolderLevel($folder_row, $level)
+    {
+        if ($level > GRN_MESSAGE_FOLDER_LIMIT) {
+            require_once('message/error_code.csp');
+            cb_throw_error(E_GRN_MESSAGE_FOLDER_NOT_CREATED_LIMIT, null,
+                ['limit' => GRN_MESSAGE_FOLDER_LIMIT]);
+        }
+        $folder_row->set('level', $level);
+        $rowset = new CB_RowSet($this->_folders);
+        $rowset->addCondition($rowset->queryf("col_parent_folder = '@S'",
+            $folder_row->getOID()));
+        $user_table_info = $this->_manager->getTableInfo('cb_user');
+        $on = CB_DATABASE_TABLE_PREFIX
+              . $this->_folders->getTableName()
+              . '.col_user = u._id '
+              . 'AND u.col_deleted IS NULL';
+        $rowset->addJoin($user_table_info, $on, CB_DATABASE_INNER_JOIN, 'u');
+        while ( ! is_null($row = $rowset->iterate())) {
+            $this->_modifyFolderLevel($row, $level + 1);
+        }
+    }
+
+    /**
+     * フォルダ削除
+     *
+     * @param    object $user      user CB_User object
+     * @param    string $folder_id folder id which you wanna delete
+     *
+     * @return   boolean   TRUE: success deleting specified folder
+     */
+    function deleteFolder($user, $folder_id)
+    {
+        $row = $this->_folders->getRow($folder_id);
+
+        if ( ! $row) {
+            return false;
+        }
+        if ($this->_is_specialFolder($row, true)) {
+            return false;
+        }
+        $folder_owner = $row->get('user');
+        if (is_null($folder_owner)) {
+            return false;
+        } else {
+            if ($user->getOID() != $folder_owner->getOID()) {
+                return false;
+            }
+        }
+
+        // フォルダ内ファイルをゴミ箱へ移動
+
+        // get folder tree
+        $folder_tree = [];
+        $this->getFolderTree($user, $folder_id, $folder_tree);
+
+        require_once('message/personal_logic.csp');
+        $personal_logic = GRN_Message_PersonalLogic::getInstance();
+        $use_garbage = $personal_logic->getUseGarbageBoxAttribute($user);
+
+        require_once('message/message_logic.csp');
+        $message_logic = new GRN_Message_Logic();
+        if ($use_garbage == '1') {
+            $source_fid = key($folder_tree);
+            $ret = $this->_moveAllMessages2GarbageBox($user,
+                $message_logic, $source_fid,
+                current($folder_tree));
+        } else {
+            $ret = $this->_deleteAllMessages($user, $message_logic,
+                $folder_tree);
+        }
+
+        if ( ! $ret) {
+            return false;
+        }
+
+        //Logging
+        require_once('message/inspection.csp');
+        $logger = GRN_Message_Logger_25::getInstance();
+        $logger->deleteFolderLogNotice($folder_tree);
+        //end logging
+
+        // delete folder
+        $row->delete();
+
+        return true;
+    }
+
+    /**
+     * move all message in specified folder to garbage box
+     *
+     * @access   private
+     *
+     * @param $user
+     * @param $message_logic GRN_Message_Logic
+     * @param $source_fid
+     * @param $folder_tree
+     *
+     * @return   boolean   TRUE: success moving all messages
+     */
+    function _moveAllMessages2GarbageBox(
+        $user,
+        $message_logic,
+        $source_fid,
+        $folder_tree
+    ) {
+        $ret = $message_logic->moveAllMessages2GarbageBox($user, $source_fid);
+        if ( ! $ret) {
+            return false;
+        }
+
+        if ($folder_tree['children_num'] > 0) {
+            foreach ($folder_tree['children'] as $fid => $subfolder_tree) {
+                $ret = $this->_moveAllMessages2GarbageBox($user, $message_logic,
+                    $fid,
+                    $subfolder_tree);
+                if ( ! $ret) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $user          CB_User
+     * @param $message_logic GRN_Message_Logic
+     * @param $folder_tree
+     *
+     * @return bool
+     */
+    function _deleteAllMessages($user, $message_logic, $folder_tree)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $manager = $app_locator->getTableManager('message');
+        $table_name = grn_get_personal_tablename_message($user->getOID(),
+            GRN_MESSAGE_FOLDERMESSAGERELATIONS);
+        $relations = $manager->getTableInfo($table_name);
+
+        $rowset = new CB_RowSet($relations);
+        $rowset->addCondition($rowset->queryf("col_folder = '@S'",
+            key($folder_tree)));
+
+        $messages = [];
+        while ( ! is_null($row = $rowset->iterate())) {
+            $message = $row->get('message');
+            $messages[$row->getOID()] = $message->getOID();
+        }
+
+        $ret = $message_logic->deleteMessages($user, $messages);
+        if ($ret === false) {
+            return false;
+        }
+
+        $current_folder_tree = current($folder_tree);
+        if ($current_folder_tree['children_num'] > 0) {
+            foreach (
+                $current_folder_tree['children'] as $fid => $subfolder_tree
+            ) {
+                $tmp_tree = [];
+                $tmp_tree[$fid] = $subfolder_tree;
+                $ret = $this->_deleteAllMessages($user,
+                    $message_logic, $tmp_tree);
+                if ( ! $ret) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * フォルダ詳細取得
+     *
+     * @param    object $user      ユーザー CB_User オブジェクト
+     * @param    string $folder_id フォルダID
+     *
+     * @return   mixed    フォルダ情報
+     *                    if can't get folder information, return FALSE.
+     *
+     * フォルダ情報['folder_id']         フォルダID
+     *             ['folder_name']       フォルダ名
+     *             ['memo']              メモ
+     *             ['folder_type']       folder type
+     *             ['subscription_flag'] 購読フラグ(0: 購読しない, 1:購読する)
+     *             ['parent_id']         parent folder ID
+     *             ['parent_name']       親フォルダ名
+     */
+    function getFolderInfo($user, $folder_id)
+    {
+        $this->_folders->setLock(CB_DATABASE_NO_LOCK);
+        $row = $this->_folders->getRow($folder_id);
+        $this->_folders->setLock(CB_DATABASE_DEFAULT_LOCK);
+        if ( ! $row) {
+            return false;
+        }
+        $folder_owner = $row->get('user');
+        if (is_null($folder_owner)) {
+            return false;
+        } else {
+            if ($user->getOID() != $folder_owner->getOID()) {
+                return false;
+            }
+        }
+
+        $folder_info['folder_id'] = $folder_id;
+        $folder_info['memo'] = $row->get('memo');
+        $folder_info['ctime'] = $row->get('ctime');
+        $folder_info['mtime'] = $row->get('mtime');
+        $folder_info['folder_type'] = $row->get('folder_type');
+        $folder_info['subscription_flag'] = $row->get('subscription_flag');
+        $folder_info['view_order']
+            = $row->get('view_order');// use for mobile api
+        $folder_info['folder_name'] = $this->_getFolderName($row);
+
+        // get parent folder info
+        $parent_row = $row->get('parent_folder');
+        if (is_object($parent_row)) {
+            $folder_info['parent_id'] = $parent_row->getOID();
+            $folder_info['parent_name'] = $this->_getFolderName($parent_row);
+        } else {
+            $folder_info['parent_id'] = '';
+            $folder_info['parent_name'] = '';
+        }
+
+        return $folder_info;
+    }
+
+    /**
+     * get folder name
+     *
+     * @description if the folder you specify is a root folder, return
+     *              it's name from resources file
+     * @access      private
+     *
+     * @param    object $folder_row folder CB_Row object
+     *
+     * @return   string    folder name
+     */
+    function _getFolderName($folder_row)
+    {
+        if ($folder_row->get('folder_type') == GRN_MESSAGE_GENERALFOLDER) {
+            $folder_name = $folder_row->get('folder_name');
+        } else {
+            $folder_name = cb_msg(GRN_MESSAGE_MODULEID,
+                $folder_row->get('folder_name'));
+        }
+
+        return $folder_name;
+    }
+
+    /**
+     * get folder name
+     *
+     * @param    object $user      user CB_User object
+     * @param    string $folder_id folder id
+     *
+     * @return   mixed    folder name. if specified folder doesn't exist, return FALSE.
+     */
+    function getFolderName($user, $folder_id)
+    {
+        $row = $this->_folders->getRow($folder_id);
+        if ( ! $row) {
+            return false;
+        }
+        $folder_owner = $row->get('user');
+        if (is_null($folder_owner)) {
+            return false;
+        } else {
+            if ($user->getOID() != $folder_owner->getOID()) {
+                return false;
+            }
+        }
+
+        return $this->_getFolderName($row);
+    }
+
+    /**
+     * フォルダの最大表示順序取得
+     *
+     * @access   private
+     *
+     * @param    CB_User $user      CB_User
+     * @param    string  $parent_id 親フォルダID
+     *
+     * @return   int      表示順序
+     */
+    function _getViewOrder($user, $parent_id)
+    {
+        $view_order = 0;
+        $rowset = new CB_RowSet($this->_folders);
+        $format = "col_user = '@S' AND col_parent_folder = '@S'";
+        $rowset->addCondition($rowset->queryf($format, $user->getOID(),
+            $parent_id));
+        //  $user は CB_User なので、UUMが削除フラグチェック済み。
+        $rowset->addOrderColumn('col_view_order', true);
+        if ($rowset->count() > 0) {
+            $row = $rowset->iterate();
+            if ($row->get('folder_type') == GRN_MESSAGE_GARBAGEFOLDER) {
+                $row = $rowset->iterate();
+            }
+            $view_order = $row->get('view_order');
+        }
+
+        return $view_order + 1;
+    }
+
+    /**
+     * フォルダが特殊フォルダかチェック
+     *
+     * @access   private
+     *
+     * @param    object  $folder_row フォルダCB_Rowオブジェクト
+     * @param    boolean $check_root TRUE: ルートフォルダ含む, FALSE: 含めず
+     *
+     * @return   boolean   TRUE: 特殊フォルダ, FALSE: 特殊フォルダでない
+     */
+    function _is_specialFolder($folder_row, $check_root)
+    {
+        $folder_type = $folder_row->get('folder_type');
+
+        // ルートフォルダチェック
+        if ($check_root && $folder_type == GRN_MESSAGE_ROOTFOLDER) {
+            return true;
+        }
+
+        // ルートフォルダ以外
+        switch ($folder_type) {
+            case GRN_MESSAGE_RECEIVINGFOLDER:
+            case GRN_MESSAGE_SENDINGFOLDER:
+            case GRN_MESSAGE_DRAFTFOLDER:
+            case GRN_MESSAGE_GARBAGEFOLDER:
+                return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * get specific folder id
+     *
+     * @param    object $user        user CB_User object
+     * @param    string $folder_type folder type (see resources.csp)
+     *
+     * @return   mixed    string   folder id. if folder type is invalid, return FALSE.
+     */
+    function getSpecificFolderID($user, $folder_type)
+    {
+        $this->initialize($user);
+
+        $row = $this->getSpecificFolderRow($user, $folder_type);
+        if ( ! $row) {
+            return false;
+        }
+
+        return $row->getOID();
+    }
+
+    /**
+     * 任意のフォルダIDと同じフォルダタイプを持つユーザーのフォルダIDを返す
+     *
+     * @param    object $user      CB_User
+     * @param    string $folder_id folder id
+     *
+     * @return   string   folder id
+     */
+    function getFolderIDBySpecificFolderID($user, $folder_id)
+    {
+        $this->initialize($user);
+
+        $rowset = new CB_RowSet($this->_folders);
+        $rowset->addJoin(
+            $this->_folders,
+            $rowset->queryf("tab_grn_message_folders.col_user = '@S' AND f._id = '@S' AND tab_grn_message_folders.col_folder_type = f.col_folder_type",
+                $user->getOID(), $folder_id),
+            CB_DATABASE_INNER_JOIN,
+            'f'
+        );
+        //  $user は CB_User なので、UUMが削除フラグチェック済み。
+        $row = $rowset->iterate();
+        if (is_null($row)) {
+            return false;
+        }
+
+        $folder_id = $row->getOID();
+        $rowset->destroy();
+
+        return $folder_id;
+    }
+
+    /**
+     * get specific folder CB_Row
+     *
+     * @param    object $user        user CB_User object
+     * @param    string $folder_type folder type (see resources.csp)
+     *
+     * @return   mixed    CB_Row   if folder type is invalid, return FALSE.
+     */
+    function getSpecificFolderRow($user, $folder_type)
+    {
+        $rowset = new CB_RowSet($this->_folders);
+        $rowset->addCondition($rowset->queryf("col_user = '@S' AND col_folder_type = '@S'",
+            $user->getOID(), $folder_type));
+        //  $user は CB_User なので、UUMが削除フラグチェック済み。
+        $row = $rowset->iterate();
+
+        if ( ! $row) {
+            {
+                $___ret = false;
+
+                return $___ret;
+            }
+        }
+
+        $folder_owner = $row->get('user');
+        if (is_null($folder_owner)) {
+            {
+                $___ret = false;
+
+                return $___ret;
+            }
+        } else {
+            if ($user->getOID() != $folder_owner->getOID()) {
+                {
+                    $___ret = false;
+
+                    return $___ret;
+                }
+            }
+        }
+
+        return $row;
+    }
+
+    /**
+     * get specified folder type
+     *
+     * @param    object $user      user CB_User object
+     * @param    string $folder_id folder id
+     *
+     * @return   mixed    folder type. if specified folder doesn't exist, return FALSE.
+     */
+    function getFolderType($user, $folder_id)
+    {
+        $row = $this->_folders->getRow($folder_id);
+
+        if ( ! $row) {
+            return false;
+        }
+        $folder_owner = $row->get('user');
+        if (is_null($folder_owner)) {
+            return false;
+        } else {
+            if ($user->getOID() != $folder_owner->getOID()) {
+                return false;
+            }
+        }
+
+        return $row->get('folder_type');
+    }
+
+    /**
+     * get subscription flag
+     *
+     * @param    object $user      user CB_User object
+     * @param    string $folder_id folder id
+     *
+     * @return   boolean   TRUE: subscribe, FALSE: unsubscribe
+     */
+    function getSubscription($user, $folder_id)
+    {
+        $row = $this->_folders->getRow($folder_id);
+
+        if ( ! is_object($row)) {
+            require_once('message/error_code.csp');
+            cb_throw_error(E_GRN_MESSAGE_FOLDER_NOT_FOUND);
+        }
+        $folder_owner = $row->get('user');
+        if (is_null($folder_owner)) {
+            return false;
+        } else {
+            if ($user->getOID() != $folder_owner->getOID()) {
+                require_once('message/error_code.csp');
+                cb_throw_error(E_GRN_MESSAGE_FOLDER_NOT_FOUND);
+            }
+        }
+
+        $subscription_flag = $row->get('subscription_flag');
+
+        if ($subscription_flag == '1') {
+            $ret = true;
+        } else {
+            $ret = false;
+        }
+
+        return $ret;
+    }
+
+    /**
+     * set subscription flag
+     *
+     * @param   object  $user         user CB_User object
+     * @param   string  $folder_id    folder id
+     * @param   boolean $subscription TRUE: subscribe, FALSE: unsubscribe
+     *
+     * @return bool
+     */
+    function setSubscription($user, $folder_id, $subscription)
+    {
+        $row = $this->_folders->getRow($folder_id);
+
+        if ( ! is_object($row)) {
+            require_once('message/error_code.csp');
+            cb_throw_error(E_GRN_MESSAGE_FOLDER_NOT_FOUND);
+        }
+        $folder_owner = $row->get('user');
+        if (is_null($folder_owner)) {
+            return false;
+        } else {
+            if ($user->getOID() != $folder_owner->getOID()) {
+                require_once('message/error_code.csp');
+                cb_throw_error(E_GRN_MESSAGE_FOLDER_NOT_FOUND);
+            }
+        }
+
+        if ($subscription) {
+            $row->set('subscription_flag', '1');
+        } else {
+            $row->set('subscription_flag', '0');
+        }
+
+        $row->updateNow();
+    }
+
+    /**
+     * set subscription flag to all folders except garbage folder
+     *
+     * @param   object $user    user CB_User object
+     * @param   array  $folders folder list which is subscribed
+     */
+    function setAllSubscription($user, $folders)
+    {
+        $rowset = new CB_RowSet($this->_folders);
+        $rowset->addCondition($rowset->queryf("col_user = '@S'",
+            $user->getOID()));
+        //  $user は CB_User なので、UUMが削除フラグチェック済み。
+
+        while ( ! is_null($row = $rowset->iterate())) {
+            if ($row->get('folder_type') != GRN_MESSAGE_GARBAGEFOLDER) {
+                $flag = false;
+                foreach ($folders as $folder_id) {
+                    if ($row->getOID() == $folder_id) // subscribed
+                    {
+                        if ($row->get('subscription_flag') == '0') {
+                            $row->set('subscription_flag', '1');
+                            $row->updateNow();
+                        }
+                        $flag = true;
+                    }
+                }
+
+                if ( ! $flag) {
+                    if ($row->get('subscription_flag') == '1') {
+                        $row->set('subscription_flag', '0');
+                        $row->updateNow();
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * get folder information which are located on the same level as specified folder
+     *
+     * @param    object $user      CB_User
+     * @param    string $folder_id folder id
+     *
+     * @return   mixed    folder information array
+     *                    if specified folder doesn't exist or cannot access this folder,
+     *                    return FALSE.
+     */
+    function getSiblingFolders($user, $folder_id)
+    {
+        $user_id = $user->getOID();
+
+        // check privilege
+        $folder = $this->_folders->getRow($folder_id);
+        if ( ! $folder) {
+            return false;
+        }
+        $folder_owner = $folder->get('user');
+        if (is_null($folder_owner) || $folder_owner->getOID() != $user_id) {
+            return false;
+        }
+        $parent = $folder->get('parent_folder');
+        if ( ! $parent) {
+            return false;
+        }
+
+
+        $dao = new GrnMessageFoldersDAO();
+        $children = $dao->getChildren($user_id, $parent->getOID());
+
+        $folders = [];
+        foreach ($children as $id => $folder) {
+            if ($folder['col_folder_type'] == GRN_MESSAGE_GENERALFOLDER) {
+                $folders[$id] = $folder['col_folder_name'];
+            }
+        }
+
+        return $folders;
+    }
+
+    /**
+     * change specifid folder order
+     *
+     * @param    object $user
+     * @param    array  $folders
+     *
+     * @return   boolean   TRUE: success changing folder order
+     *                     FALSE: specified folders don't exist or cannot access these folders
+     *
+     * $folder[] => folder id
+     */
+    function changeFolderOrder($user, $folders)
+    {
+        $user_id = $user->getOID();
+
+        $order = 1;
+        if (count($folders) > 0) {
+            $row = $this->_folders->getRow($folders[0]);
+            if ( ! $row) {
+                return false;
+            }
+            if ($row->get('level') == 1) // a parent folder is a root
+            {
+                $order = 4;
+            }
+        }
+
+        foreach ($folders as $folder) {
+            $rowset = new CB_RowSet($this->_folders);
+            $rowset->addCondition($rowset->queryf("tab_grn_message_folders._id = '@S' AND col_user = '@S'",
+                $folder, $user_id));
+            //  $user は CB_User なので、UUMが削除フラグチェック済み。
+            $row = $rowset->iterate();
+            if (is_null($row)) {
+                return false;
+            }
+
+            // update modify time
+            $time = new CB_TimeStamp();
+            $time->unix_ts = time();
+            $row->set('mtime', $time);
+            $row->set('view_order', $order);
+
+            $row->updateNow();
+
+            //Logging
+            $parent_row = $row->get('parent_folder');
+            require_once('message/inspection.csp');
+            $logger = GRN_Message_Logger_25::getInstance();
+            $params = [
+                'folder_id'        => $folder,
+                'parent_folder_id' => $parent_row->getOID(),
+                'list_index'       => $order
+            ];
+            $logger->notice('move', 'folder', $params);
+            //End Logging
+
+            $order++;
+        }
+
+        return true;
+    }
+
+    /**
+     * check specified folder has child folders
+     *
+     * @param    string $folder_id
+     *
+     * @return   boolean   TRUE: has child folders
+     */
+    function hasChildFolders($folder_id)
+    {
+        $rowset = new CB_RowSet($this->_folders);
+        $rowset->addCondition($rowset->queryf("col_parent_folder = '@S'",
+            $folder_id));
+        $user_table_info = $this->_manager->getTableInfo('cb_user');
+        $on = CB_DATABASE_TABLE_PREFIX
+              . $this->_folders->getTableName()
+              . '.col_user = u._id '
+              . 'AND u.col_deleted IS NULL';
+        $rowset->addJoin($user_table_info, $on, CB_DATABASE_INNER_JOIN, 'u');
+        $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+        $result = $rowset->iterate();
+
+        if ($result['count'] > 0) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * 指定したフォルダの親をルートフォルダまで返します。
+     * $ids = array( root, ... ,parent folder, target folder);
+     *
+     * @param string $folderId
+     *
+     * @return array
+     */
+    public function getParentFoldersList($folderId)
+    {
+        $dao = new GrnMessageFoldersDAO();
+        $ids = [$folderId];
+        do {
+            $folderId = $dao->getParentFolderId($folderId);
+            if ( ! is_null($folderId)) {
+                $ids = array_merge((array)$folderId, $ids);
+            }
+        } while ($folderId);
+
+        return $ids;
+    }
+
+    /**
+     * @param GRN_Message_Messages $message
+     * @param array                $users CB_User[]
+     * @param array                $addressees
+     *
+     * @return array
+     */
+    public function decideMessageFolderHashByUserId(
+        GRN_Message_Messages $message,
+        array $users,
+        array $addressees
+    ) {
+        $dao = new GrnMessageFilterDAO();
+        $filters = $dao->getFiltersHashedByUserId(array_keys($users));
+
+
+        $sender = $message->get("creator");
+        $senderName = [$message->get("creator_name")];
+        if ( ! is_null($sender)) {
+
+            $senderName[] = $sender->get("display_name");
+            $senderName[] = $sender->get("nickname");
+        }
+
+        $addresseesNames = [];
+
+        foreach ($addressees as $addressee) {
+            if ( ! isset($users[$addressee['addressee_id']])) {
+                continue;
+            }
+
+            if (isset($addressee['is_sender'])) {
+                continue;
+            }
+            /** @var  $user CB_User */
+            $user = $users[$addressee['addressee_id']];
+            $addresseesNames[] = [
+                $user->get("display_name"),
+                $user->get("nickname")
+            ];
+        }
+
+        $destinationFolders
+            = $this->foldersDao->getFolderIdsHashByUserId(GRN_MESSAGE_RECEIVINGFOLDER,
+            array_keys($users));;
+        foreach ($users as $userId => $eachUser) {
+            if ( ! isset($filters[$userId])) {
+                continue;
+            }
+
+            foreach ($filters[$userId] as $filter) {
+                /** @var $filter GrnMessageFilter */
+                if ( ! $filter->isMatchWith($message->get("subject"),
+                    $senderName, $addresseesNames)
+                ) {
+                    continue;
+                }
+                $destinationFolders[$userId] = $filter->getFolder();
+                break;
+            }
+        }
+
+        return $this->foldersDao->getFolderInfoHashByUserId(array_values($destinationFolders));
+    }
+
+    /**
+     * @param array $users
+     */
+    public function initializeFolders(array $users)
+    {
+        $this->foldersDao->initializeFolders($users);
+    }
+
+}
+
+/**
+ * メッセージフォルダキャッシュクラス
+ *
+ * @package  grn.message
+ */
+class GRN_Message_FolderLogic_Cache
+{
+    /**
+     * フォルダ初期化状況
+     */
+    private $_initialize = [];
+
+    /**
+     * シングルトン
+     *
+     * @return  GRN_Message_FolderLogic_Cache
+     */
+    private static $_instance = null;
+
+    public static function clear()
+    {
+        self::$_instance = null;
+    }
+
+    /**
+     * @return GRN_Message_FolderLogic_Cache
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * コンストラクタ
+     */
+    function __construct()
+    {
+        // do nothing
+    }
+
+    /**
+     * キャッシュを格納
+     */
+    function initialize($id, $row)
+    {
+        $this->_initialize[$id] = $row;
+    }
+
+    /**
+     * キャッシュ状況を確認
+     */
+    function is_initialize($id)
+    {
+        return array_key_exists($id, $this->_initialize);
+    }
+
+    /**
+     * キャッシュ情報を返却
+     */
+    function get_initialize($id)
+    {
+        if (is_initialize($id)) {
+            return $this->_initialize[$id];
+        }
+
+        return false;
+    }
+}
+
+/*
+ * render folder for folder combobox ( move, delete multi )
+ */
+function render_message_select_folder($folder_tree)
+{
+    $ret = [];
+    $folder_tree = current($folder_tree);
+    if (array_key_exists('children', $folder_tree)) {
+        $root_children = $folder_tree['children'];
+        foreach ($root_children as $id => $root_child) {
+            // ignore trash
+            if ($root_child['folder_type'] == 4) {
+                continue;
+            }
+            $ret[$id] = $root_child['folder_name'];
+            if (array_key_exists('children', $root_child)) {
+                _render_message_select_folder_node($ret, '',
+                    $root_child['children']);
+            }
+        }
+    }
+
+    return $ret;
+}
+
+function _render_message_select_folder_node(
+    &$ret,
+    $padding = '',
+    $folder_children
+) {
+    $padding .= '　';
+    $mark = cb_msg('grn.message', 'select_folder_brach');
+    foreach ($folder_children as $id => $folder_child) {
+        $ret[$id] = $padding . $mark . $folder_child['folder_name'];
+        if (array_key_exists('children', $folder_child)) {
+            _render_message_select_folder_node($ret, $padding,
+                $folder_child['children']);
+        }
+    }
+}
+

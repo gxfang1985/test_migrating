@@ -1,0 +1,594 @@
+<?php
+/*
+ * Created on 2006/09/25
+ *
+ * タイムカード登録機能
+ * 
+ * ■データ受信仕様
+ *
+ *    項目名                   |説明
+ *    ---------------------------+--------------------------------------------------
+ *    date                     |日付を指定します。
+ *    remarks                  |備考を指定します。
+ *    start_hour               |出社時刻(時)を指定します。※0
+ *    start_minute             |出社時刻(分)を指定します。※0
+ *    finish_hour              |退社時刻(時)を指定します。※0
+ *    finish_minute            |退社時刻(分)を指定します。※0
+ *    before_trip_mod_hour[]   |修正したい外出時刻(時)を指定します。※1
+ *    before_trip_mod_minute[] |修正したい外出時刻(分)を指定します。※1
+ *    after_trip_mod_hour[]    |外出時刻(時)(修正後)を指定します。※1
+ *    after_trip_mod_minute[]  |外出時刻(分)(修正後)を指定します。※1
+ *    after_back_mod_hour[]    |復帰時刻(時)(修正後)を指定します。※1
+ *    after_back_mod_minute[]  |復帰時刻(分)(修正後)を指定します。※1
+ *    clearflg                 |不在記録も出社・退社時刻もメモもクリア (削除)
+ *    registrant               |coopLoginにて使用　対象者を指定します。(→このユーザーでLoginAs)
+ *                             |パラメータがなければログインユーザーで対象者
+ *    app                      |coopLoginにて使用"timecard"
+ *    system                   |coopLoginにて使用"2"
+ *    manage                   |coopLoginにて使用"timecard"
+ *
+ *   ※0 項目名自体が存在しない場合又は "*" の場合は、既存登録情報をセットする
+ *   (JAVA側で渡してくるパラメータは、設定したい項目のみを渡す,値をクリアする場合は、""を渡す)
+ *   
+ *   ※1は、before_trip,after_trip,after_backの各配列の数は一致＆対応するものとする
+ *    (即ち count(before_trip_mod_hour)==count(after_trip_mod_hour)==count(after_back_mod_hour)
+ *        ==count(before_trip_mod_minute)==count(after_trip_mod_minute)==count(after_back_mod_minute)
+ *    (一致するようJAVA側で制御,保障する)
+ *    各配列の要素 =="*" の場合は、既存値をセットすることとする
+ * 
+ *     例)
+ *      before_trip_mod_hour[]   array("11","12","13",  "")
+ *      before_trip_mod_minute[] array( "0", "0", "0",  "")
+ *      after_trip_mod_hour[]    array("11", "*","13","17")
+ *      after_trip_mod_minute[]  array("30", "*","30", "0")
+ *      after_trip_mod_hour[]    array("12",  "", "*", "")
+ *      after_trip_mod_minute[]  array("30",  "", "*", "")
+ *      [0] → 11:00の外出時間を11:30に修正,復帰時間に12:30をセット
+ *      [1] → 12:00の外出時間はそのまま,復帰時間をクリア 
+ *      [2] → 13:00の外出時間を13:30に修正,復帰時間はそのまま
+ *      [3] → 外出時間17:00を新規登録
+ *   最大回数=1 の場合
+ *    ・before値を問わずafter値で上書き(before値の指定は、なんでもよい)
+ *    ・指定が複数あった場合は、最後に指定された値が採用される
+ *   
+ *   最大回数 <> 1 の場合
+ *    ・before値にマッチする既存レコードがない場合は、新規扱い(tripNx_hourの形式)
+ *     (マッチする場合は、修正扱い)
+ *    ・(最大回数 - 修正扱い数)が新規扱いで登録できる数
+ *     　新規扱いの数>(最大回数 - 修正扱い数)の場合は、新規扱いが後ろから削られる
+ *    ・新規扱いのafter値に * (既存値セット用)があった場合は、 ""(空)扱いとする
+ *     
+ *
+ *   最大回数 = 0 の場合は、外出・復帰時刻の設定パラメータがあったとしても無視(エラーにはしない)
+ *
+ */
+// 元ソース (ver 2.0.3) 基本は、元ソース、パラメータも合わせるようにする
+// timecard/command_modify.csp
+// timecard/_command_modify.csp
+
+global $G_INPUT;
+/////////////////////////////////////////////////////////////////////////////////////////
+//20061120修正
+//coopファイルが存在しないとFatal Erorrになるためファイル存在チェック
+$loginpage = "coopLogin.csp";
+if ( ! is_file(cb_basedir() . '/code/doc_root/' . dirname(cb_get_pagename())
+               . '/' . $loginpage)
+) {
+    //コピーライトとHTML閉じタグ出力しない
+    global $G_state_set;
+    $G_state_set->set('copyright_should_be_written', false);
+    $G_state_set->set('html_should_be_closed', false);
+
+    //   2007/03/27 coopLogin.cspがない場合のエラーメッセージ修正 不具合管理(199)
+    include_once('error_code.csp');
+    header("X-Cybozu-Error:" . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Header Data><CR><LF>");
+    print("1," . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Footer Data><CR><LF>");
+    print("ERROR<CR><LF>");
+    cb_safe_exit();
+}
+
+//ログイン認証
+require($loginpage);
+/////////////////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////////////////////////////////////////////
+//---------------------------------------------
+//  アプリケーションの使用/停止状態をチェック
+//---------------------------------------------
+require_once('grn/application.csp');
+$locator = GRN_ApplicationLocator::instance();
+if ( ! ($G_application =& $locator->getInstance($G_INPUT['app']))) {
+    require_once('grn/error_code.csp');
+    cb_throw_error(E_GRN_APPLICATION_NOT_ACTIVE);
+}
+unset($locator, $G_application);
+
+
+if (array_key_exists('date', $G_INPUT)
+    && @$G_INPUT['registrant'] != ''
+)  // 登録者が指定された場合
+{
+    $user = $uum->getUserByForeignKey($G_INPUT['registrant']);
+    $G_login = null;
+    if ($user) {
+        $user_id = $user->getOID();
+        $G_login =& $uum->getUser($user_id);
+    }
+} else {
+    $G_login = &$uum->getLoginUser();
+}
+
+if ( ! $G_login) {
+    require_once('grn/error_code.csp');
+    cb_throw_error(E_GRN_USER_NOT_FOUND);
+}
+$is_system = 1;
+
+//////////////////////////////////////////////////////////////////////
+if ( ! array_key_exists('date', $G_INPUT) || strlen($G_INPUT['date']) < 1) {
+    require_once('timecard/error_code.csp');
+    cb_throw_error(E_GRN_TIMECARD_INVALID_DATE);
+}
+
+
+$date = new CB_Date();
+
+if ( ! $date->parse($G_INPUT['date'])) {
+    require_once('timecard/error_code.csp');
+    cb_throw_error(E_GRN_TIMECARD_INVALID_DATE);
+}
+
+// **************************************************************************
+//   2007/03/22 日付の制限がない 不具合管理(174)
+//   範囲外(1970-01-02 ～ 2037-11-30 外)の場合は、日付不正エラー(FW00030)
+// **************************************************************************  
+if ( ! api_date_check(new CB_DateEx($date))) {
+    cb_throw_error(E_COMMON_INVALID_DATE);
+
+}
+// ************************************************************************** 
+
+
+require_once('fw/date.csp');
+$ts = new CB_TimeStampEx();
+$today = $ts->getDate();
+
+require_once('timecard/logic.csp');
+$logic = GRN_Timecard_Logic::getInstance();
+
+if (is_null(($record =& $logic->getRecord($G_login, $date)))) {
+    $record =& $logic->createRecord($G_login, $date);
+}
+
+$previous_values = $record->getRecordedValues();
+
+require_once('timecard/functions.csp');
+////////////////////////////////////////////////////////////////// tsukurimichi add start
+//パラメータがわたってきていないものは、既存値を取得し$G_INPUTにセットする
+require_once('timecard/config.csp');
+$config = GRN_Timecard_SystemConfig::getInstance();
+$limit = $config->getAbsenceMax();
+unset($config);
+
+if (array_key_exists("clear", $G_INPUT)) //初期化
+{
+    $temp_date = $G_INPUT['date'];
+    unset($G_INPUT);
+    $G_INPUT = [];
+    $G_INPUT['date'] = $temp_date;
+} elseif ($today->compare($date) < 0) {
+    // 未来日付の場合
+    if ( ! array_key_exists("remarks", $G_INPUT)) {
+        $G_INPUT['remarks'] = $record->get('description');
+    }
+} else { // 未来日付じゃない場合
+    //パラメータ 不在情報の配列チェック 
+    $cnt_btmh = array_key_exists("before_trip_mod_hour", $G_INPUT)
+        ? count($G_INPUT['before_trip_mod_hour']) : 0;
+    $cnt_btmm = array_key_exists("before_trip_mod_minute", $G_INPUT)
+        ? count($G_INPUT['before_trip_mod_minute']) : 0;
+    $cnt_atmh = array_key_exists("after_trip_mod_hour", $G_INPUT)
+        ? count($G_INPUT['after_trip_mod_hour']) : 0;
+    $cnt_atmm = array_key_exists("after_trip_mod_minute", $G_INPUT)
+        ? count($G_INPUT['after_trip_mod_minute']) : 0;
+    $cnt_abmh = array_key_exists("after_back_mod_hour", $G_INPUT)
+        ? count($G_INPUT['after_back_mod_hour']) : 0;
+    $cnt_abmm = array_key_exists("after_back_mod_minute", $G_INPUT)
+        ? count($G_INPUT['after_back_mod_minute']) : 0;
+
+    //配列の数がマッチしない場合は、不明エラー
+    if ( ! (($cnt_btmh == $cnt_btmm) && ($cnt_btmh == $cnt_atmh)
+            && ($cnt_btmh == $cnt_atmm)
+            && ($cnt_btmh == $cnt_abmh)
+            && ($cnt_btmh == $cnt_abmm))
+    ) {
+        require_once('timecard/error_code.csp');
+        cb_throw_error(E_GRN_TIMECARD_INTERNAL);
+
+    }
+
+    if ( ! array_key_exists("remarks", $G_INPUT)) {
+        $G_INPUT['remarks'] = $record->get('description');
+    }
+
+    //出社時間のパラメータが存在しない又は"*"の場合は(既存値セット)
+    if ( ! array_key_exists("start_hour", $G_INPUT)
+         || $G_INPUT['start_hour'] == "*"
+    ) {
+        if (is_null($record->get('in')) == true
+            || $record->get('in') == false
+        ) {
+            $G_INPUT["start_hour"] = "";
+            $G_INPUT["start_minute"] = "";
+        } else {
+            $st = grn_timecard_convert2datetime($record->get('in'));
+            $G_INPUT["start_hour"] = $st->hour;
+            $G_INPUT["start_minute"] = $st->minute;
+        }
+    }
+
+    //帰社時間のパラメータが存在しない又は"*"の場合は(既存値セット)
+    if ( ! array_key_exists("finish_hour", $G_INPUT)
+         || $G_INPUT['finish_hour'] == "*"
+    ) {
+        if (is_null($record->get('out')) == true
+            || $record->get('out') == false
+        ) {
+            $G_INPUT["finish_hour"] = "";
+            $G_INPUT["finish_minute"] = "";
+        } else {
+            $et = grn_timecard_convert2datetime($record->get('out'));
+            $G_INPUT["finish_hour"] = $et->hour;
+            $G_INPUT["finish_minute"] = $et->minute;
+        }
+    }
+    if ($limit == 1) {
+
+        // 最大回数=1の場合は、パラメータの最後の配列を上書
+        $tmp_atmh = "*";
+        $tmp_atmm = "*";
+        $tmp_abmh = "*";
+        $tmp_abmm = "*";
+
+
+        if (array_key_exists("before_trip_mod_hour", $G_INPUT)) {
+            $tmp_atmh = end($G_INPUT["after_trip_mod_hour"]);
+            $tmp_atmm = end($G_INPUT["after_trip_mod_minute"]);
+            $tmp_abmh = end($G_INPUT["after_back_mod_hour"]);
+            $tmp_abmm = end($G_INPUT["after_back_mod_minute"]);
+
+        }
+
+        $key = 0;
+        $absences = $record->listAbsenceRecords();
+        foreach ($absences as $key => $val) {
+            //外出・復帰の既存値取得
+            if ( ! is_null($val->get('out'))) {
+                $tt = grn_timecard_convert2datetime($val->get('out'));
+                $bt = grn_timecard_convert2datetime($val->get('in'));
+                if ($tmp_atmh == "*") {
+                    $tmp_atmh = is_null($val->get('out')) ? "" : $tt->hour;
+                    $tmp_atmm = is_null($val->get('out')) ? "" : $tt->minute;
+                }
+
+                if ($tmp_abmh == "*") {
+                    $tmp_abmh = is_null($val->get('in')) ? "" : $bt->hour;
+                    $tmp_abmm = is_null($val->get('in')) ? "" : $bt->minute;
+                }
+                break;
+            }
+        }
+        $key = $key == 0 ? "N1" : $key;
+        $G_INPUT["trip" . $key . "_hour"] = $tmp_atmh == "*" ? "" : $tmp_atmh;
+        $G_INPUT["trip" . $key . "_minute"] = $tmp_atmm == "*" ? "" : $tmp_atmm;
+        $G_INPUT["back" . $key . "_hour"] = $tmp_abmh == "*" ? "" : $tmp_abmh;
+        $G_INPUT["back" . $key . "_minute"] = $tmp_abmm == "*" ? "" : $tmp_abmm;
+
+    } elseif ($limit > 1) {     //外出・復帰時刻を使用しない場合は、なにもしない
+        //外出・復帰
+
+        $absences = $record->listAbsenceRecords();
+        $acsences_cnt = 0;
+        foreach ($absences as $key => $val) {
+            //外出・復帰の既存値をセット
+            if ( ! is_null($val->get('out'))) {
+                $tt = grn_timecard_convert2datetime($val->get('out'));
+                $bt = grn_timecard_convert2datetime($val->get('in'));
+
+//                reset($G_INPUT["before_trip_mod_hour"]);
+
+                foreach ($G_INPUT["before_trip_mod_hour"] as $key2 => $val2) {
+                    //修正前の値が一致したら値を修正後の値をセット
+                    if ($val2 == $tt->hour
+                        && $G_INPUT["before_trip_mod_minute"][$key2]
+                           == $tt->minute
+                    ) {
+                        //外出
+                        if ($G_INPUT["after_trip_mod_hour"][$key2]
+                            == "*"
+                        ) //既存値のまま
+                        {
+                            $G_INPUT["trip" . $key . "_hour"]
+                                = is_null($val->get('out')) ? "" : $tt->hour;
+                            $G_INPUT["trip" . $key . "_minute"]
+                                = is_null($val->get('out')) ? "" : $tt->minute;
+                        } else //NewValueをセット
+                        {
+                            $G_INPUT["trip" . $key . "_hour"]
+                                = $G_INPUT["after_trip_mod_hour"][$key2];
+                            $G_INPUT["trip" . $key . "_minute"]
+                                = $G_INPUT["after_trip_mod_minute"][$key2];
+
+                        }
+
+                        //復帰
+                        if ($G_INPUT["after_back_mod_hour"][$key2]
+                            == "*"
+                        ) //既存値のまま
+                        {
+                            $G_INPUT["back" . $key . "_hour"]
+                                = is_null($val->get('in')) ? "" : $bt->hour;
+                            $G_INPUT["back" . $key . "_minute"]
+                                = is_null($val->get('in')) ? "" : $bt->minute;
+                        } else //NewValueをセット
+                        {
+                            $G_INPUT["back" . $key . "_hour"]
+                                = $G_INPUT["after_back_mod_hour"][$key2];
+                            $G_INPUT["back" . $key . "_minute"]
+                                = $G_INPUT["after_back_mod_minute"][$key2];
+                        }
+
+                        unset($G_INPUT["before_trip_mod_hour"][$key2],
+                            $G_INPUT["before_trip_mod_minute"][$key2]);
+                        break;
+                    }
+                }
+            }
+
+            //パラメータがなければ、既存のまま(外出)
+            if ( ! array_key_exists("trip" . $key . "_hour", $G_INPUT)) {
+                $G_INPUT["trip" . $key . "_hour"] = is_null($val->get('out'))
+                    ? "" : $tt->hour;
+                $G_INPUT["trip" . $key . "_minute"] = is_null($val->get('out'))
+                    ? "" : $tt->minute;
+            }
+
+            //パラメータがなければ、既存のまま(復帰)
+            if ( ! array_key_exists("back" . $key . "_hour", $G_INPUT)) {
+                $G_INPUT["back" . $key . "_hour"] = is_null($val->get('in'))
+                    ? "" : $bt->hour;
+                $G_INPUT["back" . $key . "_minute"] = is_null($val->get('in'))
+                    ? "" : $bt->minute;
+            }
+
+            $acsences_cnt++;
+            if ($acsences_cnt >= $limit) {
+                break;
+            }
+        }
+
+        //新規登録分
+        // before_trip_mod_hour&minuteがマッチしなかった分は、before_trip_mod_hour&minuteが設定してあっても新規分とみなす
+        $j = count($absences) + 1;
+        if (array_key_exists("before_trip_mod_hour", $G_INPUT)
+            && is_array($G_INPUT['before_trip_mod_hour'])
+        ) {
+            reset($G_INPUT["before_trip_mod_hour"]);
+            foreach ($G_INPUT["before_trip_mod_hour"] as $key2 => $val2) {
+
+                // after_trip値に * (既存値セット)があったら ""空文字 にする
+                if ($G_INPUT["after_trip_mod_hour"][$key2] == "*"
+                    || $G_INPUT["after_trip_mod_minute"][$key2] == "*"
+                ) {
+                    $G_INPUT["after_trip_mod_hour"][$key2] = "";
+                    $G_INPUT["after_trip_mod_minute"][$key2] = "";
+                }
+
+                if ($G_INPUT["after_back_mod_hour"][$key2] == "*"
+                    || $G_INPUT["after_back_mod_minute"][$key2] == "*"
+                ) {
+                    $G_INPUT["after_back_mod_hour"][$key2] = "";
+                    $G_INPUT["after_back_mod_minute"][$key2] = "";
+                }
+
+                $G_INPUT["tripN" . $j . "_hour"]
+                    = $G_INPUT["after_trip_mod_hour"][$key2];
+                $G_INPUT["tripN" . $j . "_minute"]
+                    = $G_INPUT["after_trip_mod_minute"][$key2];
+                $G_INPUT["backN" . $j . "_hour"]
+                    = $G_INPUT["after_back_mod_hour"][$key2];
+                $G_INPUT["backN" . $j . "_minute"]
+                    = $G_INPUT["after_back_mod_minute"][$key2];
+                $j++;
+            }
+        }
+
+    }
+
+    //いらない値は削除
+    unset($G_INPUT["before_trip_mod_hour"],
+        $G_INPUT["before_trip_mod_minute"],
+        $G_INPUT["after_trip_mod_hour"],
+        $G_INPUT["after_trip_mod_minute"],
+        $G_INPUT["after_back_mod_hour"],
+        $G_INPUT["after_back_mod_minute"]);
+
+
+}
+
+
+///////////////////////////////////////////////////////////////////////////////tsukurimichi add end
+//改行コード除去 + 100文字以上切捨て
+$description = preg_replace('/\x0D\x0A|\x0D|\x0A/', '', @$G_INPUT['remarks']);
+if (mb_strlen($description) > 100) {
+    $description = mb_substr($description, 0, 100);
+}
+$G_INPUT['remarks'] = $description;
+
+$record->set('description', $G_INPUT['remarks']);
+
+if ( ! isset($utility) || is_null($utility)) {
+    require_once('timecard/controller.csp');
+    $utility = new GRN_Timecard_ControllerUtil();
+}
+$config = $utility->getConfigValues();
+
+// 未来の日付では備考以外を変更しない
+// システム管理以外でユーザーに時刻の修正を許可していない場合も変更しない。
+if ($today->compare($date) >= 0
+    && ($is_system
+        || $config['enable_modify_record'])
+) {
+
+////上部で呼び出したので不要 tsuku
+//    require_once('timecard/functions.csp');
+
+    // 出社
+    if (($ts = grn_timecard_argtime2timestamp('start', $date)) !== false) {
+        $record->set('in', $ts);
+    } else {
+        $record->set('in', null);
+    }
+
+    // 退社
+    if (($ts = grn_timecard_argtime2timestamp('finish', $date)) !== false) {
+        $record->set('out', $ts);
+    } else {
+        $record->set('out', null);
+    }
+
+
+    // 追加されている不在記録を修正
+
+    $absences = $record->listAbsenceRecords();
+
+    foreach (array_keys($absences) as $key) {
+        $absence =& $absences[$key];
+
+        // 外出
+        if (($ts = grn_timecard_argtime2timestamp('trip' . $key, $date))
+            !== false
+        ) {
+            $absence->set('out', $ts);
+        } else {
+            $absence->set('out', null);
+        }
+
+        // 復帰
+        if (($ts = grn_timecard_argtime2timestamp('back' . $key, $date))
+            !== false
+        ) {
+            $absence->set('in', $ts);
+        } else {
+            $absence->set('in', null);
+        }
+
+        // 両方の時刻が未設定となれば削除
+        if (is_null($absence->get('out')) && is_null($absence->get('in'))) {
+            $absence->delete();
+            unset($absences[$key]);
+        }
+    }
+
+
+//上部で取得済みなのでコメントアウト
+    // 新たに追加される不在記録
+//    require_once('timecard/config.csp');
+//    $config = GRN_Timecard_SystemConfig::getInstance();
+//    $limit = $config->getAbsenceMax();
+
+    for ($i = 1; $i <= $limit; ++$i) {
+        $ots = grn_timecard_argtime2timestamp('tripN' . $i, $date);
+        $its = grn_timecard_argtime2timestamp('backN' . $i, $date);
+
+        if ($ots || $its) {
+            $absence =& $logic->createAbsenceRecord($record);
+            if ($ots !== false) {
+                $absence->set('out', $ots);
+            }
+            if ($its !== false) {
+                $absence->set('in', $its);
+            }
+
+            $absences[$absence->getOID()] =& $absence;
+
+            $absence->registerNow();
+        }
+    }
+
+    // 不在記録も出社・退社時刻もメモもクリアされたら削除
+    if (count($absences) < 1) {
+        if (is_null($record->get('in')) && is_null($record->get('out'))
+            && is_null($record->get('description'))
+        ) {
+            $logic->onDelete($record);
+            $record->delete();
+        } else {
+            // 時刻設定をチェック
+            $record->validate();
+            $logic->onModify($record);
+            require_once('timecard/inspection.csp');
+//start 2008/01/11 G2.5対応
+//            grn_timecard_write_record_log( $record, $previous_values );
+            $inspection = GRN_Timecard_Inspection::getInstance();
+            $inspection->record($record, $previous_values);
+//end 2008/01/11 G2.5対応
+        }
+    } else {
+        // 時刻設定をチェック
+        $record->validate();
+        $logic->onModify($record);
+        require_once('timecard/inspection.csp');
+//start 2008/01/11 G2.5対応
+//        grn_timecard_write_record_log( $record, $previous_values );
+        $inspection = GRN_Timecard_Inspection::getInstance();
+        $inspection->record($record, $previous_values);
+//end 2008/01/11 G2.5対応
+    }
+}
+
+//戻り値なし
+
+///////////////////////////////////////
+printf("<Header Data><CR><LF>");
+printf("0, ");
+printf("<Footer Data><CR><LF>");
+printf("NOERROR<CR><LF>");
+///////////////////////////////////////
+
+
+// **************************************************************************
+//   2008/01/15 チェックの範囲期間を変更 ( 1970-01-02 ～ 2037-12-31 とする)
+//   2007/03/22 日付の制限がない 不具合管理(174)
+//   範囲外(1970-01-02 ～ 2037-11-30 外)の場合は、日付不正エラー(FW00030)
+// **************************************************************************  
+/**
+ * タイムカード設定の日付チェック関数 (2007-03-22)
+ * 1970-01-02 ～ 2037-11-30 を対象とする(画面の登録可能期間と合わせる）
+ *
+ * @param $dateEx  CB_DateEx
+ *
+ * @return boolean  false  : 対象外
+ *                  true   : 対象内 (1970-01-02 ～ 2037-11-30)
+ */
+function api_date_check($dateEx)
+{
+
+    $compare_date = new CB_Date();
+    $compare_date->parse("1970-01-02");
+    if ($dateEx->compare($compare_date) < 0) {
+        return false;
+    }
+
+    $compare_date->parse("2037-12-31");
+    if ($dateEx->compare($compare_date) > 0) {
+        return false;
+    }
+
+    return true;
+}
+// ************************************************************************** 
+
+

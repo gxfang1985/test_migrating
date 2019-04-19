@@ -1,0 +1,1427 @@
+<?php
+
+/**
+ * ユーザー所属情報に対する評価
+ *
+ * @date    2005/03/08
+ * @author  Y.Tanaka
+ * @package grn.cabinet
+ */
+
+require_once('cabinet/table.csp');
+require_once('cabinet/functions.csp');
+require_once('grn/application.csp');
+
+define('GRN_CABINET_UUMEVAL_MAX_CACHE_USERS', 8);
+
+/**
+ * @package grn.cabinet
+ */
+class GRN_Cabinet_UumEvaluationCacher
+{
+    /**
+     * @access private
+     */
+    var $_cache = [];
+
+
+    function __construct()
+    {
+    }
+
+
+    function clear()
+    {
+        $this->_cache = [];
+    }
+
+    function cache(& $user, $cid, $auth)
+    {
+        assert('is_a($user,"CB_User")');
+
+        $uid = $user->getOID();
+
+        if ( ! array_key_exists($uid, $this->_cache)) {
+            if (count($this->_cache) >= GRN_CABINET_UUMEVAL_MAX_CACHE_USERS) {
+                $cache_keys = array_keys($this->_cache);
+                $first = array_shift($cache_keys);
+                unset($this->_cache[$first]);
+            }
+            $this->_cache[$uid] = [];
+        }
+
+        $this->_cache[$uid][$cid] = $auth;
+
+        return true;
+    }
+
+    function &get(& $user, $cid)
+    {
+        if ( ! $user) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $uid = $user->getOID();
+
+        if ( ! array_key_exists($uid, $this->_cache)) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        if ( ! array_key_exists($cid, $this->_cache[$uid])) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        return $this->_cache[$uid][$cid];
+    }
+}
+
+
+// 特権カラムのプレフィックス
+define('GRN_CABINET_UUMEVAL_PREFIX', 'authrity_');
+
+
+/**
+ * ユーザー情報による権限評価クラス
+ *
+ * @package grn.cabinet
+ */
+class GRN_Cabinet_UumEvaluation
+{
+
+    /**
+     * 設定対象のクラス定義、「type」は値の型（0:文字列、1:ID）、「alias」は検索時のエイリアス名
+     *
+     * @access private
+     */
+    var $_targets
+        = [
+            'cb_user'      => ['type' => 1, 'alias' => 'u'],
+            'cb_group'     => ['type' => 1, 'alias' => 'g'],
+            'cb_role'      => ['type' => 1, 'alias' => 'r'],
+            'dynamic_role' => ['type' => 0, 'alias' => 'd']
+        ];
+
+
+    /**
+     * @access private
+     */
+    var $_cacher = null;
+    /**
+     * 権限テーブルのプレフィックス
+     * $table_name = $object_class_name .'_'. $this->_table_prefix .'_'. $target_class_name
+     *
+     * @access private
+     */
+    var $_table_prefix = 'auth';
+    /**
+     * 権限カラムのプレフィックス
+     * $column_name = $this->_column_prefix . $authority_name
+     *
+     * @access private
+     */
+    var $_column_prefix = 'authority_';
+    /**
+     * 権限カラム
+     *
+     * @access protected
+     */
+    var $_auth_columns = [];
+    /**
+     * 制御対象のクラス名
+     *
+     * @access private
+     */
+    var $_object_class_name = 'grn_cabinet_folderentity';
+
+
+    /**
+     * コンストラクタ
+     */
+    function __construct()
+    {
+        $this->_cacher = new GRN_Cabinet_UumEvaluationCacher();
+    }
+
+    function onAction($action, & $object, & $target, $authorities)
+    {
+    }
+
+    /**
+     * オブジェクトから行オブジェクトを取得する
+     *
+     * @access private
+     */
+    function _getObjectRow(& $object)
+    {
+        assert('is_a( $object, "cb_persistentbase" ) || method_exists( $object, "_getRow" )');
+        $ret = null;
+        if (is_a($object, 'cb_persistentbase')) {
+            $ret = $object;
+        } else {
+            $ret = $object->_getRow();
+        }
+
+        return $ret;
+    }
+
+
+    /**
+     * 有効なオブジェクトかどうか問い合わせる
+     */
+    function isValidObject(& $object)
+    {
+        return ( ! is_null($object)) && is_object($object);
+    }
+
+    /**
+     * 有効な権限設定かどうか問い合わせる
+     */
+    function isValidAuthorities($action, & $object, $authorities)
+    {
+        return true;
+    }
+
+
+    /**
+     * 設定対象のクラス文字列を取得
+     */
+    function getTargetClass(& $target)
+    {
+        return is_object($target)
+            ? strtolower(get_class($target))
+            : ((is_string($target) && $target !== '\0') ? 'dynamic_role'
+                : null);
+    }
+
+    /**
+     * 設定対象クラス文字列の一覧を取得
+     */
+    function getTargetClasses()
+    {
+        return array_keys($this->_targets);
+    }
+
+    /**
+     * 有効な設定対象クラスか問い合わせる
+     */
+    function isTargetClass($target_class_name)
+    {
+        return ( ! is_null($target_class_name))
+               && array_key_exists($target_class_name, $this->_targets);
+    }
+
+    /**
+     * 設定対象が文字列データかどうか問い合わせる
+     */
+    function isStringTargetClass($target_class_name)
+    {
+        if (is_null($target_class_name)) {
+            return false;
+        }
+        if ( ! $this->isTargetClass($target_class_name)) {
+            return false;
+        }
+
+        return $this->_targets[$target_class_name]['type'] === 0;
+    }
+
+    /**
+     * 有効な設定対象クラスか問い合わせる
+     */
+    function isValidTarget(& $target)
+    {
+        $target_class_name = $this->getTargetClass($target);
+        if ( ! $this->isTargetClass($target_class_name)) {
+            return false;
+        }
+
+        return true;
+    }
+
+
+    /**
+     * 権限テーブル名の取得
+     *
+     * @param string $target_class_name 設定対象オブジェクトクラス名
+     *
+     * @access private
+     */
+    function _getTableName($target_class_name)
+    {
+        if ( ! isset($target_class_name) || $target_class_name == '\0') {
+            assert('FALSE');
+
+            return null;
+        }
+
+        assert('$this->isTargetClass($target_class_name)');
+
+        return $this->_object_class_name . '_' . $this->_table_prefix . '_'
+               . $target_class_name;
+    }
+
+
+    /**
+     * 権限テーブルの取得
+     *
+     * @param string $target_class_name 設定対象オブジェクトクラス名
+     *
+     * @access private
+     */
+    function _getTable($target_class_name)
+    {
+        $table_name = $this->_getTableName($target_class_name);
+
+        if (is_null($table_name)) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('cabinet');
+
+        $ret = $tm->getTableInfo($table_name);
+
+        return $ret;
+    }
+
+
+    /**
+     * @access private
+     */
+    function _createTable($target_class_name)
+    {
+        $table = $this->_getTable($target_class_name);
+
+        if (is_null($table)) {
+            assert('FALSE');
+            $ret = null;
+
+            return $ret;
+        }
+
+        $table->addColumn('object',
+            ['type' => 'relation', 'to' => $this->_object_class_name]);
+
+        if ($this->isStringTargetClass($target_class_name)) {
+            $table->addColumn('target',
+                ['type' => 'char', 'length' => CB_DATABASE_MAX_STRINDEX]);
+        } else {
+            $table->addColumn('target',
+                ['type' => 'relation', 'to' => $target_class_name]);
+        }
+
+        foreach (array_keys($this->_auth_columns) as $auth) {
+            $table->addColumn($this->_column_prefix . $auth, ['type' => 'int']);
+        }
+
+        $table->addIndex('authority',
+            ['cols' => ['object', 'target'], 'unique' => true]);
+        $table->createTable();
+
+        return $table;
+    }
+
+
+    /**
+     * 権限テーブルの生成
+     */
+    function createTables()
+    {
+        foreach (array_keys($this->_targets) as $target_class_name) {
+            if (is_null(($table =& $this->_createTable($target_class_name)))) {
+                assert('FALSE');
+
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 権限テーブルの破棄
+     */
+    function dropTables()
+    {
+        foreach (array_keys($this->_targets) as $target_class_name) {
+            if ( ! is_null($table =& $this->_getTable($target_class_name))) {
+                $table->dropTable();
+            }
+        }
+    }
+
+    /**
+     * @access private
+     */
+    function _setColumns(& $row, $authorities)
+    {
+        foreach ($authorities as $key => $value) {
+            $row->set($this->_column_prefix . $key, $value);
+        }
+        $row->updateNow();
+    }
+
+    /**
+     * @access private
+     */
+    function _setRow(& $row, & $object, & $target, $authorities)
+    {
+        $row->set('object', $object);
+        $row->set('target', $target);
+        $this->_setColumns($row, $authorities);
+    }
+
+    /**
+     * @access private
+     */
+    function _makeTargetObjectCondition(& $target, $alias = null)
+    {
+        if (is_null($table) || ! $this->isValidTarget($target)) {
+            return null;
+        }
+
+        if ( ! is_null($alias)) {
+            $alias .= '.';
+        }
+
+        if ( ! $this->isStringTargetClass($this->getTargetClass($target))) {
+            return $alias . "col_target = " . $target->getOID();
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db =& $app_locator->getConnection('cabinet');
+
+        return $db->queryf($alias . 'col_target = \'@S\'', $target);
+    }
+
+    /**
+     * @access private
+     */
+    function _makeTargetCondition($target_class_name, & $target, $alias = null)
+    {
+        if ( ! is_array($target)) {
+            return $this->_makeTargetObjectCondition($target, $alias);
+        }
+
+        if (count($target) < 1) {
+            return null;
+        }
+
+        if ( ! is_null($alias)) {
+            $alias .= '.';
+        }
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('cabinet');
+
+        if ( ! $this->isStringTargetClass($target_class_name)) {
+            $escaped_ids = [];
+            foreach (array_keys($target) as $id) {
+                $escaped_ids[] = "'" . $db->escape($id) . "'";
+            }
+
+            return $alias . "col_target IN (" . implode(',', $escaped_ids)
+                   . ")";
+        }
+
+        $keys = [];
+        foreach (array_keys($target) as $value) {
+            if ( ! is_string($value) || strlen($value) < 1) {
+                continue;
+            }
+
+            $keys[] = '\'' . $db->escape($value) . '\'';
+        }
+
+        if (count($keys) < 1) {
+            return null;
+        }
+
+        return $alias . "col_target IN (" . implode(',', $keys) . ")";
+    }
+
+    /**
+     * @access private
+     * @return CB_RowSet
+     */
+    function _createRowSet(& $table, $oid, $target_class_name, & $target)
+    {
+        $rowset = new CB_RowSet($table);
+
+        $conditions = [];
+
+        if ( ! is_null($oid)) {
+            $conditions[] = $rowset->queryf("col_object = '@S'", $oid);
+        }
+
+        if ( ! is_null($target)) {
+            if ( ! is_null(($c = $this->_makeTargetCondition($target_class_name,
+                $target)))
+            ) {
+                $conditions[] = $c;
+            }
+        }
+
+        if (count($conditions) > 0) {
+            $rowset->addCondition(implode(' AND ', $conditions));
+        }
+
+        $rowset->addOrderColumn(null);
+
+        return $rowset;
+    }
+
+
+    /**
+     * @access protected
+     */
+    function _getTargetArray(& $target)
+    {
+        if ( ! $this->isValidTarget($target)) {
+            return null;
+        }
+
+        $target_class_name = $this->getTargetClass($target);
+
+        $targets = [$target_class_name => []];
+
+        if ($this->isStringTargetClass($target_class_name)) {
+            $targets[$target_class_name][$target] = $target;
+        } else {
+            $targets[$target_class_name][$target->getOID()] =& $target;
+        }
+
+        return $targets;
+    }
+
+
+    /**
+     * 指定オブジェクトに対する権限を複数の対象について同時に設定追加する
+     *
+     * @param object $object      権限を設定するオブジェクト
+     * @param array  $targets     設定対象リスト
+     * @param array  $authorities 権限
+     *
+     * @return bool
+     */
+    function addTargets(& $object, $targets, $authorities)
+    {
+        if ( ! $this->isValidObject($object)) {
+            return false;
+        }
+        if ( ! is_array($targets) || count($targets) < 1) {
+            return false;
+        }
+        if ( ! is_array($authorities) || count($authorities) < 1) {
+            return false;
+        }
+        if ( ! $this->isValidAuthorities('add', $object, $authorities)) {
+            return false;
+        }
+
+        if (is_null(($object_row =& $this->_getObjectRow($object)))) {
+            return false;
+        }
+
+        if ($authorities == $this->_auth_columns) {
+            return false;
+        }
+
+        foreach ($targets as $target_class_name => $target_objects) {
+            if ( ! $this->isTargetClass($target_class_name)) {
+                continue;
+            }
+            if ( ! is_array($target_objects) || count($target_objects) < 1) {
+                continue;
+            }
+
+            if (is_null(($table =& $this->_getTable($target_class_name)))) {
+                assert('FALSE');
+                continue;
+            }
+
+            foreach (array_keys($target_objects) as $id) {
+                $target =& $target_objects[$id];
+
+                if ( ! $this->isValidTarget($target)) {
+                    continue;
+                }
+
+                $row =& $table->newRow();
+                $this->_setRow($row, $object_row, $target, $authorities);
+                $this->onAction("create", $object, $target, $authorities);
+            }
+        }
+
+        $this->_cacher->clear();
+
+        if (is_a($object, 'GRN_Cabinet_Folder')) {
+            $object->runHook('update');
+        }
+
+        return true;
+    }
+
+    /**
+     * 指定オブジェクトに対する権限を設定追加する
+     *
+     * @param object $object      権限設定するオブジェクト
+     * @param mixed  $target      設定対象オブジェクト
+     * @param array  $authorities 権限
+     *
+     * @return bool
+     */
+    function addTarget(& $object, & $target, $authorities)
+    {
+        if ( ! $this->isValidTarget($target)) {
+            return false;
+        }
+
+        if (is_null(($targets = $this->_getTargetArray($target)))) {
+            return false;
+        }
+
+        return $this->addTargets($object, $targets, $authorities);
+    }
+
+
+    /**
+     * 指定オブジェクトに対する権限を変更する
+     *
+     * @param object $object      権限設定するオブジェクト
+     * @param array  $targets     設定対象リスト
+     * @param array  $authorities 権限
+     * @param bool   $create_flag TRUEの場合に未設定時自動追加が行われる
+     *
+     * @return bool
+     */
+    function modifyTargets(
+        & $object,
+        $targets,
+        $authorities,
+        $create_flag = false
+    ) {
+        if ( ! $this->isValidObject($object)) {
+            return false;
+        }
+        if ( ! is_array($authorities) || count($authorities) < 1) {
+            return false;
+        }
+        if ( ! $this->isValidAuthorities('modify', $object, $authorities)) {
+            return false;
+        }
+
+
+        if (is_null($targets)) {
+            $targets = [];
+            foreach (array_keys($this->_targets) as $target_name) {
+                $targets[$target_name] = null;
+            }
+        }
+        if ( ! is_array($targets) || count($targets) < 1) {
+            return false;
+        }
+
+        if (is_null(($object_row =& $this->_getObjectRow($object)))) {
+            return false;
+        }
+
+        if ($authorities == $this->_auth_columns) {
+            return $this->deleteTargets($object, $targets);
+        }
+
+        foreach ($targets as $target_class_name => $target_objects) {
+            if ( ! $this->isTargetClass($target_class_name)) {
+                continue;
+            }
+            if ( ! is_array($target_objects) || count($target_objects) < 1) {
+                continue;
+            }
+
+            if (is_null(($table =& $this->_getTable($target_class_name)))) {
+                assert('FALSE');
+                continue;
+            }
+
+            $rowset =& $this->_createRowSet($table, $object->getOID(),
+                $target_class_name, $target_objects);
+
+            if (is_null($rowset)) {
+                assert('FALSE');
+                continue;
+            }
+
+            // ターゲットがユーザーなら削除フラグをチェックする
+            if (strcasecmp('cb_user', $target_class_name) == 0) {
+                $app_locator = GRN_ApplicationLocator::instance();
+                $tm =& $app_locator->getTableManager('cabinet');
+
+                $user_table =& $tm->getTableInfo('CB_User');
+                $table_name = CB_DATABASE_TABLE_PREFIX
+                              . $this->_getTableName($target_class_name);
+                $rowset->addJoin($user_table,
+                    $table_name
+                    . '.col_target = u._id AND u.col_deleted IS NULL',
+                    CB_DATABASE_INNER_JOIN, 'u');
+            }
+
+            while ( ! is_null(($row = $rowset->iterate()))) {
+                $this->_setColumns($row, $authorities);
+
+                $not_null = false;
+                foreach (array_keys($this->_auth_columns) as $key) {
+                    if ($row->get($this->_column_prefix . $key)) {
+                        $not_null = true;
+                        break;
+                    }
+                }
+
+                $t =& $row->get('target');
+
+                if ( ! $not_null) {
+                    $this->onAction("delete", $object, $t, null);
+                    $row->delete();
+                    continue;
+                }
+
+                $this->onAction("modify", $object, $t, $authorities);
+
+                if ($create_flag) {
+                    if ($this->isStringTargetClass($target_class_name)) {
+                        unset($target_objects[$row->get('target')]);
+                    } else {
+                        unset($target_objects[$row->getId('target')]);
+                    }
+                }
+            }
+
+            $rowset->destroy();
+
+            if ($create_flag) {
+                foreach (array_keys($target_objects) as $id) {
+                    $target =& $target_objects[$id];
+
+                    if ( ! $this->isValidTarget($target)) {
+                        continue;
+                    }
+
+                    $row =& $table->newRow();
+                    $this->_setRow($row, $object_row, $target, $authorities);
+                    $this->onAction("create", $object, $target, $authorities);
+                }
+            }
+        }
+
+        $this->_cacher->clear();
+
+        if (is_a($object, 'GRN_Cabinet_Folder')) {
+            $object->runHook('update');
+        }
+
+        return true;
+    }
+
+    /**
+     * 指定オブジェクトに対する権限を変更する
+     *
+     * @param object $object      権限設定するオブジェクト
+     * @param mixed  $target      設定対象オブジェクト
+     * @param array  $authorities 権限
+     * @param bool   $create_flag TRUEの場合に未設定時自動追加が行われる
+     *
+     * @return bool
+     */
+    function modifyTarget(
+        & $object,
+        & $target,
+        $authorities,
+        $create_flag = false
+    ) {
+        if ( ! $this->isValidTarget($target)) {
+            return false;
+        }
+
+        if (is_null(($targets = $this->_getTargetArray($target)))) {
+            return false;
+        }
+
+        return $this->modifyTargets($object, $targets, $authorities,
+            $create_flag);
+    }
+
+
+    /**
+     * 指定オブジェクトに対する権限を取得する
+     *
+     * @param object $object  権限設定するオブジェクト
+     * @param array  $targets 設定対象リスト
+     *
+     * @return array
+     */
+    function getTargets(& $object, $targets)
+    {
+        if ( ! $this->isValidObject($object)) {
+            return false;
+        }
+
+        if (is_null($targets)) {
+            $targets = [];
+            foreach (array_keys($this->_targets) as $target_name) {
+                $targets[$target_name] = null;
+            }
+        }
+
+        if ( ! is_array($targets) || count($targets) < 1) {
+            return false;
+        }
+
+        $authorities = [];
+
+        foreach ($targets as $target_class_name => $target_objects) {
+            if ( ! $this->isTargetClass($target_class_name)) {
+                continue;
+            }
+
+            if (is_null(($table =& $this->_getTable($target_class_name)))) {
+                assert('FALSE');
+                continue;
+            }
+
+            $rowset =& $this->_createRowSet($table, $object->getOID(),
+                $target_class_name, $target_objects);
+
+            if (is_null($rowset)) {
+                assert('FALSE');
+                continue;
+            }
+
+            // ターゲットがユーザーなら削除フラグをチェックする
+            if (strcasecmp('cb_user', $target_class_name) == 0) {
+                $app_locator = GRN_ApplicationLocator::instance();
+                $tm =& $app_locator->getTableManager('cabinet');
+
+                $user_table =& $tm->getTableInfo('CB_User');
+                $table_name = CB_DATABASE_TABLE_PREFIX
+                              . $this->_getTableName($target_class_name);
+                $rowset->addJoin($user_table,
+                    $table_name
+                    . '.col_target = u._id AND u.col_deleted IS NULL',
+                    CB_DATABASE_INNER_JOIN, 'u');
+            }
+
+            if ( ! array_key_exists($target_class_name, $authorities)) {
+                $authorities[$target_class_name] = [];
+            }
+
+            while ( ! is_null(($row = $rowset->iterate()))) {
+                $target_authorities = $this->_auth_columns;
+
+                foreach (array_keys($target_authorities) as $column_name) {
+                    $target_authorities[$column_name]
+                        = $row->get($this->_column_prefix . $column_name);
+                }
+
+                if ($this->isStringTargetClass($target_class_name)) {
+                    $authorities[$target_class_name][$row->get('target')]
+                        = $target_authorities;
+                } else {
+                    $authorities[$target_class_name][$row->getId('target')]
+                        = $target_authorities;
+                }
+            }
+            $rowset->destroy();
+        }
+
+        return $authorities;
+    }
+
+    /**
+     * 指定オブジェクトに対する権限を取得する
+     *
+     * @param object $object 権限設定するオブジェクト
+     * @param mixed  $target 対象オブジェクト
+     *
+     * @return array
+     */
+    function getTarget(& $object, & $target)
+    {
+        if ( ! $this->isValidTarget($target)) {
+            return false;
+        }
+
+        if (is_null(($targets = $this->_getTargetArray($target)))) {
+            return false;
+        }
+
+        $authorities = $this->getTargets($object, $targets);
+
+        foreach (array_keys($authorities) as $class_type) {
+            foreach (array_keys($authorities[$class_type]) as $id) {
+                return $authorities[$class_type][$id];
+            }
+        }
+
+        return false;
+    }
+
+
+    /**
+     * 指定オブジェクトに対する権限を削除する
+     *
+     * @param object $object  権限設定するオブジェクト
+     * @param array  $targets 対象リスト
+     *
+     * @return array
+     */
+    function deleteTargets(& $object, $targets)
+    {
+        if ( ! $this->isValidObject($object)) {
+            return false;
+        }
+
+        if (is_null($targets)) {
+            $targets = [];
+            foreach (array_keys($this->_targets) as $target_name) {
+                $targets[$target_name] = null;
+            }
+        }
+
+        if ( ! is_array($targets) || count($targets) < 1) {
+            return false;
+        }
+
+        foreach ($targets as $target_class_name => $target_objects) {
+            if ( ! $this->isTargetClass($target_class_name)) {
+                continue;
+            }
+
+            if (is_null(($table =& $this->_getTable($target_class_name)))) {
+                assert('FALSE');
+                continue;
+            }
+
+            $rowset =& $this->_createRowSet($table, $object->getOID(),
+                $target_class_name, $target_objects);
+
+            if (is_null($rowset)) {
+                assert('FALSE');
+                continue;
+            }
+
+            // ターゲットがユーザーなら削除フラグをチェックする
+            if (strcasecmp('cb_user', $target_class_name) == 0) {
+                $app_locator = GRN_ApplicationLocator::instance();
+                $tm =& $app_locator->getTableManager('cabinet');
+
+                $user_table =& $tm->getTableInfo('CB_User');
+                $table_name = CB_DATABASE_TABLE_PREFIX
+                              . $this->_getTableName($target_class_name);
+                $rowset->addJoin($user_table,
+                    $table_name
+                    . '.col_target = u._id AND u.col_deleted IS NULL',
+                    CB_DATABASE_INNER_JOIN, 'u');
+            }
+
+            //$rowset->deleteAllMatched();
+            while (($row = $rowset->iterate())) {
+                $row->delete();
+            }
+            $rowset->destroy();
+
+            if (is_array($target_objects)) {
+                foreach (array_keys($target_objects) as $id) {
+                    $this->onAction("delete", $object, $target_objects[$id],
+                        null);
+                }
+            } else {
+                $this->onAction("delete_all", $object, $target_class_name,
+                    null);
+            }
+        }
+
+        $this->_cacher->clear();
+
+        if (is_a($object, 'GRN_Cabinet_Folder')) {
+            $object->runHook('update');
+        }
+
+        return true;
+    }
+
+    /**
+     * 指定オブジェクトに対する権限を削除する
+     *
+     * @param object $object 権限設定するオブジェクト
+     * @param mixed  $target 対象オブジェクト
+     *
+     * @return array
+     */
+    function deleteTarget(& $object, & $target)
+    {
+        if ( ! $this->isValidTarget($target)) {
+            return false;
+        }
+
+        $target_class_name = $this->getTargetClass($target);
+
+        $targets = [$target_class_name => []];
+
+        if ($this->isStringTargetClass($target_class_name)) {
+            $targets[$target_class_name][$target] = $target;
+        } else {
+            $targets[$target_class_name][$target->getOID()] =& $target;
+        }
+
+        return $this->deleteTargets($object, $targets);
+    }
+
+
+    /**
+     * @access private
+     */
+    function _getSingleQueryColumns()
+    {
+        $columns = ['col_object' => 0];
+
+        $i = 1;
+        foreach (array_keys($this->_auth_columns) as $auth) {
+            $columns['col_' . $this->_column_prefix . $auth] = $i;
+            $i++;
+        }
+
+        return $columns;
+    }
+
+    /*
+    function _getQueryColumns( $targets, $object_alias = 'o' )
+    {
+        if( $object_alias ) $object_alias .= '.';
+        $columns = array( $object_alias.'_id' => 0 );
+
+        $i = 1;
+        foreach( array_keys( $targets ) as $key )
+        {
+            $alias = $this->_targets[$key]['alias'];
+
+            foreach( array_keys( $this->_auth_columns ) as $auth )
+            {
+                $columns[ $alias .'.col_'. $this->_column_prefix . $auth ] = $i;
+                $i++;
+            }
+        }
+        return $columns;
+    }
+    */
+
+    /**
+     * @access private
+     */
+    function _makeSingleEvaluateQuery(
+        $object_ids,
+        $target_class_name,
+        $values,
+        $columns
+    ) {
+        $tab = "tab_" . $this->_getTableName($target_class_name);
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('cabinet');
+
+        $conditions = [];
+
+        if (is_array($object_ids) && count($object_ids) > 0) {
+            $escaped_ids = [];
+            foreach (array_keys($object_ids) as $id) {
+                $escaped_ids[] = "'" . $db->escape($id) . "'";
+            }
+            $conditions[] = 'col_object IN (' . implode(',', $escaped_ids)
+                            . ')';
+        }
+
+        if ( ! is_null(($c = $this->_makeTargetCondition($target_class_name,
+            $values, null)))
+        ) {
+            $conditions[] = $c;
+        }
+
+        $select_columns = implode(',', array_keys($columns));
+
+        // ターゲットがユーザーなら削除フラグをチェック
+        $join = '';
+        if (strcasecmp('cb_user', $target_class_name) == 0) {
+            $join = 'INNER JOIN tab_cb_user AS u ON ' . $tab
+                    . '.col_target = u._id AND u.col_deleted IS NULL';
+        }
+
+        if (count($conditions) > 0) {
+            return "SELECT $select_columns FROM $tab " . $join . " WHERE ( "
+                   . implode(' AND ', $conditions) . " ) LOCK IN SHARE MODE;";
+        }
+
+        return "SELECT $select_columns FROM $tab " . $join
+               . " LOCK IN SHARE MODE;";
+    }
+
+    /*
+    function _makeEvaluateQuery( $object_ids, $targets, $columns )
+    {
+        $join = "tab_".$this->_object_class_name." AS o";
+
+        foreach( $targets as $target_class_name => $values )
+        {
+            if( !is_array( $values ) || count( $values ) < 1 )
+                continue;
+
+            $target_table_name = 'tab_'.$this->_getTableName( $target_class_name );
+            $alias = $this->_targets[ $target_class_name ][ 'alias' ];
+            
+            $conditions = array();
+            $conditions[] = 'o._id = '. $alias . '.col_object';
+
+            if( !is_null(($c = $this->_makeTargetCondition( $target_class_name, $values, $alias ))) )
+            {
+                $conditions[] = $c;
+            }
+
+            $join_condition = sprintf( ' LEFT JOIN %s AS %s ON (%s) ', 
+                                       $target_table_name,
+                                       $alias,
+                                       implode( ' AND ', $conditions ) );
+
+            $join = '(' . $join . $join_condition . ')'; 
+        }
+
+        $select_columns = implode( ',', array_keys( $columns ) );
+
+        if( is_array( $object_ids ) && count( $object_ids ) > 0 )
+        {
+            $object_condition = 'o._id IN ('. implode( ',', array_keys($object_ids) ) . ')';
+            return "SELECT $select_columns FROM $join WHERE ( $object_condition ) LOCK IN SHARE MODE;";
+        }
+
+        return "SELECT $select_columns FROM $join LOCK IN SHARE MODE;";
+    }
+    */
+
+    /**
+     * @access private
+     */
+    function _evaluateSingleRow($row, $columns, &$authorities)
+    {
+        foreach (array_keys($this->_auth_columns) as $auth) {
+            $pos = 'col_' . $this->_column_prefix . $auth;
+
+            if (array_key_exists($pos, $columns)) {
+                if ( ! array_key_exists($auth, $authorities)) {
+                    $authorities[$auth] = 0;
+                }
+                $authorities[$auth] |= intval($row[$columns[$pos]]);
+            }
+        }
+    }
+
+    /*
+    function _evaluateRow( $row, $columns, &$authorities )
+    {
+        foreach( $this->_targets as $target )
+        {
+            $alias = $target[ 'alias' ];
+            foreach( array_keys($this->_auth_columns) as $auth )
+            {
+                $pos = $alias . '.col_' . $this->_column_prefix . $auth;
+                
+                if( array_key_exists( $pos, $columns ) )
+                {
+                    if( !array_key_exists( $auth, $authorities ) ) $authorities[ $auth ] = 0;
+                    $authorities[ $auth ] |= intval($row[ $columns[ $pos ] ]);
+                }
+                else
+                {
+                    // 不要なターゲット
+                    break;
+                }
+            }
+        }
+    }
+    */
+
+    function _evaluateSingleTarget(
+        $object_ids,
+        $target_class_namne,
+        $values,
+        $columns,
+        & $authorities
+    ) {
+        if ( ! is_array($authorities)) {
+            $authorities = [];
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('cabinet');
+
+        $query = $this->_makeSingleEvaluateQuery($object_ids,
+            $target_class_namne, $values, $columns);
+
+        $result = $db->query($query);
+        if (cb_is_db_result($result)) {
+            $n = $db->num_rows($result);
+            for ($i = 0; $i < $n; $i++) {
+                $row = $db->fetch_row($result);
+
+                if ( ! array_key_exists($row[0], $authorities)) {
+                    $authorities[$row[0]] = $this->_auth_columns;
+                }
+
+                $this->_evaluateSingleRow($row, $columns,
+                    $authorities[$row[0]]);
+            }
+            $db->free_result($result);
+        }
+
+        return $authorities;
+    }
+
+    /*
+    function _evaluateTargets( $object_ids, $targets, $columns, & $authorities )
+    {
+        if( !is_array( $authorities ) )
+        {
+            $authorities = array();
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db =& $app_locator->getConnection( 'cabinet' );
+
+        $query = $this->_makeEvaluateQuery( $object_ids, $targets, $columns );
+
+        $result = $db->query( $query );
+        if( cb_is_db_result( $result ) )
+        {
+            $n = $db->num_rows( $result );
+            for( $i = 0; $i < $n; $i++ )
+            {
+                $row = $db->fetch_row( $result );
+                
+                if( !array_key_exists( $row[0], $authorities ) )
+                    $authorities[ $row[0] ] = $this->_auth_columns;
+
+                $this->_evaluateRow( $row, $columns, $authorities[ $row[0] ] );
+            }
+            $db->free_result( $result );
+        }
+
+        return $authorities;
+    }
+    */
+
+
+    /**
+     * 評価を実行する
+     *
+     * @access private
+     */
+    function _evaluate($object_ids, $uid, $groups, $roles, $dynamic_roles)
+    {
+        $targets = [];
+
+        if ( ! is_null($uid)) {
+            $targets['cb_user'] = [$uid => $uid];
+        }
+        if ( ! is_null($groups) && is_array($groups) && count($groups) > 0) {
+            $targets['cb_group'] = $groups;
+        }
+        if ( ! is_null($roles) && is_array($roles) && count($roles) > 0) {
+            $targets['cb_role'] = $roles;
+        }
+        if ( ! is_null($dynamic_roles) && is_array($dynamic_roles)
+             && count($dynamic_roles) > 0
+        ) {
+            $targets['dynamic_role'] = $dynamic_roles;
+        }
+
+
+        $columns = $this->_getSingleQueryColumns();
+        $authorities = [];
+
+        foreach ($targets as $target_class_name => $values) {
+            $authorities = $this->_evaluateSingleTarget($object_ids,
+                $target_class_name, $values, $columns, $authorities);
+        }
+
+        foreach (array_keys($object_ids) as $oid) {
+            if ( ! array_key_exists($oid, $authorities)) {
+                $authorities[$oid] = $this->_auth_columns;
+            }
+        }
+
+        // セキュリティモデルを評価するなら、オーバーライドして結果を反転する
+
+        return $authorities;
+    }
+
+    /**
+     * 各権限対象のテーブルをJOINしてクエリーの発行1回で処理していたが
+     * ROLLBACKしたあとの検索結果が不正になるため、個別にクエリーを発行して回避した
+     * なぜROLLBACK後に検索結果が不正になるかは不明
+     * http://okachimachi.dev.cybozu.co.jp/bugzilla/show_bug.cgi?id=2150
+     */
+
+    /*
+    function _evaluateMulti( $object_ids, $uid, $groups, $roles, $dynamic_roles )
+    {
+        $targets = array();
+
+        if( ! is_null($uid) )
+            $targets['cb_user'] = array( $uid => $uid );
+        if( ! is_null($groups) && is_array($groups) && count($groups) > 0 )
+            $targets['cb_group'] = $groups;
+        if( ! is_null($roles) && is_array($roles) && count($roles) > 0 )
+            $targets['cb_role'] = $roles;
+        if( ! is_null($dynamic_roles) && is_array($dynamic_roles) && count($dynamic_roles) > 0 )
+            $targets['dynamic_role'] = $dynamic_roles;
+
+
+        $columns = $this->_getQueryColumns( $targets );
+        $authorities = array();
+        $authorities = $this->_evaluateTargets( $object_ids, $targets, $columns, $authorities );
+
+        // セキュリティモデルを評価するなら、オーバーライドして結果を反転する
+
+        return $authorities;
+    }
+    */
+
+
+    /**
+     * オブジェクトに対する権限を評価する
+     *
+     * @param array  $objects       評価オブジェクトリスト
+     * @param string $uid           ユーザーID
+     * @param array  $groups        ユーザーの所属組織リスト
+     * @param array  $roles         ユーザーの所持ロールリスト
+     * @param array  $dynamic_roles ユーザーの動的ロールリスト
+     *
+     * @return array
+     */
+    function evaluateObjects($objects, $uid, $groups, $roles, $dynamic_roles)
+    {
+        if (is_null($objects)) {
+            return false;
+        }
+        if ( ! is_array($objects) || count($objects) < 1) {
+            return false;
+        }
+
+        return $this->_evaluate($objects, $uid, $groups, $roles,
+            $dynamic_roles);
+    }
+
+    /**
+     * オブジェクトに対する権限を評価する
+     *
+     * @param object $object        評価オブジェクト
+     * @param string $uid           ユーザーID
+     * @param array  $groups        ユーザーの所属組織リスト
+     * @param array  $roles         ユーザーの所持ロールリスト
+     * @param array  $dynamic_roles ユーザーの動的ロールリスト
+     *
+     * @return array
+     */
+    function evaluateObject(& $object, $uid, $groups, $roles, $dynamic_roles)
+    {
+        if ( ! is_object($object)
+             && (is_string($object)
+                 || is_numeric($object))
+        ) {
+            return $this->_evaluate([$object => 1], $uid, $groups, $roles,
+                $dynamic_roles);
+        }
+
+        return $this->_evaluate([$object->getOID() => 1], $uid, $groups, $roles,
+            $dynamic_roles);
+    }
+
+
+    /**
+     * ユーザーに対する権限を評価する
+     *
+     * @param object $user    評価対象ユーザー
+     * @param array  $objects 評価オブジェクトリスト
+     *
+     * @return array
+     */
+    function evaluateUserObjects(& $user, $objects)
+    {
+        if (is_null($objects)) {
+            return false;
+        }
+        if ( ! is_array($objects) || count($objects) < 1) {
+            return false;
+        }
+
+        $result = [];
+
+        foreach (array_keys($objects) as $oid) {
+            if (($cached = $this->_cacher->get($user, $oid))) {
+                $result[$oid] = $cached;
+                unset($objects[$oid]);
+            } else {
+                $result[$oid] = null;
+            }
+        }
+
+        if (count($objects) < 1) {
+            return $result; // cached all
+        }
+
+
+        $uid = $user ? $user->getOID() : 0;
+
+        $authorities = $this->evaluateObjects($objects, $uid,
+            grn_cabinet_get_user_groups($uid),
+            grn_cabinet_get_user_roles($uid),
+            grn_cabinet_get_user_dynamic_roles($uid));
+
+        if (is_null($authorities)) {
+            return false;
+        }
+
+        foreach (array_keys($objects) as $oid) {
+            $this->_cacher->cache($user, $oid, $authorities[$oid]);
+            $result[$oid] = $authorities[$oid];
+        }
+
+        return $result;
+    }
+
+
+    /**
+     * ユーザーに対する権限を評価する
+     *
+     * @param object $user    評価対象ユーザー
+     * @param array  $objects 評価オブジェクト
+     *
+     * @return array
+     */
+    function evaluateUserObject(& $user, & $object)
+    {
+        if ( ! is_object($object)
+             && (is_string($object)
+                 || is_numeric($object))
+        ) {
+            return $this->evaluateUserObjects($user, [$object => 1]);
+        }
+
+        return $this->evaluateUserObjects($user, [$object->getOID() => 1]);
+    }
+
+}
+
+

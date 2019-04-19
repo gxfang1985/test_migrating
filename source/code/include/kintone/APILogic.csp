@@ -1,0 +1,197 @@
+<?php
+
+use grn\space\common\exception\ErrorCode;
+
+abstract class GRN_Kintone_APILogic
+{
+    private $_language;
+    static private $_request_token = null;
+
+    public static $APP_NOT_FOUND = 'GAIA_AP01';
+
+    public function __construct($language = null)
+    {
+        require_once('fw/i18n.csp');
+        if (is_null($language)) {
+            $i18n = CB_I18N::getInstance();
+            $language = $i18n->getCurrentLanguage();
+        }
+        $this->_language = $language;
+    }
+
+    /**
+     * Execute Kintone API
+     *
+     * @param string $api    API name. ex:'app/get.json'
+     * @param bool   $nesessaryRequestToken
+     * @param array  $params parameter
+     * @param array  $header header
+     * @param bool   $convertJSON
+     *
+     * @return array|mixed
+     */
+    protected function execute(
+        $api,
+        $nesessaryRequestToken,
+        $params = [],
+        $header = [],
+        $convertJSON = true
+    ) {
+        assert('is_string($api)');
+        assert('is_bool($nesessaryRequestToken)');
+        assert('is_array($params)');
+        assert('is_array($header)');
+
+        global $G_config_common;
+
+        //性能検証の場合はダミーデータを返す
+        if ($G_config_common->get('Global', 'performanceTest')) {
+            require_once('kintone/DummyData.csp');
+            $data = KintoneDummyData::get($api, $params);
+
+            return json_decode($data, true);
+        }
+
+        require_once('kintone/Logic.csp');
+        $kintoneURL = GRN_Kintone_Logic::getKintoneURL(true);
+        $targetURL = $kintoneURL . 'api/' . $api;
+        if ( ! is_null($this->_language)) {
+            $targetURL .= '?_lc=' . $this->_language;
+        }
+
+        if ($convertJSON) {
+            $header[] = 'Content-Type: application/json';
+        }
+
+        global $G_container_base;
+        $http_client = $G_container_base->getInstance('http_client');
+
+        if ($G_config_common->get('Kintone', 'api_account')
+            && $G_config_common->get('Kintone', 'api_password')
+        ) {
+            $params['username'] = $G_config_common->get('Kintone',
+                'api_account');
+            $params['password'] = $G_config_common->get('Kintone',
+                'api_password');
+        } else {
+            if ($nesessaryRequestToken) {
+                $params['__REQUEST_TOKEN__'] = $this->getRequestToken();
+            }
+
+            require_once('grn/authentication.csp');
+            $http_client->setCurlOption(CURLOPT_COOKIE,
+                session_name() . "=" . rawurlencode(session_id()));
+
+        }
+
+        if (defined('ON_FOREST')) {
+            require_once('fw/cydec.csp');
+            $header[] = CB_REQUEST_DOMAIN_HEADER . ": "
+                        . CB_CyDECUtil::getInstance()->getDomainID();
+        }
+
+        if ($convertJSON) {
+            if (count($params)) {
+                $params = json_encode($params);
+            } else {
+                $params = '{}';
+            }
+        }
+        $this->log(print_r($params, true), $api . " Request");
+
+        $http_client->setCurlOption(CURLOPT_POST, true);
+        $http_client->setCurlOption(CURLOPT_HTTPHEADER, $header);
+        $http_client->setCurlOption(CURLOPT_POSTFIELDS, $params);
+        $http_client->setCurlOption(CURLOPT_TIMEOUT, 10);
+        if ( ! $convertJSON) {
+            $http_client->setCurlOption(CURLOPT_RETURNTRANSFER, true);
+        }
+
+        if ($http_client->execute($targetURL)) {
+            $body = $http_client->getBody();
+            $this->log(var_export($body, true), $api . " Response");
+            if (is_null($body)) {
+                return ['success' => false, 'execute' => true];
+            } else {
+                $data = json_decode($body, true);
+                if (is_null($data)) {
+                    return ['success' => false, 'execute' => true];
+                }
+                $data = $this->iso8601ToDatetime($data);
+
+                return $data;
+            }
+        } else {
+            return ['success' => false, 'execute' => false];
+        }
+    }
+
+    private function iso8601ToDatetime($data)
+    {
+        foreach (array_keys($data) as $key) {
+            $value = $data[$key];
+            if (\CB_ISO8601Util::isISO8601($value)) {
+                $data[$key . "_datetime"] = \CB_ISO8601Util::toDateTime($value);
+            } elseif (is_array($value)) {
+                $data[$key] = $this->iso8601ToDatetime($value);
+            }
+        }
+
+        return $data;
+    }
+
+    private function getRequestToken()
+    {
+        //use cache
+        if ( ! is_null(self::$_request_token)) {
+            return self::$_request_token;
+        }
+
+        $result = $this->execute('getToken.json', false);
+        if ($result['success']) {
+            //cache
+            self::$_request_token = $result['result']['token'];
+
+            return $result['result']['token'];
+        } else {
+            $cause = [
+                'errorcode' => $result['code'],
+                'errorid'   => $result['id']
+            ];
+            cb_throw_error(ErrorCode::GRN_KINTONE_CONNECT_FAILED, null, $cause);
+        }
+    }
+
+    /**
+     * logging
+     *
+     * @param string $message
+     * @param string $apiname
+     */
+    protected function log($message, $apiname)
+    {
+        global $G_config_common;
+        $logfile = $G_config_common->get('Kintone', 'api_log_file');
+        if ( ! $logfile) {
+            return;
+        }
+
+        $fp = fopen($logfile, 'a');
+        if ( ! $fp) {
+            return;
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login = $uum->getLoginUser();
+
+        $log = "-------------------------------------------------------\n";
+        $log .= "[" . date("Y-m-d H:i:s") . "] ";
+        $log .= ($login ? $login->getOID() . " " . $login->get('display_name')
+            : "not login user");
+        $log .= " " . $apiname . "\n";
+        $log .= $message . "\n\n";
+        fwrite($fp, $log);
+        fclose($fp);
+    }
+}

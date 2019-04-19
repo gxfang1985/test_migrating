@@ -1,0 +1,1626 @@
+<?php
+
+/**
+ * カレンダー操作 API
+ *
+ * @package grn.common.calendar
+ * @version 1.0
+ */
+
+require_once('fw/persistent.csp');
+require_once('fw/database.csp');
+require_once('fw/profile.csp');
+require_once('grn/error_code.csp');
+
+define('GRN_CALENDAR_MODULEID', 'grn.common.calendar');
+define('GRN_CALENDAR_SYSTEM_DEFAULT', 1);
+define('GRN_CALENDAR_TYPE_PUBLICHOLIDAY', 1);
+define('GRN_CALENDAR_TYPE_MEMORIALDAY', 2);
+define('GRN_CALENDAR_TYPE_SYSTEM_MEMO', 3);
+define('GRN_CALENDAR_TYPE_USER_MEMO', 4);
+define('GRN_CALENDAR_TYPE_WORKDAY', 5);
+
+/**
+ * カレンダーサービスを提供する。
+ *
+ * @package grn.common.calendar
+ */
+class GRN_CalendarService extends CB_ModuleBase
+{
+    /**
+     * @access private
+     */
+    var $_loader;
+
+    /**
+     * @access private
+     */
+    var $_extensions = false;
+
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        parent::__construct(GRN_CALENDAR_MODULEID);
+        $this->_loader = $this->getPluginLoader();
+    }
+
+    /**
+     * インスタンスを取得する
+     *
+     * @return GRN_CalendarService
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_CalendarService();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * ユーザー指定でイベント情報を取得する
+     *
+     */
+    function getDaysInfo(
+        $start,
+        $end,
+        &$user,
+        $types = null,
+        $use_extension = true
+    ) {
+        $setting = null;
+
+        // セッションキャッシュ
+        if ($user) {
+            $session = $this->getSession();
+            $setting = $session->get('setting');
+        }
+
+        if ( ! is_array($setting)) {
+            $cm = GRN_CalendarManager::getInstance();
+
+            if ( ! $user) {
+                $sys_cal = $cm->getSystemCalendar(GRN_CALENDAR_SYSTEM_DEFAULT);
+                $setting['system_calendar'] = $sys_cal->getOID();
+                $setting['my_calendar'] = null;
+            } else {
+                $setting['system_calendar'] = GRN_CALENDAR_SYSTEM_DEFAULT;
+                require_once('fw/i18n/base.csp');
+                $sys_cal = CB_BaseManager::getUserCalendar($user->getOID());
+                if ($sys_cal) {
+                    $setting['system_calendar'] = $sys_cal->getOID();
+                }
+                $my_cal = $cm->getPreferenceUserCalendar($user);
+                $setting['my_calendar'] = null;
+                if ($my_cal) {
+                    $setting['my_calendar'] = $my_cal->getOID();
+                }
+            }
+
+            $setting['basic_event'] = $types;
+            if (is_null($types)) {
+                $setting['basic_event'] = $this->getBasicEventTypes();
+            }
+
+            // 拡張表示項目の取得
+            // 利用目的によっては取得しない
+            if ($use_extension) {
+                $this->setExtensionSetting($setting, $user);
+            }
+
+            // セッションキャッシュ
+            if ($user) {
+                $session->set('setting', $setting);
+            }
+        } else {
+            if ( ! $use_extension) {
+                unset($setting['extension']);
+            } elseif ( ! isset($setting['extension'])) {
+                // 前に$use_extensionがFALSEで$settingが作成されたことがあるときのためのチェック
+                $this->setExtensionSetting($setting, $user);
+            }
+        }
+
+        if (count(array_diff($setting['basic_event'], (array)$types))) {
+            $setting['basic_event'] = $types;
+        }
+
+        $ret = $this->getDaysInfoBySetting($start, $end, $setting);
+
+        return $ret;
+    }
+
+    /**
+     * Set calendar extension settings
+     *
+     * @param array   $setting
+     * @param CB_User $user
+     */
+    private function setExtensionSetting(&$setting, $user)
+    {
+        $setting['extension'] = [];
+        $extensions = $this->listExtensions();
+        foreach (array_keys($extensions) as $extension) {
+            $prop = $this->getExtensionProperties($extension,
+                $user);
+            $setting['extension'][$extension] = $prop;
+        }
+    }
+
+    /*
+     * 設定を利用してイベント情報を取得する
+     *
+     * @param array $setting    設定
+     * @return array
+     *
+     * $setting[ 'system_calendar' ] = $cid
+     *         [ 'my_calendar' ]   = $cid or null
+     *         [ 'basic_event' ] = array()
+     *         [ 'extension' ][ 'weather' ] = ....
+     */
+    function getDaysInfoBySetting($start, $end, $setting)
+    {
+        if ( ! array_key_exists('my_calendar', $setting)
+             ||
+             ! array_key_exists('system_calendar', $setting)
+        ) {
+            return false;
+        }
+
+        if (isset($setting['basic_event'])) {
+            $basic_event = $setting['basic_event'];
+        } else {
+            $basic_event = $this->getBasicEventTypes();
+        }
+        assert('is_array( $basic_event ) ');
+
+        $days = [];
+        if (count($basic_event) > 0) {
+            $cm = GRN_CalendarManager::getInstance();
+
+            $cid = $setting['system_calendar'];
+            $cal = $cm->getSystemCalendar($cid);
+            if ( ! $cal) {
+                $cal = $cm->getSystemCalendar(GRN_CALENDAR_SYSTEM_DEFAULT);
+            }
+
+            $contents = $cal->getDaysInfoFast('system', $start, $end,
+                $basic_event);
+            foreach ($contents as $data) {
+                $days[$data['date']->format()][] = $data;
+            }
+            if ($setting['my_calendar']) {
+                $cal = $cm->getUserCalendar($setting['my_calendar']);
+                if ($cal) {
+                    $contents = $cal->getDaysInfoFast('user', $start, $end,
+                        $basic_event);
+                    foreach ($contents as $data) {
+                        $days[$data['date']->format()][] = $data;
+                    }
+                }
+            }
+        }
+
+        // 拡張イベントの取得
+        $extension_setting = false;
+        if (isset($setting['extension'])) {
+            $extension_setting = $setting['extension'];
+        }
+
+        $extensions = $this->listExtensions();
+        foreach (array_keys($extensions) as $extension) {
+            $logic = $this->getLogic($extension);
+            $ret = $logic->getDaysInfo($start, $end,
+                $extension_setting[$extension]);
+            $days = array_merge_recursive((array)$days, (array)$ret);
+        }
+
+        return $days;
+    }
+
+    /**
+     * 併用するカレンダーのイベント情報を取得する
+     *
+     */
+    function getDaysInfoFromSharedCalendar($start, $end, &$user, $types = null)
+    {
+        $days = [];
+        $setting = [];
+
+        $setting['basic_event'] = $types;
+        if (is_null($types)) {
+            $setting['basic_event'] = $this->getBasicEventTypes();
+        }
+        $setting['my_calendar'] = null;
+
+        if ($user) {
+            $cm = GRN_CalendarManager::getInstance();
+            require_once('fw/i18n/base.csp');
+            $sys_cal = CB_BaseManager::getUserCalendar($user->getOID());
+            $sys_cal_id = $sys_cal ? $sys_cal->getOID()
+                : GRN_CALENDAR_SYSTEM_DEFAULT;
+
+            $cal_list = $cm->listSystemCalendarNames();
+
+            $shared_cids = $cm->getPreferenceSharedCalendar($user);
+            foreach ($shared_cids as $scid) {
+                if ($scid != $sys_cal_id
+                    && array_key_exists($scid, $cal_list)
+                ) {
+                    $setting['system_calendar'] = $scid;
+                    $ret
+                        = $this->getDaysInfoBySetting($start,
+                        $end, $setting);
+                    foreach (array_keys($ret) as $key1) {
+                        foreach (array_keys($ret[$key1]) as $key2) {
+                            $ret[$key1][$key2]['type']
+                                = GRN_CALENDAR_TYPE_SYSTEM_MEMO;
+                        }
+                    }
+                    $days = array_merge_recursive($days, $ret);
+                }
+            }
+        }
+
+        return $days;
+    }
+
+    /**
+     * 拡張項目のパラメータを展開する
+     */
+    function parseParameter($params, $prefix = '')
+    {
+        $ret = [];
+        foreach ($params as $key => $value) {
+            if (strncmp($key, $prefix, strlen($prefix)) === 0) {
+                $key = substr($key, strlen($prefix));
+                $ret[$key] = $value;
+            }
+        }
+
+        return $ret;
+    }
+
+    /**
+     * @access private
+     */
+    function _getProfile(&$user)
+    {
+        if ($user) {
+            $profile = $this->getUserProfile($user);
+        } else {
+            $profile = $this->getSystemProfile();
+        }
+
+        return $profile;
+    }
+
+    /**
+     * 拡張項目の設定を取得する
+     */
+    function getExtensionProperties($ext_name, &$user)
+    {
+        $profile = $this->_getProfile($user);
+        if ($profile->getAttribute($ext_name, $prop)) {
+            return $prop;
+        }
+
+        return false;
+    }
+
+    /**
+     * 拡張項目の設定を保存する
+     */
+    function setExtensionProperties($ext_name, $prop, &$user)
+    {
+        $profile = $this->_getProfile($user);
+
+        if ($profile->getAttribute($ext_name, $dummy)) {
+            return $profile->updateAttribute($ext_name, $prop);
+        } else {
+            return $profile->createAttribute($ext_name, $prop);
+        }
+    }
+
+    /**
+     * カレンダー拡張モジュール名の一覧を取得する
+     */
+    function listExtensions()
+    {
+        if (is_array($this->_extensions)) {
+            return $this->_extensions;
+        }
+
+        $files = $this->_loader->listFiles();
+        $this->_extensions = [];
+
+        foreach ($files as $file) {
+            $module = basename($file, '.csp');
+            $this->_extensions[$module] = $module;
+        }
+
+        return $this->_extensions;
+    }
+
+    /**
+     * カレンダー拡張ロジックを取得する
+     *
+     * @param string $type イベントタイプ
+     *
+     * @return plugin_grn_common_calendar_weather|plugin_grn_common_calendar_six_kinds_of_day
+     */
+    function getLogic($type)
+    {
+        /**
+         * @var $ret plugin_grn_common_calendar_weather|plugin_grn_common_calendar_six_kinds_of_day
+         */
+        $ret = $this->_loader->loadDriver($type);
+
+        return $ret;
+    }
+
+    /**
+     * 基本イベントのリストを取得する
+     */
+    function getBasicEventTypes()
+    {
+        return [
+            GRN_CALENDAR_TYPE_PUBLICHOLIDAY,
+            GRN_CALENDAR_TYPE_MEMORIALDAY,
+            GRN_CALENDAR_TYPE_SYSTEM_MEMO,
+            GRN_CALENDAR_TYPE_USER_MEMO,
+            GRN_CALENDAR_TYPE_WORKDAY
+        ];
+    }
+
+    /**
+     * 基本イベント名を取得する
+     */
+    function getEventName($type)
+    {
+        $id = 'event_type_' . $type;
+
+        return $this->getMessage($id);
+    }
+}
+
+/**
+ * カレンダーを管理する。
+ *
+ * @package grn.common.calendar
+ */
+class GRN_CalendarManager
+{
+    /**
+     * @access private
+     */
+    var $_system_calendar_table;
+
+    /**
+     * @access private
+     */
+    var $_user_calendar_table;
+
+    /**
+     * コンストラクタ
+     *
+     * @access private
+     */
+    function __construct()
+    {
+        $this->_system_calendar_table = cb_class2table('GRN_SystemCalendar');
+        $this->_user_calendar_table = cb_class2table('GRN_UserCalendar');
+    }
+
+    /**
+     * シングルトンインスタンス取得する。
+     *
+     * @return GRN_CalendarManager
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_CalendarManager();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * @access private
+     */
+    function _getSystemRow($name)
+    {
+        $rowset = new CB_Rowset($this->_system_calendar_table);
+        $condition = $rowset->queryf("col_name='@S'", $name);
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return $row;
+    }
+
+    /**
+     * @access private
+     */
+    function _getUserRow($name, $user)
+    {
+        $conn = $this->_user_calendar_table->getDBConnection();
+        $rowset = new CB_RowSet($this->_user_calendar_table);
+        $condition = sprintf("col_name='%s' and col_user='%s'",
+            $conn->escape($name), $conn->escape($user->getOID()));
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return $row;
+    }
+
+    /**
+     * システムカレンダーを追加する。
+     * idによってオブジェクトIDを指定することができる。
+     * 指定しない場合自動で追加される。
+     *
+     * @param string $name カレンダー名
+     * @param string $code カレンダーコード
+     * @param int    $id   オブジェクトID
+     *
+     * @return object GRN_SystemCalendar
+     */
+    public function addSystemCalendar($name, $code, $id = null)
+    {
+        $this->checkDuplicateCode($code);
+
+        $row = $this->_system_calendar_table->newRow($id);
+        $row->set('name', $name);
+        $row->set('code', $code);
+        $row->updateNow();
+
+        return $row;
+    }
+
+    public function checkDuplicateCode($code)
+    {
+        $calendar = $this->getSystemCalendarByCode($code);
+        if ($calendar) {
+            cb_throw_error(E_GRN_CALENDAR_DUPLICATE_CODE);
+        }
+    }
+
+    /**
+     * システムカレンダーを取得する。
+     *
+     * @param int $id オブジェクトID
+     *
+     * @return mixed GRN_SystemCalendar または null
+     */
+    function getSystemCalendar($id)
+    {
+        $row = $this->_system_calendar_table->getRow($id);
+
+        return $row;
+    }
+
+    /**
+     * Get system calendar by calendar code
+     *
+     * @param string $code
+     *
+     * @return CB_Row
+     */
+    public function getSystemCalendarByCode($code)
+    {
+        $rowset = new CB_RowSet($this->_system_calendar_table);
+        $condition = $rowset->queryf("col_code='@S'", $code);
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return $row;
+    }
+
+    /**
+     * システムカレンダーを削除する。
+     *
+     * @param int $id オブジェクトID
+     *
+     * @return bool
+     */
+    function removeSystemCalendar($id)
+    {
+        $row = $this->_system_calendar_table->getRow($id);
+        if ( ! $row || $row->getOID() == 1) {
+            cb_throw_error(E_GRN_CALENDAR_CALENDAR_NOT_FOUND);
+        }
+
+        return $row->delete();
+    }
+
+    /**
+     * システムカレンダーを更新する。
+     *
+     * @param int    $id   オブジェクトID
+     * @param string $name カレンダー名
+     * @param string $code カレンダーコード
+     *
+     * @return object GRN_SystemCalendar
+     */
+    public function updateSystemCalendar($id, $name, $code)
+    {
+        $row = $this->_system_calendar_table->getRow($id);
+        if ( ! $row) {
+            cb_throw_error(E_GRN_CALENDAR_CALENDAR_NOT_FOUND);
+        }
+        if ($row->get('code') !== $code) {
+            $this->checkDuplicateCode($code);
+        }
+        $row->set('name', $name);
+        $row->set('code', $code);
+        $row->updateNow();
+
+        return $row;
+    }
+
+    /**
+     * カレンダー名の一覧を取得する。
+     *
+     * @return array array( '1' => 'AAAAA', ... );
+     */
+    function listSystemCalendarNames()
+    {
+        $rowset = new CB_RowSet($this->_system_calendar_table);
+        $rowset->addOrderColumn('_id');
+        $names = [];
+        while ($row = $rowset->iterate()) {
+            $names[$row->getOID()] = $row->get('name');
+            if ($row->getOID() == GRN_CALENDAR_SYSTEM_DEFAULT) {
+                $names[$row->getOID()] = $row->getDefaultCalendarName();
+            }
+        }
+
+        return $names;
+    }
+
+    /**
+     * ユーザーカレンダーを追加する。
+     *
+     * @param string $name カレンダー名
+     * @param object CB_User    $user       ユーザー
+     * @param int    $id   オブジェクトID
+     *
+     * @return object GRN_UserCalendar
+     */
+    function addUserCalendar($name, $user, $id = null)
+    {
+        assert('is_string( $name )');
+        assert('is_a( $user, \'cb_user\' )');
+
+        $row = $this->_user_calendar_table->newRow($id);
+        $row->set('name', $name);
+        $row->set('user', $user);
+        $row->updateNow();
+
+        return $row;
+    }
+
+    /**
+     * ユーザーカレンダーを取得する。
+     *
+     * @param int $id オブジェクトID
+     *
+     * @return object GRN_UserCalendar または null
+     */
+    function getUserCalendar($id)
+    {
+        $ret = $this->_user_calendar_table->getRow($id);
+
+        return $ret;
+    }
+
+    /**
+     *  ユーザーカレンダーを削除する。
+     *
+     * @param int $id オブジェクトID
+     *
+     * @return bool
+     */
+    function removeUserCalendar($id)
+    {
+        $row = $this->_user_calendar_table->getRow($id);
+        if ( ! $row) {
+            cb_throw_error(E_GRN_CALENDAR_CALENDAR_NOT_FOUND);
+        }
+
+        return $row->delete();
+    }
+
+    /**
+     * ユーザーカレンダーを更新する。
+     *
+     * @param int    $id   オブジェクトID
+     * @param string $name カレンダー名
+     *
+     * @return object GRN_UserCalendar
+     */
+    function updateUserCalendar($id, $name, &$user)
+    {
+        $row = $this->_user_calendar_table->getRow($id);
+        if ( ! $row) {
+            cb_throw_error(E_GRN_CALENDAR_CALENDAR_NOT_FOUND);
+        }
+        $row->set('name', $name);
+        $row->set('user', $user);
+
+        return $row;
+    }
+
+    /**
+     * ユーザーカレンダー名の一覧を取得する。
+     *
+     * @return array array( '1' => 'AAAAA', ... );
+     */
+    function listUserCalendarNames(&$user)
+    {
+        $rowset = new CB_RowSet($this->_user_calendar_table);
+        $condition = $rowset->queryf("col_user='@S'", $user->getOID());
+        $rowset->addCondition($condition);
+        $names = [];
+        while ($row = $rowset->iterate()) {
+            $names[$row->getOID()] = $row->get('name');
+        }
+
+        return $names;
+    }
+
+    /**
+     * ユーザーの利用するカレンダーを設定する
+     */
+    function setPreferenceUserCalendar(&$user, $cid)
+    {
+        if ( ! $user) {
+            return false;
+        }
+
+        $profile = cb_get_user_profile($user, GRN_CALENDAR_MODULEID);
+
+        return $this->_setProfileAttribute($profile, 'my_calendar', $cid);
+    }
+
+    /**
+     * ユーザーの併用するカレンダーを設定する
+     */
+    function setPreferenceSharedCalendar(&$user, $cids)
+    {
+        $profile = cb_get_user_profile($user, GRN_CALENDAR_MODULEID);
+
+        return $this->_setProfileAttribute($profile, 'shared_calendar', $cids);
+    }
+
+    /**
+     * ユーザーが使用するユーザーカレンダーを取得する。
+     *
+     * @param object CB_User    $user   ユーザー
+     *
+     * @return object GRN_UserCalendar
+     */
+    function getPreferenceUserCalendar(&$user)
+    {
+        if ( ! $user) {
+            $___ret = false;
+
+            return $___ret;
+        }
+
+        $profile = cb_get_user_profile($user, GRN_CALENDAR_MODULEID);
+        $ret = $profile->getAttribute('my_calendar', $id);
+        if ($ret) {
+            $ret = $this->getUserCalendar($id);
+
+            return $ret;
+        } else {
+            $cal = $this->addUserCalendar('', $user);
+            $this->setPreferenceUserCalendar($user, $cal->getOID());
+
+            return $cal;
+        }
+        {
+            $___ret = false;
+
+            return $___ret;
+        }
+    }
+
+    /**
+     * ユーザーが併用するシステムカレンダーを取得する。
+     *
+     * @param object CB_User    $user   ユーザー
+     *
+     * @return array            $ids
+     */
+    function getPreferenceSharedCalendar(&$user)
+    {
+        $profile = cb_get_user_profile($user, GRN_CALENDAR_MODULEID);
+        $ret = $profile->getAttribute('shared_calendar', $ids);
+        if ( ! $ret) {
+            $ids = [];
+        }
+
+        return $ids;
+    }
+
+    /**
+     * @access private
+     */
+    function _setProfileAttribute(&$profile, $key, $value)
+    {
+        $ret = $profile->getAttribute($key, $dummy);
+        if ($ret) {
+            return $profile->updateAttribute($key, $value);
+        } else {
+            return $profile->createAttribute($key, $value);
+        }
+    }
+}
+
+
+/**
+ * カレンダーベースクラス
+ *
+ * @package grn.common.calendar
+ * @abstract
+ */
+class GRN_Calendar extends CB_PersistentBase
+{
+    var $col_name = ['type' => 'char', 'notnull' => true];
+
+    /**
+     * @access private
+     */
+    var $_profile;
+
+    /**
+     * @access private
+     */
+    var $_attribute_table;
+
+    /**
+     * @access private
+     */
+    function _getRowById($id)
+    {
+        $rowset = new CB_RowSet($this->_attribute_table);
+        $condition = $rowset->queryf("col_calendar='@S' and _id='@S'",
+            $this->getOID(), $id);
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return $row;
+    }
+
+    /**
+     * @access private
+     */
+    function _getRow($date, $type)
+    {
+        $conn = $this->_attribute_table->getDBConnection();
+        $rowset = new CB_RowSet($this->_attribute_table);
+        $condition
+            = sprintf("col_calendar='%s' and col_type=%ld and col_date='%s'",
+            $conn->escape($this->getOID()), (int)$type,
+            $conn->escape($date->format()));
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return $row;
+    }
+
+    /**
+     * @access private
+     * @return CB_RowSet
+     */
+    function _getRows($start, $end, $type = null)
+    {
+        $conn = $this->_attribute_table->getDBConnection();
+        $rowset = new CB_RowSet($this->_attribute_table);
+
+        $type_condition = null;
+        if (is_array($type) && count($type) > 0) {
+            $tmp_types = [];
+            foreach ($type as $t) {
+                array_push($tmp_types, "'" . $conn->escape($t) . "'");
+            }
+
+            $type_condition = 'col_type IN ( ' . implode(',', $tmp_types) . ')';
+        }
+
+        if ( ! is_null($type_condition)) {
+            $condition
+                = sprintf("col_calendar='%s' and %s and col_date between '%s' and '%s'",
+                $conn->escape($this->getOID()), $type_condition,
+                $conn->escape($start->format()), $conn->escape($end->format()));
+        } else {
+            $condition
+                = sprintf("col_calendar='%s' and col_date between '%s' and '%s'",
+                $conn->escape($this->getOID()), $conn->escape($start->format()),
+                $conn->escape($end->format()));
+        }
+
+        $rowset->addCondition($condition);
+        $rowset->addOrderColumn('col_date');
+
+        return $rowset;
+    }
+
+    /**
+     * 属性テーブルを取得する。
+     *
+     * return bool
+     */
+    function getAttributeTable()
+    {
+        return $this->_attribute_table;
+    }
+
+    /**
+     * 日付に情報を追加する。
+     *
+     * @param object CB_Date    $date       日付
+     * @param string $type 情報のタイプ( 祝日、記念日, メモ, ... )
+     *                     @ @param string $info 書き込む情報
+     *                     return bool
+     */
+    function addDayInfo($date, $type, $info)
+    {
+        if (mb_strlen($info) > 0xFFFF) {
+            cb_throw_error(E_GRN_CALENDAR_TOO_LONG_EVENT_CONTENTS,
+                null,
+                ['max' => 0xFFFF]);
+        }
+
+        if (false === cb_date_validate_date($date)) {
+            cb_throw_error(E_COMMON_INVALID_DATE);
+        }
+
+        $row = $this->_attribute_table->newRow();
+        $row->set('calendar', $this);
+        $row->set('type', $type);
+        $row->set('date', $date);
+        $row->set('info', $info);
+
+        return $row->updateNow();
+    }
+
+    /**
+     * 日付に書き込んである情報を更新する
+     *
+     * @param int    $id   オブジェクトID
+     * @param object CB_Date    $date       日付
+     * @param string $type 情報のタイプ( 祝日、記念日, メモ, ... )
+     *                     @ @param string $info 書き込む情報
+     *                     return bool
+     */
+    function updateDayInfo($id, $date, $type, $info)
+    {
+        if (mb_strlen($info) > 0xFFFF) {
+            cb_throw_error(E_GRN_CALENDAR_TOO_LONG_EVENT_CONTENTS,
+                null,
+                ['max' => 0xFFFF]);
+        }
+
+        $row = $this->_getRowById($id);
+        if ( ! $row) {
+            cb_throw_error(E_GRN_CALENDAR_DAY_NOT_FOUND);
+        }
+
+        if (false === cb_date_validate_date($date)) {
+            cb_throw_error(E_COMMON_INVALID_DATE);
+        }
+
+        $row->set('calendar', $this);
+        $row->set('type', $type);
+        $row->set('date', $date);
+        $row->set('info', $info);
+
+        return $row->updateNow();
+    }
+
+    /**
+     * 日付に書き込んである情報を取得する。
+     *
+     * @param int $id オブジェクトID
+     *
+     * @return object GRN_CalendarAttribute
+     */
+    function getDayInfoById($oid)
+    {
+        $ret = $this->_getRowById($oid);
+
+        return $ret;
+    }
+
+    /**
+     * 日付に書き込んである情報を取得する。
+     *
+     * @param object CB_Date    $date   日付
+     * @param string $type 情報のタイプ
+     *
+     * @return object GRN_CalendarAttribute
+     */
+    function getDayInfo($date, $type)
+    {
+        $ret = $this->_getRow($date, $type);
+
+        return $ret;
+    }
+
+    /**
+     * 範囲を指定して日付に書き込んである情報を取得する。
+     *
+     * @param object CB_Date    $start      開始日付
+     * @param object CB_Date    $end        終了日付
+     * @param string $type 情報のタイプ
+     *
+     * @return object GRN_CalendarAttribute
+     */
+    function getDaysInfo($start, $end, $type = null)
+    {
+        $rowset = $this->_getRows($start, $end, $type);
+        $rowset->addOrderColumn('col_date, col_type, _id');
+
+        return $rowset;
+    }
+
+    /**
+     * 範囲を指定して日付に書き込んである情報を取得する。
+     * ( クエリーによる直取 )
+     *
+     * @param object CB_Date    $start      開始日付
+     * @param object CB_Date    $end        終了日付
+     * @param string $type 情報のタイプ
+     *
+     * @return object GRN_CalendarAttribute
+     */
+    function getDaysInfoFast($cal_type, $start, $end, $type = null)
+    {
+        global $G_container_base;
+        $db = $G_container_base->getInstance('dbconn');
+
+        $condition
+            = sprintf("WHERE col_calendar='%s' AND col_date between '%s' AND '%s'",
+            $db->escape($this->getOID()), $db->escape($start->format()),
+            $db->escape($end->format()));
+
+        if ($type) {
+            $tmp_type = [];
+            foreach ($type as $t) {
+                array_push($tmp_type, "'" . $db->escape($t) . "'");
+            }
+            $condition .= sprintf(' AND col_type IN ( %s )',
+                implode(',', $tmp_type));
+        }
+
+        $order_by = 'col_date, col_type, _id';
+        $query
+            = "SELECT * FROM tab_grn_{$cal_type}calendarattribute {$condition} ORDER BY {$order_by}";
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        $date = new CB_Date;
+        $days = [];
+        $n = $db->num_rows($result);
+        for ($i = 0; $i < $n; $i++) {
+            $r = $db->fetch_assoc($result);
+            $date->parse($r['col_date']);
+            $days[$r['_id']] = [
+                'date' => clone $date,
+                'type' => $r['col_type'],
+                'data' => $r['col_info']
+            ];
+        }
+
+        return $days;
+    }
+
+    /**
+     * 日付に書き込んである情報を削除する。
+     *
+     * @param int $id オブジェクトID
+     *
+     * @return bool
+     */
+    function removeDayInfoById($id)
+    {
+        $row = $this->_getRowById($id);
+        if ($row) {
+            return $row->delete();
+        }
+
+        return true;
+    }
+
+    /**
+     * 日付に書き込んである情報を削除する。
+     *
+     * @param object CB_Date    $date   日付
+     * @param string $type 情報のタイプ
+     *
+     * @return bool
+     */
+    function removeDayInfo($date, $type)
+    {
+        $row = $this->_getRow($date, $type);
+        if ($row) {
+            return $row->delete();
+        }
+
+        return true;
+    }
+
+    /**
+     * 範囲を指定して日付に書き込んである情報を削除する。
+     *
+     * @param object CB_Date    $start      開始日付
+     * @param object CB_Date    $end        終了日付
+     * @param string $type 情報のタイプ
+     *
+     * @return bool
+     */
+    function removeDaysInfo($start, $end, $type = null)
+    {
+        $rowset = $this->_getRows($start, $end, $type);
+        while ($row = $rowset->iterate()) {
+            $row->delete();
+        }
+
+        return true;
+    }
+}
+
+/**
+ * システムカレンダークラス
+ *
+ * @package grn.common.calendar
+ */
+class GRN_SystemCalendar extends GRN_Calendar
+{
+    var $col_code = ['type' => 'char', 'notnull' => true];
+    var $idx_code = ['cols' => 'code', 'unique' => true];
+
+    function __construct(&$row)
+    {
+        parent::__construct($row);
+        $this->_attribute_table = cb_class2table('GRN_SystemCalendarAttribute');
+        $this->_profile = $this->getProfile();
+    }
+
+    function isAllowedType($type)
+    {
+        if ($type == GRN_CALENDAR_TYPE_PUBLICHOLIDAY
+            || $type == GRN_CALENDAR_TYPE_SYSTEM_MEMO
+            || $type == GRN_CALENDAR_TYPE_WORKDAY
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param string $col_name
+     *
+     * @return CB_Row|mixed
+     */
+    function get($col_name)
+    {
+        if ($col_name === 'name') {
+            // default system calendar.
+            if ($this->getOID() == 1) {
+                $ret = cb_msg(GRN_CALENDAR_MODULEID, 'default_calendar_name');
+
+                return $ret;
+            }
+        }
+        $ret = parent::get($col_name);
+
+        return $ret;
+    }
+
+    function getDefaultCalendarName()
+    {
+        return cb_msg(GRN_CALENDAR_MODULEID, 'default_calendar_name');
+    }
+
+    function getProfile()
+    {
+        $ret = cb_get_system_profile(GRN_CALENDAR_MODULEID);
+
+        return $ret;
+    }
+}
+
+/**
+ * ユーザーカレンダークラス
+ *
+ * @package grn.common.calendar
+ */
+class GRN_UserCalendar extends GRN_Calendar
+{
+    var $col_user
+        = [
+            'type'    => 'relation',
+            'to'      => 'CB_User',
+            'notnull' => true
+        ];
+
+    function __construct(&$row)
+    {
+        parent::__construct($row);
+        $this->_attribute_table = cb_class2table('GRN_UserCalendarAttribute');
+        $this->_profile = $this->getProfile($this->get('user'));
+    }
+
+    function isAllowedType($type)
+    {
+        if ($type == GRN_CALENDAR_TYPE_MEMORIALDAY
+            || $type == GRN_CALENDAR_TYPE_USER_MEMO
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    function getProfile($user)
+    {
+        if ( ! $user) {
+            $___ret = null;
+
+            return $___ret;
+        }
+        $ret = cb_get_user_profile($user, GRN_CALENDAR_MODULEID);
+
+        return $ret;
+    }
+}
+
+/**
+ * カレンダーへの書き込み情報ベースクラス
+ *
+ * @package grn.common.calendar
+ * @abstract
+ */
+class GRN_CalendarAttribute extends CB_PersistentBase
+{
+    var $col_type = ['type' => 'int', 'notnull' => true];
+    var $col_date = ['type' => 'date', 'notnull' => true];
+    var $col_info = ['type' => 'char', 'length' => 0xFFFF];
+
+    var $col_reserve_int1 = ['type' => 'int', 'lazy' => true];
+    var $col_reserve_int2 = ['type' => 'int', 'lazy' => true];
+    var $col_reserve_int3 = ['type' => 'int', 'lazy' => true];
+    var $col_reserve_text1 = ['type' => 'char', 'lazy' => true];
+    var $col_reserve_text2 = ['type' => 'char', 'lazy' => true];
+    var $col_reserve_text3 = ['type' => 'char', 'lazy' => true];
+    var $col_reserve_blob1 = ['type' => 'blob', 'lazy' => true];
+    var $col_reserve_blob2 = ['type' => 'blob', 'lazy' => true];
+    var $col_reserve_blob3 = ['type' => 'blob', 'lazy' => true];
+
+    function __construct(&$row)
+    {
+        parent::__construct($row);
+    }
+}
+
+/**
+ * システムカレンダーへの書き込み情報クラス
+ *
+ * @package grn.common.calendar
+ */
+class GRN_SystemCalendarAttribute extends GRN_CalendarAttribute
+{
+    var $col_calendar
+        = [
+            'type'    => 'relation',
+            'to'      => 'GRN_SystemCalendar',
+            'notnull' => true
+        ];
+    var $idx_c_d_t_p = ['cols' => ['calendar', 'date', 'type', null]];
+
+    function GRN_SystemCalendarAttibute(&$row)
+    {
+        parent::__construct($row);
+    }
+}
+
+/**
+ * ユーザーカレンダーへの書き込み情報クラス
+ *
+ * @package grn.common.calendar
+ */
+class GRN_UserCalendarAttribute extends GRN_CalendarAttribute
+{
+    var $col_calendar
+        = [
+            'type'    => 'relation',
+            'to'      => 'GRN_UserCalendar',
+            'notnull' => true
+        ];
+    var $idx_c_d_t_p = ['cols' => ['calendar', 'date', 'type', null]];
+
+    function __construct(&$row)
+    {
+        parent::__construct($row);
+    }
+}
+
+/**
+ * カレンダーユーテリティクラス
+ *
+ * @package grn.common.calendar
+ */
+class GRN_CalendarUtil
+{
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+    }
+
+    /**
+     * カレンダーユーテリティのシングルトンインスタンスを取得する
+     *
+     * @return GRN_CalendarService
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_CalendarUtil();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * カレンダーの日付情報からその日が就業日かどうか返す
+     *
+     * @param array   $day_info
+     * @param CB_User $user CB_User or null
+     *
+     * @return boolean
+     */
+    public function isWorkDay($day_info, $user = null)
+    {
+        require_once('fw/i18n/base.csp');
+        $user_id = ($user instanceof CB_User) ? $user->getOID()
+            : null;
+        $user_base_setting = CB_BaseManager::getCurrentBaseSetting($user_id);
+
+        if ($user_base_setting->getApplyCalendar()
+            && $day_info['type'] == GRN_CALENDAR_TYPE_WORKDAY
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * 日付型を変換する
+     *
+     * @param object CB_Date    $date       日付
+     * @param array $calendars カレンダーデータ
+     *                         ( GRN_CalendarService::getDaysInfoによって返るデータ )
+     */
+    function getDateType($date, $calendars, $user = null)
+    {
+        $is_holiday = false;
+        $d = $date->format();
+        if (array_key_exists($d, $calendars)) {
+            foreach ($calendars[$d] as $cal) {
+                if ($this->isWorkDay($cal, $user)) {
+                    return 's_date_workday';
+                } elseif ($cal['type'] == GRN_CALENDAR_TYPE_PUBLICHOLIDAY
+                          && $is_holiday === false
+                ) {
+                    $is_holiday = true;
+                }
+            }
+            if ($is_holiday) {
+                return 's_date_holiday';
+            }
+        }
+
+        $dow = cb_get_day_of_week($date->year, $date->month, $date->day);
+
+        switch ($dow) {
+            case 0:
+                return 's_date_sunday';
+            case 1:
+                return 's_date_monday';
+            case 2:
+                return 's_date_tuesday';
+            case 3:
+                return 's_date_wednesday';
+            case 4:
+                return 's_date_thursday';
+            case 5:
+                return 's_date_friday';
+            case 6:
+                return 's_date_saturday';
+            default:
+                assert(false);
+        }
+    }
+
+    /**
+     * 日付に対応する曜日を取得する
+     *
+     * @param object CB_Date    $date       日付
+     *
+     * @return string   日, 月, ...
+     */
+    function getNameDayOfWeek($date)
+    {
+        $dow = cb_get_day_of_week($date->year, $date->month, $date->day);
+
+        return cb_msg('fw.date', "WDayFull{$dow}");
+    }
+
+    /**
+     * カレンダーの開始日付を取得する
+     *
+     * @param object CB_Date    $d      日付
+     * @param int $start 開始曜日(0=日曜 - 5=土曜)
+     *
+     * @return object CB_DateEx 開始日付
+     */
+    function getStartDate($d, $start)
+    {
+        $dx = new CB_DateEx($d);
+        $dx->day = 1;
+        $offset = (intval($start) - $dx->getDayOfWeek());
+        if ($offset > 0) {
+            $offset = -7 + $offset;
+        }
+        $dx->moveDays($offset);
+
+        return $dx;
+    }
+
+    /**
+     * カレンダーの終了日付を取得する
+     *
+     * @param object CB_Date    $d      日付
+     * @param int $start 開始曜日(0=日曜 - 5=土曜)
+     *
+     * @return object CB_DateEx 終了日付
+     */
+    function getEndDate($d, $start)
+    {
+        $dx = new CB_DateEx($d);
+        $dx->day = $dx->getEndOfMonthDay();
+
+        $offset = 6 - ($dx->getDayOfWeek() - intval($start));
+        if ($offset > 6) {
+            $offset = 0;
+        }
+        $dx->moveDays($offset);
+
+        return $dx;
+    }
+
+    /**
+     * カレンダーの前の月(最終日)を取得する。
+     *
+     * @param object CB_Date    $d      日付
+     * @param int $move 移動量
+     *
+     * @return object CB_DateEx 前月最終日
+     */
+    function getPrevMonth($d, $move = 1)
+    {
+        $d->day = 1;
+        $dx = new CB_DateEx($d);
+        $dx->moveMonths(-1 * intval($move));
+        $dx->day = $dx->getEndOfMonthDay();
+
+        return $dx;
+    }
+
+    /**
+     * カレンダーの次の月(最初日)を取得する。
+     *
+     * @param object CB_Date    $d      日付
+     * @param int $move 移動量
+     *
+     * @return object CB_DateEx 次月最初日
+     */
+    function getNextMonth($d, $move = 1)
+    {
+        $d->day = 1;
+        $dx = new CB_DateEx($d);
+        $dx->moveMonths(1 * intval($move));
+
+        return $dx;
+    }
+
+    /**
+     * 日付情報(文字列)からCB_Dateオブジェクトへ変換
+     *
+     * @param  string $event_date 日付(文字列)
+     *
+     * @retuen object CB_Date   $date or NULL
+     */
+    function convertStringToDate($event_date)
+    {
+        $date = new CB_Date;
+        // parse date.
+        if (preg_match('#([0-9]+)-([0-9]+)-([0-9]+)#', $event_date, $regs)) {
+            $date->year = intval($regs[1]);
+            $date->month = intval($regs[2]);
+            $date->day = intval($regs[3]);
+        } elseif (preg_match('#([0-9]+)-([0-9]+)#', $event_date, $regs)) {
+            $now = getdate();
+
+            $date->year = $now['year'];
+            $date->month = intval($regs[1]);
+            $date->day = intval($regs[2]);
+        } elseif (preg_match('#([0-9]+)/([0-9]+)/([0-9]+)#', $event_date,
+            $regs)
+        ) {
+            $date->year = intval($regs[1]);
+            $date->month = intval($regs[2]);
+            $date->day = intval($regs[3]);
+        } elseif (preg_match('#([0-9]+)/([0-9]+)#', $event_date, $regs)) {
+            $now = getdate();
+
+            $date->year = $now['year'];
+            $date->month = intval($regs[1]);
+            $date->day = intval($regs[2]);
+        } else {
+            return null;
+        }
+
+        return $date;
+    }
+}
+
+/**
+ * カレンダーへの祝日自動取り込みクラス
+ *
+ * @package grn.common.calendar
+ */
+class GRN_Calendar_Auto_Import_Holiday
+{
+    private $_cache_dir;
+    private $_cache_file;
+
+    /**
+     * constructor
+     */
+    private function __construct()
+    {
+        $this->_cache_dir = cb_tmpdir() . '/calendar';
+        $this->_cache_file = $this->_cache_dir . '/holidays_ja.csv';
+    }
+
+    /**
+     * get instance
+     *
+     * @return   GRN_Calendar_Auto_Import_Holiday
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+
+        if (is_null($_instance)) {
+            $_instance = new GRN_Calendar_Auto_Import_Holiday();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * make holiday data cache file directory
+     */
+    private function _makeCacheDir()
+    {
+        $dir = $this->_cache_dir;
+        if ( ! is_dir($dir)) {
+            cb_mkdir($dir, 0700, true, true);
+        }
+    }
+
+    /**
+     * get holiday data cache file path
+     *
+     * @return   string   cache file path
+     */
+    function getCacheFile()
+    {
+        return $this->_cache_file;
+    }
+
+    /**
+     * get holiday data URL
+     *
+     * @return   string  holiday data URL
+     */
+    function getHolidayDataURL()
+    {
+        global $G_config_grn;
+
+        return $G_config_grn->get('Calendar', 'holiday_data_url');
+    }
+
+    /**
+     * get holiday data
+     *
+     * @param    string $url     holiday data URL
+     * @param    int    $timeout timeout second (default: 30)
+     *
+     * @return   boolean
+     */
+    function execute($url, $timeout = 30)
+    {
+        require_once('grn/http_proxy.csp');
+        $phc = new GRN_ProxyHttpClient();
+        $hc = $phc->getHttp();
+        $ch = $hc->getCurlHandle();
+        $hc->setCurlOption(CURLOPT_TIMEOUT, $timeout);
+
+        if ($phc->execute($url)) {
+            $status_line = $hc->getStatusLine();
+
+            $status_code = -1;
+            if (array_key_exists('status-code', $status_line)) {
+                $status_code = $status_line['status-code'];
+            }
+
+            switch ($status_code) {
+                case 200: // OK
+                    $this->_makeCacheDir();
+                    if (file_put_contents($this->_cache_file, $hc->getBody())
+                        === false
+                    ) {
+                        cb_throw_error(E_COMMON_FOPEN_WRITE, null,
+                            ['file' => $this->_cache_file]);
+                    }
+
+                    return true;
+                case 301: // Moved Permanently
+                case 302: // Found
+                case 303: // See Other
+                    $headers = $hc->getHeaders();
+                    if (array_key_exists('location', $headers)) {
+                        // redirect
+                        return $this->execute($headers['location'][0],
+                            $timeout);
+                    } else {
+                        cb_throw_error(E_GRN_CALENDAR_FAIL_TO_ACCESS_HOLIDAY_DATA);
+                    }
+                    break;
+                case 304: // Not Modified
+                    return false;
+                default:  // something wrong
+                    cb_throw_error(E_GRN_CALENDAR_FAIL_TO_ACCESS_HOLIDAY_DATA);
+            }
+        } else {
+            cb_throw_error(E_GRN_CALENDAR_FAIL_TO_ACCESS_HOLIDAY_DATA);
+        }
+
+        return false;
+    }
+
+}

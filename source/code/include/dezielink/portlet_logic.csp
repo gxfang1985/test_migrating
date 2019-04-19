@@ -1,0 +1,250 @@
+<?php
+
+/**
+ * DezieLink Porlet Logic.
+ *
+ * @author  Huy Nguyen 2009/02
+ * @version 1.0
+ * @package grn.dezielink
+ */
+
+require_once('dezielink/error_code.csp');
+
+class GRN_DezieLink_PortletLogic
+{
+    var $_URL;
+    var $_cookies;
+    var $_headers;
+    var $_portlet_cacher;
+
+    function __construct()
+    {
+        $this->_URL = null;
+        $this->_cookies = null;
+        $this->_headers = null;
+
+        require_once('dezielink/portlet_cacher.csp');
+        $this->_portlet_cacher = GRN_DezieLink_Porlet_Cacher::getInstance();
+    }
+
+    private static $_instance = null;
+
+    /**
+     * @return GRN_DezieLink_PortletLogic
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * Return content of portlet
+     *
+     * @param    string $params portlet params
+     * @param    array  $errors errors infomation
+     * @param    mixed       return FALSE: if fail,
+     *                          return HTML data of portlet if success
+     */
+    function getPortletContent($params, &$errors)
+    {
+        // get url from system profile
+        $url = $this->_getURL($params);
+
+        if ( ! $url) {
+            return false;
+        }
+
+        global $G_container_base;
+        $http_client = $G_container_base->getInstance('http_client');
+
+        if ($cookies = $this->_getCookies()) {
+            $http_client->setCurlOption(CURLOPT_COOKIE, $cookies);
+        }
+
+        if ($headers = $this->_getHttpHeaders()) {
+            $http_client->setCurlOption(CURLOPT_HTTPHEADER, $headers);
+        }
+
+        if ($http_client->execute($url)) {
+            //get http result code
+            $status_line = $http_client->getStatusLine();
+            $status_code = -1;
+            if (array_key_exists('status-code', $status_line)) {
+                $status_code = $status_line['status-code'];
+            }
+            if ($status_code != 200) {
+                $errors = [];
+                $errors['error'] = E_GRN_DZLK_HTTP_ERROR;
+                $errors['status_code'] = $status_code;
+                $errors['url'] = $url;
+                require_once('dezielink/inspection.csp');
+                $inspection = GRN_Dezielink_Inspection::getInstance();
+                $inspection->writeInspectionLog(CB_LOGGER_ERROR,
+                    'dezielink_http_error',
+                    ['status_code' => $status_code, 'url' => $url]);
+
+                return false;
+            }
+
+            $body = $http_client->getBody();
+
+            // write log after get dezie data successful.
+            if ($body) {
+                require_once('dezielink/inspection.csp');
+                $inspection = GRN_Dezielink_Inspection::getInstance();
+                if ($inspection->isEnabled()) {
+                    $inspection->writeInspectionLogNotice('get',
+                        'dezielink_portlet_data', ['url' => $url]);
+                }
+            }
+
+            return $body;
+        } else {
+            $error_info = $http_client->getError();
+            $error_msg = array_key_exists('message', $error_info)
+                ? $error_info['message'] : null;
+            $error_code = array_key_exists('errno', $error_info)
+                ? $error_info['errno'] : null;
+            $errors = [];
+            $errors['error'] = E_GRN_DZLK_DEZIE_CONNECTION_ERROR;
+            $errors['error_code'] = $error_code;
+            $errors['error_msg'] = $error_msg;
+            require_once('dezielink/inspection.csp');
+            $inspection = GRN_Dezielink_Inspection::getInstance();
+            $inspection->writeInspectionLog(CB_LOGGER_ERROR,
+                'dezielink_connection_error',
+                ['error_code' => $error_code, 'error_msg' => $error_msg]);
+
+            return false;
+
+        }
+    }
+
+    /**
+     * Return content of portlet from cache
+     *
+     * @param    int $portlet_layout_id portlet layout ID
+     *
+     * @return   string   cached content of portlet
+     */
+    function getPortletFromCache($portlet_layout_id)
+    {
+        require_once('portal/portlet_layout_logic.csp');
+        $portlet_layout_logic = GRN_Portal_PortletLayoutLogic::getInstance();
+        $portlet =& $portlet_layout_logic->get($portlet_layout_id);
+
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+        $login =& $uum->getLoginUser();
+
+        require_once('dezielink/system_logic.csp');
+        $sys_logic = GRN_DezieLink_SystemLogic::getInstance();
+        $portlet_cache_expire = $sys_logic->getPortletCacheExpire();
+
+        $retval = $this->_portlet_cacher->get($login, $portlet,
+            $portlet_cache_expire);
+
+        return $retval;
+    }
+
+    /**
+     * Save content of portlet to cache
+     *
+     * @param    int    $portlet_layout_id portlet layout ID
+     * @param    string $porlet_data       content of portlet
+     */
+    function cachePortlet($portlet_layout_id, $porlet_data)
+    {
+        require_once('portal/portlet_layout_logic.csp');
+        $portlet_layout_logic = GRN_Portal_PortletLayoutLogic::getInstance();
+        $portlet =& $portlet_layout_logic->get($portlet_layout_id);
+
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+        $login =& $uum->getLoginUser();
+
+        $this->_portlet_cacher->set($login, $portlet, $porlet_data);
+    }
+
+    /**
+     * @access private
+     */
+    function _getURL($params)
+    {
+        $url = null;
+        if ( ! $this->_URL) {
+            require_once('dezielink/system_logic.csp');
+            $system_logic = GRN_DezieLink_SystemLogic::getInstance();
+            $url = $system_logic->getURL();
+        } else {
+            $url = $this->_URL;
+        }
+        if ( ! $url) {
+            return false;
+        }
+        $idx = strpos($url, '?');
+        if ($idx === false) {
+            $url .= '?';
+        } else {
+            $url = substr($url, 0, $idx + 1);
+        }
+        // create full
+        $url .= $params;
+
+        return $url;
+    }
+
+    /**
+     * @access private
+     */
+    function _getCookies()
+    {
+        if ($this->_cookies) {
+            return $this->_cookies;
+        }
+
+        $cookies = [];
+        foreach ($_COOKIE as $key => $value) {
+            $cookies[] = $key . '=' . $value;
+        }
+        $this->_cookies = implode('; ', $cookies);
+
+        return $this->_cookies;
+    }
+
+    /**
+     * @access private
+     */
+    function _getHttpHeaders()
+    {
+        if ($this->_headers) {
+            return $this->_headers;
+        }
+
+        $accept_headers = ['X-Cybozu-Remote-Host', 'X-Cybozu-Product-Hosts'];
+
+        $headers = null;
+        $header_prefix = 'HTTP_';
+        foreach ($accept_headers as $header) {
+            $header_key = $header_prefix . str_replace('-', '_',
+                    strtoupper($header));
+            if (array_key_exists($header_key, $_SERVER)) {
+                $headers[] = $header . ': ' . $_SERVER[$header_key];
+            }
+        }
+
+        $headers[] = 'X-Cybozu-Sessionless-Request: 1';
+
+        $this->_headers = $headers;
+
+        return $this->_headers;
+    }
+}
+
+?>
+

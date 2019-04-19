@@ -1,0 +1,985 @@
+<?php
+
+namespace grn\grn\screen;
+
+use grn\grn\MemberLogic;
+
+/**
+ * Class UserSelectScreen
+ *
+ * @package grn\grn\screen
+ */
+class UserSelectScreen
+{
+    /** @var  array */
+    private $input;
+
+    /** @var UserSelectParameters */
+    protected $parameter;
+
+    /** @var GRN_Uum */
+    protected $uum;
+
+    /** @var GRN_UumUtil_Search */
+    protected $uum_util;
+
+    /** @var CB_SessionManager */
+    protected $sm;
+
+    /** @var CB_User | bool */
+    protected $login_user;
+
+    /** @var array */
+    protected $selected;
+
+    /** @var array */
+    protected $candidate;
+
+    /** @var  string */
+    protected $selected_tab;
+
+    /** @var \GRN_Smarty */
+    protected $smarty;
+
+    /** @var array|mixed|null */
+    protected $extension_items = null;
+
+    /** @var array */
+    protected $invalid_app_user_ids = [];
+
+    /** @var bool */
+    protected $permission_to_select_role = 0;
+
+    /**
+     * @var bool
+     */
+    protected $is_need_scroll = true;
+
+    /**
+     * UserSelectScreen constructor.
+     *
+     * @param $input $G_INPUT
+     */
+    public function __construct($input)
+    {
+        $this->setInput($input);
+        $this->parameter = new UserSelectParameters($input);
+
+        $this->permission_to_select_role = $this->getPermissionToSelectRole();
+        if ( ! $this->permission_to_select_role
+             && $this->parameter->system != '1'
+             && $this->parameter->selected_tab == '1'
+        ) {
+            $this->parameter->selected_tab = '0';
+        }
+
+        require_once("grn/smarty.csp");
+        $this->smarty = new \GRN_Smarty();
+
+        global $G_container_base;
+        $this->uum = $G_container_base->getInstance('uum');
+        require_once('grn/uum_util_search.csp');
+        $this->uum_util = \GRN_UumUtil_Search::getInstance();
+        $this->sm = \CB_SessionManager::getInstance();
+
+        $this->login_user = $this->uum->getLoginUser();
+
+        $this->selected = [];
+        $this->candidate = [];
+
+        $item_session
+            = $this->sm->getSession($this->parameter->item_session_name);
+        if ($item_session) {
+            $item_data = $item_session->get($this->parameter->item_data_name);
+            if (is_array($item_data) && array_key_exists('caption', $item_data)
+                && array_key_exists('prefix', $item_data)
+                && array_key_exists('data', $item_data)
+                && is_string($item_data['prefix'])
+                && preg_match('/^[a-f,h-z]$/', $item_data['prefix'])
+            ) {
+                $this->extension_items = $item_data;
+            }
+        }
+
+    }
+
+    /**
+     * Set Input.
+     *
+     * @param $input array
+     */
+    private function setInput($input)
+    {
+        $this->input = $input;
+    }
+
+    /**
+     * Set Input.
+     *
+     * @return array
+     */
+    private function getInput()
+    {
+        return $this->input;
+    }
+
+    /**
+     * Fetch.
+     *
+     * @return mixed|string|void
+     */
+    public function fetch()
+    {
+        $input = $this->getInput();
+
+        // Get Session
+        require_once('fw/session_manager.csp');
+        $sm = \CB_SessionManager::getInstance();
+        if ($this->parameter->select_func === 'init') {
+            $sm->destroy(cb_get_pagename());
+        }
+        $session = $sm->getSession(cb_get_pagename());
+        $this->selected = $session->get('selected');
+        if ( ! is_array($this->selected)) {
+            $this->selected = [];
+        }
+        $this->candidate = $session->get('candidate');
+        if ( ! is_array($this->candidate)) {
+            $this->candidate = [];
+        }
+
+        $this->checkSearchWord();
+
+        switch ($this->parameter->judgeFunction()) {
+            case GRN_USER_SELECT_PAGE_FUNC_INIT:
+            case GRN_USER_SELECT_PAGE_FUNC_BROWSE:
+                $this->browse();
+                if ( ! empty($this->parameter->selected_tid)) {
+                    $this->input['selected_users_c_id']
+                        = $this->parameter->selected_tid;
+                    $this->add();
+                    $this->parameter->selected_tid = null;
+                }
+                break;
+            case GRN_USER_SELECT_PAGE_FUNC_ADD:
+                $this->add();
+                break;
+            case GRN_USER_SELECT_PAGE_FUNC_REMOVE:
+                $this->remove();
+                break;
+            case GRN_USER_SELECT_PAGE_FUNC_APPLY:
+                $this->apply();
+                break;
+            case GRN_USER_SELECT_PAGE_FUNC_MULTI_APPLY:
+                $this->multiApply();
+                break;
+            default:
+                $this->browse();
+                break;
+        }
+
+        // org tree view
+        require_once('grn/org_tree.csp');
+
+        $page_name = cb_get_pagename();
+
+        $util = \GRN_OrgTreeUtil::getInstance();
+        $tree = $util->getTree($page_name);
+
+        if (is_null($this->parameter->s_oid)) {
+            $this->parameter->s_oid = $tree->getSelectedNode();
+        }
+
+        if (array_key_exists('top', $input) || is_null($tree->getRoot())) {
+            $tree->initialize();
+            $this->parameter->s_oid = null;
+        }
+        $tree->setSelectedNode($this->parameter->s_oid);
+        $util->setTree($page_name, $tree);
+        $org = $tree->getRoot();
+
+        if ($this->parameter->s_oid != -1) {
+            $this->smarty->assign('org_id', $this->parameter->s_oid);
+        } else {
+            $this->smarty->assign('org_id', $this->parameter->org_id);
+        }
+
+        if ($this->parameter->s_rid != -1) {
+            $this->smarty->assign('role_id', $this->parameter->s_rid);
+        } else {
+            $this->smarty->assign('role_id', $this->parameter->role_id);
+        }
+
+        $this->smarty->assign('page_name', $page_name);
+        $this->smarty->assign('org', $org);
+        // end tree view
+
+        //app_name
+        require_once('grn/application.csp');
+        $app_locator = \GRN_ApplicationLocator::instance();
+        $app_name = $app_locator->getName('schedule');
+        $this->smarty->assign('app_name', $app_name);
+
+        $page_title = $this->getPageTitle();
+        $this->smarty->assign('page_title', $page_title);
+
+        $session->set('selected', $this->selected);
+        $session->set('candidate', $this->candidate);
+        $this->smarty->assign('selected', $this->selected);
+        $this->smarty->assign('candidate', $this->candidate);
+
+        $url_param_names = [
+            'searchword',
+            'no_multiple',
+            'form_name',
+            'include_org',
+            'system',
+            'system_display',
+            'select_name',
+            'plugin_data_name',
+            'plugin_session_name',
+            'item_data_name',
+            'item_session_name',
+            'send_cgi_parameter',
+            'app_id',
+            'return_page',
+            'multi_apply',
+            'plid',
+            'item_group_id',
+            'require_role_tab',
+            'is_calendar',
+            'is_search_result',
+            'show_group_role',
+            'require_dynamic_roles',
+            'require_administrator_role',
+            'ajax_url',
+            'selected_tid'
+        ];
+        $url_params = [];
+        foreach ($url_param_names as $url_param_name) {
+            $url_params[$url_param_name] = $this->parameter->$url_param_name;
+        }
+        $more_user_offset = $this->parameter->more_user_offset
+                            + $this->parameter->more_user_limit;
+        $this->smarty->assign('url_params', $url_params);
+        $this->smarty->assign('select_func', $this->parameter->select_func);
+        $this->smarty->assign('selected_tab', $this->parameter->selected_tab);
+        $this->smarty->assign('s_oid', $this->parameter->s_oid);
+        $this->smarty->assign('s_rid', $this->parameter->s_rid);
+        $this->smarty->assign('extension_items', $this->extension_items);
+        $this->smarty->assign('permission_to_select_role',
+            $this->permission_to_select_role);
+        $this->smarty->assign('require_role_tab',
+            $this->parameter->require_role_tab);
+        $this->smarty->assign('is_calendar', $this->parameter->is_calendar);
+        $this->smarty->assign('is_search_result',
+            $this->parameter->is_search_result);
+        $this->smarty->assign('show_group_role',
+            $this->parameter->show_group_role);
+        $this->smarty->assign('is_need_scroll', $this->is_need_scroll);
+        $this->smarty->assign('more_user_offset', $more_user_offset);
+        $this->smarty->assign('more_user_limit',
+            $this->parameter->more_user_limit);
+        $this->smarty->assign('require_dynamic_roles',
+            $this->parameter->require_dynamic_roles);
+        $this->smarty->assign('require_administrator_role',
+            $this->parameter->require_administrator_role);
+
+        return $this->smarty->fetch($this->getTemplateName());
+    }
+
+    /**
+     * @return string
+     */
+    protected function getTemplateName()
+    {
+        return 'grn/popup_user_select.tpl';
+    }
+
+    /**
+     * Get Page Title
+     *
+     * @return string
+     */
+    protected function getPageTitle()
+    {
+        if ($this->parameter->form_name == 'schedule/personal_day'
+            || $this->parameter->form_name == 'schedule/personal_week'
+            || $this->parameter->form_name == 'schedule/personal_month'
+        ) {
+            $page_title
+                = grn_get_page_display_name('schedule/popup_user_facility_select');
+        } else {
+            $page_title = grn_get_page_display_name('common/popup_user_select');
+        }
+
+        return $page_title;
+    }
+
+    /**
+     * browse.
+     */
+    protected function browse()
+    {
+        $this->candidate = [];
+
+        if ($this->extension_items && $this->parameter->selected_tab) {
+            $prefix = $this->extension_items['prefix'];
+            if (array_key_exists('groups', $this->extension_items)
+                && is_array($this->extension_items['groups'])
+            ) {
+                // item belongs to selected group
+                if ($this->parameter->item_group_id
+                    && array_key_exists($this->parameter->item_group_id,
+                        $this->extension_items['groups'])
+                ) {
+                    $select_item_group
+                        = $this->extension_items['groups'][$this->parameter->item_group_id];
+                    foreach (
+                        array_keys($select_item_group['belongs']) as
+                        $belong_item_id
+                    ) {
+                        $belong_item_name
+                            = $this->extension_items['data'][$belong_item_id];
+                        $this->candidate[] = [
+                            'id'   => $prefix . $belong_item_id,
+                            'type' => 'item',
+                            'name' => $belong_item_name
+                        ];
+                    }
+                } // all items
+                else {
+                    foreach ($this->extension_items['data'] as $id => $name) {
+                        $this->candidate[] = [
+                            'id'   => $prefix . $id,
+                            'type' => 'item',
+                            'name' => $name
+                        ];
+                    }
+                }
+            } else {
+                foreach ($this->extension_items['data'] as $id => $name) {
+                    $this->candidate[] = [
+                        'id'   => $prefix . $id,
+                        'type' => 'item',
+                        'name' => $name
+                    ];
+                }
+            }
+        } else {
+            // access_plugin
+            $plugin_datas = $this->getPluginDatas();
+            $plugin = $plugin_datas['plugin'];
+            $plugin_param = $plugin_datas['plugin_param'];
+
+            $selected_organization = null;
+
+            if ($this->parameter->s_oid > 0) {
+                $selected_organization
+                    = $this->uum->getGroupInfo($this->parameter->s_oid);
+            }
+
+            if ($selected_organization) {
+                $users = [];
+                $disabled = true;
+                if ($plugin) {
+                    // Display if anyone is allowed in the affiliation user
+                    $all_user_ids
+                        = $this->uum->getGroupUsersId($this->parameter->s_oid);
+                    $users_id = $plugin->evalUsers($all_user_ids,
+                        $plugin_param);
+                    $this->setInvalidAppUsers($all_user_ids, $users_id);
+                    if (count($users) > 0) {
+                        // Check also the organization itself if you want to view the schedule of the organization
+                        if ($this->parameter->include_org) {
+                            $evaluated
+                                = $plugin->evalGroups([$this->parameter->s_oid => $selected_organization],
+                                $plugin_param);
+                            if (count($evaluated) > 0) {
+                                $disabled = false;
+                            }
+                        }
+                    } else {
+                        // If you belong to user is not
+                        if ($this->parameter->include_org) {
+                            $evaluated
+                                = $plugin->evalGroups([$this->parameter->s_oid => $selected_organization],
+                                $plugin_param);
+                            if (count($evaluated) > 0) {
+                                $disabled = false;
+                            }
+                        }
+                    }
+                } else {
+                    $users_id
+                        = $this->uum->getGroupUsersId($this->parameter->s_oid);
+                    $disabled = false;
+                }
+                $org_name = $selected_organization['col_name'];
+                if ($this->parameter->include_org && ! $disabled
+                    && $this->showGroupRole()
+                ) {
+                    $item_name = $org_name;
+                    $this->candidate[] = [
+                        'id'   => 'g' . $this->parameter->s_oid,
+                        'type' => 'group',
+                        'name' => $item_name
+                    ];
+                }
+
+                $users_info
+                    = \GRN_ControllerUtil::getUserInfoToShowUserName($users_id,
+                    $this->login_user);
+                foreach ($users_id as $uid) {
+                    $this->candidate[] = [
+                        'id'   => $uid . ':g' . $this->parameter->s_oid,
+                        'type' => 'user',
+                        'name' => \GRN_ControllerUtil::getUserNameText($this->login_user->getOID(),
+                            $uid,
+                            $users_info)
+                    ];
+                }
+                $this->setIsNeedScroll(count($users_id));
+                $this->parameter->is_search_result = 0;
+            } elseif ($this->parameter->s_oid == -1) {
+                $this->userSearch($plugin, $plugin_param);
+                $this->setIsNeedScroll(count($this->candidate));
+            } elseif ($this->parameter->s_oid == -2) {
+                $users_id = $this->uum->getNoGroupIdUsers();
+                if ($plugin) {
+                    $users_id = $plugin->evalUsers($users_id, $plugin_param);
+                }
+
+                $users_info
+                    = \GRN_ControllerUtil::getUserInfoToShowUserName($users_id,
+                    $this->login_user);
+                foreach ($users_id as $uid) {
+                    $this->candidate[] = [
+                        'id'   => $uid,
+                        'type' => 'user',
+                        'name' => \GRN_ControllerUtil::getUserNameText($this->login_user->getOID(),
+                            $uid,
+                            $users_info)
+                    ];
+                }
+                $this->setIsNeedScroll(count($users_id));
+                $this->parameter->is_search_result = 0;
+            }
+        }
+    }
+
+    /**
+     * Set Invalid Application Users.
+     *
+     * It is used in the icon display.
+     *
+     * @param $before
+     * @param $after
+     */
+    protected function setInvalidAppUsers($before, $after)
+    {
+
+        $diff = array_diff($before, $after);
+        foreach ($diff as $id) {
+            $this->invalid_app_user_ids[$id] = null;
+        }
+
+    }
+
+    /*
+     * Get Plugin Datas
+     */
+    protected function getPluginDatas()
+    {
+        $plugin = null;
+        $plugin_param = [];
+        $plugin_session
+            = $this->sm->getSession($this->parameter->plugin_session_name);
+        if ($plugin_session) {
+            $plugin_data
+                = $plugin_session->get($this->parameter->plugin_data_name);
+            if (is_array($plugin_data)
+                && array_key_exists('name', $plugin_data)
+            ) {
+                $loader = new \CB_PluginLoader('grn.common.user.select');
+                $plugin = $loader->loadDriver($plugin_data['name']);
+            }
+            if (is_array($plugin_data)
+                && array_key_exists('params', $plugin_data)
+            ) {
+                $plugin_param = $plugin_data['params'];
+            }
+        }
+
+        $result = [];
+        $result['plugin'] = $plugin;
+        $result['plugin_param'] = $plugin_param;
+
+        return $result;
+    }
+
+    /**
+     * @param      $plugin
+     * @param      $plugin_param
+     * @param bool $is_role
+     */
+    protected function userSearch($plugin, $plugin_param, $is_role = false)
+    {
+        require_once('grn/org_util.csp');
+        require_once('grn/org_util_search.csp');
+        if ($is_role) {
+            $tmp_org_id = '';
+        } else {
+            $tmp_org_id = ($this->parameter->org_id == -2)
+                ? '-1'
+                : (($this->parameter->org_id != 0) ? $this->parameter->org_id
+                    : '');
+        }
+
+        $condition = grn_get_user_info_search_condition($tmp_org_id,
+            $this->parameter->searchword,
+            $this->parameter->system);
+        $users_id = grn_search_user_ids($tmp_org_id, $condition);
+        if ($plugin) {
+            $users_id = $plugin->evalUsers($users_id, $plugin_param);
+        }
+        $primary_groups
+            = $this->uum->getManyUserPrimaryGroupInfoList($users_id);
+        $users_info = \GRN_ControllerUtil::getUserInfoToShowUserName($users_id,
+            $this->login_user);
+        foreach ($users_id as $uid) {
+            $info = [
+                'id'   => $uid,
+                'type' => 'user',
+                'name' => \GRN_ControllerUtil::getUserNameText($this->login_user->getOID(),
+                    $uid,
+                    $users_info)
+            ];
+
+            $group = cb_at($primary_groups, $uid, false);
+            if ($group !== false) {
+                $group_id = $group['_id'];
+                $eval = [$group_id => $group];
+
+                if ($plugin) {
+                    $eval = $plugin->evalGroups($eval, $plugin_param);
+                }
+
+                if (count($eval) > 0) {
+                    $info['id'] .= ':g' . $group_id;
+                }
+            }
+            $this->candidate[] = $info;
+        }
+
+    }
+
+    /**
+     * Check Search Word.
+     */
+    private function checkSearchWord()
+    {
+        if (strlen($this->parameter->searchword) > 0) {
+            $this->parameter->is_search_result = 1;
+        } else {
+            $this->parameter->is_search_result = 0;
+        }
+    }
+
+    /**
+     * Add.
+     */
+    protected function add()
+    {
+        require_once('grn/multi_select_utility.csp');
+        $input = grn_deploy_selected_users('selected_users_c_id', 'c_id',
+            $this->input, ',');
+
+        $ids = [];
+        if (array_key_exists('c_id', $input)) {
+            $ids = $input['c_id'];
+        }
+        $userIds = [];
+        $groupIds = [];
+        $roleIds = [];
+        $newInputs = [];
+        foreach ($ids as $id) {
+            $input = [];
+            if (preg_match('/^([0-9]+):g([0-9]+)$/', $id, $regs)
+                || preg_match('/^([0-9]+):([0-9]+)$/', $id, $regs)
+            ) {
+                $uid = (int)$regs[1];
+                $oid = (int)$regs[2];
+                $userIds[] = $uid;
+                $groupIds[] = $oid;
+                $input['id'] = $id;
+                $input['type'] = MemberLogic::TYPE_USER;
+                $input['uid'] = $uid;
+                $input['oid'] = $oid;
+                $input['rid'] = MemberLogic::EMPTY_ID;
+            } elseif (preg_match('/^([0-9]+)$/', $id, $regs)) {
+                $uid = (int)$regs[1];
+                $userIds[] = $uid;
+                $input['id'] = $id;
+                $input['type'] = MemberLogic::TYPE_USER;
+                $input['uid'] = $uid;
+                $input['oid'] = MemberLogic::EMPTY_ID;
+                $input['rid'] = MemberLogic::EMPTY_ID;
+            } elseif (preg_match('/^g([0-9]+)$/', $id, $regs)) {
+                $oid = (int)$regs[1];
+                $groupIds[] = $oid;
+                $input['id'] = $id;
+                $input['type'] = MemberLogic::TYPE_ORGANIZATION;
+                $input['uid'] = MemberLogic::EMPTY_ID;
+                $input['oid'] = $oid;
+                $input['rid'] = MemberLogic::EMPTY_ID;
+
+            } elseif (preg_match('/^r([0-9]+)$/', $id, $regs)) {
+                $rid = (int)$regs[1];
+                $roleIds[] = $rid;
+                $input['id'] = $id;
+                $input['type'] = MemberLogic::TYPE_STATIC_ROLE;
+                $input['uid'] = MemberLogic::EMPTY_ID;
+                $input['oid'] = MemberLogic::EMPTY_ID;
+                $input['rid'] = $rid;
+            } elseif (preg_match('/^dr(.*)$/', $id, $regs)) {
+                $rid = (string)$regs[1];
+                $roleIds[] = $rid;
+                $input['id'] = $id;
+                $input['type'] = MemberLogic::TYPE_DYNAMIC_ROLE;
+                $input['uid'] = MemberLogic::EMPTY_ID;
+                $input['oid'] = MemberLogic::EMPTY_ID;
+                $input['rid'] = $rid;
+            } elseif ($this->extension_items
+                      && preg_match('/^/' . $this->extension_items['prefix']
+                                    . '(.*)$', $id, $regs)
+            ) {
+                $item_id = $regs[1];
+                if (array_key_exists($item_id,
+                    $this->extension_items['data'])
+                ) {
+                    $input['id'] = $id;
+                    $input['type'] = MemberLogic::TYPE_ITEM;
+                    $input['name'] = $this->extension_items['data'][$item_id];
+                    $input['uid'] = MemberLogic::EMPTY_ID;
+                    $input['oid'] = MemberLogic::EMPTY_ID;
+                }
+            }
+            if ( ! empty($input)) {
+                foreach ($this->selected as $key => $item) {
+                    if ($input['uid'] !== MemberLogic::EMPTY_ID
+                        && $item['uid'] === $input['uid']
+                    ) {
+                        unset($this->selected[$key]);
+                    }
+                }
+                $newInputs[$input['id']] = $input;
+            }
+        }// end of foreach
+
+        $users_info = \GRN_ControllerUtil::getUserInfoToShowUserName($userIds,
+            $this->login_user);
+        $groups = $this->uum->getGroupListByIds($groupIds);
+        $roles = $this->uum->getStaticRoles();
+        foreach ($newInputs as $id => $input) {
+            if ($input['type'] === MemberLogic::TYPE_USER) {
+                $userId = $input['uid'];
+                $groupId = $input['oid'];
+                if (isset($users_info[$userId])) {
+                    $input['name']
+                        = \GRN_ControllerUtil::getUserNameText($this->login_user->getOID(),
+                        $userId, $users_info);
+                    $input['oid'] = isset($groups, $groupId) ? $groupId
+                        : MemberLogic::EMPTY_ID;
+                    $this->selected[$id] = $input;
+                } else {
+                    unset($this->selected[$id]);
+                }
+            } elseif ($input['type'] === MemberLogic::TYPE_ORGANIZATION) {
+                $groupId = $input['oid'];
+                if (isset($groups[$groupId])) {
+                    $input['name'] = $groups[$groupId]->get('name');
+                    $this->selected[$id] = $input;
+                } else {
+                    unset($this->selected[$id]);
+                }
+            } elseif ($input['type'] === MemberLogic::TYPE_STATIC_ROLE) {
+                $roleId = $input['rid'];
+                if (isset($roles[$roleId])) {
+                    $input['name'] = $roles[$roleId]->get('foreign_key');
+                    $this->selected[$id] = $input;
+                } else {
+                    unset($this->selected[$id]);
+                }
+            } elseif ($input['type'] === MemberLogic::TYPE_DYNAMIC_ROLE) {
+                $roleId = $input['rid'];
+                if ($roleId == MemberLogic::ROLE_ID_EVERYONE
+                    || $roleId == MemberLogic::ROLE_ID_LOGINUSER
+                ) {
+                    $input['name'] = $roleId;
+                    $this->selected[$id] = $input;
+                } else {
+                    unset($this->selected[$id]);
+                }
+            } else {
+                $this->selected[$id] = $input;
+            }
+        }
+    }
+
+    /**
+     * Remove.
+     */
+    protected function remove()
+    {
+        require_once('grn/multi_select_utility.csp');
+        $input = grn_deploy_selected_users('selected_users_s_id', 's_id',
+            $this->input, ",");
+        $ids = [];
+        if (array_key_exists('s_id', $input)) {
+            $ids = $input['s_id'];
+        }
+        foreach ($ids as $id) {
+            unset($this->selected[$id]);
+        }
+    }
+
+    /**
+     * Apply.
+     */
+    protected function apply()
+    {
+        if ($this->parameter->no_multiple
+            && ( ! array_key_exists('s_id', $this->input)
+                 || ! is_array($this->input['s_id'])
+                 || ! array_key_exists(0, $this->input['s_id']))
+        ) {
+            $this->parameter->select_func = 'browse';
+        } elseif ($this->parameter->no_multiple) {
+            $id = $this->input['s_id'][0];
+            if (preg_match('/^([0-9]+):g([0-9]+)$/', $id, $regs)) {
+                $uid = $regs[1];
+                $oid = $regs[2];
+                $user = $this->uum->getUserInfo($uid);
+                $org = $this->uum->getGroupInfo($oid);
+                if ($user) {
+                    $result = [
+                        'value' => $uid,
+                        'type'  => 'user',
+                        'name'  => \GRN_ControllerUtil::getUserNameText($this->login_user->getOID(),
+                            $uid)
+                    ];
+                    $this->smarty->assign('item', $result);
+                    if ( ! $this->parameter->system && $this->login_user) {
+                        $this->uum_util->selectUsers($this->login_user, [$uid]);
+                        if ($org) {
+                            $this->uum_util->selectGroups($this->login_user,
+                                [$oid]);
+                        }
+                    }
+                }
+            } elseif (preg_match('/^([0-9]+)$/', $id, $regs)) {
+                $uid = $regs[1];
+                $user = $this->uum->getUserInfo($uid);
+                if ($user) {
+                    $result = [
+                        'value' => $uid,
+                        'type'  => 'user',
+                        'name'  => \GRN_ControllerUtil::getUserNameText($this->login_user->getOID(),
+                            $uid)
+                    ];
+                    $this->smarty->assign('item', $result);
+                    if ( ! $this->parameter->system && $this->login_user) {
+                        $this->uum_util->selectUsers($this->login_user, [$uid]);
+                    }
+                }
+            } elseif (preg_match('/^g([0-9]+)$/', $id, $regs)) {
+                $oid = $regs[1];
+                $org = $this->uum->getGroupInfo($oid);
+                if ($org) {
+                    $result = [
+                        'value' => $id,
+                        'type'  => 'group',
+                        'name'  => $org['col_name']
+                    ];
+                    $this->smarty->assign('item', $result);
+                    if ( ! $this->parameter->system && $this->login_user) {
+                        $this->uum_util->selectGroups($this->login_user,
+                            [$oid]);
+                    }
+                }
+            } elseif ($this->extension_items
+                      && preg_match('/^/' . $this->extension_items['prefix']
+                                    . '(.*)$', $id, $regs)
+            ) {
+                $item_id = $regs[1];
+                if (array_key_exists($item_id,
+                    $this->extension_items['data'])
+                ) {
+                    $result = [
+                        'value' => $id,
+                        'type'  => 'item',
+                        'name'  => $this->extension_items['data'][$item_id]
+                    ];
+                    $this->smarty->assign('item', $result);
+                }
+            }
+        } else {
+            $apply_result = [];
+            $chk_users = [];
+            $chk_groups = [];
+            foreach ($this->selected as $item) {
+                if ($item['uid']) {
+                    $chk_users[] = $item['uid'];
+                    $result = [
+                        'value' => $item['uid'],
+                        'type'  => 'user',
+                        'name'  => $item['name']
+                    ];
+                    if ($item['oid']) {
+                        $chk_groups[] = $item['oid'];
+                    }
+                    $apply_result[] = $result;
+                } elseif ($item['oid']) {
+                    $chk_groups[] = $item['oid'];
+                    $apply_result[] = [
+                        'value' => $item['id'],
+                        'type'  => 'group',
+                        'name'  => $item['name']
+                    ];
+                } else {
+                    $apply_result[] = [
+                        'value' => $item['id'],
+                        'type'  => 'item',
+                        'name'  => $item['name']
+                    ];
+                }
+            }
+
+            if (count($chk_users) > 0 && ! $this->parameter->system
+                && $this->login_user
+            ) {
+                $this->uum_util->selectUsers($this->login_user, $chk_users);
+            }
+            if (count($chk_groups) > 0 && ! $this->parameter->system
+                && $this->login_user
+            ) {
+                $this->uum_util->selectGroups($this->login_user, $chk_groups);
+            }
+
+            $this->smarty->assign('apply_result', $apply_result);
+            $this->smarty->assign('apply_result_count', count($apply_result));
+        }
+
+        // Use a apply
+        $this->smarty->assign('selected', $this->selected);
+    }
+
+    /**
+     * Multi Apply.
+     */
+    private function multiApply()
+    {
+        $login = $this->uum->getLoginUser();
+
+        $selected_item_list = [];
+        $chk_users = [];
+        $chk_groups = [];
+        foreach ($this->selected as $item) {
+            if ($item['uid']) {
+                $chk_users[] = $item['uid'];
+                $selected_item = [
+                    'value' => $item['uid'],
+                    'type'  => 'user'
+                ];
+
+                if ($item['oid']) {
+                    $chk_groups[] = $item['oid'];
+                }
+                $selected_item_list[] = $selected_item;
+            } elseif ($item['oid']) {
+                $chk_groups[] = $item['oid'];
+                $selected_item_list[] = [
+                    'value' => $item['id'],
+                    'type'  => 'group'
+                ];
+            } else {
+                $selected_item_list[] = [
+                    'value' => $item['id'],
+                    'type'  => 'item'
+                ];
+            }
+        }
+
+        if (count($chk_users) > 0 && ! $this->parameter->system && $login) {
+            $this->uum_util->selectUsers($login, $chk_users);
+        }
+        if (count($chk_groups) > 0 && ! $this->parameter->system && $login) {
+            $this->uum_util->selectGroups($login, $chk_groups);
+        }
+
+        $selected_count = count($selected_item_list);
+        $this->smarty->assign('selected_count', $selected_count);
+        if ($selected_count > 0) {
+            if (is_null($this->parameter->app_id)) {
+                $this->parameter->app_id = 'grn.common';
+            }
+
+            // selected items are save session
+            require_once('fw/session_manager.csp');
+            $session_manager = \CB_SessionManager::getInstance();
+            $session_multiple_user
+                = $session_manager->getSession('grn.common_multiple_user_select');
+            $session_multiple_user->set($this->parameter->app_id,
+                $selected_item_list);
+        }
+    }
+
+    /**
+     * @return int
+     */
+    private function getPermissionToSelectRole()
+    {
+        require_once('grn/system_logic.csp');
+        $system = \GRN_System::getInstance();
+
+        return $system->getPermissionToSelectRole();
+    }
+
+    /**
+     * @return boolean
+     */
+    protected function showGroupRole()
+    {
+        if ($this->parameter->is_calendar == '1') {
+            return true;
+        }
+
+        return $this->parameter->show_group_role;
+    }
+
+    /**
+     * set is_need_scroll
+     *
+     * @param int $all_user_count
+     */
+    protected function setIsNeedScroll($all_user_count)
+    {
+        $selected_count = $this->parameter->more_user_offset
+                          + $this->parameter->more_user_limit;
+        if ($selected_count >= $all_user_count) {
+            $this->is_need_scroll = false;
+        }
+    }
+
+    /**
+     * get is_need_scroll
+     *
+     * @return bool
+     */
+    public function getIsNeedScroll()
+    {
+        return $this->is_need_scroll;
+    }
+}
+

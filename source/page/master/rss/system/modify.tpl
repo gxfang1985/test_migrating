@@ -1,0 +1,2 @@
+{capture name='grn_rss_system_GRN_RSS_SY_4'}{cb_msg module='grn.rss.system' key='GRN_RSS_SY-4' replace='true'}{/capture}{capture name='grn_rss_system_GRN_RSS_SY_5'}{cb_msg module='grn.rss.system' key='GRN_RSS_SY-5' replace='true'}{/capture}{include file='rss/_std_form.tpl' config_id='system' post_page='rss/system/command_modify' attention='1' explanation=$smarty.capture.grn_rss_system_GRN_RSS_SY_4 code_title='URL' code_explanation=$smarty.capture.grn_rss_system_GRN_RSS_SY_5}
+

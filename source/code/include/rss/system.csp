@@ -1,0 +1,892 @@
+<?php
+
+/**
+ * RSS Reader System Logic
+ *
+ * @author  Eiji TAEN    2005/05
+ * @version 1.0
+ * @package grn.rss
+ */
+
+require_once('rss/resources.csp');
+require_once('rss/config.csp');
+require_once('grn/application.csp');
+
+/**
+ * RSS Reader system logic class
+ *
+ * @author  Eiji TAEN    2005/05
+ * @version 1.0
+ * @package grn.rss
+ */
+class GRN_RSS_SystemLogic extends GRN_RSS_ConfigBase
+{
+    /**
+     * @access   private
+     */
+    var $_profile = null;
+
+    /**
+     * @access   private
+     */
+    var $_app = null;
+
+    /**
+     * constructor
+     */
+    function __construct()
+    {
+        parent::__construct('Shared');
+    }
+
+    private static $_instance = null;
+
+    /**
+     * get instance
+     *
+     * @return   GRN_RSS_SystemLogic
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * get shared channel
+     *
+     * @param    string $id relation id
+     *
+     * @return   array    shared channel information
+     *                    if specified channel doesn't exist, return FALSE.
+     *
+     * return['title'] => string   shared channel title
+     *       ['memo']  => string   shared channel memo
+     *       ['url']   => string   channel id (XML file URL)
+     */
+    function &getSharedChannelInfo($id)
+    {
+        $ret =& $this->_getChannelInfo($id);
+
+        return $ret;
+    }
+
+    /**
+     * @return   mixed   object     GRN_RSS_SharedChannelInfo
+     *                   boolean    return FALSE if specified channel info doesn't exist
+     */
+    function getSharedChannelInfoByURL($url)
+    {
+        $ret = $this->_getChannelInfoByURL($url);
+
+        return $ret;
+    }
+
+    /**
+     * get channel list
+     *
+     * @param    object $user       CB_User
+     * @param    string $channel_id channel id (XML file URL)
+     * @param    array  $channel    channel data
+     *
+     * @option   string   $folder_id    folder id
+     * @option   boolean  $import       TRUE: from import function (default: FALSE)
+     * @return   mixed    GRN_RSS_SharedFolderRelation
+     *                    if specified channel already exist, return TRUE.
+     *                    if specified folder doesn't exist, return FALSE.
+     *
+     * $channel['title']       => string   channel title
+     *         ['memo']        => string   channel memo
+     */
+    function addSharedChannelInfo(
+        & $user,
+        $channel_id,
+        $channel,
+        $folder_id = GRN_RSS_SHAREDROOTFOLDER,
+        $import = false
+    ) {
+        require_once('rss/folder.csp');
+        $folder_manager = GRN_RSS_FolderManager::getInstance();
+        $folder_row = $folder_manager->getSharedFolder($folder_id);
+        if ( ! $folder_row) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $channel_info_row = $this->getSharedChannelInfoByURL($channel_id);
+        if ($channel_info_row !== false) {
+            $ret = true;
+
+            return $ret;
+        }
+
+        // add/update channel row and get it
+        if ($import) {
+            require_once('grn/rss.csp');
+            $rss_manager = GRN_RSS_Manager::getInstance();
+            $channel_row = $rss_manager->updateChannel($channel_id, $channel);
+        } else {
+            require_once('rss/logic.csp');
+            $rss_logic = new GRN_RSS_ReaderLogic();
+            $channel_row = $rss_logic->onDemandSyncDataByURL($channel_id, true);
+        }
+        $utime = $channel_row->get('utime');
+        if ( ! is_object($utime) || ! is_a($utime, 'tab_grn_rss_channel')) {
+            $utime = new CB_TimeStamp();
+            $utime->unix_ts = 0;
+            $channel_row->set('utime', $utime);
+        }
+
+        // add shared channel
+        $channel['channel'] = $channel_row;
+        $shared_row = $this->_addSharedChannelInfo($channel_id,
+            $channel);
+        if ( ! $shared_row) {
+            $ret = true;
+
+            return $ret;
+        }
+
+        // write log create shared site
+        if ($import === false) {
+            $cid = $channel_row->getOID();//channel ID
+            $url = $channel_row->get('id');// URL
+            $memo = $shared_row->get('memo');//memo
+            $user_id = $user->getOID();//User ID
+            require_once('rss/inspection.csp');
+            $inspection = GRN_Rss_Inspection::getInstance();
+            if ($inspection->isEnabled()) {
+                $inspection->writeInspectionLogNotice('create', 'system_rss', [
+                    'cid'  => $cid,
+                    'url'  => $url,
+                    'memo' => $memo,
+                    'uid'  => $user_id
+                ]);
+            }
+        } else // from import function
+        {
+            //$shared_row->onCreateFromImport( $user );
+            require_once('rss/inspection.csp');
+            $inspection = GRN_Rss_Inspection::getInstance();
+            if ($inspection->isEnabled()) {
+                $inspection->writeInspectionLogNotice('import', 'system_rss',
+                    ['uid' => $user->getOID()]);
+            }
+        }
+
+        // add shared folder relation
+        $ret = $this->_addSharedFolderRelation($folder_row,
+            GRN_RSS_RELATION_TYPE_CHANNEL,
+            $shared_row);
+
+        return $ret;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param    string $id      channel id (channel url)
+     * @param    array  $channel channel data
+     *
+     * @return   mixed    GRN_RSS_SharedChannelInfo
+     *                    if specified channel already exist, return FALSE.
+     *
+     * $channel['title']   => string   channel title
+     *         ['memo']    => string   channel memo
+     *         ['channel'] => object   GRN_RSS_Channel
+     */
+    function _addSharedChannelInfo($id, $channel)
+    {
+        require_once('rss/tables.csp');
+
+        $row = $this->getSharedChannelInfoByURL($id);
+        if ($row) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $ret = $this->_addChannelInfo($channel);
+
+        return $ret;
+    }
+
+    /**
+     * @access   private
+     * @return   GRN_RSS_SharedFolderRelation
+     */
+    function _addSharedFolderRelation(& $parent, $type, & $data)
+    {
+        $ret = $this->_addFolderRelation($parent, $type, $data);
+
+        return $ret;
+    }
+
+    /**
+     * modify shared channel information
+     *
+     * @param    object $user        CB_User
+     * @param    string $relation_id shared relation id
+     * @param    array  $channel     shared channel data
+     * @param    string $memo        shared channel memo
+     * @param    string $new_url     RSS data url
+     *
+     * @option   string   $parent_id     parent folder id (default: GRN_RSS_SHAREDROOTFOLDER)
+     * @option   boolean  $import       TRUE: from import function (default: FALSE)
+     * @return   mixed    GRN_RSS_SharedChannelInfo
+     *                    return FALSE if specified $relation_id or $parent_id doesn't exist.
+     *
+     * $channel['title'] => string   channel title
+     *         ['memo']  => string   channel memo
+     */
+    function modifySharedChannelInfo(
+        $user,
+        $relation_id,
+        $channel,
+        $new_url,
+        $parent_id = GRN_RSS_SHAREDROOTFOLDER,
+        $import = false
+    ) {
+        require_once('grn/rss.csp');
+        require_once('rss/tables.csp');
+        $table_manager = GRN_RSS_TableManager::getInstance();
+        $table
+            = $table_manager->getTableInfo('GRN_RSS_SharedFolderRelation');
+        $table->setLock(CB_DATABASE_NO_LOCK);
+
+        // relation
+        $relation_row = $table->getRow($relation_id);
+        if ( ! $relation_row) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        // folder
+        $folder_row = $relation_row->get('parent');
+        if ($folder_row->getOID() != $parent_id) {
+            require_once('rss/folder.csp');
+            $folder_manager = GRN_RSS_FolderManager::getInstance();
+            $folder_row = $folder_manager->getSharedFolder($parent_id);
+            if ( ! $folder_row) {
+                $ret = false;
+
+                return $ret;
+            }
+            $channel['parent'] = $folder_row;
+        }
+
+        // shared channel
+        $channel_info_row = $relation_row->get('channel');
+
+        // channel
+        $channel_row = $channel_info_row->get('channel');
+        $old_url = $channel_row->get('id');
+        $cid = '';
+        $url = '';
+        $cid = $channel_row->getOID(); //channel ID
+        $url = $old_url; // URL
+        if (strcmp($old_url, $new_url) !== 0 && ! $import) // url was modified
+        {
+            // $new_url already exists?
+            if ($this->getSharedChannelInfoByURL($new_url) !== false) {
+                $ret = false;
+
+                return $ret;
+            }
+
+            // update new channel data
+            require_once('rss/logic.csp');
+            $rss_logic = new GRN_RSS_ReaderLogic();
+            $new_channel_row = $rss_logic->onDemandSyncDataByURL($new_url,
+                true);
+            $channel['channel'] = $new_channel_row;
+
+            // modify shared channel info
+            $channel_info_row->setData($channel);
+            $channel_info_row->updateNow();
+
+            // delete channel and cache file
+            $this->_deleteSharedChannel($channel_row);
+            $url = $new_channel_row->get('id');// URL
+        } else {
+            // modify shared channel info
+            $channel_info_row->setData($channel);
+        }
+        //write log notice modify  site
+        if ($import === false) {
+            if (array_key_exists('memo', $channel)) {
+                $memo = $channel['memo'];//memo
+            }
+            require_once('rss/inspection.csp');
+            $inspection = GRN_Rss_Inspection::getInstance();
+            if ($inspection->isEnabled()) {
+                $inspection->writeInspectionLogNotice('modify', 'system_rss', [
+                    'cid'  => $cid,
+                    'url'  => $url,
+                    'memo' => $memo,
+                    'uid'  => $user->getOID()
+                ]);
+            }
+        } else {
+            require_once('rss/inspection.csp');
+            $inspection = GRN_Rss_Inspection::getInstance();
+            if ($inspection->isEnabled()) {
+                $inspection->writeInspectionLogNotice('import', 'system_rss',
+                    ['uid' => $user->getOID()]);
+            }
+        }
+
+        return $channel_info_row;
+    }
+
+    /**
+     * delete shared channel info
+     *
+     * @param    string $relation_id relation ID
+     *
+     * @return   object   GRN_RSS_SharedChannelInfo
+     */
+    function deleteSharedChannelInfo($relation_id)
+    {
+        require_once('rss/tables.csp');
+        $manager = GRN_RSS_TableManager::getInstance();
+        $table = $manager->getTableInfo('GRN_RSS_SharedFolderRelation');
+        $table->setLock(CB_DATABASE_NO_LOCK);
+        $row = $table->getRow($relation_id);
+        if ( ! $row) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        // get shared channel
+        $row = $row->get('channel');
+
+        // channel
+        require_once('grn/rss.csp');
+        $channel_row = $row->get('channel');
+
+        //write log notice delete  personal site
+        $cid = $channel_row->getOID();//channel ID
+        $url = $channel_row->get('id');// URL
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $user = $uum->getLoginUser();
+        $user_id = $user->getOID();
+        require_once('rss/inspection.csp');
+        $inspection = GRN_Rss_Inspection::getInstance();
+        if ($inspection->isEnabled()) {
+            $inspection->writeInspectionLogNotice('delete', 'system_rss',
+                ['cid' => $cid, 'url' => $url, 'uid' => $user_id]);
+        }
+
+        // delete channel and cache file
+        $chanel = $row->get('channel');
+        $this->_deleteSharedChannel($chanel);
+
+        $row->delete();
+
+        return $row;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param    object $channel_row GRN_RSS_Channel
+     */
+    function _deleteSharedChannel(& $channel_row)
+    {
+        require_once('grn/rss.csp');
+        // no one share specified channel
+        if ($channel_row->get('user_num') == 0
+            && $channel_row->get('type') != GRN_RSS_CHANNEL_TYPE_CYBOZU
+        ) {
+            $this->_deleteChannel($channel_row);
+        }
+    }
+
+    /**
+     * change shared relation order
+     *
+     * @param    array $relation_list relation list
+     *
+     * @option   string   $folder_id   shared folder id (default: GRN_RSS_SHAREDROOTFOLDER)
+     *
+     * $relation_list[shared relation OID] => display order
+     */
+    function changeSharedRelationOrder(
+        $relation_list,
+        $folder_id = GRN_RSS_SHAREDROOTFOLDER
+    ) {
+        require_once('rss/folder.csp');
+        $folder_manager = GRN_RSS_FolderManager::getInstance();
+        $folder_row = $folder_manager->getSharedFolder($folder_id);
+        if ( ! $folder_row) {
+            return false;
+        }
+        $folder_id = $folder_row->getOID();
+
+        $this->_changeRelationOrder($relation_list, $folder_id);
+    }
+
+    /**
+     * get system delimiter
+     *
+     * @param    string $id folder relation OID
+     *
+     * @return   object   GRN_RSS_SharedFolderRelation
+     *                    if specified channel doesn't exist, return FALSE.
+     */
+    function getSystemDelimiter($id)
+    {
+        $ret = $this->_getDelimiter($id);
+
+        return $ret;
+    }
+
+    /**
+     * add delimiter
+     *
+     * @option   string   $folder_id   personal folder id (default: GRN_RSS_SHAREDROOTFOLDER)
+     * @return   mixed    GRN_RSS_SharedFolderRelation
+     *                    if specified folder doesn't exist, return FALSE.
+     */
+    function addDelimiter($folder_id = GRN_RSS_SHAREDROOTFOLDER)
+    {
+        require_once('rss/folder.csp');
+        $folder_manager = GRN_RSS_FolderManager::getInstance();
+        $folder_row =& $folder_manager->getSharedFolder($folder_id);
+        if ( ! $folder_row) {
+            return false;
+        }
+
+        return $this->_addDelimiter($folder_row);
+    }
+
+    /**
+     * delete delimiter
+     *
+     * @param    string $relation id   relation ID
+     *
+     * @return   mixed    GRN_RSS_SharedFolderRelation
+     *                    if specified relation doesn't exist, return FALSE.
+     */
+    function deleteDelimiter($relation_id)
+    {
+        $row = $this->_getDelimiter($relation_id);
+        if ( ! $row) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $row->delete();
+
+        return $row;
+    }
+
+    /**
+     * get shared relation list
+     *
+     * @option   string   $folder_id   personal folder id (default: GRN_RSS_SHAREDROOTFOLDER)
+     * @return   mixed    array
+     *                    if specified folder doesn't exist, return FALSE.
+     *
+     * return[relation id]                => array   (key: relation id)
+     *                    ['title']       => string   relation data title
+     *                    ['type']        => int      relation type (see resources.csp)
+     *                    ['has_error']   => boolean
+     *                    ['channel_oid'] => string   channel OID
+     */
+    function getSharedRelationList($folder_id = GRN_RSS_SHAREDROOTFOLDER)
+    {
+        require_once('rss/folder.csp');
+        $folder_manager = GRN_RSS_FolderManager::getInstance();
+        $folder_row =& $folder_manager->getSharedFolder($folder_id);
+        if ( ! $folder_row) {
+            return false;
+        }
+
+        return $this->_getRelationList($folder_row);
+    }
+
+    /**
+     * get csv data for exporting
+     *
+     * @param    object   CB_CSVWriter
+     */
+    function export(& $csv)
+    {
+        require_once('grn/rss.csp');
+        require_once('rss/tables.csp');
+        $tbl_manager = GRN_RSS_TableManager::getInstance();
+        $rowset
+            = new CB_MultiRowSet($tbl_manager->getTableInfo('GRN_RSS_SharedChannelInfo'),
+            's');
+        $rowset->addJoin($tbl_manager->getTableInfo('GRN_RSS_Channel'),
+            'col_channel = c._id',
+            CB_DATABASE_INNER_JOIN,
+            'c');
+        $rowset->addOrderColumn('s._id');
+        $rowset->setLock(CB_DATABASE_NO_LOCK);
+
+        while ( ! is_null($row =& $rowset->iterate())) {
+            $line = [];
+            $line[] = $row['s']->get('title');
+            $line[] = $row['c']->get('id');
+            $line[] = $row['s']->get('memo');
+
+            $csv->writeLine($line);
+        }
+    }
+
+    /**
+     * import csv data
+     *
+     * @param    object $user CB_User
+     * @param    array  $line a row data from csv
+     *
+     * @return   mixed     GRN_RSS_SharedChannelInfo
+     *                     if $line format is invalid, return FALSE.
+     *
+     * $line[0] => string   shared channel title (not original title!)
+     *      [1] => string   channel url
+     *      [2] => string   chennel memo
+     */
+    function import($user, $line)
+    {
+        $channel = [];
+        $channel['title'] = $line[0];
+        $channel['memo'] = $line[2];
+
+        $row = $this->_getFolderRelationByURL($line[1]);
+        if ($row === false) {
+            $row = $this->addSharedChannelInfo($user, $line[1], $channel,
+                GRN_RSS_SHAREDROOTFOLDER, true);
+        } else {
+            $row = $this->modifySharedChannelInfo($user, $row->getOID(),
+                $channel, $line[1],
+                GRN_RSS_SHAREDROOTFOLDER, true);
+        }
+
+        return $row;
+    }
+
+    /**
+     * delete all channels except cybozu information
+     */
+    function deleteAllChannels($user)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('rss');
+
+        $query
+            = 'SELECT _id FROM tab_grn_rss_sharedfolderrelation WHERE col_type =\''
+              . GRN_RSS_RELATION_TYPE_CHANNEL . '\'';
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        while ($row = $db->fetch_assoc($result)) {
+            $this->deleteSharedChannelInfo($row['_id']);
+        }
+        require_once('rss/inspection.csp');
+        $inspection = GRN_Rss_Inspection::getInstance();
+        if ($inspection->isEnabled()) {
+            $inspection->writeInspectionLogNotice('delete_all', 'system_rss',
+                ['uid' => $user->getOID()]);
+        }
+        // delete delimiter
+        $this->_deleteAllDelimiters();
+    }
+
+    /**
+     * @access   private
+     */
+    function _deleteAllDelimiters()
+    {
+        require_once('rss/tables.csp');
+        require_once('rss/resources.csp');
+        $manager = GRN_RSS_TableManager::getInstance();
+        $rowset
+            = new CB_RowSet($manager->getTableInfo('GRN_RSS_SharedFolderRelation'));
+        //定数なのでOK
+        $rowset->addCondition('col_type = ' . GRN_RSS_RELATION_TYPE_DELIMITER);
+        $rowset->setLock(CB_DATABASE_NO_LOCK);
+
+        while ( ! is_null($row = $rowset->iterate())) {
+            $row->delete();
+        }
+    }
+
+    /**
+     * delete caches
+     *
+     * @param   object $timestamp CB_TimeStamp
+     */
+    /*
+    function deleteCaches( $timestamp )
+    {
+        // delete items
+        require_once( 'rss/tables.csp' );
+        $tbl_manager = GRN_RSS_TableManager::getInstance();
+        $rowset = new CB_RowSet( $tbl_manager->getTableInfo( 'GRN_RSS_Item' ) );
+        $rowset->addCondition( 'col_utime < ' . $timestamp );
+
+        while( ! is_null( $row =& $rowset->iterate() ) )
+        {
+            $row->delete();
+        }
+    }
+     */
+
+    /**
+     * delete caches automatically
+     */
+    /*
+    function autoDeleteCaches()
+    {
+        $max_htime = 60 * 60 * 24 * 14; // 2 weeks
+
+        $this->deleteCaches( time() - $max_htime );
+    }
+     */
+
+    /**
+     * get specified attribute
+     *
+     * @access   private
+     *
+     * @param    string $name    attribute name
+     * @param    mixed  $default default value
+     *
+     * @return   mixed    specified attribute. if it doesn't exist, return $default
+     */
+    function _getAttribute($name, $default)
+    {
+        require_once('rss/resources.csp');
+        require_once('rss/tables.csp');
+        $tbl_manager = GRN_RSS_TableManager::getInstance();
+        $table = $tbl_manager->getTableInfo('GRN_RSS_SystemConfig');
+        $table->setLock(CB_DATABASE_NO_LOCK);
+        $row = $table->getRow(GRN_RSS_SYSTEM_CONFIG_ID);
+
+        if ( ! $row) {
+            return $default;
+        }
+
+        $value = $row->get($name);
+        if (is_null($value) || $value === '' || $value === false) {
+            $value = $default;
+        }
+
+        return $value;
+    }
+
+    /**
+     * set specified attribute
+     *
+     * @access   private
+     *
+     * @param    object $user  CB_User
+     * @param    string $name  attribute name
+     * @param    string $value attribute value
+     *
+     * @return   object   GRN_RSS_SystemConfig
+     */
+    function _setAttribute(& $user, $name, $value)
+    {
+        require_once('rss/resources.csp');
+        require_once('rss/tables.csp');
+        $tbl_manager = GRN_RSS_TableManager::getInstance();
+        $table = $tbl_manager->getTableInfo('GRN_RSS_SystemConfig');
+        $table->setLock(CB_DATABASE_NO_LOCK);
+        $row = $table->getRow(GRN_RSS_SYSTEM_CONFIG_ID);
+
+        if ( ! $row) {
+            $row = $table->newRow();
+        }
+
+        $row->set($name, $value);
+
+        return $row;
+    }
+
+    /**
+     * @access   private
+     * @return   CB_Profile
+     */
+    function _getSystemProfile()
+    {
+        if (is_null($this->_profile)) {
+            require_once('rss/application.csp');
+            $application = new GRN_RSS_Reader();
+            $this->_profile = $application->getSystemProfile();
+        }
+
+        return $this->_profile;
+    }
+
+    /**
+     * get specified system profile attribute
+     *
+     * @access   private
+     *
+     * @param    $name      string   attribute name
+     * @param    $default   string   default value
+     *
+     * @return   string              specified attribute. if it doesn't exist,
+     *                               return $default
+     */
+    function _getProfileAttribute($name, $default)
+    {
+        $profile = $this->_getSystemProfile();
+
+        if ( ! $profile->getAttribute($name, $value)) {
+            return $default;
+        }
+
+        return $value;
+    }
+
+    /**
+     * set specified system profile attribute
+     *
+     * @access   private
+     *
+     * @param    $name    string   attribute name
+     * @param    $value   string   attribute value
+     *
+     * @return   boolean           TRUE: success setting attribute, FALSE: fail
+     */
+    function _setProfileAttribute($name, $value)
+    {
+        $profile = $this->_getSystemProfile();
+
+        if ( ! $profile->getAttribute($name, $dummy)) {
+            if ( ! $profile->createAttribute($name, $value)) {
+                return false;
+            }
+        } else {
+            if ( ! $profile->updateAttribute($name, $value)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @access   private
+     */
+    function _getConfig($name, $value)
+    {
+        if (is_null($this->_app)) {
+            require_once('rss/application.csp');
+            $this->_app = GRN_RSS_Reader::getInstance();
+        }
+
+        $ret = $this->_app->getConfig($name);
+        if ($ret === false) {
+            $ret = $value;
+        }
+
+        return $ret;
+    }
+
+    function getUseSharedAttribute()
+    {
+        return $this->_getAttribute('use_shared', '0');
+    }
+
+    function setUseSharedAttribute(& $user, $value)
+    {
+        $ret = $this->_setAttribute($user, 'use_shared', $value);
+
+        return $ret;
+    }
+
+    function getUsePersonalAttribute()
+    {
+        return $this->_getAttribute('use_personal', '1');
+    }
+
+    function setUsePersonalAttribute(& $user, $value)
+    {
+        $ret = $this->_setAttribute($user, 'use_personal', $value);
+
+        return $ret;
+    }
+
+    function getCacheIntervalAttribute()
+    {
+        return $this->_getAttribute('cache_interval', 60); // default 60min
+    }
+
+    function setCacheIntervalAttribute(& $user, $value)
+    {
+        $ret = $this->_setAttribute($user, 'cache_interval', $value);
+
+        return $ret;
+    }
+
+    function getCachePreservationAttribute()
+    {
+        return $this->_getAttribute('cache_preservation', 14); // default 14days
+    }
+
+    function setCachePreservationAttribute(& $user, $value)
+    {
+        $ret = $this->_setAttribute($user, 'cache_preservation', $value);
+
+        return $ret;
+    }
+
+    function getTimeoutAttribute()
+    {
+        return $this->_getAttribute('timeout', 5); // default 5sec
+    }
+
+    function setTimeoutAttribute(& $user, $value)
+    {
+        $ret = $this->_setAttribute($user, 'timeout', $value);
+
+        return $ret;
+    }
+
+    function getMaxChannelNumAttribute()
+    {
+        return $this->_getConfig('max_update_channel_num', 10);
+    }
+
+    function getMaxUserNumAttribute()
+    {
+        return $this->_getConfig('min_shared_user_num', 10);
+    }
+
+    function getSchedulingTimeoutAttribute()
+    {
+        return $this->_getConfig('scheduling_timeout', 30);
+    }
+
+    function getTargetChannelNumAttribute()
+    {
+        return $this->_getProfileAttribute('target_channel_num', 1);
+    }
+
+    function setTargetChannelNumAttribute($value)
+    {
+        return $this->_setProfileAttribute('target_channel_num', $value);
+    }
+
+}
+
+

@@ -1,0 +1,948 @@
+<?php
+
+//  help、exec、app オプションの定数を定義する。
+define('CB_CLI_HELP_OPTION', 'help');
+define('CB_CLI_EXEC_OPTION', 'exec');
+define('CB_CLI_APP_OPTION', 'app');
+
+//  ツールのオプションを配列として返す。
+function cb_cli_start()
+{
+    global $G_INPUT;
+
+    $opt = [];
+
+    foreach ($G_INPUT as $g_input_key => $g_input_value) {
+        if (strcmp($g_input_key, CB_CLI_HELP_OPTION) === 0) {
+            help_and_exit();
+        } elseif (strcmp($g_input_key, CB_CLI_EXEC_OPTION) === 0) {
+            $opt[CB_CLI_EXEC_OPTION] = true;
+        } elseif (strcmp($g_input_key, CB_CLI_APP_OPTION) === 0) {
+            $opt[CB_CLI_APP_OPTION] = $G_INPUT[$g_input_key];
+        } else {
+            cb_cli_log('Error: Invalid argument: ' . $g_input_key);
+            help_and_exit();
+        }
+    }
+    if ( ! array_key_exists(CB_CLI_APP_OPTION, $G_INPUT)
+         || (strlen($G_INPUT[CB_CLI_APP_OPTION])) <= 0
+    ) {
+        cb_cli_log('Error: Missing argument: ' . CB_CLI_APP_OPTION);
+        help_and_exit();
+    }
+
+    return $opt;
+}
+
+/**
+ *  指定のメッセージを標準出力に出力する。
+ */
+function cb_cli_log($message = "", $output_to_console = true)
+{
+    global $_cb_cli_log_file;
+    if (is_null($_cb_cli_log_file)) {
+        $log_file = str_replace('.csp', '.log', basename(__FILE__));
+        $_cb_cli_log_file = fopen($log_file, 'a');
+        register_shutdown_function('_cb_cli_close_logging');
+    }
+    $message = date("r") . ' ' . $message . "\n";
+
+    if ($output_to_console) {
+        echo $message;
+    }
+    fwrite($_cb_cli_log_file, $message);
+
+    while (ob_get_level() > 0) {
+        ob_end_flush();
+    }
+}
+
+/**
+ *  ツール実行時間[秒]を追加してサマリを出力する。
+ *
+ */
+function cb_cli_end($summary = null)
+{
+    _cb_cli_emit_trailer($summary);
+}
+
+/**
+ *  ログファイルを閉じる
+ */
+function _cb_cli_close_logging()
+{
+    global $_cb_cli_log_file;
+    if ($_cb_cli_log_file != null) {
+        fclose($_cb_cli_log_file);
+        $_cb_cli_log_file = null;
+    }
+}
+
+$_cb_cli_log_file = null;
+
+/***************************************************************************
+ *
+ *  ここからがファイル削除ツール本体
+ *
+ ***************************************************************************/
+
+//  ファイルを求める際に利用。
+define('NUMBER_FORMAT_1ST_LAYER', "/^(0|[1-9]\d*)$/");
+define('NUMBER_FORMAT_2ND_LAYER', "/^(0|[1-9]\d{0,2})$/");
+define('NUMBER_FORMAT_2ND_LAYER_F', "/^\d{3}$/");
+//  サイズ計算で利用。
+define('BYTE_UNIT', 1024);
+
+/**
+ *  ヘルプメッセージを出力して終了する。
+ */
+
+function help_and_exit()
+{
+    //  ログファイル名を表示する。
+    cb_cli_log('Usage: ' . basename(__FILE__) . ' [OPTION] ...');
+    //  必須オプション。
+    cb_cli_log('Mandatory Options:');
+    //  app オプションの説明。
+    cb_cli_log('  app                            List of application ids, separated by character: \',\'');
+
+    //  利用可能なアプリ名を取得する。
+    $cleanerMap = getCleanerMap();
+    $app_id_string = '';
+    foreach (array_keys($cleanerMap) as $appid) {
+        if (0 < strlen($app_id_string)) {
+            $app_id_string .= ', ';
+        }
+        $app_id_string .= $appid;
+    }
+    cb_cli_log('                                 Available appid: '
+               . $app_id_string);
+    //  その他のオプション。
+    cb_cli_log('Other Options:');
+    //  exec オプションの説明。
+    cb_cli_log('  exec                           When specified, actually make changes to the system');
+    //  help オプションの説明。
+    cb_cli_log('  help                           Show this help message');
+    die;
+}
+
+/**
+ *  アプリごとの、ファイル削除を行うためのAbstractクラス。
+ *  各アプリはこのクラスを継承し、その動作に応じて処理を変えること。
+ *
+ * @abstract
+ */
+class ServerFileCleaner
+{
+    var $dbconn;
+    var $is_exec;
+    var $file_num;
+    var $failed_num;
+    var $summary;
+    var $root_dir;
+    var $conditions;
+
+    function __construct()
+    {
+        return null;
+    }
+
+    /**
+     * @public final
+     *
+     *  このアプリに属する、不要なファイル実体を削除する。
+     */
+    function clean($options, & $summary)
+    {
+        $this->file_num = 0;
+        $this->failed_num = 0;
+        $this->summary = &$summary;
+        $app_id = $this->getModuleID();
+
+        //  処理を行うアプリ（テーブル名）を表示する。
+        $table_dir = substr($this->getFileBodyTableName(), 4);
+        cb_cli_log('Starting for ' . $table_dir . ' ');
+
+        //  アプリのルートディレクトリを求める。
+        global $G_config_common;
+        $root_dir = $G_config_common->get('Files', 'dir');
+        $table_dir = substr($this->getFileBodyTableName(), 4);
+        $this->root_dir = $root_dir . DIRECTORY_SEPARATOR . $app_id
+                          . DIRECTORY_SEPARATOR . $table_dir
+                          . DIRECTORY_SEPARATOR;
+
+        //  DBに接続する。
+        if (strcmp($app_id, 'system') === 0) {
+            global $G_container_base;
+            $this->dbconn =& $G_container_base->getInstance('dbconn');
+        } else {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->dbconn =& $app_locator->getConnection($app_id);
+        }
+
+        //  引数を確認する。デフォルト値はいずれもFALSEとする。
+        $this->is_exec = false;
+        if (array_key_exists(CB_CLI_EXEC_OPTION, $options)) {
+            $this->is_exec = true;
+        }
+
+        $this->cleanFilesIn($this->root_dir, 1, 0, false);
+
+        //  アプリ毎のサマリを表示する。
+        $log = ($this->is_exec) ? 'Cleanup' : 'Hit';
+        $log = $log . ' ' . $this->file_num . ', ' . $app_id . ' file';
+        cb_cli_end($log);
+
+        //  後始末する。
+        unset($app_id, $app_locator, $root_dir, $table_dir, $this->dbconn);
+
+        $summary->addSuccess($this->file_num);
+        $summary->addError($this->failed_num);
+    }
+
+    /**
+     *  指定のディレクトリ内のファイルをリストアップし、
+     *  DBに対応するレコードがなければ削除する。
+     *
+     * @private
+     */
+    function cleanFilesIn($dir_path, $depth, $parentNumber, $forceDelete)
+    {
+        $dir_handler = @opendir($dir_path);
+        if ($dir_handler === false) {
+            cb_cli_log('Failed to open ' . $dir_path);
+
+            return;
+        }
+
+        $condition = $this->getConditonOf($depth);
+        while (($file = readdir($dir_handler)) !== false) {
+            //  スキップする
+            if ((strcmp($file, '.') === 0) || (strcmp($file, '..') === 0)) {
+                continue;
+            }
+
+            $full_path = $dir_path . $file;
+
+            //  削除対象かを判定する
+            $isIlegal = false;
+            if ($forceDelete
+                || (( ! $condition->isLegal($full_path, $parentNumber))
+                    || ( ! $this->existsOnDB($full_path, $depth)))
+            ) {
+                $isIlegal = true;
+            }
+
+            //  ディレクトリは内部のファイルを先に整理する
+            if (is_dir($full_path)) {
+                $parentNumber4Child = $parentNumber;
+                if ((is_numeric(basename($full_path)))
+                    && (0 < intval(basename($full_path)))
+                ) {
+                    $parentNumber4Child = 1;
+                }
+//                echo "@@@     recirsive into $full_path ( ".basename( $full_path )." ), parentNumber: $parentNumber4Child\n";
+                $this->cleanFilesIn($full_path . DIRECTORY_SEPARATOR,
+                    $depth + 1, $parentNumber4Child, $isIlegal);
+            }
+
+            //  正規ファイルでなければ削除する
+            if ($isIlegal) {
+                $this->deleteFile($full_path);
+            }
+        }
+        closedir($dir_handler);
+        unset($dir_handler, $file);
+    }
+
+    /**
+     *  指定の階層用の LayersCondition を返す
+     *
+     * @private
+     */
+    function getConditonOf($depth)
+    {
+        if (is_null($this->conditions)) {
+            $this->conditions = [
+                new IlegalCondition(),
+                new FirstLayerCondition(),
+                new SecondLayerCondition(),
+                new ThirdLayerCondition()
+            ];
+        }
+
+        if (($depth < 1) || (3 < $depth)) {
+            $depth = 0;
+        }
+
+        return $this->conditions[$depth];
+    }
+
+    /**
+     *  指定のファイルに対応するレコードがDBにあれば TRUE を、
+     *  そうでなければ FALSE を返す
+     */
+    function existsOnDB($file_path, $depth)
+    {
+        //  3階層めでなければ TRUE を返す
+        if ($depth != 3) {
+            return true;
+        }
+
+        $exists = true;
+
+        //  ファイル名が数値のみの場合、ガルーンが作ったファイルなので、DBを確認した上で削除する。
+        $file_id = substr($file_path, strlen($this->root_dir));
+        $file_id = str_replace(DIRECTORY_SEPARATOR, '', $file_id);
+        $file_id = floatval($file_id);
+
+        $sql = 'SELECT _id FROM ' . $this->getFileBodyTableName()
+               . ' WHERE _id = \'' . $this->dbconn->escape($file_id) . '\'';
+        $result = $this->dbconn->query($sql);
+        $row = $this->dbconn->fetch_assoc($result);
+        if ($row === false) {
+            $exists = false;
+        }
+        $this->dbconn->free_result($result);
+        unset($file_id, $sql, $result, $row);
+
+        return $exists;
+    }
+
+    /**
+     * @private
+     *
+     *  ファイル実体を削除する
+     */
+    function deleteFile($file_path)
+    {
+        $file_size = @filesize($file_path);
+
+        if ($this->is_exec) {
+            if (is_dir($file_path)) {
+                $result = @rmdir($file_path);
+            } else {
+                $result = @unlink($file_path);
+            }
+
+            if ($result) {
+                cb_cli_log('Delete: ' . $file_path . ', ' . $file_size
+                           . ' byte');
+                $this->file_num++;
+                $this->summary->addSize($file_size);
+            } else {
+                cb_cli_log('Failed to delete: ' . $file_path . ', ' . $file_size
+                           . ' byte');
+                $this->failed_num++;
+            }
+        } else {
+            cb_cli_log('Hit ' . $file_path . ', ' . $file_size . ' byte');
+            $this->file_num++;
+            $this->summary->addSize($file_size);
+        }
+        unset($result);
+    }
+
+    /**
+     * @abstract
+     *
+     *  GRN_ApplicationLocator::getConnection() に渡す引数を返す。
+     */
+    function getModuleID()
+    {
+        return null;
+    }
+
+    /**
+     * @abstract
+     *
+     *  アプリの filebody テーブル名を返す
+     */
+    function getFileBodyTableName()
+    {
+        return null;
+    }
+}
+
+/**
+ *  すべてのファイルをGr2の正規ファイルとはみなさないクラス。
+ *  デフォルト用途なので安全面に倒している。
+ *
+ * @private
+ */
+class IlegalCondition
+{
+    function isLegal($file, $parentNumber)
+    {
+        return false;
+    }
+
+    /*
+        function suppressZero( $number )
+        {
+            if ( strcmp( $number, '0' ) === 0 ) return $number;
+
+            return preg_replace( "/^0+/", '', $number );
+        }
+    */
+}
+
+/**
+ *  第1階層用の IlegalCondition 拡張
+ *
+ * @private
+ */
+class FirstLayerCondition extends IlegalCondition
+{
+    function isLegal($file, $parentNumber)
+    {
+        //  ファイルはNG
+        if ( ! is_dir($file)) {
+            return false;
+        }
+
+        //  ファイル名は 0 か 1～9 で始まる数字
+        $base_name = basename($file);
+        if (preg_match(NUMBER_FORMAT_1ST_LAYER, $base_name)) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
+/**
+ * 第2階層用の IlegalCondition 拡張
+ *
+ * @private
+ */
+class SecondLayerCondition extends IlegalCondition
+{
+    function isLegal($file, $parentNumber)
+    {
+        //  ファイルはNG
+        if ( ! is_dir($file)) {
+            return false;
+        }
+
+        //  １階層めが 0 かどうかで桁数が変わる
+        if ($parentNumber == 0) {
+            //  ファイル名は 0 か、 1～9 で始まる最大3桁の数字
+            $format = NUMBER_FORMAT_2ND_LAYER;
+        } else {
+            //  ファイル名は 0～9 で構成される3桁の数字
+            $format = NUMBER_FORMAT_2ND_LAYER_F;
+        }
+
+        $base_name = basename($file);
+        if (preg_match($format, $base_name)) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
+/**
+ *  第3階層用の IlegalCondition 拡張
+ *
+ * @private
+ */
+class ThirdLayerCondition extends IlegalCondition
+{
+    function isLegal($file, $parentNumber)
+    {
+        //  ファイルのみOK
+        if (is_dir($file)) {
+            return false;
+        }
+
+        //  １階層めが 0 かどうかで桁数が変わる
+        if ($parentNumber == 0) {
+            //  ファイル名は 0 か、 1～9 で始まる最大3桁の数字
+            $format = NUMBER_FORMAT_2ND_LAYER;
+        } else {
+            //  ファイル名は 0～9 で構成される3桁の数字
+            $format = NUMBER_FORMAT_2ND_LAYER_F;
+        }
+
+        $base_name = basename($file);
+        if (preg_match($format, $base_name)) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
+/**
+ *  総計結果の保管用クラス
+ *
+ * @public
+ */
+class Summary
+{
+    var $size;
+    var $success;
+    var $error;
+
+    function __construct()
+    {
+        $this->init();
+    }
+
+    function addSuccess($count)
+    {
+        $this->success += $count;
+    }
+
+    function addError($count)
+    {
+        $this->error += $count;
+    }
+
+    function addSize($size)
+    {
+        $this->size += $size;
+    }
+
+    function getSuccess()
+    {
+        return $this->success;
+    }
+
+    function getError()
+    {
+        return $this->error;
+    }
+
+    function getMSize()
+    {
+        return round(($this->size / BYTE_UNIT / BYTE_UNIT), 3);
+    }
+
+    function getSize()
+    {
+        return number_format($this->size);
+    }
+
+    function init()
+    {
+        $this->size = 0;
+        $this->success = 0;
+        $this->error = 0;
+    }
+}
+
+/**
+ *  システムの不要ファイルを削除するクラス。
+ *
+ * @public
+ */
+class SystemServerFileCleaner extends ServerFileCleaner
+{
+    //  @Override
+    function getModuleID()
+    {
+        return 'system';
+    }
+
+    //  @Override
+    function getFileBodyTableName()
+    {
+        return 'tab_grn_filebody';
+    }
+}
+
+/**
+ *  アドレス帳の不要ファイルを削除するクラス。
+ *
+ * @public
+ */
+class AddressServerFileCleaner extends ServerFileCleaner
+{
+    //  @Override
+    function getModuleID()
+    {
+        return 'address';
+    }
+
+    //  @Override
+    function getFileBodyTableName()
+    {
+        return 'tab_grn_address_filebody';
+    }
+}
+
+/**
+ *  掲示板の不要ファイルを削除するクラス。
+ *
+ * @public
+ */
+class BulletinServerFileCleaner extends ServerFileCleaner
+{
+    //  @Override
+    function getModuleID()
+    {
+        return 'bulletin';
+    }
+
+    //  @Override
+    function getFileBodyTableName()
+    {
+        return 'tab_grn_bulletin_filebody';
+    }
+}
+
+/**
+ *  ファイル管理の不要ファイルを削除するクラス。
+ *
+ * @public
+ */
+class CabinetServerFileCleaner extends ServerFileCleaner
+{
+    //  @Override
+    function getModuleID()
+    {
+        return 'cabinet';
+    }
+
+    //  @Override
+    function getFileBodyTableName()
+    {
+        return 'tab_grn_cabinet_filebody';
+    }
+}
+
+/**
+ *  メモの不要ファイルを削除するクラス。
+ *
+ * @public
+ */
+class MemoServerFileCleaner extends ServerFileCleaner
+{
+    //  @Override
+    function getModuleID()
+    {
+        return 'memo';
+    }
+
+    //  @Override
+    function getFileBodyTableName()
+    {
+        return 'tab_grn_memo_filebody';
+    }
+}
+
+/**
+ *  メッセージの不要ファイルを削除するクラス。
+ *
+ * @public
+ */
+class MessageServerFileCleaner extends ServerFileCleaner
+{
+    //  @Override
+    function getModuleID()
+    {
+        return 'message';
+    }
+
+    //  @Override
+    function getFileBodyTableName()
+    {
+        return 'tab_grn_message_filebody';
+    }
+}
+
+/**
+ *  ワークフローの不要ファイルを削除するクラス。
+ *
+ * @public
+ */
+class WorkflowServerFileCleaner extends ServerFileCleaner
+{
+    //  @Override
+    function getModuleID()
+    {
+        return 'workflow';
+    }
+
+    //  @Override
+    function getFileBodyTableName()
+    {
+        return 'tab_grn_workflow_filebody';
+    }
+}
+
+/**
+ *  マルチレポートの不要ファイルを削除するクラス。
+ *
+ * @public
+ */
+class ReportServerFileCleaner extends ServerFileCleaner
+{
+    //  @Override
+    function getModuleID()
+    {
+        return 'report';
+    }
+
+    //  @Override
+    function getFileBodyTableName()
+    {
+        return 'tab_grn_report_filebody';
+    }
+}
+
+/**
+ *  メールファイルの不要ファイルを削除するクラス。
+ *
+ * @public
+ */
+class MailServerFileCleaner extends ServerFileCleaner
+{
+    var $no;
+
+    function __construct($no)
+    {
+        $this->no = $no;
+    }
+
+    //  @Override
+    function getModuleID()
+    {
+        return 'mail';
+    }
+
+    //  @Override
+    function getFileBodyTableName()
+    {
+        return 'tab_grn_mail_filebody___p' . $this->no;
+    }
+}
+
+/**
+ *  メールソースファイルの不要ファイルを削除するクラス。
+ *
+ * @public
+ */
+class MailSourceFileCleaner extends ServerFileCleaner
+{
+    var $no;
+
+    function __construct($no)
+    {
+        $this->no = $no;
+    }
+
+    //  @Override
+    function getModuleID()
+    {
+        return 'mail';
+    }
+
+    //  @Override
+    function getFileBodyTableName()
+    {
+        return 'tab_grn_mail_sourcefilebody___p' . $this->no;
+    }
+}
+
+/**
+ *  スーペースの不要ファイルを削除するクラス。
+ *
+ * @public
+ */
+class SpaceServerFileCleaner extends ServerFileCleaner
+{
+    //  @Override
+    function getModuleID()
+    {
+        return 'space';
+    }
+
+    //  @Override
+    function getFileBodyTableName()
+    {
+        return 'tab_grn_space_filebody';
+    }
+}
+
+class ScheduleServerFileCleaner extends ServerFileCleaner
+{
+    //  @Override
+    function getModuleID()
+    {
+        return 'schedule';
+    }
+
+    //  @Override
+    function getFileBodyTableName()
+    {
+        return 'tab_grn_schedule_filebody';
+    }
+}
+
+/**
+ *  ツールの処理できる ServerFileCleaner のリスト。
+ *  新しい Cleaner を作ったら、このリストに追加してください。
+ */
+global $normal_cleaner_names;
+$normal_cleaner_names = [
+    'SystemServerFileCleaner',
+    'AddressServerFileCleaner',
+    'BulletinServerFileCleaner',
+    'CabinetServerFileCleaner',
+    'MemoServerFileCleaner',
+    'MessageServerFileCleaner',
+    'WorkflowServerFileCleaner',
+    'ReportServerFileCleaner',
+    'SpaceServerFileCleaner',
+    'ScheduleServerFileCleaner'
+];
+
+global $distributed_cleaner_names;
+$distributed_cleaner_names = [
+    'MailServerFileCleaner',
+    'MailSourceFileCleaner',
+];
+
+/**
+ *   CleanerMap の配列を作成する。
+ *
+ */
+function getCleanerMap()
+{
+    global $normal_cleaner_names, $distributed_cleaner_names;
+
+    $cleanerMap = [];
+    foreach ($normal_cleaner_names as $cleaner_name) {
+        $cleaner = new $cleaner_name();
+        if ( ! array_key_exists($cleaner->getModuleID(), $cleanerMap)) {
+            $cleanerMap[$cleaner->getModuleID()] = [];
+        }
+        $cleanerMap[$cleaner->getModuleID()][] = $cleaner;
+    }
+
+    foreach ($distributed_cleaner_names as $cleaner_name) {
+        for ($i = 0; $i < 50; $i++) {
+            $cleaner = new $cleaner_name($i);
+            if ( ! array_key_exists($cleaner->getModuleID(), $cleanerMap)) {
+                $cleanerMap[$cleaner->getModuleID()] = [];
+            }
+            $cleanerMap[$cleaner->getModuleID()][] = $cleaner;
+        }
+    }
+
+    return $cleanerMap;
+}
+
+/**
+ *   引数:appをパースして対応する Cleaner の配列を作成する。
+ *
+ * @private
+ */
+function getCleaners($options)
+{
+    $cleaners = [];
+    $cleanerMap = getCleanerMap();
+    $appids = array_unique(explode(',', $options[CB_CLI_APP_OPTION]));
+
+    foreach ($appids as $appid) {
+        if (0 < strlen($appid)) {
+            if (array_key_exists($appid, $cleanerMap)) {
+                $cleaners = array_merge($cleaners, $cleanerMap[$appid]);
+            } else {
+                cb_cli_log('Error: Invalid application : ' . $appid);
+                help_and_exit();
+            }
+        }
+    }
+
+    return $cleaners;
+}
+
+
+//  メインルーチン
+$summary = new Summary();
+$options = cb_cli_start();
+
+//  ログ出力するログファイル名を表示する。
+global $G_config_grn;
+$log_file = str_replace('.csp', '.log', basename(__FILE__));
+cb_cli_log("Writing to log file: $log_file");
+
+//  ガルーンのバージョン情報を表示する。
+$grn_version = $G_config_grn->get("System", "version");
+cb_cli_log("Garoon: Version $grn_version");
+
+// オペレーティングシステムに関する情報を返す
+$system_os = php_uname();
+cb_cli_log($system_os);
+
+//  ツールの実行にかかる時間を取得する。
+global $_cb_cli_starting_timestamp;
+$_cb_cli_starting_timestamp
+    = new CB_DateTimeEx(_cb_date_convert_to_datetime(null));
+cb_cli_log('Starting');
+
+//  ツールの実行時間を変換する。
+function _cb_cli_seconds_to_string($seconds)
+{
+    $str = "";
+    // Time unit words and the divisor that can produce the associated unit from seconds
+    $ary = [
+        "day"    => 24 * 60 * 60,
+        "hour"   => 60 * 60,
+        "minute" => 60,
+        "second" => 1
+    ];
+    // WARNING: Assuming/Relying that foreach() iterates over $ary elements in order of appearance
+    foreach ($ary as $unit => $divisor) {
+        $dividend = intval($seconds / $divisor);
+        if ($dividend > 0 or (strlen($str) == 0 and $divisor
+                                                    == 1)
+        ) // The 2nd condition will at least say "0 seconds".
+        {
+            $str .= sprintf("%d %s%s ", $dividend, $unit,
+                $dividend == 1 ? "" : "s");
+        }
+        $seconds %= $divisor;
+    }
+
+    return trim($str);
+}
+
+
+//  メインルーチンの続き
+$cleaners = getCleaners($options);
+
+foreach ($cleaners as $cleaner) {
+    $cleaner->clean($options, $summary);
+}
+
+//実行結果をSummaryにまとめて出力する。
+//  ツールの実行時間を集計する。
+function _cb_cli_emit_trailer($summary = null)
+{
+    $_cb_cli_ending_timestamp
+        = new CB_DateTimeEx(_cb_date_convert_to_datetime(null));
+    global $_cb_cli_starting_timestamp;
+    $duration
+        = $_cb_cli_ending_timestamp->getInterval($_cb_cli_starting_timestamp);
+    $duration_str = _cb_cli_seconds_to_string($duration->toSeconds());
+
+    cb_cli_log(sprintf("Done in %s%s", $duration_str,
+        strlen($summary) < 1 ? '.' : ": $summary"));
+}
+
+cb_cli_log('Summary.');
+cb_cli_log('  Hit ' . $summary->getSuccess() . ' files, ' . $summary->getMSize()
+           . ' MB ( ' . $summary->getSize() . ' byte ), Finished.');
+if (0 < $summary->getError()) {
+    cb_cli_log('  Error: Failed to delete ' . $summary->getError() . ' files.');
+}
+
+//'  Done in '.$summary->getSuccess().
+
+

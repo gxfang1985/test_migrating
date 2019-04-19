@@ -1,0 +1,1695 @@
+<?php
+
+/**
+ * ファイル管理、通知設定
+ *
+ * @author  Tanaka, Yoshiaki        2004/11
+ * @package grn.cabinet
+ */
+
+require_once('fw/i18n.csp');
+require_once('cabinet/folder.csp');
+require_once('cabinet/table.csp');
+require_once('cabinet/CabinetFacade.csp');
+require_once('grn/application.csp');
+
+// 購読設定をキャッシュするユーザー数
+define('GRN_CABINET_MAX_CACHE_USERS', 1);
+// 一度に処理する通知数の上限
+define('GRN_CABINET_MAX_NOTIFICATION', 100);
+// 1秒間で受け取る通知の上限
+define('GRN_CABINET_LIMIT_NOTIFICATION', 500);
+
+define('GRN_CABINET_NOTIFICATION_CSV_FOREINKEY', 0);
+define('GRN_CABINET_NOTIFICATION_CSV_ITEM', 1);
+define('GRN_CABINET_NOTIFICATION_CSV_VALUE', 2);
+define('GRN_CABINET_NOTIFICATION_CSV_TARGET', 3);
+
+/**
+ * @package grn.cabinet
+ */
+class GRN_Cabinet_NotifyFolder
+{
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Cabinet_NotifyFolder
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * @access private
+     */
+    private $_cache = [];
+    private $_folder_ids = [];
+
+
+    function __construct()
+    {
+    }
+
+    /**
+     * @access private
+     */
+    private $_db = null;
+
+    /**
+     * @access private
+     */
+    function _getDatabase()
+    {
+        if (is_null($this->_db)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->_db = $app_locator->getConnection('cabinet');
+        }
+
+        return $this->_db;
+    }
+
+    /**
+     * @access private
+     */
+    function makeQuery(& $user)
+    {
+        $uid = $user->getOID();
+
+        require_once('cabinet/functions.csp');
+
+        $groups = grn_cabinet_get_user_groups($uid);
+        $roles = grn_cabinet_get_user_roles($uid);
+        $dynamic_roles = grn_cabinet_get_user_dynamic_roles($uid);
+
+        $conditions = [];
+
+        $join = 'tab_grn_cabinet_folderentity AS c';
+
+        $conditions[] = 'u.col_user = ' . $uid;
+        $join_condition
+            = ' LEFT JOIN tab_grn_cabinet_usernotification AS u ON c._id = u.col_folder';
+        $join = '(' . $join . $join_condition . ')';
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('cabinet');
+
+        // 組織指定の通知
+        if (count($groups) > 0) {
+            $join_condition
+                = ' LEFT JOIN tab_grn_cabinet_groupnotification AS g ON c._id = g.col_folder';
+            $join = '(' . $join . $join_condition . ')';
+
+            $escaped_groups = [];
+            foreach (array_keys($groups) as $key) {
+                $escaped_groups[] = cb_queryf($dbconn, "'@S'", $key);
+            }
+
+            $conditions[] = 'g.col_group IN (' . implode(',', $escaped_groups)
+                            . ')';
+        }
+
+        // ロール指定の通知
+        if (count($roles) > 0) {
+            $join_condition
+                = ' LEFT JOIN tab_grn_cabinet_rolenotification AS r ON c._id = r.col_folder';
+            $join = '(' . $join . $join_condition . ')';
+
+            $escaped_roles = [];
+            foreach (array_keys($roles) as $key) {
+                $escaped_roles[] = cb_queryf($dbconn, "'@S'", $key);
+            }
+
+            $conditions[] = 'r.col_role IN (' . implode(',', $escaped_roles)
+                            . ')';
+        }
+
+        // 動的ロール指定の通知
+        if (count($dynamic_roles) > 0) {
+            $join_condition
+                = ' LEFT JOIN tab_grn_cabinet_dynamicrolenotification AS d ON c._id = d.col_folder';
+            $join = '(' . $join . $join_condition . ')';
+
+            $escaped_roles = [];
+            foreach (array_keys($dynamic_roles) as $key) {
+                $escaped_roles[] = cb_queryf($dbconn, "'@S'", $key);
+            }
+
+            $conditions[] = 'd.col_dynamic_role IN (' . implode(',',
+                    $escaped_roles) . ')';
+        }
+
+        // WHERE句で条件を単純にORで列挙せず, UNION結合することで
+        // パフォーマンスを改善.
+        $queries = [];
+        foreach ($conditions as $condition) {
+            $queries[] = "SELECT c._id FROM $join WHERE $condition";
+        }
+
+        return implode(' UNION DISTINCT ', $queries);
+    }
+
+    /**
+     * @param  object $user          user object
+     * @param  array  $targets       target folders (ex. array( $id=>1, ... ))
+     *                               (if null, this returns all notified folders)
+     *
+     * @return array  $results
+     */
+    function &get(& $user, $targets = null)
+    {
+        if ( ! $user) {
+            assert('FALSE');
+            $ret = [];
+
+            return $ret;
+        }
+
+        $results = [];
+        $uid = $user->getOID();
+
+        // 通知設定されているフォルダを取得する
+        if (array_key_exists($uid, $this->_folder_ids)) {
+            $folder_ids = $this->_folder_ids[$uid];
+        } else {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $db = $app_locator->getConnection('cabinet');
+
+            $query = $this->makeQuery($user);
+            $result = $db->query($query);
+
+            $folder_ids = [];
+            if (cb_is_db_result($result)) {
+                $n = $db->num_rows($result);
+                for ($i = 0; $i < $n; $i++) {
+                    $row = $db->fetch_row($result);
+                    $folder_ids[$row[0]] = 1;
+                }
+                $db->free_result($result);
+            }
+
+            $this->_folder_ids[$uid] = $folder_ids;
+        }
+
+        if (is_null($targets) || ! is_array($targets)) {
+            // 対象が指定されていないときは、すべての通知設定されているフォルダを返す
+            $targets = $folder_ids;
+        } else {
+            // 対象が指定されているときは、通知設定されていないフォルダを外す
+            foreach ($targets as $id => $value) {
+                if ( ! array_key_exists($id, $folder_ids)) {
+                    unset($targets[$id]);
+                }
+            }
+        }
+
+        // 全部通知設定されていなければ、空の配列を返す
+        if (count($targets) == 0) {
+            return $results;
+        }
+
+        // cache
+        $cache = [];
+        if (array_key_exists($uid, $this->_cache)) {
+            $cache = $this->_cache[$uid];
+            foreach ($targets as $id => $value) {
+                if (array_key_exists($id, $cache)) {
+                    unset($targets[$id]);
+                    if ($cache[$id]) {
+                        $results[$id] = 1;
+                    }
+                }
+            }
+
+            // 全部キャッシュされていたら終了
+            if (count($targets) == 0) {
+                return $results;
+            }
+        }
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        $cache += $acc->evaluateFolders($user, $targets, GRN_CABINET_ACCESS_R);
+
+        foreach ($targets as $id => $value) {
+            if ( ! array_key_exists($id, $cache)) {
+                // アクセス権限がないものをキャッシュ
+                $cache[$id] = 0;
+            } elseif ($cache[$id]) {
+                // アクセス権限がある
+                $results[$id] = 1;
+            }
+        }
+
+        if (count($this->_cache) >= GRN_CABINET_MAX_CACHE_USERS) {
+            $cache_keys = array_keys($this->_cache);
+            $idx = array_shift($cache_keys);
+            unset($this->_cache[$idx]);
+        }
+
+        // update cache
+        $this->_cache[$uid] = $cache;
+
+        return $results;
+    }
+
+    function isNotified(& $user, $hid)
+    {
+        if ( ! $user || ! $hid) {
+            assert('FALSE');
+
+            return false;
+        }
+
+        $cache = $this->get($user);
+
+        return array_key_exists($hid, $cache);
+    }
+
+    /**
+     * @access private
+     */
+    private $_tables = null;
+
+    /**
+     * @access private
+     */
+    function _initTables()
+    {
+        if ( ! is_null($this->_tables)) {
+            return;
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('cabinet');
+
+        $this->_tables = [];
+        $this->_tables['user']
+            = $tm->getTableInfo('grn_cabinet_usernotification');
+        $this->_tables['group']
+            = $tm->getTableInfo('grn_cabinet_groupnotification');
+        $this->_tables['role']
+            = $tm->getTableInfo('grn_cabinet_rolenotification');
+        $this->_tables['dynamic_role']
+            = $tm->getTableInfo('grn_cabinet_dynamicrolenotification');
+    }
+
+    /**
+     * @access private
+     */
+    function _target2column(& $target)
+    {
+        if (is_null($target)) {
+            return null;
+        }
+
+        if (is_string($target)) {
+            return 'dynamic_role';
+        }
+
+        return substr(strtolower(get_class($target)), 3);
+    }
+
+    /**
+     * @access private
+     */
+    function &_column2table($column)
+    {
+        $this->_initTables();
+
+        if ( ! array_key_exists($column, $this->_tables)) {
+            $ret = null;
+
+            return $ret;
+        }
+        if ($column == 'folder') {
+            $ret = null;
+
+            return $ret;
+        }
+
+        return $this->_tables[$column];
+    }
+
+    /**
+     * @access private
+     */
+    function _addUserJoin(& $rowset, $target_column, $alias = '')
+    {
+        if (strcasecmp($target_column, 'user') === 0) {
+            if (is_string($alias) && strlen($alias) > 0) {
+                $table_name = $alias;
+            } else {
+                $table_name = CB_DATABASE_TABLE_PREFIX
+                              . $this->_tables['user']->getTableName();
+            }
+
+            $app_locator = GRN_ApplicationLocator::instance();
+            $tm =& $app_locator->getTableManager('cabinet');
+            $user_table_info =& $tm->getTableInfo('cb_user');
+
+            $on = "${table_name}.col_user = u._id AND u.col_deleted IS NULL";
+            $rowset->addJoin($user_table_info, $on, CB_DATABASE_INNER_JOIN,
+                'u');
+        }
+    }
+
+    /**
+     * @access private
+     */
+    function _getTableRow(& $folder, & $target)
+    {
+        if ( ! $folder || ! $target) {
+            return false;
+        }
+
+        if ( ! ($column = $this->_target2column($target))) {
+            return false;
+        }
+
+        if ( ! ($table = $this->_column2table($column))) {
+            return false;
+        }
+
+        $target_value = null;
+
+        if (is_object($target)) {
+            $target_value = $target->getOID();
+        } else {
+            $target_value = $target;
+        }
+
+        $rowset = new CB_RowSet($table);
+        $this->_addUserJoin($rowset, $column);
+        $condition
+            = $rowset->queryf("col_{$column} = '@S' AND col_folder = '@S'",
+            $target_value, $folder->getOID());
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return ['table' => $table, 'row' => $row];
+    }
+
+    function setTarget(& $folder, & $target, $onoff)
+    {
+        if ( ! ($tablerow = $this->_getTableRow($folder, $target))) {
+            return false;
+        }
+
+        if ($onoff) {
+            if ( ! $tablerow['row']) {
+                if ( ! ($column = $this->_target2column($target))) {
+                    return false;
+                }
+
+                $row =& $tablerow['table']->newRow();
+                $row->set('folder', $folder->_getRow());
+                $row->set($column, $target);
+                $row->registerNow();
+                $this->_cache = [];
+            }
+        } else {
+            if ($tablerow['row']) {
+                $tablerow['row']->delete();
+                $this->_cache = [];
+            }
+        }
+
+        return true;
+    }
+
+    function getTargets($folder, $target_column)
+    {
+        if ( ! $folder) {
+            return [];
+        }
+
+        if ( ! ($table =& $this->_column2table($target_column))) {
+            return [];
+        }
+
+        $rowset = new CB_RowSet($table);
+        $this->_addUserJoin($rowset, $target_column);
+        $rowset->addCondition('col_folder = ' . $folder->getOID());
+
+        $targets = [];
+        while ( ! is_null(($row = $rowset->iterate()))) {
+            $target = $row->get($target_column);
+
+            if (is_object($target)) {
+                $targets[$target->getOID()] = $target;
+            } else {
+                $targets[$target] = 1;
+            }
+        }
+        $rowset->destroy();
+
+        return $targets;
+    }
+
+    function deleteTargets(& $folder)
+    {
+        if ( ! $folder) {
+            return false;
+        }
+
+        $columns = ['user', 'group', 'role', 'dynamic_role'];
+
+        foreach ($columns as $column) {
+            $table =& $this->_column2table($column);
+
+            $rowset = new CB_RowSet($table);
+            $rowset->addCondition('col_folder = ' . $folder->getOID());
+            $rowset->deleteAllMatched();
+            $rowset->destroy();
+        }
+        $this->_cache = [];
+
+        return true;
+    }
+
+
+    function existsTarget(& $folder, & $target)
+    {
+        if ( ! ($tablerow = $this->_getTableRow($folder, $target))) {
+            return false;
+        }
+
+        return ! is_null($tablerow['row']);
+    }
+
+    function importCSV(&$user, &$folder, $line)     // Huy added
+    {
+        /*
+          $line[0] : "フォルダコード"
+          $line[1] : "設定項目"
+          $line[2] : "設定値"
+          $line[3] : "設定対象"
+         */
+
+        $ret = false;
+
+        $item = cb_trim($line[GRN_CABINET_NOTIFICATION_CSV_ITEM]);
+        $onoff = cb_trim($line[GRN_CABINET_NOTIFICATION_CSV_VALUE]);
+        $target = cb_trim($line[GRN_CABINET_NOTIFICATION_CSV_TARGET]);
+
+        if ($onoff != "1" && $onoff != "0") {
+            cb_throw_error(E_GRN_CABINET_NOTIFICATION_CSV_INVALID_VALUE);
+        }
+
+        global $G_container_base;
+        require_once('grn/uum_util.csp');
+        $uum =& $G_container_base->getInstance('uum');
+        $uum_util = GRN_UumUtil::getInstance();
+        $dynamic_roles = $uum_util->listDynamicRoles();
+
+        switch ($item) {
+            case 'user':
+                if (($user =& $uum->getUserByForeignKey($target))) {
+                    $ret = $folder->setNotificationTarget($user, $onoff);
+                } else {
+                    require_once('grn/error_code.csp');
+                    cb_throw_error(E_GRN_USER_NOT_FOUND);
+                }
+                break;
+
+            case 'group':
+                if (($group =& $uum->getGroupByForeignKey($target))) {
+                    $ret = $folder->setNotificationTarget($group, $onoff);
+                } else {
+                    require_once('grn/error_code.csp');
+                    cb_throw_error(E_GRN_GROUP_NOT_FOUND);
+                }
+                break;
+
+            case 'role':
+                if (($role =& $uum->getStaticRoleByForeignKey($target))) {
+                    $ret = $folder->setNotificationTarget($role, $onoff);
+                } else {
+                    require_once('grn/error_code.csp');
+                    cb_throw_error(E_GRN_ROLE_NOT_FOUND);
+                }
+                break;
+
+            case 'dynamic_role':
+                if (array_key_exists($target, $dynamic_roles)) {
+                    $ret = $folder->setNotificationTarget($target, $onoff);
+                } else {
+                    require_once('grn/error_code.csp');
+                    cb_throw_error(E_GRN_ROLE_NOT_FOUND);
+                }
+                break;
+            default:
+                cb_throw_error(E_GRN_CABINET_NOTIFICATION_CSV_TARGET_NOT_FOUND,
+                    null, ['item' => $item]);
+        }
+
+        return $ret;
+    }
+
+    function exportCSV(&$folder, &$csv)     // Huy added
+    {
+        $folder_code = $folder->get('foreign_key');
+
+        /*
+          $line[0] : "フォルダコード"
+          $line[1] : "設定項目"
+          $line[2] : "設定値"
+          $line[3] : "設定対象"
+         */
+
+        $targets = $folder->getNotificationTargets('dynamic_role');
+        foreach (array_keys($targets) as $id) {
+            $line = [];
+            $line[] = $folder_code;
+            $line[] = 'dynamic_role';
+            $line[] = 1;
+            $line[] = $id;
+
+            $csv->writeLine($line);
+        }
+
+        $targets = $folder->getNotificationTargets('role');
+        foreach (array_keys($targets) as $id) {
+            $item =& $targets[$id];
+
+            $line = [];
+            $line[] = $folder_code;
+            $line[] = 'role';
+            $line[] = 1;
+            $line[] = $item->get('foreign_key');
+
+            $csv->writeLine($line);
+        }
+
+        $targets = $folder->getNotificationTargets('group');
+        foreach (array_keys($targets) as $id) {
+            $item =& $targets[$id];
+
+            $line = [];
+            $line[] = $folder_code;
+            $line[] = 'group';
+            $line[] = 1;
+            $line[] = $item->get('foreign_key');
+
+            $csv->writeLine($line);
+        }
+
+        $targets = $folder->getNotificationTargets('user');
+        foreach (array_keys($targets) as $id) {
+            $item =& $targets[$id];
+
+            $line = [];
+            $line[] = $folder_code;
+            $line[] = 'user';
+            $line[] = 1;
+            $line[] = $item->get('foreign_key');
+
+            $csv->writeLine($line);
+        }
+    }
+
+}
+
+
+/**
+ * @package grn.cabinet
+ */
+class GRN_Cabinet_NotificationManager
+{
+    /**
+     * @access private
+     */
+    private $_module_id = null;
+
+
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Cabinet_NotificationManager
+     */
+    public static function getInstance($available = true)
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c($available);
+        }
+
+        return self::$_instance;
+    }
+
+    function __construct($available = true)
+    {
+        require_once('grn/application.csp');
+        $locator = GRN_ApplicationLocator::instance();
+        $app = $locator->getInstance('cabinet');
+
+        $this->_module_id = $app->getModuleId();
+    }
+
+
+    /**
+     * 購読設定
+     * この操作でフォルダの通知設定は考慮しないので、強制通知フォルダであっても
+     * 購読解除を設定することができる
+     *
+     * @param object CB_User $user    操作ユーザー
+     * @param mixed $object GRN_Cabinet_Folder
+     * @param bool  $onoff  購読の場合はTRUE、解除の場合はFALSEを指定
+     *
+     * @return bool  成功の場合にTRUE、それ以外の場合にはFALSE
+     */
+    function subscribe(& $user, & $object, $onoff)
+    {
+        if ( ! $user || ! $object) {
+            return false;
+        }
+
+        if (is_a($object, 'GRN_Cabinet_Folder')) {
+            require_once('cabinet/include_subscribe.csp');
+            $subfolder = GRN_Cabinet_SubscribeFolders::getInstance();
+
+            return $subfolder->set($user, $object, $onoff);
+        }
+
+        return false;
+    }
+
+
+    /**
+     * 購読状態を取得する
+     * 通知設定は考慮せず、ユーザーの購読設定を調べるだけ
+     *
+     * @param CB_User                             $user 操作ユーザー
+     * @param GRN_Cabinet_File|GRN_Cabinet_Folder $object
+     *
+     * @return bool  購読している場合にはTRUE、それ以外の場合にはFALSE
+     */
+    function isSubscribed($user, $object)
+    {
+        if ( ! $user || ! $object) {
+            return false;
+        }
+
+        if ($object instanceof GRN_File) {
+            require_once('cabinet/file.csp');
+            $fm = GRN_Cabinet_FileManager::getInstance();
+            $folder =& $fm->getFolder($object);
+
+            require_once('cabinet/include_subscribe.csp');
+            $subfolder = GRN_Cabinet_SubscribeFolders::getInstance();
+
+            return $subfolder->exists($user, $folder);
+        } elseif ($object instanceof GRN_Cabinet_Folder) {
+            require_once('cabinet/include_subscribe.csp');
+            $subfolder = GRN_Cabinet_SubscribeFolders::getInstance();
+
+            return $subfolder->exists($user, $object);
+        }
+
+        return false;
+    }
+
+    /**
+     * 通知設定
+     *
+     * @param object GRN_Cabinet_Folder $folder  設定対象フォルダ
+     * @param mixed $target 通知対象（User,Group,Role）
+     * @param bool  $onoff  通知を受ける場合はTRUE
+     *
+     * @return bool  設定に成功した場合にはTRUE、それ以外でFALSE
+     */
+    function setNotificationTarget(& $folder, & $target, $onoff)
+    {
+        $notify = GRN_Cabinet_NotifyFolder::getInstance();
+
+        return $notify->setTarget($folder, $target, $onoff);
+    }
+
+    /**
+     * フォルダの通知先を一括削除する
+     *
+     * @param object GRN_Cabinet_Folder $folder
+     *
+     * @return bool
+     */
+    function deleteAllNotificationTargets(& $folder)
+    {
+        $notify = GRN_Cabinet_NotifyFolder::getInstance();
+
+        return $notify->deleteTargets($folder);
+    }
+
+
+    /**
+     * 通知されているか調べる
+     *
+     * @param mixed $target ユーザーまたは組織またはロールオブジェクト
+     * @param object GRN_Cabinet_Folder $folder
+     *
+     * @return bool
+     */
+    function isNotificationTarget(& $folder, & $target)
+    {
+        $notify = GRN_Cabinet_NotifyFolder::getInstance();
+
+        return $notify->existsTarget($folder, $target);
+    }
+
+
+    /**
+     * 通知先を取得する
+     *
+     * @param object GRN_Cabinet_Folder $folder  フォルダ
+     * @param string $target_column "user" or "group" or "role"
+     *
+     * @return array  array( $oid => & $object, ... )
+     */
+    function getNotificationTargets(& $folder, $target_column)
+    {
+        $notify = GRN_Cabinet_NotifyFolder::getInstance();
+
+        return $notify->getTargets($folder, $target_column);
+    }
+
+
+    /**
+     * 通知対象かどうか調べる
+     *
+     * @param CB_User                             $user ユーザー
+     * @param GRN_Cabinet_File|GRN_Cabinet_Folder $object
+     *
+     * @return bool
+     */
+    function isNotified($user, $object)
+    {
+        if ( ! $user || ! $object) {
+            return false;
+        }
+
+        if (is_a($object, 'GRN_File')) {
+            require_once('cabinet/file.csp');
+            $fm = GRN_Cabinet_FileManager::getInstance();
+            $folder =& $fm->getFolder($object);
+
+            $notify = GRN_Cabinet_NotifyFolder::getInstance();
+            if ($notify->isNotified($user, $folder->getOID())) {
+                return true;
+            }
+        } elseif (is_a($object, 'GRN_Cabinet_Folder')) {
+            $notify = GRN_Cabinet_NotifyFolder::getInstance();
+            if ($notify->isNotified($user, $object->getOID())) {
+                return true;
+            }
+
+            //return $this->isSubscribed( $user, $object );
+        }
+
+
+        return false;
+    }
+
+    /**
+     * ユーザーの購読しているフォルダ一覧を取得する、通知設定は考慮されない
+     *
+     * @access private
+     */
+    function getSubscribedFolderIds(& $user)
+    {
+        if ( ! $user) {
+            return [];
+        }
+
+        require_once('cabinet/include_subscribe.csp');
+        $subfolder = GRN_Cabinet_SubscribeFolders::getInstance();
+
+        return $subfolder->get($user);
+    }
+
+    function getSubscribedFolders(& $user)
+    {
+        $folder_ids = $this->getSubscribedFolderIds($user);
+        if (count($folder_ids) < 1) {
+            return [];
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('cabinet');
+
+        $i18n = CB_I18N::getInstance();
+        $table_info = cb_class2table('GRN_Cabinet_FolderEntity');
+
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        $dataObj['offset'] = 0;
+        $dataObj['limit'] = -1;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+        $folderIdArray = array_keys($folder_ids);
+
+        $folderList = $dao->getCabinetFolderListByIds($dataObj, $folderIdArray);
+
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+        $folders = [];
+        foreach ($folderList as $folder) {
+            $row = $table_info->getRow($folder->getId(),
+                $folder->convertArray());
+            $folderId = $row->getOID();
+            $folders[$folderId] = $factory->row2object($row);
+        }
+
+        return $folders;
+    }
+
+
+    /**
+     * 通知フォルダの取得
+     *
+     * @param object CB_User $user                 ユーザー
+     * @param bool $contains_subscribed 購読フォルダを含む場合はTRUE
+     *
+     * @return array  array( $cid => & GRN_Cabinet_Folder, ... )
+     */
+    function getNotifiedFolderIds(& $user, $contains_subscribed = false)
+    {
+        if ( ! $user) {
+            return [];
+        }
+
+        $notify = GRN_Cabinet_NotifyFolder::getInstance();
+
+        $notified = $notify->get($user);
+
+        if ($contains_subscribed) {
+            // 購読フォルダを含む場合
+
+            // 購読フォルダを取得
+            $subscribed = $this->getSubscribedFolderIds($user);
+
+            // 通知フォルダと購読フォルダをマージ
+            foreach (array_keys($subscribed) as $hid) {
+                if ( ! array_key_exists($hid, $notified)) {
+                    $notified[$hid] = 1;
+                }
+            }
+        }
+
+        return $notified;
+    }
+
+    function getNotifiedFolders(& $user)
+    {
+        $folder_ids = $this->getNotifiedFolderIds($user);
+
+        if (count($folder_ids) < 1) {
+            return [];
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('cabinet');
+
+        $i18n = CB_I18N::getInstance();
+        $table_info = cb_class2table('GRN_Cabinet_FolderEntity');
+
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        $dataObj['offset'] = 0;
+        $dataObj['limit'] = -1;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+        $folderIdArray = array_keys($folder_ids);
+
+        $folderList = $dao->getCabinetFolderListByIds($dataObj, $folderIdArray);
+
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+        $folders = [];
+        foreach ($folderList as $folder) {
+            $row = $table_info->getRow($folder->getId(),
+                $folder->convertArray());
+            $folderId = $row->getOID();
+            $folders[$folderId] = $factory->row2object($row);
+        }
+
+        return $folders;
+    }
+
+    /**
+     * 既読処理
+     *
+     * @param CB_User      $user           ユーザー
+     * @param GRN_File     $file           ファイル
+     * @param CB_TimeStamp $ts             処理時間、「null」の場合は現在時刻
+     * @param bool         $enable_confirm 通知処理を実行する場合にTRUE
+     *
+     * @return bool
+     */
+    function read(& $user, & $file, $ts = null, $enable_confirm = true)
+    {
+        if ( ! $user || ! $file) {
+            return false;
+        }
+
+        if (is_null($ts)) {
+            $ts = new CB_TimeStamp();
+            $ts->unix_ts = time();
+        }
+
+        require_once('cabinet/readstatus.csp');
+        $cacher = GRN_Cabinet_FileReadStatus::getInstance();
+        $status = $cacher->get($user, $file);
+
+        if ( ! $status) {
+            // 通知の確認処理の中で既読情報をチェックするため
+            // 既読情報を更新する前に通知の確認処理を呼び出す
+
+            if ($enable_confirm) {
+                $this->confirmNotification($user, $file, $ts);
+            }
+
+            // 最初の閲覧
+
+            $status = $cacher->create($user, $file, $ts);
+        } else {
+            if ($enable_confirm) {
+                $mtime = $file->get('mtime');
+                $ltime = $status->get('last_timestamp');
+
+                if ($ltime->unix_ts < $mtime->unix_ts) {
+                    // 更新されている場合は通知の確認処理
+
+                    $this->confirmNotification($user, $file, $ts);
+                }
+            }
+        }
+
+        $status->set('last_timestamp', $ts);
+
+        $status->updateNow();
+
+        return true;
+    }
+
+    /**
+     * ファイルの既読タイムスタンプを取得
+     *
+     * @param CB_User  $user ユーザー
+     * @param GRN_File $file ファイル
+     *
+     * @return CB_TimeStamp
+     */
+    function getReadTimeStamp(& $user, & $file)
+    {
+        if ( ! $user || ! $file) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        require_once('cabinet/readstatus.csp');
+        $cacher = GRN_Cabinet_FileReadStatus::getInstance();
+        $status = $cacher->get($user, $file);
+
+        if ( ! $status) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        $ret = $status->get('last_timestamp');
+
+        return $ret;
+    }
+
+    /**
+     * 既読状態を取得する
+     *
+     * @param object CB_User  $user  ユーザー
+     * @param object GRN_File $file  ファイル
+     *
+     * @return integer  未読の場合「-1」更新後未読の場合「1」既読の場合「0」
+     */
+    function getReadStatus(& $user, & $file)
+    {
+        if (is_null(($rtime = $this->getReadTimeStamp($user, $file)))) {
+            return -1;
+        }
+
+        $ntime = $file->get('mtime');
+
+        return $ntime->unix_ts > $rtime->unix_ts ? 1 : 0;
+    }
+
+    /**
+     * 既読確認
+     *
+     * @param object CB_User  $user  ユーザー
+     * @param object GRN_File $file  ファイル
+     *
+     * @return bool  既読の場合にはTRUE、未読の場合にはFALSE
+     */
+    function isRead(& $user, & $file)
+    {
+        return $this->getReadStatus($user, $file) == 0;
+    }
+
+
+    /**
+     * 通知ファイル検索用のCB_MultiRowSetを生成する
+     *
+     * @param object CB_User $user            ユーザー
+     * @param string  $last_timestamp  最終通知処理時刻
+     * @param integer $limit           検索件数
+     * @param bool    $equal_timestamp $last_timestamp と同時刻を検索する場合にTRUE
+     * @param array   $select_columns  検索結果カラム情報
+     *
+     * @return array
+     * @access private
+     */
+    function _createNotifyFileList(
+        & $user,
+        $last_timestamp,
+        $limit,
+        $equal_timestamp,
+        & $select_columns
+    ) {
+        // 通知フォルダを取得
+        $notified = $this->getNotifiedFolderIds($user, true);
+
+        // 通知フォルダが全くなければ何もしない
+        if ( ! $notified) {
+            return null;
+        }
+
+        $select_columns = [
+            'f._id'                => 0,
+            'f.col_title'          => 1,
+            'f.col_version'        => 2,
+            'f.col_title_sort_key' => 3,
+            'f.col_ctime'          => 4,
+            'f.col_creator'        => 5,
+            'f.col_creator_name'   => 6,
+            'f.col_mtime'          => 7,
+            'f.col_modifier'       => 8,
+            'f.col_modifier_name'  => 9,
+            'b.col_name'           => 10,
+            'b.col_mime'           => 11,
+            'b.col_size'           => 12,
+            'r.col_last_timestamp' => 13,
+            'fr.col_folder'        => 14,
+        ];
+
+        $query = "SELECT " . implode(',', array_keys($select_columns));
+
+        $uid = $user->getOID();
+
+        $query .= " FROM tab_grn_cabinet_filerelation AS fr";
+
+        $query .= " LEFT JOIN tab_grn_cabinet_file AS f ON fr.col_file = f._id AND f.col_modifier != {$uid}";
+        $query .= " LEFT JOIN tab_grn_cabinet_filebody AS b ON f._id = b.col_file AND f.col_version = b.col_version";
+        $query .= " LEFT JOIN tab_grn_cabinet_readstatus AS r ON r.col_user = {$uid} AND r.col_file = f._id";
+        $query .= " INNER JOIN tab_cb_user AS u ON f.col_modifier = u._id AND u.col_deleted IS NULL";
+
+        // クエリーの生成
+
+        $conditions = [];
+
+        if ($last_timestamp) {
+            if ($equal_timestamp) {
+                // 最終通知処理時刻に更新されているファイルに限定する
+                $conditions[] = "(f.col_mtime = {$last_timestamp})";
+            } else {
+                // 最終通知処理時刻以降に更新されているファイルに限定する
+                $conditions[] = "(f.col_mtime > {$last_timestamp})";
+            }
+        }
+
+        // 未読ファイルに限定
+        $conditions[]
+            = '(r.col_user IS NULL OR r.col_last_timestamp < f.col_mtime)';
+
+        // フォルダ条件
+        $conditions[] = 'fr.col_folder IN (' . implode(',',
+                array_keys($notified)) . ')';
+
+        $query .= " WHERE " . implode(' AND ', $conditions);
+
+        $query .= " ORDER BY f.col_mtime, f._id";
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db =& $app_locator->getConnection('cabinet');
+
+        $query = $db->select_format($query, 0, $limit, CB_DATABASE_NO_LOCK);
+
+        $result = $db->query($query);
+
+        if ( ! cb_is_db_result($result)) {
+            return [];
+        }
+
+        $rows = [];
+
+        while (($row = $db->fetch_row($result)) !== false) {
+            $rows[$row[$select_columns['f._id']]] = $row;
+        }
+
+        $db->free_result($result);
+
+        return $rows;
+    }
+
+
+    /**
+     * 最新の通知状態が設定された通知データを生成
+     *
+     * @param object CB_User               $user  閲覧ユーザー
+     * @param object GRN_File              $file  ファイル
+     * @param object GRN_Notification_Data $data  通知データオブジェクト
+     *
+     * @return bool
+     * @access private
+     */
+    function _createCurrentNotification(& $user, & $file, & $data)
+    {
+        require_once('cabinet/readstatus.csp');
+        $cacher = GRN_Cabinet_FileReadStatus::getInstance();
+        $rstate =& $cacher->get($user, $file);
+
+        $status = null;
+
+        if ( ! $rstate) {
+            $status = 'unread';
+        } else {
+            $mtime = $file->get('mtime');
+            $ltime = $rstate->get('last_timestamp');
+
+            if ($mtime->unix_ts > $ltime->unix_ts) {
+                $status = 'update';
+            } else {
+                $status = 'confirm';
+            }
+        }
+
+        $data->initData();
+
+        if ($status == 'unread') {
+            $data->setStatusToUnread();
+        } elseif ($status == 'update') {
+            $data->setStatusToUpdate();
+        } else {
+            $data->setStatusToConfirm();
+
+            return true;
+        }
+
+        $data->setModuleId($this->_module_id);
+        $data->setUniqueId($file->getOID());
+
+        $body =& $file->getCurrentBody();
+
+        $title = $file->get('title');
+
+        if (strlen($title) > 0) {
+            $data->setSubjectData($title);
+        } else {
+            $data->setSubjectData($body->get('name'));
+        }
+
+        $data->setAbstractData($body->get('name'));
+
+        $modifier =& $file->get('modifier');
+
+        if ($modifier) {
+            $data->setSenderData($modifier->get('display_name'),
+                $modifier->getOID());
+        } else {
+            $data->setSenderData($file->get('modifier_name'), 0);
+        }
+
+        $data->setTimeStampData($file->get('mtime'));
+        $data->setOrgData(['name' => $body->get('name')]);
+
+        return true;
+    }
+
+
+    /**
+     * 最新の通知状態が設定された通知データを生成（配列バージョン）
+     *
+     * @param object CB_User               $user     閲覧ユーザー
+     * @param array $row     通知検索データ
+     * @param array $columns 通知検索データの取得カラム情報
+     * @param object GRN_Notification_Data $data     通知データオブジェクト
+     *
+     * @return bool
+     * @access private
+     */
+    function _createCurrentNotificationRow(& $user, $row, $columns, & $data)
+    {
+        $status = null;
+
+        if ( ! $row[$columns['r.col_last_timestamp']]) {
+            $status = 'unread';
+        } else {
+            if ($row[$columns['f.col_mtime']]
+                > $row[$columns['r.col_last_timestamp']]
+            ) {
+                $status = 'update';
+            } else {
+                $status = 'confirm';
+            }
+        }
+
+        $data->initData();
+
+        if ($status == 'unread') {
+            $data->setStatusToUnread();
+        } elseif ($status == 'update') {
+            $data->setStatusToUpdate();
+        } else {
+            $data->setStatusToConfirm();
+
+            return true;
+        }
+
+        $data->setModuleId($this->_module_id);
+        $data->setUniqueId($row[$columns['f._id']]);
+
+        if (strlen($row[$columns['f.col_title']]) > 0) {
+            $data->setSubjectData($row[$columns['f.col_title']]);
+        } else {
+            $data->setSubjectData($row[$columns['b.col_name']]);
+        }
+
+        $data->setAbstractData($row[$columns['b.col_name']]);
+
+        static $uum_instance = null;
+
+        if (is_null($uum_instance)) {
+            global $G_container_base;
+            $uum_instance =& $G_container_base->getInstance('uum');
+        }
+
+        $modifier =& $uum_instance->getUser($row[$columns['f.col_modifier']]);
+
+        if ($modifier) {
+            $data->setSenderData($modifier->get('display_name'),
+                $modifier->getOID());
+        } else {
+            $data->setSenderData($row[$columns['f.col_modifier_name']], 0);
+        }
+
+        static $_temp_ts = null;
+
+        if (is_null($_temp_ts)) {
+            $_temp_ts = new CB_TimeStamp();
+        }
+        $_temp_ts->unix_ts = $row[$columns['f.col_mtime']];
+
+        $data->setTimeStampData($_temp_ts);
+        $data->setOrgData([
+            'name' => $row[$columns['b.col_name']],
+            'hid'  => $row[$columns['fr.col_folder']]
+        ]);
+
+        return true;
+    }
+
+
+    /**
+     * 通知の更新処理（高速バージョン）
+     *
+     * @param object CB_User $user ユーザー
+     * @param object CB_TimeStamp $last_timestamp 最終通知処理時刻
+     * @param object CB_TimeStamp $new_timestamp 最終通知処理時刻の更新値
+     */
+    function updateNotification(& $user, $last_timestamp, & $new_timestamp)
+    {
+        assert('! is_null( $last_timestamp )');
+        /*
+        // 最初の通知ではユーザーか追加された時刻以降の更新を受信する
+        if( ! $last_timestamp )
+        {
+            $last_timestamp = $user->get( 'ctime' );
+        }
+        $last_ts = is_null($last_timestamp) ? NULL : $last_timestamp->unix_ts;
+        */
+        $last_ts = $last_timestamp->unix_ts;
+
+        $columns = [];
+
+        // 1回の最大通知処理件数＋1件の検索を行う
+        $rows = $this->_createNotifyFileList($user, $last_ts,
+            GRN_CABINET_MAX_NOTIFICATION + 1, false, $columns);
+
+        if ( ! is_array($rows) || count($rows) < 1) {
+            return;
+        }
+
+        require_once('grn/notification.csp');
+        $service = GRN_Notification_Service::getInstance();
+
+        $timestamps = [];
+        $dirty_timestamp = null;
+
+        require_once('grn/notification.csp');
+        $data = new GRN_Notification_Data();
+
+        $add_list = [];
+
+        foreach (array_keys($rows) as $fid) {
+            $row = $rows[$fid];
+
+            //For Bug 1138 case user create --> delete
+            //Check file in cabinet --> is move strash ????
+            require_once('grn/application.csp');
+            $locator = GRN_ApplicationLocator::instance();
+            $cabinet_notification = $locator->getInstance('cabinet');
+
+            unset($locator);
+            global $G_container_base;
+            $uum = $G_container_base->getInstance('uum');
+            $login_user = $uum->getLoginUser();
+
+            $file = $cabinet_notification->getFile($login_user, $fid);
+
+            if ($file->isInTrash()) {
+                continue;
+            }
+            // end bug 1138 case user create --> delete
+
+            if (is_null($dirty_timestamp)) {
+                //
+                // 1回の通知処理件数以上の通知がある場合、最後の通知時刻を比較して
+                // 同一ならばその1秒間の通知を全て（最大500件）処理する
+                //
+                if (count($timestamps) == GRN_CABINET_MAX_NOTIFICATION) {
+                    $timestamps_keys = array_keys($timestamps);
+                    $last = array_pop($timestamps_keys);
+                    $last_dirty_timestamp = $timestamps[$last];
+
+                    $dirty_timestamp = $row[$columns['f.col_mtime']];
+
+                    assert('!is_null($last_dirty_timestamp)');
+                    assert('!is_null($dirty_timestamp)');
+
+                    if ($last_dirty_timestamp) {
+                        if ( ! is_a($new_timestamp, 'CB_TimeStamp')) {
+                            $new_timestamp = new CB_TimeStamp();
+                        }
+                        $new_timestamp->unix_ts = $last_dirty_timestamp;
+                    }
+
+                    // 最後に2件が同じ更新時刻ならその1秒間の通知を再検索する
+                    if ($last_dirty_timestamp && $dirty_timestamp
+                        && $last_dirty_timestamp == $dirty_timestamp
+                    ) {
+                        $rows = $this->_createNotifyFileList($user,
+                            $dirty_timestamp, GRN_CABINET_LIMIT_NOTIFICATION,
+                            true, $columns);
+                        continue;
+                    }
+                    break;
+                } else {
+                    $timestamps[$fid] = $row[$columns['f.col_mtime']];
+                }
+            } else {
+                // 1秒間の通知処理では前回の処理とダブる可能性があるのではじく
+                if (array_key_exists($fid, $timestamps)) {
+                    continue;
+                }
+            }
+
+            // 現在の通知状態を生成
+            if ( ! $this->_createCurrentNotificationRow($user, $row, $columns,
+                $data)
+            ) {
+                $service->deleteNotifyData($user, $this->_module_id,
+                    $row[$columns['f._id']]);
+            } else {
+                $actions
+                    = []; // Multiple actions may occur before pulling time, so we have to infer which kinds of actions have happened
+                $c_time = $row[$columns['f.col_ctime']];
+                $dirty_time = $row[$columns['f.col_mtime']];
+
+                if ($c_time <= $last_ts) {
+                    $actions[] = [
+                        'time' => $dirty_time,
+                        'id'   => GRN_NOTIFICATION_ACTION_UPDATE_ID
+                    ];
+                } else {
+                    // $actionIds should store actions in the order same to actions' occurring order
+                    $actions[] = [
+                        'time' => $c_time,
+                        'id'   => GRN_NOTIFICATION_ACTION_CREATE_ID
+                    ];
+
+                    if ($c_time < $dirty_time) {
+                        $actions[] = [
+                            'time' => $dirty_time,
+                            'id'   => GRN_NOTIFICATION_ACTION_UPDATE_ID
+                        ];
+                    }
+                }
+
+                foreach ($actions as $action) {
+                    $data->setActionId($action['id']);
+
+                    $timestamp_obj = new CB_TimeStamp();
+                    $timestamp_obj->unix_ts = $action['time'];
+                    $data->setTimeStampData($timestamp_obj);
+
+                    $result = $service->modifyNotifyData($user, $data, true,
+                        true);
+                }
+            }
+        }
+
+        $c = count($timestamps);
+
+        if ($c > 0 && $c < GRN_CABINET_MAX_NOTIFICATION) {
+            $timestamps_keys = array_keys($timestamps);
+            $last = array_pop($timestamps_keys);
+
+            if ( ! is_a($new_timestamp, 'CB_TimeStamp')) {
+                $new_timestamp = new CB_TimeStamp();
+            }
+            $new_timestamp->unix_ts = $timestamps[$last];
+        }
+    }
+
+
+    /**
+     * 通知の確認処理
+     *
+     * @param object CB_User  $user       閲覧ユーザー
+     * @param object GRN_File $file       ファイル
+     * @param timestamp $timestamp 確認時刻
+     *
+     * @access private
+     */
+    function confirmNotification(& $user, & $file, $timestamp)
+    {
+        require_once('grn/notification.csp');
+        $service = GRN_Notification_Service::getInstance();
+
+        if ( ! $this->isNotified($user, $file)
+             && ! $this->isSubscribed($user, $file)
+        ) {
+            // 通知されていない場合は現状を調べて未読であれば確認しておく
+            // 通知されてから通知先から削除されるとこの状態になる
+
+            if ( ! ($curr_notify = $service->getNotifyDataProperties($user,
+                $this->_module_id, $file->getOID()))
+            ) {
+                return;
+            }
+
+            if ($curr_notify->isStatusConfirmed()) {
+                return;
+            }
+        }
+
+        require_once('grn/notification.csp');
+        $data = new GRN_Notification_Data();
+
+        if ( ! $this->_createCurrentNotification($user, $file, $data)) {
+            // 最後の通知が無効となる場合
+            $service->deleteNotifyData($user, $this->_module_id,
+                $file->getOID());
+
+            return;
+        }
+
+        $ctime = $file->get('ctime');
+        $dirty_time = $file->get('dirty_timestamp');
+
+        if ($dirty_time == false) {
+            $actionId = GRN_NOTIFICATION_ACTION_CREATE_ID;
+        } elseif ($dirty_time->unix_ts > $ctime->unix_ts) {
+            $actionId = GRN_NOTIFICATION_ACTION_UPDATE_ID;
+        } else {
+            $actionId = GRN_NOTIFICATION_ACTION_CREATE_ID;
+        }
+
+        $data->setActionId($actionId);
+
+        if ($data->isStatusConfirmed()) {
+            // 既読ならなにもしない
+            return;
+        }
+
+        $sender = $data->getSenderData();
+
+        if ( ! array_key_exists('id', $sender)
+             || $user->getOID() != $sender['id']
+        ) {
+            // 確認前に最新の通知へ更新
+            $service->modifyNotifyData($user, $data, true, true);
+        }
+
+        // 通知確認
+        $service->confirmNotifyData($user, $this->_module_id, $file->getOID(),
+            $timestamp, false);
+    }
+
+
+    /**
+     * ファイルの通知を削除
+     *
+     * @param object GRN_File $file  削除するファイル
+     */
+    function deleteNotification(& $file)
+    {
+        if ( ! $file) {
+            return;
+        }
+
+        require_once('grn/notification.csp');
+        $service = GRN_Notification_Service::getInstance();
+        $service->deleteNotifyDataForAllUser($this->_module_id,
+            $file->getOID());
+    }
+
+    /**
+     * フォルダの通知設定コピー
+     *
+     * @param int   $src_id     コピー元フォルダID
+     * @param array $target_ids コピー先フォルダID
+     *
+     * @return bool
+     */
+    function copyNotification($src_id, $target_ids)
+    {
+        if ( ! $src_id) {
+            return false;
+        }
+        if ( ! is_array($target_ids) || 0 == count($target_ids)) {
+            return false;
+        }
+
+        require_once('grn/application.csp');
+        global $G_cabinet, $G_cabinet_login;
+        if ( ! ($src_folder = $G_cabinet->getFolder($G_cabinet_login,
+            $src_id))
+        ) {
+            cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        require_once('grn/uum_util.csp');
+        $uum_util = GRN_UumUtil::getInstance();
+        $dynamic_roles = $uum_util->listDynamicRoles();
+
+        require_once('grn/access_resources.csp');
+        $notifyFolder = GRN_Cabinet_NotifyFolder::getInstance();
+        $notify_list = [];
+
+        $targets = $notifyFolder->getTargets($src_folder, 'dynamic_role');
+        foreach (array_keys($targets) as $id) {
+            $mixed = null;
+            if (array_key_exists($id, $dynamic_roles)) {
+                $mixed = $id;
+            }
+            $notify_list[] = [
+                'type'  => GRN_ACCESS_TARGET_TYPE_DYNAMIC_ROLE,
+                'tid'   => $id,
+                'mixed' => $mixed
+            ];
+        }
+
+        $targets = $notifyFolder->getTargets($src_folder, 'role');
+        foreach (array_keys($targets) as $id) {
+            $mixed = null;
+            if (($role = $uum->getStaticRole($id))) {
+                $mixed = $role;
+            }
+            $notify_list[] = [
+                'type'  => GRN_ACCESS_TARGET_TYPE_STATIC_ROLE,
+                'tid'   => $id,
+                'mixed' => $mixed
+            ];
+        }
+
+        $targets = $notifyFolder->getTargets($src_folder, 'group');
+        foreach (array_keys($targets) as $id) {
+            $mixed = null;
+            if (($role = $uum->getGroup($id))) {
+                $mixed = $role;
+            }
+            $notify_list[] = [
+                'type'  => GRN_ACCESS_TARGET_TYPE_GROUP,
+                'tid'   => $id,
+                'mixed' => $mixed
+            ];
+        }
+
+        $targets = $notifyFolder->getTargets($src_folder, 'user');
+        foreach (array_keys($targets) as $id) {
+            $mixed = null;
+            if (($role = $uum->getUser($id))) {
+                $mixed = $role;
+            }
+            $notify_list[] = [
+                'type'  => GRN_ACCESS_TARGET_TYPE_USER,
+                'tid'   => $id,
+                'mixed' => $mixed
+            ];
+        }
+
+        // 対象カテゴリへコピー
+        foreach ($target_ids as $id) {
+            $folder = $G_cabinet->getFolder($G_cabinet_login, $id);
+            if ( ! $folder) {
+                cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+            }
+
+            // ルートは適用先として設定できないが念のためチェックしておく
+            if ($id == GRN_CABINET_ROOT_FOLDER_ID) {
+                continue;
+            }
+
+            // 登録されている通知一覧をすべて削除
+            $notifyFolder->deleteTargets($folder);
+            // 通知設定をセット
+            foreach ($notify_list as $notify) {
+                if ( ! is_null($notify['mixed'])) {
+                    $notifyFolder->setTarget($folder, $notify['mixed'], true);
+                }
+            }
+        }
+
+        return true;
+    }
+}
+
+

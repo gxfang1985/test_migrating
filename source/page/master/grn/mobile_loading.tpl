@@ -1,0 +1,1 @@
+<div class="mobile_spinner_grn" style="display:none;"><span></span></div>

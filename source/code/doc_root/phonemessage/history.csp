@@ -1,0 +1,239 @@
+<?php
+
+require_once('grn/application.csp');
+
+require_once('grn/smarty.csp');
+$t = new GRN_Smarty;
+
+//for escape
+$app_locator = GRN_ApplicationLocator::instance();
+$dbconn = $app_locator->getConnection('phonemessage');
+
+////////////////////////////////////////////////////////////////
+
+// 電話メモを取得する
+require_once('phonemessage/application.csp');
+$app_locator = GRN_ApplicationLocator::instance();
+/** @var GRN_PhoneMessage_Application $app */
+$app = $app_locator->getInstance(GRN_PHONEMESSAGE_APPLICATION_ID);
+if ( ! ($app instanceof GRN_PhoneMessage_Application)) {
+    cb_throw_error(E_GRN_APPLICATION_NOT_AVAILABLE);
+}
+$app_name = $app->getName();
+$message_manager = $app->getMessageManager();
+
+// GET/POSTされたパラメータを取得する
+$cid = null;
+if (array_key_exists('cid', $G_INPUT)) {
+    $cid = $G_INPUT['cid'];
+}
+if ( ! grn\grn\Validate::isIn($cid,
+    [GRN_PHONEMESSAGE_CATEGORY_ALL, GRN_PHONEMESSAGE_CATEGORY_SENT])
+) {
+    $cid = null;
+}
+$gid = null;
+if (array_key_exists('gid', $G_INPUT)) {
+    $gid = $G_INPUT['gid'];
+}
+
+if ( ! empty($gid) && ! grn\grn\Validate::isNumber($gid) && 'selected' !== $gid
+     && 'm' !== $gid{0}
+) {
+    $gid = null;
+}
+$uid = null;
+if (array_key_exists('uid', $G_INPUT)) {
+    $uid = $G_INPUT['uid'];
+}
+if (0 == strlen($uid)) {
+    cb_throw_error(E_GRN_PHONEMESSAGE_INVALID_USER_ID);
+}
+
+// ユーザーを取得する
+global $G_container_base;
+$uum = $G_container_base->getInstance('uum');
+$user = $uum->getUser($uid);
+if ( ! ($user instanceof CB_User)) {
+    cb_throw_error(E_GRN_USER_NOT_FOUND);
+}
+
+// ログインユーザーを取得する
+$login = $uum->getLoginUser();
+if ( ! ($login instanceof CB_User)) {
+    cb_throw_error(E_GRN_USER_NOT_FOUND);
+}
+$login_id = $login->getOID();
+
+if ('sent' == $cid) {
+    if ($uid != $login_id) {
+        $uid = $login_id;
+        $user = $login;
+    }
+    $add_condition = cb_queryf($dbconn, "col_sender = '@S'", $login_id);
+} else {
+    //$add_condition = 'col_receiver = '.$uid;
+    //Escape
+    $add_condition = cb_queryf($dbconn, "col_receiver = '@S'", $uid);
+}
+
+// ユーザー情報を取得する
+require_once('phonemessage/controller.csp');
+$page = 'phonemessage/history?cid=' . $cid;
+$controller_util = new GRN_PhoneMessage_ControllerUtil($page);
+$user_for_view = $controller_util->getUser($user);
+// 名前を多言語対応する
+require_once('grn/controller.csp');
+$user_for_view['display_name'] = GRN_ControllerUtil::getUserNameText($login_id,
+    $uid);
+
+// ダイナミックロール一覧を取得する
+$dynamic_roles = $uum->listGrantedRoles();
+
+// ユーザーのアクセス権を評価する
+require_once('phonemessage/access.csp');
+$access_manager = GRN_PhoneMessage_AccessManager::getInstance();
+$users = [$uid => & $user];
+$user_info = $access_manager->getObjectInfo($users);
+$authorities = ['browse', 'add'];
+if (0 < count($user_info['objects'])) {
+    $user_info['accesses']
+        = $access_manager->evaluateAccesses($user_info['objects'], $login,
+        $dynamic_roles, $authorities);
+} else {
+    $user_info['accesses'] = [];
+}
+
+// 組織一覧を取得する
+$groups = $uum->getGroupList();
+
+// 組織一覧のアクセス権を評価する
+$group_info = $access_manager->getObjectInfo($groups);
+if (0 < count($group_info['objects'])) {
+    $group_info['accesses']
+        = $access_manager->evaluateAccesses($group_info['objects'], $login,
+        $dynamic_roles, $authorities);
+} else {
+    $group_info['accesses'] = [];
+}
+
+// スタティックロール一覧を取得する
+$roles = $uum->listStaticRoles();
+
+// スタティックロール一覧のアクセス権を評価する
+$role_info = $access_manager->getObjectInfo($roles);
+if (0 < count($role_info['objects'])) {
+    $role_info['accesses']
+        = $access_manager->evaluateAccesses($role_info['objects'], $login,
+        $dynamic_roles, $authorities);
+} else {
+    $role_info['accesses'] = [];
+}
+
+// 組織、スタティックロールを考慮し、ユーザーのアクセス権を再評価する
+$accesses_for_view = $controller_util->evaluateAccesses($users, $user_info,
+    $group_info, $role_info);
+// 自分自身のアクセス権は無視する
+if (array_key_exists($login_id, $accesses_for_view)) {
+    $accesses_for_view[$login_id] = [];
+}
+if (array_key_exists($uid, $accesses_for_view)) {
+    if (array_key_exists('browse', $accesses_for_view[$uid])) {
+        cb_throw_error(E_GRN_PHONEMESSAGE_ACCESS_DENY_BROWSE);
+    }
+} else {
+    assert('FALSE');
+}
+
+// 電話メモの設定を取得する
+require_once('grn/ui.csp');
+$ui_config_manager = GRN_UIConfigManager::getInstance();
+$ui_config = $ui_config_manager->getUserConfig($login);
+
+// n件ナビゲーション情報を取得する
+$offset = $controller_util->getNaviStartPosition();
+$controller_util->setNaviStartPosition($offset);
+$limit = $ui_config->getListMax();
+
+// _idが削除フラグ対応で重複してしまうのでテーブル名を取得
+$real_table_name = $message_manager->getRealTableName();
+
+// 電話メモ履歴一覧を取得する
+$order_by = $real_table_name . '._id';
+$messages = $message_manager->getList($offset, $limit + 1, $order_by,
+    $add_condition);
+$isExistsNextPage = count($messages) > $limit;
+if ($isExistsNextPage) {
+    array_pop($messages);
+}
+
+// 電話メモ履歴情報一覧を取得する
+$messages_for_view = $controller_util->listMessages($messages);
+
+// yonekawa add grn_user_name修正
+$users_id = [];
+foreach ($messages_for_view as $message) {
+    $users_id[] = $message['sender'];
+}
+require_once("grn/controller.csp");
+$users_info = GRN_ControllerUtil::getUserInfoToShowUserName($users_id, $login);
+$t->assign('users_info', $users_info);
+
+// n件ナビゲーション情報を生成する
+$args = ['cid' => $cid, 'gid' => $gid, 'uid' => $uid];
+$view_set = $controller_util->makeSimpleNaviInformation($offset, $limit,
+    count($messages_for_view), $isExistsNextPage, $args);
+
+require_once('fw/session_manager.csp');
+$session_manager = CB_SessionManager::getInstance();
+$session_manager->destroy(GRN_PHONEMESSAGE_MODULE_ID);
+
+//--- k.niizeki add 
+
+//アクセス権をuser_for_viewに追加する
+$temp = array_pop($accesses_for_view);
+$user_for_view = array_merge($user_for_view, $temp);
+//--- k.niizeki add end
+
+$t->assign('application_name', $app_name);
+$t->assign('category_id', $cid);
+$t->assign('group_id', $gid);
+$t->assign('user_id', $uid);
+$t->assign('user', $user_for_view);
+$t->assign('messages', $messages_for_view);
+$t->assign('view_set', $view_set);
+
+
+$delete_info_multi = [
+    'title'        => grn_get_page_display_name('phonemessage/delete_multi'),
+    'page'         => 'phonemessage/delete_multi.tpl',
+    'no_confirm'   => false,
+    'data'         => [
+        'category_id' => $cid,
+        'group_id'    => $gid,
+        'user_id'     => $uid,
+    ],
+    'handler'      => ['btn_delete_multi1', 'btn_delete_multi2'],
+    'multi_target' => 'mids[]',
+    'form_target'  => 'phonemessage/history',
+];
+$t->assign('delete_info_multi', $delete_info_multi);
+//--------------------------------------------------------------
+
+// Smartyにページタイトルを割り当てる
+$page_title = grn_get_page_display_name('phonemessage/index');
+$t->assign('page_title', $page_title);
+
+// Smartyにサイトポジションを割り当てる
+$page_info = [
+    'index'   => ['sf' => 1, 'gid' => $gid],
+    'history' => null
+];
+$site_position = $controller_util->makeSitePosition('phonemessage/',
+    $page_info);
+$t->assign('site_position', $site_position);
+
+// Smartyを実行する
+$t->display(cb_get_pagename() . '.tpl');
+
+

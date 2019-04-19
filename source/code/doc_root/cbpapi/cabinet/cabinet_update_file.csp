@@ -1,0 +1,103 @@
+<?php
+
+use grn\fts\Application as FtsApplication;
+use grn\fts\cabinet\IndexService;
+
+require_once('cbpapi/error_code.csp');
+if (isset($cbpapi_service)) {
+    $request = $cbpapi_service->getRequestParameters();
+    $file_id = @$request['attributes']['file_id'];
+    $name = @$request['attributes']['name'];
+    $comment = @$request['attributes']['comment'];
+    $contentNodes = $cbpapi_service->selectNodes($request, 'content');
+    if (is_array($contentNodes) && isset($contentNodes[0]['text'])) {
+        $content = $contentNodes[0]['text'];
+    } else {
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'content']);
+    }
+
+    if ( ! isset($file_id)) {
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'file_id']);
+    }
+
+    if ( ! isset($name)) {
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'name']);
+    }
+
+    global $G_container_base;
+    /** @var GRN_Uum $uum */
+    $uum = $G_container_base->getInstance('uum');
+    $G_cabinet_login = $uum->getLoginUser();
+
+    require_once('cabinet/error_code.csp');
+    require_once('grn/application.csp');
+    $locator = GRN_ApplicationLocator::instance();
+    /** @var GRN_Cabinet $G_cabinet */
+    $G_cabinet = $locator->getInstance('cabinet');
+    $file = $G_cabinet->getFile($G_cabinet_login, $file_id,
+        GRN_CABINET_ACCESS_W);
+    if ( ! $file) {
+        cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+    }
+
+    // check in Trash
+    if ($file->isInTrash()) {
+        cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+    }
+
+    // check lock file
+    require_once('grn/ui.csp');
+    $uim = GRN_UIConfigManager::getInstance();
+    $uisysconf = $uim->getSystemConfig();
+    if ($uisysconf->getFileLockable()) {
+        // Lock the file
+        $lock = $file->getLockObject();
+        $lock->acquireLock();
+    }
+
+    $file_update_info = [];
+    $file_update_info['content'] = $content;
+    $file_update_info['name'] = $name;
+    $file_update = cbpapi_upload_file($file_update_info);
+    $file->update($G_cabinet_login, $file_update, $comment);
+
+    if (FtsApplication::isAvailable()) {
+        $searchService = new IndexService();
+        $searchService->updateFileIndex($file);
+    }
+
+    //Write log: update file
+    $folder = $G_cabinet->getFileFolder($file);
+    require_once('cabinet/inspection.csp');
+    $inspection = GRN_Cabinet_Inspection::getInstance();
+    $inspection->writeLogFile('update', $file, $folder->getOID());
+    $lock = $file->getLockObject();
+    $lock->releaseLock();
+
+    // SOAP response
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty();
+    $t->assign('action', $cbpapi_service->getAction());
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('cabinet')]);
+
+    require_once('cabinet/controller.csp');
+    $utility = new GRN_Cabinet_ControllerUtil();
+    $file_for_view = $utility->getFileView($file);
+    $file_for_view['folder_id'] = $folder->getOID();
+    $creator
+        = $uum->getUser($file_for_view['creator_uid']);
+    $file_for_view['creator_login_name'] = $creator
+        ? $creator->get('foreign_key') : $file_for_view['creator_name'];
+    $file_for_view['ctime']
+        = grn_cbpapi_iso8601($file_for_view['ctime']);
+    $file_for_view['modifier_login_name']
+        = $G_cabinet_login->get('foreign_key');
+    $file_for_view['mtime']
+        = grn_cbpapi_iso8601($file_for_view['mtime']);
+    $t->assign('file', $file_for_view);
+
+    grn_cbpapi_response($t, __FILE__);
+}

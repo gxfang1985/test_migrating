@@ -1,0 +1,1891 @@
+<?php
+
+// The filename extension for Cybozu PHP scripts.
+define('CB_SCRIPT_EXTENSION', '.csp');
+// Name of the magic environment variable mainly for AzUnit
+define('CB_MAGIC_ENV', 'CB_FORCE_COMMAND_LINE');
+
+// exit code for abnormal exit.
+define('CB_EXIT_SUCCESS', /** 0x00 */
+    0);
+define('CB_EXIT_ERROR',                   /* 0x00 | */
+    1);
+define('CB_EXIT_INFINITE_LOOP',           /* 0x00 | */
+    2);
+define('CB_EXIT_ERROR_TEMPLATE_ENGINE',   /* 0x00 | */
+    3);
+define('CB_EXIT_INVALID_USER',            /* 0x00 | */
+    4);
+define('CB_EXIT_INITIALIZE', 0x80 | 1);
+define('CB_EXIT_LICENSE_REDIRECT', 0x80 | 2);
+define('CB_EXIT_REQUIRE_ROLE', 0x80 | 3);
+define('CB_EXIT_BACKUP_MODE', 0x80 | 4);
+define('CB_TYPE_HTML', 1);
+define('CB_TYPE_TEXT', 2);
+define('CB_TYPE_ATOM', 3);
+require_once("fw/lwc_miscFunctions.csp");
+/**
+ * Get application base directory.
+ * For CGI version, it is the CGI directory where php.exe is.
+ */
+function cb_basedir()
+{
+    static $_basedir = null;
+    if (is_null($_basedir)) {
+        $_basedir = dirname(dirname(dirname(dirname(__FILE__))));
+    }
+
+    return $_basedir;
+}
+
+
+/**
+ * Get HTTP output encoding properly.
+ *
+ * @return string
+ */
+function cb_get_http_output_encoding()
+{
+    // -- supported dynamic encoding --
+    if (cb_is_cellular_page()) {
+        return 'SJIS-win';
+    }
+
+    $encoding = mb_http_output();
+
+    return ($encoding == 'pass') ? mb_internal_encoding() : $encoding;
+}
+
+function cb_get_http_input_encoding()
+{
+    if (cb_get_pagename() === 'cbwebsrv/tool_in') {
+        require_once('cbwebsrv/common.csp');
+
+        return grn_cbwebsrv_get_encoding();
+    }
+
+    return cb_get_http_output_encoding();
+}
+
+/**
+ * Get Accept Languages from HTTP header
+ */
+function cb_get_http_accept_language()
+{
+    $languages = [];
+    if ( ! array_key_exists('HTTP_ACCEPT_LANGUAGE', $_SERVER))    //コマンドラインから実行
+    {
+        return $languages;
+    }
+
+    $language_qvalues = explode(',', strtr($_SERVER['HTTP_ACCEPT_LANGUAGE'], ' ', ''));
+
+    $q_languages = [];
+    foreach ($language_qvalues as $lq) {
+        $s = preg_split('/; *q=/', $lq);
+        if (count($s) == 1) {
+            $languages[] = strtolower($s[0]);
+            continue;
+        }
+        if ( ! array_key_exists($s[1], $q_languages)) {
+            $q_languages[$s[1]] = [];
+        }
+        $q_languages[$s[1]][] = $s[0];
+    }
+    krsort($q_languages);
+
+    foreach ($q_languages as $key => $langs) {
+        foreach ($langs as $l) {
+            $languages[] = strtolower($l);
+        }
+    }
+
+    return $languages;
+}
+
+/**
+ * 出力内容の種別を保持するクラス.
+ * インスタンスは $G_state_set に割り当てられた1つだけ存在する
+ *
+ * 一回のスクリプト呼び出しの出力を終えるときに、copyrightを出したり
+ * HTMLの閉じタグを書いたりする。
+ * ユーザカスタマイズで copyright を消されて転売されたりすると嫌なので、
+ * この処理はテンプレートではなく、PHPスクリプトの auto_append される
+ * append.csp 中で行なう。
+ *
+ * 具体的には、以下の場合が(今のところ)見えている
+ * [copyright を書きたくない場合]
+ *  - ファイルダウンロード時, CSV出力時 など、混ざり物が入るとおかしくなる場合
+ *  - ケータイ、ポケットなど出力内容を絞るとき
+ *     (現Office6では、トップページだけにcopyrightが出る)
+ *  - ブラウザでなく、バッチ処理的に他プログラムから呼ぶとき(ガルーンである)
+ *  - ブラウザ以外の専用クライアントから呼ぶとき(リマインダー、シンクなど)
+ * [HTMLタグを閉じたくない場合]
+ *  - ファイルダウンロード時, CSV出力時 など、混ざり物が入るとおかしくなる場合
+ *  - ブラウザでなく、バッチ処理的に他プログラムから呼ぶとき(ガルーンである)
+ *  - ブラウザ以外の専用クライアントから呼ぶとき(リマインダー、シンクなど)
+ *
+ * @package fw.core
+ */
+class CB_StateSet
+{
+    /**
+     * @access private
+     */
+    var $_state_array = [];
+
+    function set($key, $value)
+    {
+        $this->_state_array[$key] = $value;
+    }
+
+    function &get($key)
+    {
+        $ret = null;
+
+        if (array_key_exists($key, $this->_state_array)) {
+            $ret = $this->_state_array[$key];
+        }
+
+        return $ret;
+    }
+}
+
+/**
+ * Return temporary directory.  The directory is guaranteed to exist.
+ */
+function cb_tmpdir()
+{
+    static $tmpdir = null;
+
+    if (is_null($tmpdir)) {
+        if (defined("ON_FOREST")) {
+            $tmpdir = cb_tmpdir_onforest();
+        } else {
+            $tmpdir = cb_tmpdir_onpremise();
+        }
+    }
+
+    return $tmpdir;
+}
+
+function cb_tmpdir_onforest()
+{
+    global $G_config_common;
+
+    require_once('fw/cydec.csp');
+    $util = CB_CyDECUtil::getInstance();
+
+    $retval = "{$G_config_common->get('Global', 'tmp_dir')}/tmp_{$util->getDomainID()}";
+
+    cb_mkdir($retval, 0755, true);
+
+    return $retval;
+}
+
+function cb_tmpdir_onpremise()
+{
+    global $G_config_common;
+
+    return $G_config_common->get('Global', 'tmp_dir') . '/tmp';
+}
+
+/**
+ * @param string $dirPath
+ * @param int    $mode
+ * @param bool   $recursive
+ * @param bool   $error
+ *
+ * @return bool
+ */
+function cb_mkdir($dirPath, $mode = 0777, $recursive = false, $error = false)
+{
+    if (is_dir($dirPath)) {
+        return true;
+    }
+    // mkdirによるPHP Errorを回避するため、mkdirにエラー抑制演算子をつける
+    if (@mkdir($dirPath, $mode, $recursive) === false) {
+        if ($error) {
+            require_once('fw/error_code.csp');
+            cb_throw_error(E_COMMON_CANNOT_CREATE_DIRECTORY);
+        } else {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Prepare to download a file.
+ *
+ * @param string $filename
+ *  The file name of the downloading contents.
+ * @param string $mimetype
+ *  The MIME content type specifier such as 'image/jpeg'.
+ * @param bool   $allowInline
+ *  If <var>TRUE</var>, Content-Disposition header may have 'inline'
+ *  keyword instead of 'attachment' to allow clients to inline the
+ *  downloading contents.
+ */
+function cb_prepare_download($filename, $mimetype, $allowInline = true, $output_expires = false, $check_ticket = true)
+{
+    if ($check_ticket) {
+        include('grn/_download_prepend.csp');
+    }
+
+    global $G_state_set;
+    $G_state_set->set('html_should_be_closed', false);
+    $G_state_set->set('copyright_should_be_written', false);
+    mb_http_output('pass');
+    ini_set('default_charset', '');
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+    header('Content-Type: ' . $mimetype);
+    // Disposition determination
+    $disposition = 'attachment';
+    global $G_config_common;
+    $disposition_filename = $G_config_common->get('File_Download', 'content_disposition_filename');
+
+    if ($disposition_filename) {
+        // get browser
+        require_once('grn/ui.csp');
+        $user_agent = grn_ui_get_user_agent();
+        $browser = null;
+        if (is_array($user_agent) && array_key_exists('app', $user_agent)) {
+            $browser = $user_agent['app'];
+        }
+
+        // get encoding
+        global $G_INPUT;
+        $encoding = '';
+        if (isset($G_INPUT['lc_sys'])) {
+            $encoding = $G_config_common->get('File_Download', 'encoding_' . $G_INPUT['lc_sys']);
+            if ($encoding === false) {
+                $encoding = '';
+            }
+        }
+
+        // check conditions Browser / lc_sys URL parameter / Enable convert encoding
+        require_once('fw/string_util.csp');
+        if ($encoding != '' && $browser == 'ie' && cb_test_charset_validity($filename, $encoding)) {
+            require_once('fw/i18n.csp');
+            $filename = cb_encode($filename, $encoding);
+            header('Content-Disposition:' . $disposition . '; filename="' . str_replace(";", "%3B", $filename) . '"');
+        } else {
+            header("Content-Disposition: ${disposition}");
+        }
+    } else {
+        header("Content-Disposition: ${disposition}");
+    }
+
+    global $G_state_set;
+    $G_state_set->set('no_cache', false);
+    if ($output_expires) {
+        header("Cache-Control: max-age=315360000");
+        header("Expires: " . gmdate('D, d M Y H:i:s T', strtotime("+10 year")));
+    }
+
+    //output Byte Order Mark of utf-8-bom
+    $csv_charset = cb_at($G_INPUT, 'charset');
+    $add_bom = cb_at($G_INPUT, "bom", false);
+    if ((strcasecmp($csv_charset, 'UTF-8') === 0) && $add_bom) {
+        echo "\xEF\xBB\xBF";
+    }
+}
+
+function cb_is_need_download_ticket()
+{
+    global $G_config_common;
+    if ( ! $G_config_common->get('File_Download', 'check_ticket')) {
+        return false;
+    }
+
+    // Check ticket when user using IE6 or IE7
+    require_once('fw/ui.csp');
+    $browser = cb_ui_get_browser();
+
+    if ($browser['type'] != 'msie') {
+        return false;
+    }
+
+    if ($browser['ver_major'] != 6 && $browser['ver_major'] != 7) {
+        return false;
+    }
+
+    return true;
+}
+
+/*
+ * =============================================================
+ * URL generators
+ * =============================================================
+ */
+function cb_get_page_prefix()
+{
+    static $prefix = null;
+    if (is_null($prefix)) {
+        if (defined('ON_FOREST')) {
+            //GTM-129 for server side customization
+            //because of server side redirection, SCRIPT_NAME and PATH_INFO are not correct.
+            //we retrieve it from PHP_SELF.
+            //expected result on Forest is '/g'
+            $pos = strpos($_SERVER['PHP_SELF'], '/', 1);
+            $prefix = substr($_SERVER['PHP_SELF'], 0, $pos);
+        } else {
+            global $G_config_common;
+            $is_standard = strcmp($G_config_common->get('Global', 'php'), 'standard') == 0;
+
+            if ($is_standard) {
+                global $G_pagedir;
+                $dir = dirname(str_replace('\\', '/', strtolower($_SERVER['SCRIPT_NAME'] . 'dummy')));
+                $prefix = substr($dir, 0, strlen($dir) - strlen($G_pagedir));
+            } else {
+                $prefix = $_SERVER['SCRIPT_NAME'];
+            }
+        }
+    }
+
+    return $prefix;
+}
+
+function cb_get_page_extension()
+{
+    static $extension = null;
+    if (is_null($extension)) {
+        global $G_config_common;
+        $is_standard = strcmp($G_config_common->get('Global', 'php'), 'standard') == 0;
+
+        //GTM-129 for server side customization
+        // On and after F3.0, Forest environment is working on 'php = cybozu'.
+        // But URL have to be contained '.csp'.
+        if ($is_standard || defined('ON_FOREST')) {
+            $extension = CB_SCRIPT_EXTENSION;
+        } else {
+            $extension = '';
+        }
+    }
+
+    return $extension;
+}
+
+function cb_is_https()
+{
+    $https = defined('ON_FOREST') ? 'HTTP_HTTPS' : 'HTTPS';
+
+    return (array_key_exists($https, $_SERVER) && strcasecmp($_SERVER[$https], 'on') == 0);
+}
+
+/**
+ * Return a path for remote service.
+ *
+ * @return string  empty when having no remote headers
+ */
+function cb_get_remote_path()
+{
+    $remote_id = array_key_exists('HTTP_X_CYBOZU_REMOTE_KID', $_SERVER) ? $_SERVER['HTTP_X_CYBOZU_REMOTE_KID'] : '';
+    $remote_auth = array_key_exists('HTTP_X_CYBOZU_REMOTE_KAUTH', $_SERVER) ? $_SERVER['HTTP_X_CYBOZU_REMOTE_KAUTH']
+        : '';
+    if (strcmp($remote_id, '') === 0 || strcmp($remote_auth, '') === 0) {
+        return '';
+    }
+
+    return '/' . $remote_id . '/' . $remote_auth;
+}
+
+function cb_get_url_prefix($ignore_referer = false)
+{
+    if (defined('USE_HOST') && array_key_exists('HTTP_HOST', $_SERVER)
+        && ! cb_is_remote_access()
+    ) {
+        $schema = cb_is_https() ? 'https' : 'http';
+
+        return $schema . '://' . $_SERVER['HTTP_HOST'];
+    }
+
+    $prefix = null;
+    if (array_key_exists('HTTP_REFERER', $_SERVER) && ! $ignore_referer) {
+        $page_prefix = cb_get_page_prefix();
+        $pos = false;
+        $match = false;
+
+        global $G_config_common;
+        $is_standard = strcmp($G_config_common->get('Global', 'php'), 'standard') == 0;
+
+        /* ドキュメントプレフィックス(ex. '/cgi-bin/cbgrn/grn.cgi')にマッチする位置を
+           後方一致で検索する（CGI版） */
+        if ( ! $is_standard) {
+
+            while (true) {
+                $_offset = ($pos === false ? 0 : $pos + 1);
+                $_pos = strpos($_SERVER['HTTP_REFERER'], $page_prefix, $_offset);
+                if ($_pos === false) {
+                    //ドキュメントプレフィックスがなければ終了
+                    break;
+                } else {
+                    //ドキュメントプレフィックスがあれば、マッチポジションをマークし継続
+                    $pos = $_pos;
+                    $match = true;
+                }
+            }
+
+        }
+
+        /* ドキュメントプレフィックス(ex. '/grn')にマッチする位置を
+           前方一致で検索し、かつ、マッチした場合は、
+           それ以降のパスがドキュメントルート下に存在するかをチェック（CGI版） */
+        if ($is_standard) {
+            while (true) {
+                $_offset = ($pos === false ? 0 : $pos + 1);
+                $_pos = strpos($_SERVER['HTTP_REFERER'], $page_prefix, $_offset);
+                if ($_pos === false) {
+                    //ドキュメントプレフィックスがなければ終了
+                    break;
+                } else {
+                    $pos = $_pos;
+
+                    if (strlen($_SERVER['HTTP_REFERER']) > $_pos + strlen($page_prefix)) {
+                        //ドキュメントプレフィックス以降のパス
+                        $rest = substr($_SERVER['HTTP_REFERER'], $_pos + strlen($page_prefix));
+
+                        //パスが'/'で始らなければ非マッチ
+                        if (strpos($rest, '/') === 0) {
+                            //パスに'?'が含まれる場合はそれ以降をトリム
+                            if (($endpos = strpos($rest, '?')) !== false) {
+                                $rest = substr($rest, 0, $endpos);
+                            }
+
+                            $endpos = strpos($rest, '/-/');
+                            if ($endpos !== false) {
+                                $rest = substr($rest, 0, $endpos);
+                            }
+
+                            //ドキュメントルート下にファイルが存在すればマッチして終了
+                            //そうでなければ継続
+                            $filepath = cb_basedir() . '/code/doc_root' . $rest;
+                            if (is_file($filepath)) {
+                                $match = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($pos !== false && $match !== false) {
+            $prefix = substr($_SERVER['HTTP_REFERER'], 0, $pos);
+        }
+    }
+
+    if (is_null($prefix)) {
+        $scheme = 'http';
+        $port = $_SERVER['SERVER_PORT'];
+        if ( ! $port) {
+            $port = 80;
+        }
+        $host_domain = $_SERVER['SERVER_NAME'];
+        if ( ! $host_domain) {
+            $host_domain = 'localhost';
+        }
+        $need_port = true;
+        if (cb_is_https() || ($port == 443)) {
+            $scheme .= 's';
+            if ($port == 443) {
+                $need_port = false;
+            }
+        } elseif ($port == 80) {
+            $need_port = false;
+        }
+        if ($need_port) {
+            $prefix = $scheme . '://' . $host_domain . ':' . $port;
+        } else {
+            $prefix = $scheme . '://' . $host_domain;
+        }
+    }
+
+    return $prefix;
+}
+
+
+/**
+ * Format a relative URL string for the named page.
+ * The URL to be returned will look like '/scripts/php.exe/foo'.
+ *
+ * @param string $page     The destination page.
+ * @param array  $args     An associative array of GET parameters, or <var>null</var>.<br>
+ *                         e.g.) array('uid'=>20, 'view'=>'foo')
+ * @param string $fragment Optional fragment of the URL.  If not NULL, the returned
+ *                         URL will be followed by '#' . urlencode($fragment)
+ * @param string $postfix  Optional postfix string after $page.
+ *
+ * @return string          A relative URL to $page.
+ */
+function cb_format_url($page, $args = null, $fragment = null, $postfix = null)
+{
+    assert('strpos( $page, "/-/" ) === FALSE');
+
+    $convArgs = [];
+    if ( ! is_null($args)) {
+        foreach ($args as $key => $value) {
+            $convArgs[] = ["key" => $key, "value" => $value];
+        }
+    }
+
+    return cb_format_url_with_many_arg($page, $convArgs, $fragment, $postfix);
+}
+
+function cb_format_url_with_many_arg($page, $args = [], $fragment = null, $postfix = null)
+{
+    assert('strpos( $page, "/-/" ) === FALSE');
+
+    $prefix = cb_get_page_prefix();
+    $extension = cb_get_page_extension();
+
+    // URL generation
+    if (strlen($page) == 0) {
+        $page = 'index';
+    }
+    $url = $prefix . '/' . $page . $extension;
+
+    // add postfix
+    $adding_postfix = (strlen($postfix) !== 0);
+    if ($adding_postfix) {
+
+        ////////////////////////////////////////////////////////////////////
+        // The length of url must be 256 bytes or less.
+        // Therefore, the length of postfix must be 100 or less.
+        //
+        // Preference URL
+        // http://office.microsoft.com/ja-jp/assistance/HP010574111041.aspx
+        ////////////////////////////////////////////////////////////////////
+        $pos = mb_strrpos($postfix, '.');
+        if ($pos !== false) {
+            $name = mb_substr($postfix, 0, $pos);
+            $ext = mb_substr($postfix, $pos);
+        } else {
+            $name = $postfix;
+            $ext = '';
+        }
+
+        $tmpname = $name;
+        $name = '';
+        while (mb_strlen($tmpname) > 0) {
+            $c = mb_substr($tmpname, 0, 1);
+
+            if (strlen($c) === 1 && ctype_cntrl($c)) {
+                $name .= '_';
+            } else {
+                $name .= $c;
+            }
+
+            if (mb_strlen($tmpname) === 1) {
+                break;
+            }
+            $tmpname = mb_substr($tmpname, 1);
+        }
+
+        $tmpext = $ext;
+        $ext = '';
+        while (mb_strlen($tmpext) > 0) {
+            $c = mb_substr($tmpext, 0, 1);
+
+            if (strlen($c) === 1 && ctype_cntrl($c)) {
+                $ext .= '_';
+            } else {
+                $ext .= $c;
+            }
+
+            if (mb_strlen($tmpext) === 1) {
+                break;
+            }
+            $tmpext = mb_substr($tmpext, 1);
+        }
+
+        global $G_config_common;
+        $disposition_filename = $G_config_common->get('File_Download', 'content_disposition_filename');
+
+        $postfix = $name . $ext;
+        if ( ! $disposition_filename) {
+            if (strlen(urlencode($ext)) > 100) {
+                while (1) {
+                    $len = strlen(urlencode($postfix));
+                    if ($len <= 100) {
+                        break;
+                    }
+                    $ext = mb_substr($ext, 1, mb_strlen($ext));
+                    $postfix = $ext;
+                }
+            } else {
+                while (1) {
+                    $len = strlen(urlencode($postfix));
+                    if ($len <= 100) {
+                        break;
+                    }
+                    $name = mb_substr($name, 0, -1);
+                    $postfix = $name . $ext;
+                }
+            }
+
+        }
+
+        $postfix = urlencode($postfix);
+        $postfix = mb_convert_encoding($postfix, 'UTF-8');
+        $postfix_ext = $ext;
+    }
+
+    if ($adding_postfix) {
+        $postfix = '/-/' . $postfix . '?';
+    } else {
+        $postfix = '?';
+    }
+    $url .= $postfix;
+
+    // add GET parameters
+    $toPutAnd = false;
+    $internal = mb_internal_encoding();
+    $output = cb_get_http_output_encoding();
+    foreach ($args as $key_value) {
+        $key = $key_value["key"];
+        $value = $key_value["value"];
+
+        if ($internal != $output) {
+            $value = (string)mb_convert_encoding($value, $output, $internal);
+        }
+        if ($toPutAnd) {
+            $url .= '&';
+        } else {
+            $toPutAnd = true;
+        }
+        $key = urlencode($key);
+        $value = urlencode($value);
+        $url .= "${key}=${value}";
+    }
+
+
+    if ($adding_postfix && strlen($postfix_ext) > 0) {
+        $url .= "&${postfix_ext}";
+    }
+
+    if ( ! is_null($fragment)) {
+        if ($internal != $output) {
+            $fragment = (string)mb_convert_encoding($fragment, $output, $internal);
+        }
+        /*
+         * If you have to check fragment, then you enable this code.
+         *
+        // check fragment in debug mode. refer to RFC3986.
+        global $G_config_common;
+        if( $G_config_common->get( 'Global', 'debug' ) )
+        {
+            // invalid fragment
+            assert( preg_match( '/^((([a-zA-Z0-9]|\-|\.|_|~)|%([0-9]|[a-f]|[A-F]){2}|(!|\$|&|\'|\(|\)|\*|\+|,|;|=)|:|@)|\/|\?)+$/', $fragment ) > 0 );
+        }
+        */
+        $url .= '#' . $fragment;
+
+    }
+
+    return $url;
+}
+
+
+/**
+ * Generate Fully Qualified URL from a relative URL.
+ *
+ * For example, when '/scritps/php.exe/foo' is given as $url,
+ * this may return 'http://www.bar.com/scripts/php.exe/foo'
+ *
+ * @param string $url            A relative URL that starts with '/'.
+ * @param bool   $ignore_referer Ingore REFERER request header.
+ *
+ * @return string        A fully qualified abstract URL.
+ */
+function cb_fully_qualify_url($url, $ignore_referer = false)
+{
+    $prefix = cb_get_url_prefix($ignore_referer);
+
+    return $prefix . $url;
+}
+
+/**
+ * Generate Fully Qualified URL of a page.
+ * e.g.) http://www.foo.com/scripts/php.exe/some_page
+ *
+ * Note that you will need to escape the returned URL by
+ * <b>htmlspecialchars</b> function to embed the URL in HTML documents.
+ *
+ * @param string $page
+ *                               The destination page.
+ * @param array  $args
+ *                               An associative array of GET parameters, or <var>null</var>.<br>
+ *                               e.g.) array('uid'=>20, 'view'=>'foo')
+ * @param string $fragment
+ *                               Optional fragment of the URL.  If not NULL, the returned URL will
+ *                               be followed by '#' . urlencode($fragment)
+ * @param string $postfix        Optional postfix string after $page.
+ * @param bool   $ignore_referer Ingore REFERER request header.
+ *
+ * @return string
+ *  Fully qualified URL of the specified page.
+ */
+function cb_get_full_url($page, $args = null, $fragment = null, $postfix = null, $ignore_referer = false)
+{
+    return cb_fully_qualify_url(cb_format_url($page, $args, $fragment, $postfix), $ignore_referer);
+}
+
+
+/**
+ * Return the URL of the specified page.
+ * The returned URL will be escaped by <b>htmlspecialchars</b> function
+ * to be embedded in HTML documents.
+ *
+ * @param string $page
+ *                        The destination page.
+ * @param array  $args
+ *                        An associative array of GET parameters, or <var>null</var>.<br>
+ *                        e.g.) array('uid'=>20, 'view'=>'foo')
+ * @param string $fragment
+ *                        Optional fragment of the URL.  If not NULL, the returned URL will
+ *                        be followed by '#' . urlencode($fragment)
+ * @param string $postfix Optional postfix string after $page.
+ *
+ * @return string
+ *  An escaped representation of URL to be embedded in HTML documents.
+ */
+function cb_pageurl($page, $args = null, $fragment = null, $postfix = null)
+{
+    // escape HTML entities to return suitable string embedded in HTML documents.
+    return htmlspecialchars(cb_format_url($page, $args, $fragment, $postfix));
+}
+
+/**
+ * Return the invoked page name.
+ * This function will strip file name extension (.csp).
+ * 'index' will be returned if the script is executed from command line.
+ */
+function cb_get_pagename()
+{
+    global $G_pagedir, $G_pagename, $G_config_common;
+    if (is_null($G_pagename)) {
+        $G_pagename = cb_get_server_pagename();
+    }
+
+    return $G_pagename;
+}
+
+/**
+ * Return the invoked page name from $_SERVER variables.
+ * This function will strip file name extension (.csp).
+ * 'index' will be returned if the script is executed from command line.
+ *
+ * @return string
+ */
+function cb_get_server_pagename()
+{
+    global $G_pagedir, $G_config_common;
+
+    //GTM-129 for server side customization
+    if (defined('ON_FOREST')) {
+        //because of server side redirection, SCRIPT_NAME and PATH_INFO are not correct.
+        //we retrieve it from PHP_SELF.
+        $pos = strpos($_SERVER['PHP_SELF'], '/', 1);
+        $pagename = substr($_SERVER['PHP_SELF'], $pos + 1);
+
+        if (strlen($pagename) > 1) {
+            if (($pos = strpos($pagename, '/-/')) !== false) {
+                $pagename = substr($pagename, 0, $pos);
+            }
+            // remove after .csp extension
+            $extension_position = strpos($pagename, CB_SCRIPT_EXTENSION);
+            if ($extension_position !== false) {
+                $pagename = substr($pagename, 0, $extension_position);
+            } elseif (mb_substr($pagename, -1) == '/') {
+                // access '(domain)/g/portal/'
+                $pagename .= "index";
+            }
+        } else {
+            // access '(domain)/g/'
+            $pagename = 'index';
+        }
+    } else {
+        if (strcmp($G_config_common->get('Global', 'php'), 'standard') == 0) {
+            $pagename = 'index.csp';
+            if (array_key_exists('SCRIPT_NAME', $_SERVER)) {
+                if (strlen($G_pagedir) > 0) {
+                    // remove leading '/'
+                    $pagename = substr($G_pagedir, 1) . '/' . basename($_SERVER['SCRIPT_NAME'], CB_SCRIPT_EXTENSION);
+                } else {
+                    $pagename = basename($_SERVER['SCRIPT_NAME'], CB_SCRIPT_EXTENSION);
+                }
+
+                if ($pagename === "api") {
+                    $pagename .= $_SERVER['PATH_INFO'] ?? "";
+                    if (($pos = strpos($pagename, '/-/')) !== false) {
+                        $pagename = substr($pagename, 0, $pos);
+                    }
+                }
+            }
+        } else {
+            $pagename = 'index';
+            if (array_key_exists('PATH_INFO', $_SERVER) && (strlen($_SERVER['PATH_INFO']) > 1)) {
+                $pagename = substr($_SERVER['PATH_INFO'], 1);
+
+                if (($pos = strpos($pagename, '/-/')) !== false) {
+                    $pagename = substr($pagename, 0, $pos);
+                }
+            }
+        }
+    }
+
+    return $pagename;
+}
+
+/**
+ * Set page name forcibly.
+ *
+ * @param   string $basename page name
+ */
+function cb_set_pagename($pagename)
+{
+    global $G_pagename;
+    $G_pagename = $pagename;
+}
+
+/*
+ * ===============================================================
+ * Unified User Management
+ * ===============================================================
+ */
+
+/**
+ * Require named role.
+ * Thie method Judges on OR conditions, if two or more roles passed.
+ * execute according to the order of an argument, when there is no roll.
+ *
+ * ex. cb_require_role( 'WorkflowAdmin', 'SystemAdmin' );
+ *
+ * @param string $roleName  role name.
+ * @param string $roleName2 , ...    role name.
+ */
+function cb_require_role($roleName /* $roleName2, $roleName3, ... */)
+{
+    $args = func_get_args();
+    cb_vrequire_role($args);
+}
+
+/**
+ * @param array $roleNames role names
+ */
+function cb_vrequire_role($roleNames)
+{
+    global $G_container_base;
+    /** @var GRN_Uum $uum */
+    $uum = $G_container_base->getInstance('uum');
+    $uum->requireRole($roleNames);
+}
+
+/**
+ * @return bool|\CB_User
+ */
+function cb_get_login_user()
+{
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+
+    /* @var \GRN_Uum $uum */
+    return $uum->getLoginUser();
+}
+
+/**
+ * @return sting|bool
+ */
+function cb_get_login_user_id()
+{
+    $login_user = cb_get_login_user();
+
+    return $login_user ? $login_user->getOID() : false;
+}
+
+
+/*
+ * ===============================================================
+ * License driver
+ * ===============================================================
+ */
+
+/**
+ * @return CB_LicenseBaseDriver  An instance of CB_LicenseBaseDriver
+ *                or one of it's subclasses.
+ */
+function cb_get_license_driver()
+{
+    static $_driver = null;
+    if ( ! is_null($_driver)) {
+        return $_driver;
+    }
+
+    global $G_config_common;
+    $lic_driver = $G_config_common->get('License', 'driver');
+    if ( ! $lic_driver) {
+        cb_throw_error(E_COMMON_MISSING_LICENSE_DRIVER);
+    }
+
+    require_once('fw/plugin.csp');
+    $loader = new CB_PluginLoader('fw.license');
+    $_driver = $loader->loadDriver($lic_driver);
+    if (($_driver === false) || ( ! is_a($_driver, 'CB_LicenseBaseDriver'))) {
+        cb_throw_error(E_COMMON_MISSING_LICENSE_DRIVER);
+    }
+
+    $day = getdate();
+    $challenge = md5($day['year'] . $day['mon'] . $day['mday'] .
+                     $day['hours'] . $day['minutes']);
+
+    $response = $_driver->getResponse($challenge);
+    $result = md5('9752071af32161d2ab9b8db522cb1c8e 0109 af38822a662ced88901084e956661738' . $challenge);
+    if ($response != $result) {
+        cb_throw_error(E_COMMON_INVALID_LICENSE_DRIVER);
+    }
+
+    return $_driver;
+}
+
+/**
+ * @return object CB_BackupModeBaseDriver  An instance of CB_BackupModeBaseDriver
+ *                or one of it's subclasses.
+ */
+function cb_get_backupmode_driver()
+{
+    static $_driver = null;
+    if ( ! is_null($_driver)) {
+        return $_driver;
+    }
+
+    global $G_config_common;
+    $mnt_driver = $G_config_common->get('BackupMode', 'driver');
+    if ( ! $mnt_driver) {
+        cb_throw_error(E_COMMON_MISSING_BACKUPMODE_DRIVER);
+    }
+
+    require_once('fw/plugin.csp');
+    $loader = new CB_PluginLoader('fw.backupmode');
+    $_driver = $loader->loadDriver($mnt_driver);
+    if (($_driver === false) || ( ! is_a($_driver, 'CB_BackupModeBaseDriver'))) {
+        cb_throw_error(E_COMMON_MISSING_BACKUPMODE_DRIVER);
+    }
+
+    return $_driver;
+}
+
+function cb_is_versionup_process()
+{
+    global $argv;
+    if (is_array($argv) && array_key_exists(0, $argv)) {
+        if (strcmp(basename($argv[0]), 'versionup.csp') === 0) {
+            return true;
+        } elseif (strcmp(basename($argv[0]), 'versionup3.csp') === 0) {
+            return true;
+        } elseif (strcmp(basename($argv[0]), 'mark.csp') === 0) {
+            return true;
+        } elseif (strcmp(basename($argv[0]), 'update.csp') === 0) {
+            return true;
+        } elseif (strcmp(basename($argv[0]), 'update_after.csp') === 0) {
+            return true;
+        } elseif (strcmp(basename($argv[0]), 'update_after_massive.csp') === 0) {
+            return true;
+        } elseif (strcmp(basename($argv[0]), 'wtchk.php') === 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Initiate session id from install id
+ */
+function initialize_session_id()
+{
+    global $G_config_common;
+
+    // initiate session id from install id
+    $time = gettimeofday();
+    $strtime = substr(sprintf('%08X%05x', $time['sec'], $time['usec']), 1);
+    $pid = sprintf('%04X', getmypid() % 65536);
+    $origin = $strtime . $pid;
+    if ($G_config_common->get('Session', 'server_id')) {
+        $origin = $G_config_common->get('Session', 'server_id') . $origin;
+    }
+    $md5 = md5($origin . '3vz#t-64@!-51zdAOdr f_(t8a^#")s');
+    session_id($origin . $md5);
+    unset($time, $strtime, $pid, $origin, $md5);
+}
+
+/**
+ *
+ * Get whether Garoon is now being initialized
+ *
+ * @return boolean
+ */
+function cb_is_init_process()
+{
+    //When posted from the page 'grn.cgi/initialize'
+    global $G_INPUT;
+    if (isset($G_INPUT['_system_init'])) {
+        return true;
+    }
+
+    //When the command-line tool to initialize Garoon is executed.
+    global $argv;
+    if (is_array($argv) && array_key_exists(0, $argv)) {
+        if (strpos($argv[0], "grn_initialize.csp") !== false || strpos($argv[0], "restore_db.csp") !== false
+            || strpos($argv[0], "update_after.csp") !== false
+            || strpos($argv[0], "update_after_massive.csp") !== false
+            || strpos($argv[0], "grn_init_validate_dbuser_pw.csp") !== false
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function cb_basename($path)
+{
+    $name = str_replace('\\', '/', $path);
+    $lp = strrchr($name, '/');
+    if ($lp !== false) {
+        $name = substr($lp, 1);
+    }
+
+    return $name;
+}
+
+/**
+ * Get whether to be in cellular page
+ *
+ * @return boolean
+ */
+function cb_is_cellular_page()
+{
+    static $is_cellular = null;
+
+    if (is_null($is_cellular)) {
+        $is_cellular = false;
+
+        $page_path = strtolower(cb_get_pagename());
+        $page_parts = explode('/', $page_path);
+
+        // Check if the URL is '/celllular/...' or '/.../cellular/...'
+        // URLs like '/cellular/(personal|system)' are not for cellular pages
+        if (count($page_parts) > 1
+            && ((strcmp($page_parts[0], 'cellular') == 0 && strcmp($page_parts[1], 'personal') != 0
+                 && strcmp($page_parts[1], 'system') != 0)
+                || strcmp($page_parts[1], 'cellular') == 0)
+        ) {
+            $is_cellular = true;
+        }
+    }
+
+    return $is_cellular;
+}
+
+/**
+ * Create a new UUID.
+ *
+ * @return string
+ */
+function cb_create_uuid()
+{
+    // for Windows
+    if (function_exists('com_create_guid') === true) {
+        return strtolower(trim(com_create_guid(), '{}'));
+    }
+    if ( ! function_exists('uuid_create')) {
+        return _gen_uuid();
+    }
+
+    return uuid_create(UUID_TYPE_RANDOM);
+}
+
+/**
+ * @return string
+ */
+function cb_get_request_id()
+{
+    return $_SERVER['HTTP_X_CYBOZU_REQUEST_ID'] ?? '';
+}
+
+/**
+ * @return string
+ */
+function cb_get_request_id_header()
+{
+    return 'X-Cybozu-Request-Id: ' . cb_get_request_id();
+}
+
+function _gen_uuid()
+{
+    return sprintf('%04x%04x-%04x-%04x-%04x-%04x%04x%04x', mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff),
+        mt_rand(0, 0x0fff) | 0x4000, mt_rand(0, 0x3fff) | 0x8000, mt_rand(0, 0xffff), mt_rand(0, 0xffff),
+        mt_rand(0, 0xffff));
+}
+
+/**
+ * Validate a character encoding of $value.
+ * Throw an error if $value has invalidly encoded characters.
+ *
+ * @param string $value
+ * @param string $encoding
+ * @param bool   $throw_error
+ *
+ * @return bool
+ */
+function cb_validate_encoding($value, $encoding, $throw_error = true)
+{
+    if ( ! mb_check_encoding($value, $encoding)) {
+        if ($throw_error) {
+            cb_throw_error(E_COMMON_INVALID_ENCODING);
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Validate a character encoding of $array recursively.
+ *
+ * @param array  $array
+ * @param string $encoding
+ * @param bool   $throw_error
+ */
+function cb_array_validate_encoding(&$array, $encoding, $throw_error = true)
+{
+    foreach ($array as $key => $value) {
+        cb_validate_encoding($key, $encoding);
+        if (is_array($value)) {
+            cb_array_validate_encoding($value, $encoding);
+        } else {
+            // ignore v1 cookie having invalid encoding value
+            if (strcmp($key, 'CB_PLOGIN') !== 0) {
+                if ( ! cb_validate_encoding($value, $encoding, $throw_error)) {
+                    unset($array[$key]);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Validate a character encoding of file names.
+ *
+ * @param string $encoding
+ */
+function cb_files_validate_encoding($encoding)
+{
+    foreach ($_FILES as $key => $value) {
+        cb_validate_encoding($key, $encoding);
+        if (isset($value['name'])) {
+            if (is_array($value['name'])) {
+                foreach ($value['name'] as $name) {
+                    cb_validate_encoding($name, $encoding);
+                }
+            } else {
+                cb_validate_encoding($value['name'], $encoding);
+            }
+        }
+    }
+}
+
+/**
+ * Convert file names.
+ *
+ * @param string $name
+ * @param string $internal_encoding
+ * @param string $file_encoding
+ */
+function cb_convert_file_name($name, $internal_encoding, $file_encoding)
+{
+    if ($internal_encoding !== $file_encoding) {
+        $name = mb_convert_encoding($name, $internal_encoding, $file_encoding);
+    }
+
+    $name = str_replace("\\", '/', $name);
+    $lp = strrchr($name, '/');
+    if ($lp !== false) {
+        $name = substr($lp, 1);
+    }
+
+    return $name;
+}
+
+/**
+ * Convert files.
+ *
+ * @param string $internal_encoding
+ * @param string $file_encoding
+ */
+function cb_convert_files($internal_encoding, $file_encoding)
+{
+    foreach ($_FILES as $key => $value) {
+        if (isset($value['name'])) {
+            if (is_array($value['name'])) {
+                foreach ($value['name'] as $i => $name) {
+                    $value['name'][$i] = cb_convert_file_name($name, $internal_encoding, $file_encoding);
+                }
+            } else {
+                $value['name'] = cb_convert_file_name($value['name'], $internal_encoding, $file_encoding);
+            }
+            $_FILES[$key] = $value;
+        }
+    }
+}
+
+function cb_is_secure_access()
+{
+    return array_key_exists('HTTP_X_CYBOZU_SECURE_ID', $_SERVER) ? true : false;
+}
+
+function cb_is_remote_access()
+{
+    return array_key_exists('HTTP_X_CYBOZU_REMOTE_ID', $_SERVER) ? true : false;
+}
+
+function cb_is_http_remote_access()
+{
+    return (cb_is_remote_access()
+            &&
+            ! array_key_exists('HTTP_X_CYBOZU_REMOTE_SSL', $_SERVER));
+}
+
+function cb_check_redirect()
+{
+    $redirect_pages = [];
+    $redirect_dirs = [];
+    $excepted_pages = [];
+    if (defined('ON_FOREST')) {
+        require_once('fw/forest_util.csp');
+        $redirect_pages = CB_ForestUtil::getRedirectPages();
+        $redirect_dirs = CB_ForestUtil::getRedirectDirs();
+        $excepted_pages = CB_ForestUtil::getExceptedPages();
+    } // ONPRE
+    else {
+        $redirect_pages = [
+            'system/user/user_column_search_setting'                => 'system/common_list',
+            'system/user/command_user_column_search_setting_modify' => 'system/common_list',
+        ];
+        // SaaS
+        if (defined('ON_SAAS')) {
+            $redirect_dirs = [
+                'system/license' => 'system/common_list',
+            ];
+        }
+    }
+
+    $page = cb_get_pagename();
+    if ( ! isset($excepted_pages[$page])) {
+        if (isset($redirect_pages[$page])) {
+            cb_redirect($redirect_pages[$page]);
+        }
+
+        $pos = strrpos($page, '/');
+        if ($pos !== false) {
+            $dir = substr($page, 0, $pos);
+            if (isset($redirect_dirs[$dir])) {
+                cb_redirect($redirect_dirs[$dir]);
+            }
+        }
+    }
+}
+
+/**
+ * @return bool
+ */
+function cb_is_cybozu()
+{
+    return (isset($_SERVER['HTTP_HOST']) && preg_match('/^bozuman\.|\.cybozu-dev\.com$/', $_SERVER['HTTP_HOST'])
+            && defined('ON_FOREST'));
+}
+
+/**
+ * @return bool
+ */
+function cb_is_ios()
+{
+    if (isset($_SERVER['HTTP_USER_AGENT']) && preg_match('/(iPhone|iPad|iPod)/i', $_SERVER['HTTP_USER_AGENT'])) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Detect whether user's using android device.
+ */
+function cb_is_android()
+{
+    if (isset($_SERVER['HTTP_USER_AGENT']) && preg_match('/Android/i', $_SERVER['HTTP_USER_AGENT'])) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Get whether to be in system setting page
+ *
+ * @return boolean
+ */
+function cb_is_system_page()
+{
+    static $is_system = null;
+    if (is_null($is_system)) {
+        $is_system = false;
+        $page_path = strtolower(cb_get_pagename());
+        $page_parts = explode('/', $page_path);
+        // Check if the URL is 'system/...' or '.../system/...'
+        if (count($page_parts) > 1
+            && (strcmp($page_parts[0], 'system') == 0
+                || strcmp($page_parts[1], 'system') == 0)
+        ) {
+            $is_system = true;
+        }
+    }
+
+    return $is_system;
+}
+
+/**
+ * Get whether to be in operation page
+ *
+ * @return boolean
+ */
+function cb_is_operation_page()
+{
+    static $is_operation = null;
+    if (is_null($is_operation)) {
+        $is_operation = false;
+        $page_path = strtolower(cb_get_pagename());
+        $page_parts = explode('/', $page_path);
+        // Check if the URL is '.../operation/...'
+        if (count($page_parts) > 1 && strcmp($page_parts[1], 'operation') == 0) {
+            $is_operation = true;
+        }
+    }
+
+    return $is_operation;
+}
+
+/**
+ * Detect if in image view page
+ *
+ * @return boolean
+ */
+function cb_is_file_image_view_page()
+{
+    static $is_file_image_view = null;
+    if (is_null($is_file_image_view)) {
+        $is_file_image_view = false;
+        $page_path = strtolower(cb_get_pagename());
+        $page_path = explode('/', $page_path);
+        if (count($page_path) > 1
+            && (strcmp($page_path[1], 'file_image_view') == 0 || strcmp($page_path[1], 'draft_file_image_view') == 0
+                || (strcmp($page_path[0], 'space') == 0 && strcmp($page_path[1], 'file_view') == 0))
+        ) {
+            $is_file_image_view = true;
+        }
+    }
+
+    return $is_file_image_view;
+}
+
+/**
+ * @return string
+ */
+function cb_get_app_path()
+{
+    static $app_path = null;
+    if (is_null($app_path)) {
+        global $G_config_common;
+        $app_path = $G_config_common->get('Global', 'app_path');
+    }
+
+    return $app_path;
+}
+
+/**
+ * @param $grn_module
+ *
+ * @return string
+ */
+function cb_get_app_id($grn_module)
+{
+    if (\grn\grn\Validate::isNull($grn_module)) {
+        return "";
+    }
+
+    $application = explode('.', $grn_module);
+    if (count($application) === 2) {
+        return $application[1];
+    }
+
+    return $application[0];
+}
+
+/**
+ * @return bool
+ */
+function cb_is_cbpapi()
+{
+    $pagename = cb_get_pagename();
+    if (strpos($pagename, 'cbpapi/') === 0) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+/**
+ * @return bool
+ */
+function cb_is_rest_api()
+{
+    $page_name = cb_get_pagename();
+    if (strpos($page_name, 'api/') === 0) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+/**
+ * @return bool
+ */
+function cb_is_develop_rest_api(): bool
+{
+    $page_name = cb_get_pagename();
+    if (strpos($page_name, 'api/dev/') === 0) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+/**
+ * Error Control Operators
+ *
+ * @param array $array
+ * @param mixed $key
+ * @param mixed $defaultValue
+ *
+ * @return mixed
+ */
+function cb_at(array $array, $key, $defaultValue = null)
+{
+    assert('is_integer($key) || is_string($key) || is_null($key)');
+
+    return isset($array[$key]) ? $array[$key] : $defaultValue;
+}
+
+/**
+ * against IE compatibility setting
+ */
+function cb_set_ua_compatible()
+{
+    global $G_config_common;
+    require_once('fw/ui.csp');
+    $browser = cb_ui_get_browser();
+
+    if ($browser['type'] === 'msie') {
+        $compatible = "IE=edge";
+
+        $customset = $G_config_common->get('Global', 'ie_compatible');
+        if ($customset !== false) {
+            $compatible = htmlspecialchars($customset);
+        }
+
+        // when the setting is "", header will not be written
+        if ($customset !== "") {
+            header('X-UA-Compatible: ' . $compatible);
+        }
+    }
+}
+
+/**
+ * Return the setting value of php.ini.
+ *
+ * @return bool
+ */
+function cb_is_cookie_httponly()
+{
+    if (ini_get('session.cookie_httponly') === "1") {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+/**
+ * when connecting by https, return the setting value of php.ini.
+ * when connecting http or using remote access, return false.
+ *
+ * @return bool
+ */
+function cb_is_cookie_secure()
+{
+    if (cb_is_https() && ! cb_is_http_remote_access() && (ini_get('session.cookie_secure') === "1")) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+/**
+ * @param int $type
+ *
+ * @return string
+ */
+function cb_get_product_term($type)
+{
+    if (defined('ON_FOREST')) {
+        return '';
+    }
+    // ex. Cybozu® Garoon Version 3.7.0
+    global $G_config_grn;
+    $productTerm = ($type === CB_TYPE_HTML) ? '<!-- " --><small>' : '';
+    $productTerm .= cb_get_generator($type);
+    $productTerm .= ' Version ' . $G_config_grn->get('System', 'version');
+    $productTerm .= ($type === CB_TYPE_HTML) ? '</small>' : '';
+
+    return $productTerm;
+}
+
+/**
+ * @param int $type
+ *
+ * @return string
+ */
+function cb_get_generator($type)
+{
+    $generator = 'Cybozu';
+    switch ($type) {
+        case CB_TYPE_HTML:
+            $generator .= '&reg; ';
+            break;
+        case CB_TYPE_TEXT:
+            $generator .= '® ';
+            break;
+        case CB_TYPE_ATOM:
+        default:
+            $generator .= '(R) ';
+            break;
+    }
+    $generator .= 'Garoon';
+
+    return $generator;
+}
+
+/**
+ * @param int $type
+ *
+ * @return string
+ */
+function cb_get_copyright($type)
+{
+    $copyRight = ($type === CB_TYPE_HTML) ? '<!-- " --><small style="margin:0 5px;">&nbsp;' : '';
+    if (defined('ON_FOREST')) {
+        // ex. Garoon Copyright © 2013 Cybozu
+        $copyRight .= 'Garoon Copyright ';
+        $copyRight .= ($type === CB_TYPE_HTML) ? '&copy; ' : '© ';
+        $copyRight .= date('Y') . ' Cybozu';
+    } else {
+        // ex. Copyright © 2010 - 2013 Cybozu
+        $copyRight .= 'Copyright ';
+        switch ($type) {
+            case CB_TYPE_HTML:
+                $copyRight .= '&copy; ';
+                break;
+            case CB_TYPE_TEXT:
+                $copyRight .= '© ';
+                break;
+            case CB_TYPE_ATOM:
+            default:
+                $copyRight .= '(c) ';
+                break;
+        }
+        $copyRight .= '2014 - 2018 Cybozu';
+    }
+    $copyRight .= ($type === CB_TYPE_HTML) ? '</small>' : '';
+
+    return $copyRight;
+}
+
+/**
+ * @return CB_DatabaseConnection
+ */
+function cb_get_master_db()
+{
+    global $G_container_base;
+
+    return $G_container_base->getInstance('dbconn');
+}
+
+/**
+ * @return GRN_ApplicationLocator
+ */
+function cb_get_application_locator()
+{
+    require_once('grn/application.csp');
+    $locator = \GRN_ApplicationLocator::instance();
+
+    return $locator;
+}
+
+/**
+ * @param string $appId
+ *
+ * @return CB_DatabaseConnection
+ */
+function cb_get_app_db($appId)
+{
+    assert('strlen($appId) > 0');
+    require_once('grn/application.csp');
+    $locator = \GRN_ApplicationLocator::instance();
+
+    return $locator->getConnection($appId);
+}
+
+/**
+ * @param string $appId
+ *
+ * @return CB_DatabaseConnection[]
+ */
+function db_get_app_dbs(string $appId): array
+{
+    switch ($appId) {
+        case 'master' :
+        case 'others' :
+            return [cb_get_master_db()];
+
+        case 'notification' :
+            require_once('grn/notification.csp');
+
+            return grn_notification_get_connections();
+
+        case 'profile' :
+            require_once('fw/profile.csp');
+
+            return get_profile_get_connections();
+
+        default :
+            return [cb_get_app_db($appId)];
+    }
+}
+
+/**
+ * parse sched.ini and return sched config
+ *
+ * @return CB_ConfigManager
+ */
+function cb_get_sched_config()
+{
+    static $sched_ini = null;
+    if ($sched_ini instanceof CB_ConfigManager) {
+        return $sched_ini;
+    }
+
+    $sched_path = cb_basedir() . DIRECTORY_SEPARATOR . 'sched.ini';
+    if ( ! file_exists($sched_path)) {
+        die("{$sched_path} is missing. Check your configuration!\n");
+    }
+    $sched_ini = new CB_ConfigManager($sched_path, "Sched");
+
+    return $sched_ini;
+}
+
+/**
+ * @return string full path of executable php
+ */
+function cb_get_cli_path()
+{
+    static $cli_path = null;
+    if (is_string($cli_path)) {
+        return $cli_path;
+    }
+
+    $sched_ini = cb_get_sched_config();
+    $php = $sched_ini->get("Sched", "command");
+    if ( ! $php || empty($php)) {
+        die("command of Sched section in sched.ini should be php command.\n");
+    }
+
+    if (defined('ON_FOREST')) {
+        // In .com environment, command in sched.ini is full path
+        $cli_path = $php;
+    } else {
+        $cli_path = cb_basedir() . DIRECTORY_SEPARATOR . $php;
+    }
+
+    if ( ! file_exists($cli_path)) {
+        die("{$cli_path} not exists\n");
+    }
+
+    return $cli_path;
+}
+
+/**
+ * return execution path of php and command file.
+ * considering windows file path '"{$phpPath}" -C -q -d output_buffering=false "${commandFile}"'
+ *
+ * @param $phpPath
+ * @param $commandFile
+ *
+ * @return string
+ */
+function cb_get_fopen_execute_path($phpPath, $commandFile)
+{
+    if ( ! file_exists($phpPath)) {
+        die("{$phpPath} not found.\n");
+    }
+
+    if ( ! file_exists($commandFile)) {
+        die("{$commandFile} not found.\n");
+    }
+
+    return '"' . $phpPath . '"' . ' -C -q -d output_buffering=false ' . '"' . $commandFile . '"';
+}
+
+/**
+ * Return domain defined in forest.ini.
+ * e.g.:
+ * [Common]
+ * base_domain = yyyy.zz
+ */
+function cb_get_domain()
+{
+    $domain = null;
+    if (defined("ON_FOREST")) {
+        require_once('fw/forest_util.csp');
+        $forest_config = CB_ForestUtil::getConfig();
+        $domain = $forest_config->get("Common", "base_domain");
+    }
+
+    return $domain;
+}
+
+/**
+ * @return bool
+ */
+function cb_is_need_print_x_frame_options_header()
+{
+    if (defined('ON_FOREST')) {
+        require_once('fw/slash_util.csp');
+
+        return CB_SlashUtil::isSameOrigin();
+    } else {
+        global $G_config_common;
+        $x_frame_options = $G_config_common->get('Global', 'x_frame_options');
+        if ($x_frame_options) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/*
+ * Escape special character u+2028 u+2029
+ */
+function cb_trim_unicode_separator($string)
+{
+    $u2028 = "\xE2\x80\xA8"; // 'LINE SEPARATOR'       http://www.fileformat.info/info/unicode/char/2028/index.htm
+    $u2029 = "\xE2\x80\xA9"; // 'PARAGRAPH SEPARATOR'  http://www.fileformat.info/info/unicode/char/2029/index.htm
+    $string = preg_replace("%" . $u2028 . "%u", '', $string);
+    $string = preg_replace("%" . $u2029 . "%u", '', $string);
+
+    return $string;
+}
+
+/**
+ * @return bool
+ */
+function cb_is_forest()
+{
+    return defined('ON_FOREST');
+}
+
+/**
+ * @return bool
+ */
+function cb_is_onpremises()
+{
+    return ! cb_is_forest();
+}
+
+/**
+ * @return bool
+ */
+function cb_is_onpremises_distributed_database()
+{
+    require_once('grn/table_util.csp');
+    if (grn_check_table_merged()) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @return string
+ */
+function cb_get_host_domain()
+{
+    if (array_key_exists('HTTP_REFERER', $_SERVER)) {
+        $parsed_url = parse_url($_SERVER['HTTP_REFERER']);
+        $host_domain = $parsed_url['host'];
+    } else {
+        $host_domain = gethostname();
+    }
+
+    return $host_domain;
+}
+
+/**
+ * @param string $serialized_text
+ * @param array  $options
+ *
+ * @return mixed
+ */
+function cb_unserialize($serialized_text, array $options = [])
+{
+    if (is_null($serialized_text)) {
+        return false;
+    }
+    require_once('fw/CbUnserialize.csp');
+
+    return (new CbUnserialize())->unserialize($serialized_text, $options);
+}
+
+/**
+ * get socks info
+ *
+ * @return array
+ */
+function cb_get_socks_info()
+{
+    if (cb_is_forest()) {
+        require_once('fw/forest_util.csp');
+        $region_json = CB_RegionManager::getRegionJson();
+
+        require_once('fw/slash_util.csp');
+        $region = CB_SlashUtil::getRegion();
+
+        return $region_json[$region]['SOCKS'];
+    }
+
+    return [];
+}

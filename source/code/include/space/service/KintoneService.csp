@@ -1,0 +1,904 @@
+<?php
+
+namespace grn\space\service;
+
+use grn\space\common\exception\GrnException;
+use grn\space\data\bean\log\SyncAppManageLog;
+
+use grn\grn\MemberLogic;
+use grn\space\common\data\bean\Application;
+use grn\space\common\data\bean\ApplicationLocal;
+use grn\space\common\data\bean\LanguageStatus;
+use grn\space\common\data\bean\SpaceMember;
+use grn\space\common\data\condition\ApplicationSearchCondition;
+use grn\space\common\data\collection\ApplicationLocalCollection;
+use grn\space\common\exception\GrnKintoneException;
+use grn\space\common\exception\GrnInvalidArgumentException;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\utility\ValidateUtility;
+use grn\space\common\service\ServiceAbstract;
+use grn\space\data\bean\log\DeleteAppManageLog;
+use grn\space\data\bean\log\CreateAppManageLog;
+use grn\space\data\bean\Space;
+use grn\space\data\bean\SpaceApplication;
+use grn\space\data\condition\SpaceApplicationSearchCondition;
+use grn\space\logic\SpaceApplicationLogic;
+use grn\space\logic\ApplicationLogic;
+use grn\space\logic\SpaceLogic;
+use grn\space\logic\KintoneLogic;
+use grn\space\common\exception\GrnDataNotFoundException;
+
+/**
+ * Class KintoneService
+ */
+class KintoneService extends ServiceAbstract
+{
+    private static $_instance = null;
+
+    /**
+     * コンストラクタ
+     */
+    public function __construct()
+    {
+        parent::__construct();
+    }
+
+    /**
+     * Get Instance(Singleton pattern)
+     *
+     * @return KintoneService $_instance
+     */
+    public static function getInstance()
+    {
+        if (is_null(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * Link a Kintone application to Space
+     *
+     * @param Space  $space
+     * @param string $kAppId
+     * @param string $operationUserId
+     *
+     * @throws GrnKintoneException
+     * @return SpaceApplication
+     */
+    public function linkKintoneApplication(
+        Space $space,
+        $kAppId,
+        $operationUserId
+    ) {
+        ValidateUtility::isNumber($operationUserId);
+
+        require_once('kintone/AppAPILogic.csp');
+        $logic = new \GRN_Kintone_AppAPILogic();
+        $result = $logic->get($kAppId);
+        if ( ! $result['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_GET_APP_INFO_FAILED,
+                $result);
+        }
+
+        $application = $this->createRelation($result['result'], $space->getId(),
+            $operationUserId);
+        $this->sync($space->getId(), $operationUserId);
+
+        //Log 
+        $createAppManageLog = new CreateAppManageLog();
+        $createAppManageLog->setExternalAppName($application->getApplicationName());
+        $createAppManageLog->setExternalId($application->getExternalApplicationId());
+        $createAppManageLog->setExternalType(CreateAppManageLog::EXTERNAL_TYPE_LINK);
+        $createAppManageLog->setSpaceId($space->getId());
+        $createAppManageLog->setSpaceName($space->getSpaceName());
+        $this->getSpaceLogLogic()->info($createAppManageLog);
+
+        return $application;
+    }
+
+    /**
+     * Create a new Kintone application and connect it to Space.
+     *
+     * @param Space  $space
+     * @param string $code
+     * @param string $name
+     * @param string $description
+     * @param string $operationUserId
+     *
+     * @throws GrnKintoneException
+     * @return SpaceApplication
+     */
+    public function createKintoneApplication(
+        Space $space,
+        $code,
+        $name,
+        $description,
+        $operationUserId
+    ) {
+        $fileKey = '';
+        if (@$_FILES['iconfile']['error'] === UPLOAD_ERR_OK) {
+            require_once('kintone/BlobAPILogic.csp');
+            $logic = new \GRN_Kintone_BlobAPILogic();
+            $file = "@" . $_FILES['iconfile']['tmp_name'];
+            $result = $logic->upload($file);
+            $fileKey = $result['result']['fileKey'];
+        }
+
+        require_once('kintone/AppAPILogic.csp');
+        $logic = new \GRN_Kintone_AppAPILogic();
+        $result = $logic->add($code, $name, $description, $fileKey);
+        if ( ! $result['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_APP_CREATE_FAILED,
+                $result);
+        }
+        $new_kintone_app_id = $result['result']['appId'];
+
+        //deploy
+        $result = $logic->deploySync($new_kintone_app_id);
+        if ( ! $result['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_APP_CREATE_FAILED,
+                $result);
+        }
+
+        // create relation
+        $data = [];
+        $data['id'] = $new_kintone_app_id;
+        $data['code'] = $code;
+        $data['name'] = $name;
+        $data['isOwner'] = true;
+
+        $application = $this->createRelation($data, $space->getId(),
+            $operationUserId);
+        $this->sync($space->getId(), $operationUserId);
+
+        //Log
+        $createAppManageLog = new CreateAppManageLog();
+        $createAppManageLog->setExternalAppName($application->getApplicationName());
+        $createAppManageLog->setExternalId($application->getExternalApplicationId());
+        $createAppManageLog->setExternalType(CreateAppManageLog::EXTERNAL_TYPE_NEW);
+        $createAppManageLog->setSpaceId($space->getId());
+        $createAppManageLog->setSpaceName($space->getSpaceName());
+        $this->getSpaceLogLogic()->info($createAppManageLog);
+
+        return $application;
+    }
+
+    /**
+     * Recreate a Kintone application and connect it to Space
+     *
+     * @param Space  $space
+     * @param string $kAppId
+     * @param string $operationUserId
+     *
+     * @throws GrnKintoneException
+     * @return SpaceApplication
+     */
+    public function reuseKintoneApplication(
+        Space $space,
+        $kAppId,
+        $operationUserId
+    ) {
+        ValidateUtility::isNumber($operationUserId);
+
+        require_once('kintone/AppAPILogic.csp');
+        $KintoneAppAPILogic = new \GRN_Kintone_AppAPILogic();
+        $result = $KintoneAppAPILogic->copy($kAppId);
+        if ( ! $result['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_APP_REUSE_FAILED,
+                $result);
+        }
+        $new_kintone_app_id = $result['result']['appId'];
+
+        //deploy
+        $result = $KintoneAppAPILogic->deploySync($new_kintone_app_id);
+        if ( ! $result['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_APP_REUSE_FAILED,
+                $result);
+        }
+
+        $app = $KintoneAppAPILogic->get($new_kintone_app_id);
+        if ( ! $app['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_APP_REUSE_FAILED,
+                $app);
+        }
+
+        // create relation
+        $data = [];
+        $data['id'] = $new_kintone_app_id;
+        $data['code'] = $app['result']['code'];
+        $data['name'] = $app['result']['name'];
+        $data['isOwner'] = true;
+
+        $application = $this->createRelation($data, $space->getId(),
+            $operationUserId);
+        $this->sync($space->getId(), $operationUserId);
+
+        //Log
+        $createAppManageLog = new CreateAppManageLog();
+        $createAppManageLog->setExternalAppName($application->getApplicationName());
+        $createAppManageLog->setExternalId($application->getExternalApplicationId());
+        $createAppManageLog->setExternalType(CreateAppManageLog::EXTERNAL_TYPE_REUSE);
+        $createAppManageLog->setSpaceId($space->getId());
+        $createAppManageLog->setSpaceName($space->getSpaceName());
+        $this->getSpaceLogLogic()->info($createAppManageLog);
+
+        return $application;
+    }
+
+    /**
+     * Create relation with space and kintone appli.
+     *
+     * @param array $kAppData
+     * @param int   $spaceID space id
+     * @param int   $operationUserID
+     *
+     * @return SpaceApplication
+     * @throws GrnDataNotFoundException
+     * @throws GrnInvalidArgumentException
+     */
+    private function createRelation($kAppData, $spaceID, $operationUserID)
+    {
+        $condition = new ApplicationSearchCondition();
+        $condition->setSearchApplicationType(Application::APPLICATION_TYPE_EXTERNAL_KINTONE);
+        $condition->setSearchExternalApplicationID($kAppData['id']);
+
+        $service = SpaceService::getInstance();
+        $applications = $service->searchApplicationBySearchCondition($condition,
+            $operationUserID);
+
+        $spaceLogic = SpaceLogic::getInstance();
+        try {
+            $space = $spaceLogic->getSpace($spaceID, $operationUserID);
+        } catch (GrnDataNotFoundException $e) {
+            $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+            throw $e;
+        }
+
+        $applicationLogic = ApplicationLogic::getInstance();
+        $spaceApplicationLogic = SpaceApplicationLogic::getInstance();
+
+        global $G_container_base;
+        $operationCbUser = $G_container_base->getInstance('uum')
+                                            ->getUser($operationUserID);
+        if ( ! $operationCbUser) {
+            throw new GrnInvalidArgumentException();
+        }
+        $creator = new SpaceMember();
+        $creator->setMemberID($operationUserID);
+        $creator->setMemberType(MemberLogic::TYPE_USER);
+        $creator->setUserName($operationCbUser->get('display_name'));
+
+        // マスタが存在しない場合
+        if ($applications->count() === 0) {
+            $spaceApplication = new SpaceApplication();
+            $spaceApplication->setApplicationCode($kAppData['code']);
+            $spaceApplication->setApplicationName($kAppData['name']);
+            $spaceApplication->setExternalApplicationId($kAppData['id']);
+            $spaceApplication->setApplicationType(Application::APPLICATION_TYPE_EXTERNAL_KINTONE);
+            $spaceApplication->setCreator($creator);
+            $spaceApplication->setModifier($creator);
+            $spaceApplication->setCreateTimestamp(time());
+            $spaceApplication->setModifyTimestamp(time());
+            $spaceApplication->setExternalApplicationOwner(@$kAppData['isOwner']);
+            $spaceApplication->setSpaceId($space->getId());
+
+            $applicationLogic->save($spaceApplication,
+                new ApplicationLocalCollection());
+            $spaceApplicationLogic->createSpaceApplication($spaceApplication);
+        } // マスタが既に存在する場合
+        elseif ($applications->count() === 1) {
+            $master = $applications->getBean(0);
+
+            $spaceApplication = new SpaceApplication();
+            $spaceApplication->setApplicationMaster($master);
+            $spaceApplication->setSpaceId($spaceID);
+            $spaceApplication->setExternalApplicationOwner(false);
+            $spaceApplication->setCreator($creator);
+            $spaceApplication->setModifier($creator);
+            $spaceApplication->setCreateTimestamp(time());
+            $spaceApplication->setModifyTimestamp(time());
+
+            $spaceApplicationLogic->createSpaceApplication($spaceApplication);
+        } else {
+            // TODO
+            // データがおかしい
+            cb_throw_error();
+        }
+
+        return $spaceApplication;
+    }
+
+    /**
+     * Get list of kintone application by space id.
+     *
+     * @param int $spaceID
+     * @param int $operationUserID
+     *
+     * @return \grn\space\data\collection\SpaceApplicationCollection
+     */
+    public function listKintoneApplications($spaceID, $operationUserID)
+    {
+        assert('is_numeric($spaceID)');
+
+        $condition = new SpaceApplicationSearchCondition();
+        $condition->setSearchSpaceId($spaceID);
+        $condition->setSearchApplicationType(Application::APPLICATION_TYPE_EXTERNAL_KINTONE);
+
+        $service = SpaceService::getInstance();
+        $result = $service->searchSpaceApplicationBySearchCondition($condition,
+            $operationUserID);
+
+        return $result;
+    }
+
+    /**
+     * Sync information space and kintone.
+     *
+     * @param int $spaceID
+     * @param int $operationUserID
+     *
+     * @return bool
+     * @throws GrnInvalidArgumentException
+     * @throws GrnKintoneException
+     */
+    public function sync($spaceID, $operationUserID)
+    {
+        assert('is_numeric($spaceID)');
+
+        $this->syncKintoneApplication($spaceID, $operationUserID);
+        $this->syncAccessPrivilege($spaceID, $operationUserID);
+
+        return true;
+    }
+
+    /**
+     * Kintone アプリケーション情報を同期する。
+     *
+     * @param int $spaceID
+     * @param int $operationUserID
+     *
+     * @throws GrnInvalidArgumentException
+     * @throws GrnKintoneException
+     */
+    private function syncKintoneApplication($spaceID, $operationUserID)
+    {
+        assert('is_numeric($spaceID)');
+
+        $garoonApplications = $this->listKintoneApplications($spaceID,
+            $operationUserID);
+        $kAppIDList = [];
+        /** @var \grn\space\data\bean\SpaceApplication $app */
+        foreach ($garoonApplications as $app) {
+            $kAppIDList[] = $app->getExternalApplicationId();
+        }
+
+        if (count($kAppIDList) == 0) {
+            return;
+        }
+
+        require_once('kintone/AppAPILogic.csp');
+        $logic = new \GRN_Kintone_AppAPILogic();
+
+        // 閲覧しているユーザーが管理権限を持っているアプリのみ同期する
+        $appList = $logic->listApp($kAppIDList);
+        if ( ! $appList['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_SYNC_FAILED,
+                $appList);
+        }
+
+        $viewableKAppIDList = [];
+        foreach ($kAppIDList as $appID) {
+            foreach ($appList['result']['appList'] as $app) {
+                if ($app['id'] == $appID) {
+                    $viewableKAppIDList[] = $appID;
+                }
+            }
+        }
+        $kAppIDList = $viewableKAppIDList;
+
+        // 管理権限を持っているアプリの名前を取得
+        $kintoneAppsNameList = $logic->getAppsName($kAppIDList);
+        if ( ! $kintoneAppsNameList['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_SYNC_FAILED,
+                $kintoneAppsNameList);
+        }
+
+        $kintoneAppsNameList = $kintoneAppsNameList['result']['appNames'];
+
+        global $G_container_base;
+        $operationUser = $G_container_base->getInstance('uum')
+                                          ->getUser($operationUserID);
+        if ( ! $operationUser) {
+            throw new GrnInvalidArgumentException();
+        }
+
+        // Get Kintone Applications
+        /** @var \grn\space\data\bean\SpaceApplication $garoonApp */
+        foreach ($garoonApplications as $garoonApp) {
+            $names = new ApplicationLocalCollection();
+            if (array_key_exists($garoonApp->getExternalApplicationId(),
+                $kintoneAppsNameList)
+            ) {
+                $names = new ApplicationLocalCollection();
+                foreach (
+                    $kintoneAppsNameList[$garoonApp->getExternalApplicationId()]
+                    as $code => $name
+                ) {
+                    $local = new ApplicationLocal();
+                    $local->setLanguageCode($code);
+                    $local->setApplicationId($garoonApp->getId());
+                    $local->setApplicationName($name);
+
+                    $names->appendBean($local);
+                }
+
+                $modifier = new SpaceMember();
+                $modifier->setMemberID($operationUserID);
+                $modifier->setUserName($operationUser->get('display_name'));
+
+                $service = SpaceService::getInstance();
+                $garoonApp->setModifier($modifier);
+                $garoonApp->setModifyTimestamp(time());
+                $service->modifyApplication($garoonApp, $names,
+                    $operationUserID);
+            }
+        }
+
+        $spaceService = SpaceService::getInstance();
+        $space = $spaceService->getSpace($spaceID, $operationUserID);
+        $log = new SyncAppManageLog();
+        $log->setSyncType(SyncAppManageLog::SYNC_TYPE_APPLICATION_NAME);
+        $log->setSpaceId($spaceID);
+        $log->setSpaceName($space->getSpaceName());
+        $log->setKintoneAppIdList($kAppIDList);
+        $spaceService->getSpaceLogLogic()->info($log);
+    }
+
+    /**
+     * アクセス権を同期する。
+     * - Space が「公開」の場合、Kintone 側の ACL を消す。(つまり全員閲覧可能)
+     * - Space が「非公開」の場合、全員を閲覧不可にする設定と、閲覧可能なユーザーの ACL を設定する。
+     *
+     * @param int $spaceID
+     * @param int $operationUserID
+     *
+     * @throws GrnInvalidArgumentException
+     * @throws GrnKintoneException
+     */
+    private function syncAccessPrivilege($spaceID, $operationUserID)
+    {
+        assert('is_numeric($spaceID)');
+
+        $kAppList = $this->listKintoneApplications($spaceID,
+            $operationUserID);
+        $kAppIDList = [];
+        /** @var \grn\space\data\bean\SpaceApplication $app */
+        foreach ($kAppList as $app) {
+            //オーナーではないアプリは同期しない
+            if ( ! $app->isExternalApplicationOwner()) {
+                continue;
+            }
+
+            $kAppIDList[] = $app->getExternalApplicationId();
+        }
+
+        if (count($kAppIDList) == 0) {
+            return;
+        }
+
+        $acl = $this->createACL($spaceID, $operationUserID);
+
+        // update rights
+        require_once('kintone/AccessControlAPILogic.csp');
+        $aclAPILogic = new \GRN_Kintone_AccessControlAPILogic();
+        $result = $aclAPILogic->updateAppsRights($acl, $kAppIDList);
+        if ( ! $result['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_SYNC_FAILED,
+                $result);
+        }
+
+        //deploy 
+        require_once('kintone/AccessControlAPILogic.csp');
+        $appAPILogic = new \GRN_Kintone_AppAPILogic();
+        $result = $appAPILogic->deployApps($kAppIDList);
+        if ( ! $result['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_SYNC_FAILED,
+                $result);
+        }
+
+        $spaceService = SpaceService::getInstance();
+        $space = $spaceService->getSpace($spaceID, $operationUserID);
+        $log = new SyncAppManageLog();
+        $log->setSyncType(SyncAppManageLog::SYNC_TYPE_PERMISSION);
+        $log->setSpaceId($spaceID);
+        $log->setSpaceName($space->getSpaceName());
+        $log->setKintoneAppIdList($kAppIDList);
+        $spaceService->getSpaceLogLogic()->info($log);
+    }
+
+    /**
+     * @param int $spaceID
+     * @param int $operationUserID
+     *
+     * @return array
+     */
+    private function createACL($spaceID, $operationUserID)
+    {
+        assert('is_numeric($spaceID)');
+        require_once('kintone/Logic.csp');
+
+        $service = SpaceService::getInstance();
+        $space = $service->getSpace($spaceID, $operationUserID);
+
+        $acl = [];
+        if ($space->isPublic()) {
+            $acl[] = $this->createACE(true, 'GROUP',
+                \GRN_Kintone_Logic::EVERYONE_GROUP_ID, 1);
+        } else {
+            // Get users in space.
+            $members = $service->getSpaceUserCollection($spaceID,
+                $operationUserID);
+
+            $sortOrder = 1;
+            /** @var \grn\space\data\bean\SpaceUser $member */
+            foreach ($members as $member) {
+                switch ($member->getMemberType()) {
+                    case MemberLogic::TYPE_USER:
+                        $member_id = $member->getSlashID();
+                        $member_type = 'USER';
+                        break;
+                    case MemberLogic::TYPE_ORGANIZATION:
+                        $member_id = $member->getSlashID();
+                        $member_type = 'ORGANIZATION';
+                        break;
+                    case MemberLogic::TYPE_STATIC_ROLE:
+                        $member_id = $member->getSlashID();
+                        $member_type = 'GROUP';
+                        break;
+                    default:
+                        throw new GrnException();
+                }
+
+                $acl[] = $this->createACE(true, $member_type, $member_id,
+                    $sortOrder++);
+
+            }
+
+            // Everyone can not access
+            $acl[] = $this->createACE(false, 'GROUP',
+                \GRN_Kintone_Logic::EVERYONE_GROUP_ID, $sortOrder);
+        }
+
+        return $acl;
+    }
+
+    /**
+     * @param $access
+     * @param $type
+     * @param $entityId
+     * @param $order
+     *
+     * @return array
+     */
+    private function createACE($access, $type, $entityId, $order)
+    {
+        $data = [];
+        $data['recordViewable'] = $access;
+        $data['recordEditable'] = $access;
+        $data['recordDeletable'] = $access;
+        $data['recordImportable'] = $access;
+        $data['recordExportable'] = $access;
+        $data['appEditable'] = $access;
+        $data['recordAddable'] = $access;
+        $data['entityType'] = $type;
+        $data['entityId'] = $entityId;
+        $data['sortOrder'] = $order;
+
+        return $data;
+    }
+
+    /**
+     * @return bool
+     */
+    public function isAvailable()
+    {
+        $logic = KintoneLogic::getInstance();
+
+        return $logic->isAvailable();
+    }
+
+    /**
+     * @param $available
+     */
+    public function setAvailable($available)
+    {
+        $logic = KintoneLogic::getInstance();
+
+        return $logic->setAvailable($available);
+    }
+
+    /**
+     * スペース内の Kintone アプリと Kintone 側のアプリのアクセス権が同一かどうか調べる。
+     *
+     * @param int $spaceID
+     * @param int $operationUserID
+     *
+     * @return bool
+     * @throws GrnKintoneException
+     */
+    public function isSameACL($spaceID, $operationUserID)
+    {
+        assert('is_numeric($spaceID)');
+        assert('is_numeric($operationUserID)');
+
+        $appList = $this->listKintoneApplications($spaceID, $operationUserID);
+
+        $ownerAppIDList = [];
+        /** @var \grn\space\data\bean\SpaceApplication $app */
+        foreach ($appList as $app) {
+            if ($app->isExternalApplicationOwner()) {
+                $ownerAppIDList[] = $app->getExternalApplicationId();
+            }
+        }
+
+        if (count($ownerAppIDList) === 0) {
+            return true;
+        }
+
+        require_once('kintone/AccessControlAPILogic.csp');
+        $logic = new \GRN_Kintone_AccessControlAPILogic();
+        $result = $logic->listAppRights($ownerAppIDList);
+
+        if ( ! $result['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_SYNC_FAILED,
+                $result);
+        }
+
+        $kintoneACL = $result['result']['rights'];
+        $garoonACL = $this->createACL($spaceID, $operationUserID);
+
+        foreach ($kintoneACL as $kintoneAppACL) {
+            if (count($kintoneAppACL) != count($garoonACL)) {
+                return false;
+            }
+
+            foreach ($kintoneAppACL as $kintoneAppACE) {
+                foreach ($garoonACL as $garoonACE) {
+                    if ($kintoneAppACE['sortOrder']
+                        == $garoonACE['sortOrder']
+                    ) {
+                        if ( ! $this->isSameACE($garoonACE, $kintoneAppACE)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @param int $spaceID
+     * @param int $operationUserID
+     *
+     * @return bool
+     * @throws GrnKintoneException
+     */
+    public function isSameName($spaceID, $operationUserID)
+    {
+        assert('is_numeric($spaceID)');
+        assert('is_numeric($operationUserID)');
+
+        $appList = $this->listKintoneApplications($spaceID, $operationUserID);
+
+        $ownerAppIDList = [];
+        /** @var \grn\space\data\bean\SpaceApplication $app */
+        foreach ($appList as $app) {
+            if ($app->isExternalApplicationOwner()) {
+                $ownerAppIDList[] = $app->getExternalApplicationId();
+            }
+        }
+
+        if (count($ownerAppIDList) === 0) {
+            return true;
+        }
+
+        $appLogic = ApplicationLogic::getInstance();
+
+        require_once('kintone/AppAPILogic.csp');
+        $logic = new \GRN_Kintone_AppAPILogic();
+        $kintoneAppsName = $logic->getAppsName($ownerAppIDList);
+        if ( ! $kintoneAppsName['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_GET_APP_INFO_FAILED,
+                $kintoneAppsName);
+        }
+
+        $kintoneAppsName = $kintoneAppsName['result']['appNames'];
+
+        foreach ($appList as $app) {
+            if ( ! array_key_exists($app->getExternalApplicationId(),
+                $kintoneAppsName)
+            ) {
+                continue;
+            }
+
+            $garoonAppNames
+                = $appLogic->getApplicationLocalCollection($app->getId());
+            $kintoneAppNames
+                = $kintoneAppsName[$app->getExternalApplicationId()];
+            /** @var \grn\space\common\data\bean\ApplicationLocal $garoonAppName */
+            foreach ($garoonAppNames as $garoonAppName) {
+                if (array_key_exists($garoonAppName->getLanguageCode(),
+                    $kintoneAppNames)
+                ) {
+                    $garoonAppNameLocal = $garoonAppName->getApplicationName();
+                    $kintoneAppNameLocal
+                        = $kintoneAppNames[$garoonAppName->getLanguageCode()];
+
+                    if (strcmp($garoonAppNameLocal, $kintoneAppNameLocal)
+                        !== 0
+                    ) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @param Space       $space
+     * @param Application $application
+     *
+     * @throws GrnInvalidArgumentException
+     * @throws \grn\space\common\exception\GrnArgumentOutOfRangeException
+     */
+    public function deleteKintoneApplication(
+        Space $space,
+        Application $application
+    ) {
+        ValidateUtility::isIn($application->getApplicationType(), [
+            Application::APPLICATION_TYPE_EXTERNAL_KINTONE
+        ]);
+
+        $applicationLogic = ApplicationLogic::getInstance();
+        $spaceApplicationLogic = SpaceApplicationLogic::getInstance();
+        $spaceLogic = SpaceLogic::getInstance();
+
+        $linkSpaceApplicationCondition = new SpaceApplicationSearchCondition();
+        $linkSpaceApplicationCondition->setSearchApplicationId($application->getId());
+        $linkSpaceApplicationCondition->setSearchExternalApplicationOwner(SpaceApplication::EXTERNAL_APPLICATION_OWNER_NOT_OWNER);
+        $linkSpaceApplicationCondition->setSearchApplicationType(SpaceApplication::APPLICATION_TYPE_EXTERNAL_KINTONE);
+        $linkSpaceApplicationCollection
+            = $spaceApplicationLogic->search($linkSpaceApplicationCondition);
+
+        /** @var \grn\space\data\bean\SpaceApplication $eachLinkSpaceApplication */
+        foreach ($linkSpaceApplicationCollection as $eachLinkSpaceApplication) {
+            // for logging
+            $tmpSpace = $spaceLogic->getSpace(
+                $eachLinkSpaceApplication->getSpaceId(),
+                LanguageStatus::STANDARD_LANGUAGE_CODE);
+
+            if ( ! $eachLinkSpaceApplication->isExternalApplicationOwner()) {
+                //Log DeleteAppManageLog
+                $deleteAppManageLog = new DeleteAppManageLog();
+                $deleteAppManageLog->setSpaceId($eachLinkSpaceApplication->getSpaceId());
+                $deleteAppManageLog->setSpaceName($tmpSpace->getSpaceName());
+                $deleteAppManageLog->setExternalAppName($application->getApplicationName());
+                $deleteAppManageLog->setExternalId($application->getExternalApplicationId());
+                $deleteAppManageLog->setExternalDeleteType(DeleteAppManageLog::EXTERNAL_DELETE_TYPE_LINK);
+                $this->getSpaceLogLogic()->info($deleteAppManageLog);
+            }
+        }
+
+        $spaceApplicationLogic->deleteSpaceApplicationByApplicationId($application->getId());
+
+        $applicationLogic->delete($application);
+
+        $deleteAppManageLog = new DeleteAppManageLog();
+        $deleteAppManageLog->setSpaceId($space->getId());
+        $deleteAppManageLog->setSpaceName($space->getSpaceName());
+        $deleteAppManageLog->setExternalAppName($application->getApplicationName());
+        $deleteAppManageLog->setExternalId($application->getExternalApplicationId());
+        $deleteAppManageLog->setExternalDeleteType(DeleteAppManageLog::EXTERNAL_DELETE_TYPE_OBJECT);
+        $this->getSpaceLogLogic()->info($deleteAppManageLog);
+    }
+
+    /**
+     * @param Space       $space
+     * @param Application $application
+     *
+     * @throws GrnInvalidArgumentException
+     * @throws \grn\space\common\exception\GrnArgumentOutOfRangeException
+     */
+    public function unlinkKintoneApplication(
+        Space $space,
+        Application $application
+    ) {
+        ValidateUtility::isIn($application->getApplicationType(), [
+            Application::APPLICATION_TYPE_EXTERNAL_KINTONE
+        ]);
+
+        $spaceApplicationLogic = SpaceApplicationLogic::getInstance();
+        $spaceApplicationLogic->delete($space->getId(), $application->getId());
+
+        $deleteAppManageLog = new DeleteAppManageLog();
+        $deleteAppManageLog->setSpaceId($space->getId());
+        $deleteAppManageLog->setSpaceName($space->getSpaceName());
+        $deleteAppManageLog->setExternalAppName($application->getApplicationName());
+        $deleteAppManageLog->setExternalId($application->getExternalApplicationId());
+        $deleteAppManageLog->setExternalDeleteType(DeleteAppManageLog::EXTERNAL_DELETE_TYPE_LINK);
+        $this->getSpaceLogLogic()->info($deleteAppManageLog);
+
+    }
+
+    /**
+     * @param array $garoonACE
+     * @param array $kintoneACE
+     *
+     * @return bool
+     */
+    private function isSameACE($garoonACE, $kintoneACE)
+    {
+        return (
+            $garoonACE['appEditable'] == $kintoneACE['appEditable']
+            && $garoonACE['recordViewable'] == $kintoneACE['recordViewable']
+            && $garoonACE['recordEditable'] == $kintoneACE['recordEditable']
+            && $garoonACE['recordDeletable'] == $kintoneACE['recordDeletable']
+            && $garoonACE['recordImportable'] == $kintoneACE['recordImportable']
+            && $garoonACE['recordExportable'] == $kintoneACE['recordExportable']
+            && $garoonACE['recordAddable'] == $kintoneACE['recordAddable']
+            && $garoonACE['entityType'] == $kintoneACE['entityType']
+            && $garoonACE['entityId'] == $kintoneACE['entity']['id']
+            && $garoonACE['sortOrder'] == $kintoneACE['sortOrder']
+        );
+    }
+
+    /**
+     * @param int $spaceID
+     * @param int $kAppID
+     * @param int $operationUserID
+     *
+     * @return bool
+     * @throws GrnKintoneException
+     */
+    public function checkLinkableApp($spaceID, $kAppID, $operationUserID)
+    {
+        $applications = $this->listKintoneApplications($spaceID,
+            $operationUserID);
+
+        // 既に紐づいてたらリンクできない
+        /** @var \grn\space\data\bean\SpaceApplication $app */
+        foreach ($applications as $app) {
+            if ($app->getExternalApplicationID() == $kAppID) {
+                throw new GrnKintoneException(ErrorCode::GRN_KINTONE_LINK_FAILED_LINKED);
+            }
+        }
+
+        require_once('kintone/AppAPILogic.csp');
+        $logic = new \GRN_Kintone_AppAPILogic();
+        $kApp = $logic->listApp([$kAppID]);
+
+        // 取得できない場合
+        if ( ! $kApp['success']) {
+            throw GrnKintoneException::valueOf(ErrorCode::GRN_KINTONE_GET_APP_INFO_FAILED,
+                $kApp);
+        }
+
+        // 個人用アプリの場合
+        foreach ($kApp['result']['appList'] as $kApp) {
+            if ($kApp['id'] == $kAppID
+                && $kApp['appGroup'] == \GRN_Kintone_Logic::PERSONAL_APPGROUP_ID
+            ) {
+                throw new GrnKintoneException(ErrorCode::GRN_KINTONE_LINK_FAILED_PERSONAL);
+            }
+        }
+
+        return true;
+    }
+}

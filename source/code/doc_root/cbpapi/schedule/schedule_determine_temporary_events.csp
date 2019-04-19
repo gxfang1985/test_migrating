@@ -1,0 +1,244 @@
+<?php
+
+if (isset($cbpapi_service)) {
+    $node_parameters = $cbpapi_service->getRequestParameters();
+    $candidate_list = $cbpapi_service->selectNodes($node_parameters,
+        'candidate');
+    if ( ! $candidate_list) {
+        require_once('cbpapi/error_code.csp');
+        cb_thow_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'candidate']);
+    }
+
+    // check if required param is not found.
+    $required_params = ['event_id', 'start', 'end'];
+    foreach ($candidate_list as $candidate) {
+        foreach ($required_params as $param) {
+            if ( ! isset($candidate['attributes'][$param])) {
+                require_once('cbpapi/error_code.csp');
+                cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                    ['param' => $param]);
+            }
+        }
+    }
+
+    require_once('cbpapi/schedule_logic.csp');
+    //Get event
+    require_once('schedule/application.csp');
+    $app = GRN_Schedule_Application::getInstance();
+
+    //Get user login
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+
+    $event_ids = [];
+    foreach ($candidate_list as $candidate) {
+        $attributes = $candidate['attributes'];
+        $datetime = grn_cbpapi_parse_iso8601($attributes['start']);
+        $datetime = schedule_parse_datetime($datetime);
+        $ts = new CB_TimeStampEx();
+        $ts->setDateTime($datetime);
+        $setdatetime = $ts;
+
+        $datetime = grn_cbpapi_parse_iso8601($attributes['end']);
+        $datetime = schedule_parse_datetime($datetime);
+        $ts = new CB_TimeStampEx();
+        $ts->setDateTime($datetime);
+        $enddatetime = $ts;
+
+        $event_id = $attributes['event_id'];
+        if ( ! is_numeric($event_id)) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        $event = $app->getEvent($login, $event_id);
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        // アクセス権のチェック
+        require_once('schedule/access_logic.csp');
+        $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+        $dynamic_role = $uum->listGrantedRoles();
+        $access = $acc_logic->getEventAccess($login, $event,
+            ['read', 'add', 'modify', 'delete'], $dynamic_role);
+
+        if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+        }
+
+        // アクセス権がない
+        if ($access['add'] == GRN_SCHD_ACCESS_DENY
+            && $access['modify'] == GRN_SCHD_ACCESS_DENY
+            && $access['delete'] == GRN_SCHD_ACCESS_DENY
+        ) {
+            cb_throw_error(E_GRN_SCHD_DENY_DETERMINE);
+        }
+
+        if ( ! is_a($event, 'GRN_Schedule_TemporaryEvent')) {
+            cb_throw_error(E_GRN_SCHD_ALREADY_DETERMIN_EVENT);
+        }
+
+        $facility_id = false;
+        if ($event->isORSearch() && isset($attributes['facility_id'])) {
+            $facility_id = $attributes['facility_id'];
+        }
+
+        // エラーを出すかどうか？
+        $did = grn_temporary_event_get_datetime_id($event_id, $setdatetime,
+            $enddatetime, $facility_id);
+        if (is_null($did)) {
+            cb_throw_error(E_GRN_SCHD_NOT_FOUND_TEMPORARY_DATE);
+        }
+
+        $result = $app->determineEvent($login, $event_id, $did);
+        if ( ! $result) {
+            cb_throw_error(E_GRN_SCHD_NOT_FOUND_TEMPORARY_DATE);
+        } else {
+            require_once('schedule/notification.csp');
+            $util = GRN_Schedule_Notify_Logic::getInstance();
+            $date = new CB_Date();
+            $date->year = $result['setdatetime']->year;
+            $date->month = $result['setdatetime']->month;
+            $date->day = $result['setdatetime']->day;
+            $timestamp = new CB_TimeStampEx();
+
+            $today = $timestamp->getDate();
+            if ($today->compare($result['setdatetime']) <= 0) {
+                // ----- GRN2-4506 -----
+                // 決定した日時をeventに反映する。
+                $event->setdatetime = $result['setdatetime'];
+                $event->enddatetime = $result['enddatetime'];
+                // イベントのタイムゾーンに変更する
+                if ($event->setdatetime instanceof CB_DateTimeEx) {
+                    require_once('fw/i18n.csp');
+                    $settimestamp = new CB_TimeStampEx(null, $event->timezone);
+                    $settimestamp->setDateTime($event->setdatetime,
+                        CB_I18N::getInstance()->getCurrentTimezone());
+                    $event->setdatetime = $settimestamp->getDateTime();
+                    if (isset($event->enddatetime)) {
+                        $endtimestamp = new CB_TimeStampEx(null,
+                            $event->timezone);
+                        $endtimestamp->setDateTime($event->enddatetime,
+                            CB_I18N::getInstance()->getCurrentTimezone());
+                        $event->enddatetime = $endtimestamp->getDateTime();
+                    } else {
+                        $event->enddatetime = $event->setdatetime;
+                    }
+                }
+                // ----- GRN2-4506 -----
+
+                if (is_array($event->users) && count($event->users) > 0) {
+                    // 通知
+                    $title
+                        = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+                    $app->setNotify($event->users, $login, $event,
+                        $result['setdatetime'], $title, '',
+                        GRN_SCHEDULE_NOTIFY_FIX, $timestamp);
+                    $app->forwardMail($event,
+                        [GRN_SCHEDULE_NOTIFY_FIX => $event->users], $login,
+                        $did);
+                    $app->sendPushNotification(
+                        $event, [GRN_SCHEDULE_NOTIFY_FIX => $event->users],
+                        $login, true, $result['setdatetime'], $did);
+                }
+
+                // 通知先の指定がある場合
+                if ($event->private && is_array($event->notify_address)
+                    && count($event->notify_address) > 0
+                ) {
+                    $title
+                        = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+                    $app->sendNotificationsToPublic($login, $event,
+                        $result['setdatetime'], '', $timestamp, $title, false,
+                        true, GRN_SCHEDULE_NOTIFY_FIX, $did);
+                }
+            }
+        }
+
+        // 施設の予約期間のチェック(運用管理者は無制限)
+        require_once('schedule/facility_privilege.csp');
+        $facility_privilege = GRN_Facility_Privilege_Logic::getInstance();
+        require_once('schedule/facility_system_logic.csp');
+        $facility_logic = GRN_Facility_SystemLogic::getInstance();
+        $determined_event = $app->getEvent($login, $event_id, $date);
+        if ($obj_facilities
+            = $facility_privilege->getFacilitiesWithoutAuthority($login,
+            $event->facilities)
+        ) {
+            if (is_a($determined_event, 'GRN_Schedule_NormalEvent')) {
+                $facility_logic->checkFacilityMaxTime($obj_facilities,
+                    $determined_event->enddatetime,
+                    $determined_event->setdatetime);
+                $facility_logic->checkFacilityLimit($obj_facilities,
+                    $determined_event->enddatetime);
+            }
+        }
+
+        $event_ids[] = $attributes['event_id'];
+    }
+
+    $logic = GRN_CBPApi_Schedule_Logic::getInstance();
+    // commit schedule tables
+    $logic->saveNow();
+
+    $schedule_events = $logic->getEventsForViewByIds($login, $event_ids);
+
+    //response SOAP message
+    require_once("grn/smarty.csp");
+    $t = new GRN_Smarty;
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('schedule')]);
+    $t->assign('events', $schedule_events);
+    grn_cbpapi_response($t, __FILE__);
+}
+/************************************************************************************************
+ * Utility function
+ ************************************************************************************************
+ */
+
+function grn_temporary_event_get_datetime_id(
+    $eid,
+    $setdatetime,
+    $enddatetime,
+    $facility_id
+) {
+    $app_locator = GRN_ApplicationLocator::instance();
+    $dbconn = $app_locator->getConnection('schedule');
+    if (false === $facility_id) {
+        $query = cb_queryf($dbconn,
+            'SELECT d._id as did FROM tab_grn_schedule_eventdatetime d ' .
+            'WHERE d.col_event = \'@S\' ' .
+            'AND d.col_setdatetime = \'@S\' ' .
+            'AND d.col_enddatetime = \'@S\' ' .
+            'AND d.col_event_type = 4',
+            $eid, $setdatetime->unix_ts, $enddatetime->unix_ts);
+    } else {
+        $query = cb_queryf($dbconn,
+            'SELECT d._id as did FROM tab_grn_schedule_eventdatetime d ' .
+            'LEFT JOIN tab_grn_schedule_temporaryeventrelation r ' .
+            'ON d._id = r.col_date ' .
+            'LEFT JOIN tab_grn_schedule_eventmember m ' .
+            'ON r.col_member = m._id ' .
+            'WHERE d.col_event = \'@S\' ' .
+            'AND d.col_setdatetime = \'@S\' ' .
+            'AND d.col_enddatetime = \'@S\' ' .
+            'AND d.col_event_type = 4 ' .
+            'AND m.col_facility = \'@S\'',
+            $eid, $setdatetime->unix_ts, $enddatetime->unix_ts, $facility_id);
+    }
+    $query = $dbconn->select_format($query, 0, 1, CB_DATABASE_NO_LOCK);
+
+    $result = $dbconn->query($query);
+    if ($result === false) {
+        $dbconn->throwError(['query' => 'failed query on SELECT: ' . $query]);
+    }
+    $row = $dbconn->fetch_assoc($result);
+    $dbconn->free_result($result);
+    if (is_null($row)) {
+        $___ret = null;
+
+        return $___ret;
+    }
+
+    return $row['did'];
+}

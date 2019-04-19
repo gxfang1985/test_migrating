@@ -1,0 +1,412 @@
+<?php
+
+/**
+ * Scheduling Service API for azalea applications.
+ *
+ * @author  Kenichi, Hagiya     2004/11
+ * @package fw.schedule
+ * @version 1.0
+ */
+
+require_once('fw/persistent.csp');
+require_once('fw/database.csp');
+require_once('fw/date.csp');
+require_once('fw/module.csp');
+
+// Schedule Type
+define('CB_SCHEDULE_TYPE_ONCE', 0);
+define('CB_SCHEDULE_TYPE_REPEAT', 1);
+
+/**
+ * Provide Scheduling Service API.
+ *
+ * Use the singleton instance of this class that can be obtained by
+ * getInstance().
+ *
+ * @package fw.schedule
+ */
+class CB_SchedulingService extends CB_ModuleBase
+{
+    /**
+     * Table for schedule events
+     *
+     * @access private
+     */
+    var $_event_table = null;
+
+    /**
+     * Get singleton instance for this class.
+     *
+     * @return CB_SchedulingService
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new CB_SchedulingService;
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        parent::__construct('fw.schedule');
+        $this->_event_table = cb_class2table('CB_ScheduleEvent');
+    }
+
+    /**
+     * command validation.
+     *
+     * @access private
+     */
+    function _command_validate($command)
+    {
+        $commands = explode(' ', $command);
+
+        //////////////////////////
+        // commands[0] = minute
+        // commands[1] = hour
+        // commands[2] = day
+        // commands[3] = month
+        // commands[4] = week
+        //////////////////////////
+        assert('count( $commands ) == 5');
+        $regex_minute = '([0-9]|[1-5][0-9])';
+        $regex_hour = '([0-9]|1[0-9]|2[0-3])';
+        $regex_day = '([1-9]|[1-2][0-9]|3[0-1])';
+        $regex_month = '([1-9]|1[0-2])';
+        $regex_week = '([0-6])';
+
+        $minute_tokens = explode(',', $commands[0]);
+        foreach ($minute_tokens as $token) {
+            assert("preg_match( '/^((\*|${regex_minute}-${regex_minute})(\/${regex_minute})?|${regex_minute}(-${regex_minute})?)$/', \$token, \$info )");
+        }
+        $hour_tokens = explode(',', $commands[1]);
+        foreach ($hour_tokens as $token) {
+            assert("preg_match( '/^((\*|${regex_hour}-${regex_hour})(\/${regex_hour})?|${regex_hour}(-${regex_hour})?)$/', \$token, \$info )");
+        }
+        $day_tokens = explode(',', $commands[2]);
+        foreach ($day_tokens as $token) {
+            assert("preg_match( '/^((\*|${regex_day}-${regex_day})(\/${regex_day})?|${regex_day}(-${regex_day})?)$/', \$token, \$info )");
+        }
+        $month_tokens = explode(',', $commands[3]);
+        foreach ($month_tokens as $token) {
+            assert("preg_match( '/^((\*|${regex_month}-${regex_month})(\/${regex_month})?|${regex_month}(-${regex_month})?)$/', \$token, \$info )");
+        }
+        $week_tokens = explode(',', $commands[4]);
+        foreach ($week_tokens as $token) {
+            assert("preg_match( '/^((\*|${regex_week}-${regex_week})(\/${regex_week})?|${regex_week}(-${regex_week})?)$/', \$token, \$info )");
+        }
+    }
+
+    /**
+     * @access private
+     *
+     * @param $name
+     * @param $module
+     *
+     * @return CB_Row
+     */
+    function _getRow($name, $module)
+    {
+        $rowset = new CB_RowSet($this->_event_table);
+        $condition = $rowset->queryf("col_name = '@S' AND col_module = '@S'",
+            $name, $module);
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return $row;
+    }
+
+    /**
+     *
+     * @access private
+     *
+     * @param $row CB_Row
+     * @param $event_name
+     * @param $file_name
+     * @param $type
+     * @param $exec_info
+     * @param $arguments
+     * @param $module
+     *
+     * @return boolean
+     */
+    function _setRow(
+        $row,
+        $event_name,
+        $file_name,
+        $type,
+        $exec_info,
+        $arguments,
+        $module
+    ) {
+        $row->set('name', $event_name);
+        $row->set('module', $module);
+        $row->set('filename', $file_name);
+        $row->set('type', $type);
+        $row->set('arguments', $arguments);
+
+        switch ($type) {
+            case CB_SCHEDULE_TYPE_ONCE:
+                $row->set('execution', $exec_info);
+                $row->set('command', '');
+                break;
+
+            case CB_SCHEDULE_TYPE_REPEAT:
+                $row->set('command', $exec_info);
+                $row->set('execution', new CB_Timestamp);
+                break;
+        }
+
+        return $row->updateNow();
+    }
+
+    /**
+     * Register dynamic schedule in database.
+     *
+     *  command has five fields for specifying day,
+     *  date and time followed by the command to be run at that interval.
+     *  <pre>
+     *   *  *  *  *  *  command to be executed
+     *   -  -  -  -  -
+     *   |  |  |  |  |
+     *   |  |  |  |  +----- day of week (0 - 6) (sunday = 0)
+     *   |  |  |  +------- month (1 - 12)
+     *   |  |  +--------- day of month (1 - 31)
+     *   |  +----------- hour (0 - 23)
+     *   +------------- min (0 - 59)
+     *
+     *  BNF:
+     *  format = field field fileld field field
+     *  field = list | list, list
+     *  list = range | interval | token
+     *  range = * | token - token
+     *  interval = range / token
+     *  token = minute | hour | day | month | week
+     *
+     *  minute = [0-9]|[1-5][0-9]
+     *  hour = [0-9]|1[0-9]|2[0-3]
+     *  day = [1-9]|[1-2][0-9]|3[0-1]
+     *  month = [1-9]|1[0-2]
+     *  week = [0-6]
+     *
+     * </pre>
+     * @param string $event_name event name.
+     * @param string $file_name  execute filename
+     * @param string $command
+     * @param string $arguments  command line arguments.
+     * @param string $module
+     *
+     * @return bool
+     */
+    function registerRepeatEvent(
+        $event_name,
+        $file_name,
+        $command,
+        $arguments = '',
+        $module = ''
+    ) {
+        assert('is_string( $command )');
+        $command = trim($command);
+        $this->_command_validate($command);
+
+        $row = $this->_getRow($event_name, $module);
+        if (is_null($row)) {
+            $row = $this->_event_table->newRow();
+        }
+
+        if ( ! is_string($arguments)) {
+            $arguments = '';
+        }
+
+        return $this->_setRow($row, $event_name, $file_name,
+            CB_SCHEDULE_TYPE_REPEAT, $command, $arguments, $module);
+    }
+
+    /**
+     * @param CB_DateTime $date
+     * @param             $event_name
+     * @param             $file_name
+     * @param string      $arguments
+     * @param string      $module
+     *
+     * @return void
+     */
+    function registerRepeatEventByDateTime(
+        CB_DateTime $date,
+        $event_name,
+        $file_name,
+        $arguments = '',
+        $module = ''
+    ) {
+        $format = $this->getFormattedTimeByDateTime($date);
+        $this->registerRepeatEvent($event_name, $file_name, $format, $arguments,
+            $module);
+    }
+
+
+    /**
+     * Register once dynamic schedule in database.
+     *
+     * @param string        $event_name   event name
+     * @param string        $file_name    execute filename.
+     * @param \CB_Timestamp $execute_time execution time.
+     * @param string        $arguments    command line arguments.
+     * @param string        $module
+     *
+     * @return bool
+     */
+    function registerOnceEvent(
+        $event_name,
+        $file_name,
+        $execute_time,
+        $arguments = '',
+        $module = ''
+    ) {
+        assert('is_a( $execute_time, \'cb_timestamp\' )');
+
+        $row = $this->_getRow($event_name, $module);
+        if (is_null($row)) {
+            $row = $this->_event_table->newRow();
+        }
+
+        if ( ! is_string($arguments)) {
+            $arguments = '';
+        }
+
+        return $this->_setRow($row, $event_name, $file_name,
+            CB_SCHEDULE_TYPE_ONCE, $execute_time, $arguments, $module);
+    }
+
+
+    /**
+     * Unregister dynamic schedule from database.
+     *
+     * @param integer $event_name
+     * @param string  $module
+     *
+     * @return bool
+     */
+    function unregisterEvent($event_name, $module = '')
+    {
+        $row = $this->_getRow($event_name, $module);
+        if ( ! is_null($row)) {
+            return $row->delete();
+        }
+
+        return true;
+    }
+
+    /**
+     * Displays the event reserved.
+     * For example, the array to be returned may look like:
+     *  array( '1'=> $event, '2'=> $event, ... )
+     *
+     * @param string $module
+     *
+     * @return mixed array, of null if event is empty.
+     */
+    function listEvents($module = '')
+    {
+        $rowset = new CB_RowSet($this->_event_table);
+        if ( ! is_null($module)) {
+            $rowset->addCondition($rowset->queryf("col_module = '@S'",
+                $module));
+        }
+        $info = [];
+        while ($row = $rowset->iterate()) {
+            $info[$row->get('name')] = clone $row;
+        }
+
+        return $info;
+    }
+
+    /**
+     * Get dynamic event from database.
+     *
+     * @param string $event_name
+     * @param string $module
+     *
+     * @return CB_ScheduleEvent
+     */
+    function getEvent($event_name, $module = '')
+    {
+        $ret = $this->_getRow($event_name, $module);
+
+        return $ret;
+    }
+
+    /**
+     * return the list of performed dynamic events.
+     *
+     * @return object CB_RowSet
+     */
+    function listExecutedEventsLog()
+    {
+        require_once('fw/logger.csp');
+        $rowset = new CB_RowSet(CB_LOGGER_TABLENAME);
+        $condition = $rowset->queryf("col_category = '@S'", $this->_my_id);
+        $rowset->addCondition($condition);
+
+        return $rowset;
+    }
+
+    /**
+     * User can't use!!!!
+     * (This used by service manager.)
+     *
+     * @access protected
+     */
+    function executeLogging($param)
+    {
+        require_once('fw/logger.csp');
+        $logger_manager = CB_LoggerManager::getInstance();
+        $logger = $logger_manager->getLogger($this->_my_id);
+        $logger->setDBLogging(CB_LOGGER_NOTICE);
+        $logger->notice($param);
+    }
+
+    /**
+     * @param \CB_DateTime $date
+     *
+     * @return string
+     */
+    private function getFormattedTimeByDateTime(CB_DateTime $date)
+    {
+        return sprintf('%s %s %s %s *', $date->minute, $date->hour, $date->day,
+            $date->month);
+    }
+}
+
+/**
+ * Represent a schedule event.
+ *
+ * This is implemented as a persistent class to keep schedule events
+ * in the database.
+ *
+ * @package fw.schedule
+ */
+class CB_ScheduleEvent extends CB_PersistentBase
+{
+    function CB_PersistentBase($row)
+    {
+        parent::__construct($row);
+    }
+
+    var $col_name = ['type' => 'char', 'notnull' => true];
+    var $col_module = ['type' => 'char', 'notnull' => true];
+    var $idx_name = ['cols' => ['name', 'module'], 'unique' => true];
+    var $col_filename = ['type' => 'char', 'length' => 0xFF];
+    var $col_type = ['type' => 'int'];
+    var $col_command = ['type' => 'char', 'length' => 0x400];
+    var $col_execution = ['type' => 'timestamp'];
+    var $col_arguments = ['type' => 'char'];
+}
+
+

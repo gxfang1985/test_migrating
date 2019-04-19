@@ -1,0 +1,266 @@
+[[概要|section:abstract]]
+
+排他制御とは、一つのリソースを共有する複数のプロセスが競合しないようにすることである。本項では、アゼリアを利用するアプリケーションに要求される排他方式を分析し、各場面での排他制御の方式を解説する。
+
+[[ユースケース|section:usecases]]
+
+以下のユースケースに対応する。記載のない排他制御については、別途検討する必要があるが、アプリケーションに必要なほぼ全ての場合をカバーしているはずである。
+
+# リソースをリクエスト中の任意の期間占有し、解放する
+# リソースを１リクエストの間占有し、解放する
+# リソースを複数リクエストの間占有し、解放する
+# リソースを複数リクエストの間占有し、明示的に解放するか、一定期間経過後強制的にシステムが解放する
+
+ここに含まれないものとしては、スピンロックのように非常に細粒度のロックなどがあるが、アプリケーションレベルでそのようなチューニングを必要とさせない方針のため、サポートするユースケースから除外している。
+
+[[要求分析|section:analysis]]
+
+以下の表は、ユースケースを''ロック期間'', ''ロック対象'', ''ロックの種類''の三点で分析した結果である。
+
+[[html]]
+<table class="cb_doc_table">
+<tr>
+<th nowrap>ロック期間</th>
+<td>
+<ol style="margin-bottom: 0; margin-top: 0;">
+<li>リクエスト中の任意の期間
+<li>リクエスト開始から終了まで
+<li>複数リクエスト間 (有効期限なし)
+<li>複数リクエスト間 (有効期限つき)
+</ol>
+</td>
+</tr>
+
+<tr>
+<th nowrap>ロック対象</th>
+<td>
+<ol style="margin-bottom: 0; margin-top: 0;">
+<li>テーブルの行オブジェクト
+<li>概念的なリソース (アプリケーションとか、ネットワーク接続とか)
+</ol>
+</td>
+</tr>
+
+<tr>
+<th nowrap>ロックの種類</th>
+<td>
+<ol style="margin-bottom: 0; margin-top: 0;">
+<li>リーダーライターロック (reader-writer lock) (<a href="http://publib16.boulder.ibm.com/pseries/Ja_JP/aixprggd/genprogc/rwlocks.htm" target="_blank">参考</a>)
+</ol>
+</td>
+</tr>
+</table>
+[[/html]]
+
+ロック期間については、ユースケースからそのまま列挙した。ロック対象については、後述する理由で特にデータベースリソースとその他のリソースを分離した。ロックの種類はリーダーライターロックのみで実用上問題ないと判断した。
+
+データベース上のデータを特に分離している理由は、[[トランザクション管理|doc:pg/basic/transaction]]の必要性からである。アゼリアではフレームワークとして、アプリケーションに特定のトランザクション隔離レベルでの実装を要求している。
+
+具体的には REPEATABLE-READ という枠内でデータの整合性を確保することによって、品質の均一化をはかっており、排他制御でもその制約内での実装を前提とする必要がある。
+
+[[永続化レイヤーの排他制御|section:sql]]
+
+前項で触れたように、''データベース上のデータおよびそれに関連するリソースは、[[トランザクション管理|doc:pg/basic/transaction]]に従って管理する''必要がある。そのため、トランザクション内でのそれらのリソースの排他制御は永続化レイヤーに依存する。
+
+詳細については、[[InnoDBのマニュアル|http://dev.mysql.com/doc/mysql/en/InnoDB_transaction_model.html]]を参照すること。ここではその概略と、[[永続化レイヤー|doc:pg/basic/persistent]]中での対応を解説する。
+
+InnoDBでは行レベルのロック機構としてリーダーライター型の機構を用意している。その一方で、例えば表示用途のみに限定される場合などのため、「スナップショット」を作成してロックを獲得せずに済ますことも可能である。
+
+[[html]]
+<table class="cb_doc_table">
+<tr><th nowrap>SQL文</th><th nowrap>挙動</th><th nowrap>解説</th></tr>
+
+<tr>
+<td nowrap>SELECT ...;</td>
+<td nowrap>スナップショットを作成する</td>
+<td>
+ロックを獲得せずに、読み出した行のスナップショットを作成する。ロックを獲得しないので、INSERT や DELETE を阻止できない。
+</td>
+</tr>
+
+<tr>
+<td nowrap>SELECT ... LOCK IN SHARE MODE;</td>
+<td nowrap>リーダーロックを獲得する</td>
+<td>
+リーダーロックを獲得し、ライターロックを阻止する。リーダーロック同士は共存できる。
+</td>
+</tr>
+
+<tr>
+<td nowrap>SELECT ... FOR UPDATE;</td>
+<td nowrap>ライターロックを獲得する</td>
+<td>
+ライターロックを獲得する。リーダーロックを獲得した後に、ライターロックにグレードアップすることもできる。ライターロックは他のロックと共存できない。
+</td>
+</tr>
+
+
+<tr>
+<td nowrap>INSERT ...;</td>
+<td nowrap>ライターロックを獲得する</td>
+<td>
+ライターロックを獲得する。ライターロックは他のロックと共存できない。
+</td>
+</tr>
+
+<tr>
+<td nowrap>DELETE ...;</td>
+<td nowrap>ライターロックを獲得する</td>
+<td>
+ライターロックを獲得する。ライターロックは他のロックと共存できない。
+</td>
+</tr>
+</table>
+[[/html]]
+
+例えば、あるテーブル''Ａ''を外部キーで参照するテーブル''Ｂ''があるとする。ここで''Ａ''の行を通常のSELECTで読み込み(= スナップショット、ロックを取らない)、''Ｂ''にその行を参照する行を追加するとする。この場合、''Ａ''の行を他のトランザクションが削除可能であるため、''Ｂ''に不整合な状態の行が追加される可能性がある。これを防止するには、''Ａ''の行を "SELECT ... LOCK IN SHARE MODE;" で読めば良い。
+
+次に、あるカラムをカウンタとして利用しているテーブルがあるとする。カウンタを増加させるには、現在の値を読み取り、１を加えて書き戻せば良い。この場合に "SELECT ... LOCK IN SHARE MODE;" で読み出すのでは、同時に二つのトランザクションが同じ値(例えば３)を読み出し、本来２増加すべきカウンタ値を一つしか増加させない可能性がある。このような場合には、"SELECT ... FOR UPDATE;" で値を読み出す必要がある。
+
+永続化レイヤーではこのオペレーションをかなり簡易に提供している。永続化レイヤー経由で取得する行オブジェクト([[az:fw.persistent:CB_Row]], [[az:fw.persistent:CB_PersistentBase]])は、''通常 "LOCK IN SHARE MODE" で読み出される''。
+
+カウンタの例のように排他ロックが必要な場合のために、CB_Row には "''lock()''" メソッドが用意されている。''"lock()" を呼び出すと、該当行を "SELECT ... FOR UPDATE;" で読み込み直し、排他ロックを獲得する''。
+
+[[src]]
+class CB_Hoge extends CB_PersistentBase
+{
+    var $col_counter = array('type'=>'int');
+}
+$table =& $tm->getTableInfo( 'CB_Hoge' );
+$row =& $table->getRow( $oid );
+
+{{// 排他ロックを獲得}}
+$row->''lock()'';
+
+{{// カウンタをアトミックに更新}}
+$c = $row->get( 'counter' ) + 1;
+$row->set( 'counter', $c );
+[[/src]]
+
+ロックの獲得は、実はインデックスと密接に絡む。SELECT 実行時にロックをかけるときに、適切なインデックスが存在する場合には該当行(およびその前後)にのみロックがかかるが、インデックスが利用できない場合には非常に広くロックされる可能性がある。
+
+そのため、''複雑な検索などインデックスが利用しにくく、なおかつ検索結果を表示用途のみに使う場合はスナップショットを利用する''べきである。そのため永続化レイヤーの検索API [[az:fw.persistent:CB_RowSet]] には "setSharedLock()" というメソッドが用意されており、これに ''FALSE'' を渡すことでリードロックを獲得しない(i.e. 通常の SELECT)ようにできる。
+
+[[src]]
+$rowset = new CB_RowSet( $table );
+$rowset->addCondition( ... );
+$rowset->''setSharedLock( FALSE )'';
+
+while( ! is_null( $row =& $rowset->iterate() ) )
+{
+    {{// 表示用途に $row を使用}}
+    ...
+}
+[[/src]]
+
+[[排他制御の方法|section:method]]
+
+排他制御の方法は、ロックの期間によって大きく異なる。そのため、以下ではロック期間ごとに排他制御の方法を解説する。以下の表は、解説を簡単にまとめたものである。
+
+[[html]]
+<table class="cb_doc_table">
+<tr><th nowrap>ロック期間</th><th nowrap>対象</th><th nowrap>方法</th></tr>
+
+<tr>
+<td nowrap rowspan="2">１リクエスト中</td>
+<td nowrap>データベースオブジェクト</td>
+<td>
+サポートしない。
+</td>
+</tr>
+
+<tr>
+<td nowrap>その他のリソース</td>
+<td>
+各リソースごとの方法に任せる。ファイルなら[[php:flock]]とか。
+</td>
+</tr>
+
+<tr>
+<td nowrap rowspan="2">１リクエスト全体</td>
+<td nowrap>データベースオブジェクト</td>
+<td>
+上記、[[永続化レイヤーの排他制御|#sql]]に任せる。
+</td>
+</tr>
+
+<tr>
+<td nowrap>その他のリソース</td>
+<td>
+リクエスト中の場合に準じる。
+</td>
+</tr>
+
+<tr>
+<td nowrap rowspan="2">複数リクエスト</td>
+<td nowrap>データベースオブジェクト</td>
+<td>
+CB_Lockable クラスを継承する。
+</td>
+</tr>
+
+<tr>
+<td nowrap>その他のリソース</td>
+<td>
+CB_Lockable クラスを継承して自作管理する。
+</td>
+</tr>
+
+</table>
+[[/html]]
+
+[[１リクエスト中の任意の期間|head:short_lock]]
+
+データベースオブジェクトについてはこれまでの議論の通り、RDBMSのトランザクション管理および排他制御に任せる。さらに、アゼリアの[[リクエスト処理フロー|doc:pg/request/request_flow]]においては、''１リクエスト＝１トランザクション''である。そのためリクエスト中の任意ロックはトランザクション制御を破綻させるため、サポートしない。
+
+その他のリソースに関しては、それぞれのリソース毎の方法に任せることにする。例えばファイルであれば、[[php:flock]]が利用できる。
+
+[[１リクエスト全体|head:request_lock]]
+
+データベースオブジェクトについては[[永続化レイヤーの排他制御|#sql]]の通りである。その他のリソースでは、１リクエスト中の任意の期間で利用する方法で対応できるはずである。
+
+[[複数リクエスト|head:persistent_lock]]
+
+アゼリアではリクエストをまたがるトランザクションをサポートしていないため、リクエストをまたがる排他制御の実現のためにはデータベース上の値を読み書きして実現する必要がある。
+
+この目的のために、後述する [[az:fw.persistent:CB_Lockable]] ユーティリティを提供している。CB_Lockable を継承した永続化クラスでは簡単にリクエストをまたがる排他制御を実現できる。
+
+一般的なリソースの排他制御も、CB_Lockable を継承した適当なテーブルを利用することで実現可能である。
+
+[[CB_Lockable|section:lockable]]
+
+[[az:fw.persistent:CB_Lockable]] は [[az:fw.persistent:CB_PersistentBase]] を拡張したものであり、リクエストをまたがる排他ロックの実現手段を提供している。
+
+CB_Lockable は [[UUM|doc:pg/basic/uum]] を利用してログイン中のユーザーが排他ロックを獲得・解放する機能を提供する。具体的な動作はAPIを参照のこと。ユーザーは外部キー(weak relation)で参照しているため、ユーザーが削除された場合には自動的にロックが解放される。
+
+[[src]]
+// ログインして利用する
+''cb_require_role( 'LoginUser' );''
+
+''require_once( 'fw/lock.csp' )'';
+
+class CB_Fuga exntends ''CB_Lockable''
+{
+    var $col_counter = array('type'=>'int');
+}
+$table =& cb_class2table( 'CB_Fuga' );
+$row =& $table->getRow( $oid );
+
+{{// 1分間の時限ロックを獲得}}
+$row->''acquireLock( 1 );''
+
+{{// 無期限ロックを獲得}}
+$row->acquireLock( ''0'' );
+
+{{// カラムの更新は、ロックを獲得中でなければ失敗する}}
+$row->set( 'counter', 10 );
+[[/src]]
+
+[[リファレンス|section:reference]]
+
+*
+[[html]]
+<a href="http://dev.mysql.com/doc/mysql/en/InnoDB_transaction_model.html">InnoDBのトランザクションモデルと排他制御</a>
+[[/html]]
+* [[az:fw.persistent:CB_Lockable]]
+* [[code/include/fw/lock.csp]]

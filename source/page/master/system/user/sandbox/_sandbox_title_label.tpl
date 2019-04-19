@@ -1,0 +1,1 @@
+<span class="sandbox_label_grn mLeft7">{cb_msg module='grn.system.user.sandbox' key='GRN_SY_SANDBOX-COMMON-1' replace='true'}</span>

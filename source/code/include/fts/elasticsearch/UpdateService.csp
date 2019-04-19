@@ -1,0 +1,161 @@
+<?php
+
+namespace grn\fts\elasticsearch;
+
+use grn\cydec\mq\ESIndexJobMessage;
+use grn\cydec\mq\MessageQueue;
+use grn\cydec\mq\QueueRecord;
+use grn\cydec\mq\QueueRecordBuilder;
+use grn\fts\filter\SearchFilterInterface;
+use grn\fts\FtsProduct;
+use grn\fts\mail\cleanup\service\DeleteTempFileRegisterService;
+use grn\fts\SearchConstants;
+use grn\fts\SearchEntryInterface;
+use grn\fts\SearchFields;
+use grn\fts\UpdateServiceInterface;
+
+class UpdateService implements UpdateServiceInterface, \CB_Transactional
+{
+    /** @var \Closure */
+    private $onBuildFunction;
+
+    /** @var QueueRecordBuilder */
+    private $recordBuilder;
+
+    /** @var MessageQueue messageQueue */
+    private $messageQueue;
+
+    /** @var string */
+    private $lastQueueId = "";
+
+    public function boot()
+    {
+        $transactionManager = \CB_TransactionManager::getInstance();
+        $transactionManager->register(CB_TRANSACTION_LEVEL_FILE, $this);
+        $this->messageQueue = new MessageQueue();
+        $this->initProperty();
+    }
+
+    private function initProperty()
+    {
+        $this->onBuildFunction = function (array $records) {
+            $this->enqueue($records);
+        };
+
+        $this->recordBuilder = new QueueRecordBuilder(new ESIndexJobMessage(),
+            $this->onBuildFunction);
+    }
+
+    /**
+     * @param QueueRecord[] $queueRecords
+     */
+    private function enqueue(array $queueRecords)
+    {
+        foreach ($queueRecords as $record) {
+            $this->lastQueueId = $this->messageQueue->enqueue($record);
+        }
+    }
+
+    /**
+     * Commit changes.  Implementers must be aware that this may
+     * be called many times during the process request.
+     *
+     * @return bool    TRUE if the commit succeeds; otherwise FALSE.
+     */
+    public function commit()
+    {
+        try {
+            $this->recordBuilder->build();
+        } catch (\Exception $e) {
+            return false;
+        }
+        $this->onCommitSuccess();
+        $this->initProperty();
+
+        return true;
+    }
+
+    /**
+     * Abort and discard changes.  Implementers must be aware that
+     * this may be called many times during the process request.
+     */
+    public function abort()
+    {
+        $this->initProperty();
+    }
+
+    /**
+     * Update an index.
+     *
+     * @param SearchEntryInterface $entry
+     */
+    public function updateIndex(SearchEntryInterface $entry)
+    {
+        $type = $this->getRecordType($entry);
+        $this->recordBuilder->addArgument($entry->getMessage(FtsProduct::elasticsearch()),
+            $type);
+    }
+
+    /**
+     * Delete an index by an id.
+     *
+     * @param string $id
+     */
+    public function deleteById($id)
+    {
+        $this->recordBuilder->addArgument([SearchFields::ID_FIELD => $id],
+            'delete');
+    }
+
+    /**
+     * Delete indexes by a query.
+     *
+     * @param $query
+     */
+    public function deleteByQuery(SearchFilterInterface $query)
+    {
+        $this->recordBuilder->addArgument(
+            [SearchConstants::QUERY_KEY => $query->getQuery(FtsProduct::elasticsearch())],
+            'delete'
+        );
+    }
+
+    /**
+     * Update indexes in bulk.
+     *
+     * @param SearchEntryInterface[] $entries
+     * @param string                 $forward
+     *
+     * @return void
+     */
+    public function bulkUpdateIndex(array $entries, $forward)
+    {
+        foreach ($entries as $entry) {
+            $type = $this->getRecordType($entry);
+            $this->recordBuilder->addArgument($entry->getMessage(FtsProduct::elasticsearch()),
+                $type);
+        }
+    }
+
+    private function onCommitSuccess()
+    {
+        $deleteFileJobRegisterService
+            = DeleteTempFileRegisterService::getInstance();
+        $deleteFileJobRegisterService->register($this->lastQueueId);
+    }
+
+    /**
+     * @param SearchEntryInterface $entry
+     *
+     * @return string
+     */
+    private function getRecordType(SearchEntryInterface $entry)
+    {
+        $script = $entry->getScript();
+        if (is_array($script) && count($script) > 0) {
+            return 'update';
+        }
+
+        return 'add';
+    }
+}

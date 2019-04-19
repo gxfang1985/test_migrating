@@ -1,0 +1,543 @@
+<?php
+
+use grn\grn\access\service\AppAccess;
+
+define('MAX_COUNT_EMAIL', '10');
+global $G_container_base;
+$key_search = "";
+
+if (array_key_exists('q', $G_INPUT)) {
+    $key_search = $G_INPUT['q'];
+}
+
+global $G_state_set;
+$G_state_set->set('copyright_should_be_written', false);
+$G_state_set->set('html_should_be_closed', false);
+
+global $G_container_base;
+$uum = $G_container_base->getInstance('uum');
+$login_user = $uum->getLoginUser();
+
+require_once('mail/utility.csp');
+$utility = GRN_Mail_Utility::getInstance();
+$system_config = $utility->getSystemConfig();
+$system_config->getGeneralSetting($general_settings);
+
+if ($general_settings['incremental_search']
+    && strlen(cb_trim($key_search)) > 0
+) {
+    require_once('grn/application.csp');
+    $app_locator = GRN_ApplicationLocator::instance();
+    $db = $app_locator->getConnection('address');
+
+    //check permission
+    // アドレス帳を取得する
+    $data_result = [];
+    $data_result_tmp = [];
+    $search_conditions = ['@L%', '% @L%'];
+    require_once('address/application.csp');
+    /** @var GRN_Address_Application $app */
+    $app = $app_locator->getInstance(GRN_ADDRESS_APPLICATION_ID);
+    if ( ! is_object($app) || ! is_a($app, 'GRN_Address_Application')
+         || ! AppAccess::isAppAvailable(GRN_ADDRESS_APPLICATION_ID)
+    ) {
+        // search display_name in table incremental_search
+        searchDisplayNameIncrementalTable($data_result, $data_result_tmp,
+            $login_user->getOID(), $search_conditions,
+            $key_search,
+            MAX_COUNT_EMAIL);
+
+        $data_result = sortEmailDataByDisplayName($data_result, $key_search);
+
+        // search email in table incremental_search
+        if (count($data_result) < MAX_COUNT_EMAIL) {
+            searchEmailIncrementalTable($data_result, $data_result_tmp,
+                $login_user->getOID(), $key_search,
+                MAX_COUNT_EMAIL);
+        }
+
+        echo json_encode($data_result,
+            JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS);
+        cb_safe_exit();
+    }
+
+    $book_manager = $app->getBookManager();
+
+    // 使用権限を取得する
+    require_once('address/access.csp');
+    $access_manager = GRN_Address_AccessManager::getInstance();
+    if ( ! ($row = $access_manager->getAbstractData(GRN_ADDRESS_AVAILABLE))) {
+        assert('FALSE');
+    }
+
+    // ダイナミックロールを取得する
+    $dynamic_roles = $uum->listGrantedRoles();
+
+    // 使用権限を評価する
+    $authorities = ['private_address', 'shared_address'];
+    $security_model = $access_manager->getSecurityModel($row);
+    $access = $access_manager->evaluateAccess($row, $login_user,
+        $dynamic_roles, $authorities, $security_model);
+
+    // 共有アドレス帳の使用権限を評価する
+    $authorities = ['shared_address'];
+    $access_for_view['shared_address']
+        = $access_manager->isAllowedAccess($access, $authorities,
+        $security_model);
+
+    require_once('address/view_util.csp');
+    $view_util = GRN_Address_ViewUtil::getInstance();
+    $shared_address_books = [];
+    $allowed_books = [];
+    $books_for_view = [];
+    if ($access_for_view['shared_address']) {
+        // 共有アドレスブック一覧を取得する
+        $shared_address_books = $book_manager->listSharedAddressBooks();
+
+        if (0 < count($shared_address_books)) {
+            // 閲覧権限を持つ共有アドレスブック一覧を取得する
+            $rows = [];
+            foreach (array_keys($shared_address_books) as $book_id) {
+                $book =& $shared_address_books[$book_id];
+                $rows[$book_id] = $book->getRow();
+            }
+            $authorities = ['browse'];
+            $allowed_books = $access_manager->pickAllowedObjects($rows,
+                $login_user, $dynamic_roles, $authorities);
+
+            // 共有アドレスブック情報一覧を取得する
+            $books_for_view = $view_util->listBooks($shared_address_books,
+                $allowed_books);
+        }
+    }
+    //end check permission
+
+    //get share book_id
+    $book_ids = [];
+    foreach ($books_for_view as $book) {
+        $book_ids[] = $book['oid'];
+    }
+
+    // Start searching.
+    foreach ($search_conditions as $search_condition) {
+        // search display_name in personal address
+        if ($search_condition == '@L%') {
+            $query = cb_queryf($db, "SELECT addr.col_subject, addr.col_email_address
+                                         FROM tab_grn_address_privatedata AS addr
+                                         WHERE (addr.col_creator = '@S') AND
+                                               (addr.col_email_address <> '') AND
+                                               (addr.col_subject LIKE '"
+                                    . $search_condition . "')
+                                         ORDER BY addr.col_subject, addr.col_email_address
+                                         LIMIT @S", $login_user->getOID(),
+                $key_search, MAX_COUNT_EMAIL);
+        }
+
+        if ($search_condition == '% @L%') //1byte
+        {
+            $search_condition_2b = '%　@L%';
+            $query = cb_queryf($db, "SELECT addr.col_subject, addr.col_email_address
+                                         FROM tab_grn_address_privatedata AS addr
+                                         WHERE (addr.col_creator = '@S') AND
+                                               (addr.col_email_address <> '') AND
+                                               ((addr.col_subject LIKE '"
+                                    . $search_condition . "') OR
+                                                (addr.col_subject LIKE '"
+                                    . $search_condition_2b . "'))
+                                         ORDER BY addr.col_subject, addr.col_email_address
+                                         LIMIT @S", $login_user->getOID(),
+                $key_search, $key_search, MAX_COUNT_EMAIL);
+        }
+
+        $result = $db->query($query);
+
+        $num_rows = $db->num_rows($result);
+        if ($num_rows > 0) {
+            while ($row = $db->fetch_assoc($result)) {
+                $email = '"' . $row['col_subject'] . '" <'
+                         . $row['col_email_address'] . '>';
+                if (array_search(strtolower($email), $data_result_tmp)
+                    === false
+                ) {
+                    $data_result[] = [
+                        "key"   => $row['col_subject'],
+                        "value" => $row['col_email_address']
+                    ];
+                    $data_result_tmp[] = strtolower($email);
+                }
+            }
+        }
+        $db->free_result($result);
+
+        // search display_name in shared address
+        if (count($book_ids) > 0) {
+            if ($search_condition == '@L%') {
+                $query = cb_queryf($db, "SELECT ash.col_subject, ash.col_email_address
+                                         FROM tab_grn_address_shareddata AS ash
+                                         WHERE (ash.col_book IN (@S)) AND
+                                               (ash.col_subject LIKE '"
+                                        . $search_condition . "') AND
+                                               (ash.col_email_address <> '')
+                                         ORDER BY ash.col_subject, ash.col_email_address
+                                         LIMIT @S ", implode(',', $book_ids),
+                    $key_search, MAX_COUNT_EMAIL);
+            }
+
+            if ($search_condition == '% @L%') //1byte
+            {
+                $search_condition_2b = '%　@L%';
+                $query = cb_queryf($db, "SELECT ash.col_subject, ash.col_email_address
+                                         FROM tab_grn_address_shareddata AS ash
+                                         WHERE (ash.col_book IN (@S)) AND
+                                               ((ash.col_subject LIKE '"
+                                        . $search_condition . "') OR
+                                                (ash.col_subject LIKE '"
+                                        . $search_condition_2b . "')) AND
+                                               (ash.col_email_address <> '')
+                                         ORDER BY ash.col_subject, ash.col_email_address
+                                         LIMIT @S ", implode(',', $book_ids),
+                    $key_search, $key_search, MAX_COUNT_EMAIL);
+            }
+
+            $result = $db->query($query);
+            $num_rows = $db->num_rows($result);
+            if ($num_rows > 0) {
+                while ($row = $db->fetch_assoc($result)) {
+                    $email = '"' . $row['col_subject'] . '" <'
+                             . $row['col_email_address'] . '>';
+                    if (array_search(strtolower($email), $data_result_tmp)
+                        === false
+                    ) {
+                        $data_result[] = [
+                            "key"   => $row['col_subject'],
+                            "value" => $row['col_email_address']
+                        ];
+                        $data_result_tmp[] = strtolower($email);
+                    }
+                }
+            }
+            $db->free_result($result);
+        }
+
+        // search display_name and nickname in user
+        if ($search_condition == '@L%') {
+            $query = cb_queryf($db, "SELECT cus.col_display_name, cus.col_nickname, cus.col_display_name_language, cus.col_email_address
+                                         FROM tab_cb_user AS cus
+                                         WHERE (cus.col_deleted IS NULL ) AND (cus.col_email_address <> '') AND
+                                         ((cus.col_display_name LIKE '"
+                                    . $search_condition
+                                    . "') OR (cus.col_nickname LIKE '"
+                                    . $search_condition . "'))
+                                         ORDER BY cus.col_display_name, cus.col_nickname, cus.col_email_address
+                                         LIMIT @S", $key_search, $key_search,
+                MAX_COUNT_EMAIL);
+        }
+
+        if ($search_condition == '% @L%') //1byte
+        {
+            $search_condition_2b = '%　@L%';
+            $query = cb_queryf($db, "SELECT cus.col_display_name, cus.col_display_name_language, cus.col_nickname, cus.col_email_address
+                                         FROM tab_cb_user AS cus
+                                         WHERE (cus.col_deleted IS NULL ) AND
+                                         (cus.col_email_address <> '') AND
+                                         (((cus.col_display_name LIKE '"
+                                    . $search_condition
+                                    . "') OR (cus.col_nickname LIKE '"
+                                    . $search_condition . "')) OR
+                                         ((cus.col_display_name LIKE '"
+                                    . $search_condition_2b
+                                    . "') OR (cus.col_nickname LIKE '"
+                                    . $search_condition_2b . "')))
+                                         ORDER BY cus.col_display_name, cus.col_nickname, cus.col_email_address
+                                         LIMIT @S", $key_search, $key_search,
+                $key_search, $key_search, MAX_COUNT_EMAIL);
+        }
+
+        $result = $db->query($query);
+        $num_rows = $db->num_rows($result);
+        if ($num_rows > 0) {
+            while ($row = $db->fetch_assoc($result)) {
+                $user = [
+                    "col_display_name"          => $row['col_display_name'],
+                    "col_nickname"              => $row['col_nickname'],
+                    "col_display_name_language" => $row['col_display_name_language']
+                ];
+                $user_name = $uum->getNameOf($login_user, $user);
+                $email = '"' . $user_name . '" <'
+                         . $row['col_email_address'] . '>';
+                if (array_search(strtolower($email), $data_result_tmp)
+                    === false
+                ) {
+                    $data_result[] = [
+                        "key"   => $user_name,
+                        "value" => $row['col_email_address']
+                    ];
+                    $data_result_tmp[] = strtolower($email);
+                }
+            }
+        }
+        $db->free_result($result);
+
+        // search display_name in table incremental_search
+        searchDisplayNameIncrementalTable($data_result, $data_result_tmp,
+            $login_user->getOID(), $search_conditions,
+            $key_search, MAX_COUNT_EMAIL);
+    }
+
+    //sort Data
+    $data_result = sortEmailDataByDisplayName($data_result, $key_search);
+
+    // search email in personal address
+    if (count($data_result) < MAX_COUNT_EMAIL) {
+        $query = cb_queryf($db, "SELECT addr.col_subject, addr.col_email_address
+                                 FROM tab_grn_address_privatedata AS addr 
+                                 WHERE (addr.col_creator = '@S') AND
+                                        addr.col_email_address LIKE '@L%'
+                                 ORDER BY addr.col_subject, addr.col_email_address
+                                 LIMIT @S", $login_user->getOID(), $key_search,
+            MAX_COUNT_EMAIL);
+        $result = $db->query($query);
+        $num_rows = $db->num_rows($result);
+        if ($num_rows > 0) {
+            while ($row = $db->fetch_assoc($result)) {
+                $email = '"' . $row['col_subject'] . '" <'
+                         . $row['col_email_address'] . '>';
+                if (count($data_result) < MAX_COUNT_EMAIL
+                    && array_search(strtolower($email), $data_result_tmp)
+                       === false
+                ) {
+                    $data_result[] = [
+                        "key"   => $row['col_subject'],
+                        "value" => $row['col_email_address']
+                    ];
+                    $data_result_tmp[] = strtolower($email);
+                }
+            }
+        }
+        $db->free_result($result);
+    }
+
+    // search email in shared address
+    if (count($data_result) < MAX_COUNT_EMAIL && count($book_ids) > 0) {
+        $query = cb_queryf($db, "SELECT ash.col_subject, ash.col_email_address
+                                 FROM tab_grn_address_shareddata AS ash
+                                 WHERE ash.col_book IN (@S) AND
+                                       ash.col_email_address LIKE '@L%'
+                                 ORDER BY ash.col_subject, ash.col_email_address
+                                 LIMIT @S", implode(',', $book_ids),
+            $key_search, MAX_COUNT_EMAIL);
+        $result = $db->query($query);
+        while ($row = $db->fetch_assoc($result)) {
+            $email = '"' . $row['col_subject'] . '" <'
+                     . $row['col_email_address'] . '>';
+            if (array_search(strtolower($email), $data_result_tmp) === false) {
+                $data_result[] = [
+                    "key"   => $row['col_subject'],
+                    "value" => $row['col_email_address']
+                ];
+                $data_result_tmp[] = strtolower($email);
+            }
+        }
+        $db->free_result($result);
+    }
+
+    // search email in user
+    if (count($data_result) < MAX_COUNT_EMAIL) {
+        $query = cb_queryf($db, "SELECT cus.col_display_name, cus.col_display_name_language, cus.col_nickname, cus.col_email_address
+                                 FROM tab_cb_user AS cus
+                                 WHERE ( cus.col_deleted IS NULL ) AND (cus.col_email_address LIKE '@L%')
+                                 ORDER BY cus.col_display_name, cus.col_email_address
+                                 LIMIT @S", $key_search, MAX_COUNT_EMAIL);
+        $result = $db->query($query);
+        while ($row = $db->fetch_assoc($result)) {
+            $user = [
+                "col_display_name"          => $row['col_display_name'],
+                "col_nickname"              => $row['col_nickname'],
+                "col_display_name_language" => $row['col_display_name_language']
+            ];
+            $user_name = $uum->getNameOf($login_user, $user);
+            $email = '"' . $user_name . '" <' . $row['col_email_address']
+                     . '>';
+            if (count($data_result) < MAX_COUNT_EMAIL
+                && array_search(strtolower($email), $data_result_tmp) === false
+            ) {
+                $data_result[] = [
+                    "key"   => $user_name,
+                    "value" => $row['col_email_address']
+                ];
+                $data_result_tmp[] = strtolower($email);
+            }
+        }
+        $db->free_result($result);
+    }
+
+    // search email in table incremental_search
+    if (count($data_result) < MAX_COUNT_EMAIL) {
+        searchEmailIncrementalTable($data_result, $data_result_tmp,
+            $login_user->getOID(), $key_search,
+            MAX_COUNT_EMAIL);
+    }
+
+    echo json_encode($data_result,
+        JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS);
+} else {
+    echo json_encode([]);
+}
+
+/**
+ * Result:
+ * "$key hoge" <personal@cybozu.co.jp>
+ * "$key hoge_sh" <share@cybozu.co.jp>
+ * "$key hoge_ul" <user_list@cybozu.co.jp>
+ * "hoge $key_ul" <pe@cybozu.co.jp>
+ * "hoge12 $key hoge2" <pe@cybozu.co.jp>
+ *
+ * @param $email_array
+ * @param $key_search
+ *
+ * @return mixed
+ */
+function sortEmailDataByDisplayName($email_array, $key_search)
+{
+    $temp = [];
+    $lengthData = count($email_array);
+    for ($i = 0; $i < $lengthData - 1; $i++) {
+        for ($j = $i + 1; $j < $lengthData; $j++) {
+            $idx_i = strpos(strtolower($email_array[$i]["key"]), $key_search);
+            $idx_j = strpos(strtolower($email_array[$j]["key"]), $key_search);
+            if ($idx_j < $idx_i) {
+                for ($n = 0; $n < $i; $n++) {
+                    $temp[$n] = $email_array[$n];
+                }
+                $temp[$i] = $email_array[$j];
+                $temp[$i + 1] = $email_array[$i];
+
+                for ($k = $i + 2; $k < $lengthData; $k++) {
+                    if ($k > $j) {
+                        $temp[$k] = $email_array[$k];
+                    } else {
+                        $temp[$k] = $email_array[$k - 1];
+                    }
+                }
+                $email_array = $temp;
+            }
+        }
+    }
+
+    return $email_array;
+}
+
+/**
+ * Search display_name in table incremental_search
+ *
+ * @param $data_result
+ * @param $data_result_tmp
+ * @param $login_user_id
+ * @param $search_conditions
+ * @param $key_search
+ * @param $max_count_email
+ */
+function searchDisplayNameIncrementalTable(
+    &$data_result,
+    &$data_result_tmp,
+    $login_user_id,
+    $search_conditions,
+    $key_search,
+    $max_count_email
+) {
+    require_once('grn/application.csp');
+    $app_locator = GRN_ApplicationLocator::instance();
+    $db_mail = $app_locator->getConnection('mail');
+
+    foreach ($search_conditions as $search_condition) {
+        if ($search_condition == '@L%') {
+            $query = cb_queryf($db_mail, "SELECT gmis.col_display_name, gmis.col_email
+                                         FROM tab_grn_mail_incremental_search AS gmis
+                                         WHERE (gmis.col_user_id = '@S') AND
+                                               (gmis.col_display_name LIKE '"
+                                         . $search_condition . "' COLLATE utf8mb4_general_ci) AND
+                                               (gmis.col_email <> '')
+                                         ORDER BY gmis.col_display_name, gmis.col_email
+                                         LIMIT @S", $login_user_id, $key_search,
+                $max_count_email);
+        }
+
+        if ($search_condition == '% @L%') //1byte
+        {
+            $search_condition_2b = '%　@L%';
+            $query = cb_queryf($db_mail, "SELECT gmis.col_display_name, gmis.col_email
+                                         FROM tab_grn_mail_incremental_search AS gmis
+                                         WHERE (gmis.col_user_id = '@S') AND
+                                               ((gmis.col_display_name LIKE '"
+                                         . $search_condition . "'  COLLATE utf8mb4_general_ci) OR
+                                                (gmis.col_display_name LIKE '"
+                                         . $search_condition_2b . "'  COLLATE utf8mb4_general_ci)) AND
+                                               (gmis.col_email <> '')
+                                         ORDER BY gmis.col_display_name, gmis.col_email
+                                         LIMIT @S", $login_user_id, $key_search,
+                $key_search, $max_count_email);
+        }
+
+        $result = $db_mail->query($query);
+        $num_rows = $db_mail->num_rows($result);
+        if ($num_rows > 0) {
+            while ($row = $db_mail->fetch_assoc($result)) {
+                $email = '"' . $row['col_display_name'] . '" <'
+                         . $row['col_email'] . '>';
+                if (array_search(strtolower($email), $data_result_tmp)
+                    === false
+                ) {
+                    $data_result[] = [
+                        "key"   => $row['col_display_name'],
+                        "value" => $row['col_email']
+                    ];
+                    $data_result_tmp[] = strtolower($email);
+                }
+            }
+        }
+        $db_mail->free_result($result);
+    }
+}
+
+/**
+ * Search email in table incremental_search
+ *
+ * @param $data_result
+ * @param $data_result_tmp
+ * @param $login_user_id
+ * @param $key_search
+ * @param $max_count_email
+ */
+function searchEmailIncrementalTable(
+    &$data_result,
+    &$data_result_tmp,
+    $login_user_id,
+    $key_search,
+    $max_count_email
+) {
+    require_once('grn/application.csp');
+    $app_locator = GRN_ApplicationLocator::instance();
+    $db_mail = $app_locator->getConnection('mail');
+
+    $query = cb_queryf($db_mail, "SELECT gmis.col_display_name, gmis.col_email
+                                 FROM tab_grn_mail_incremental_search AS gmis
+                                 WHERE (gmis.col_user_id = '@S') AND (gmis.col_email LIKE '@L%')
+                                 ORDER BY gmis.col_display_name, gmis.col_email
+                                 LIMIT @S", $login_user_id, $key_search,
+        $max_count_email);
+    $result = $db_mail->query($query);
+    while ($row = $db_mail->fetch_assoc($result)) {
+        $email = '"' . $row['col_display_name'] . '" <' . $row['col_email']
+                 . '>';
+        if (count($data_result) < $max_count_email
+            && array_search(strtolower($email), $data_result_tmp) === false
+        ) {
+            $data_result[] = [
+                "key"   => $row['col_display_name'],
+                "value" => $row['col_email']
+            ];
+            $data_result_tmp[] = strtolower($email);
+        }
+    }
+    $db_mail->free_result($result);
+}

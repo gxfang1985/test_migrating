@@ -1,0 +1,1933 @@
+<?php
+
+/**
+ * Implement the common file management API for Ogre.
+ *
+ * Class Diagram:
+ *   +-----------------------------+    +-------------------------+
+ *   |GRN_FileManager              |    |GRN_FileManagerConfig    |
+ *   |  - manages GRN_File objects |    |  - keep configurations  |
+ *   |  - provides management API  |    |    for the file manager |
+ *   +-----------------------------+    +-------------------------+
+ *                 ↓
+ *      +----------------------+    +--------------------------------+
+ *      |GRN_File              |    |GRN_FileBody                    |
+ *      |  - represents a file |--→|  - extends GRN_ServerFile      |
+ *      |  - provides file API |    |  - keep file body of a version |
+ *      +----------------------+    +--------------------------------+
+ *           ↓            ↓                 ↑
+ * +-----------------+  +-------------------------+
+ * |GRN_FileLock     |  |GRN_FileLog              |
+ * | - lock GRN_File |  |  - update/rollback logs |
+ * +-----------------+  +-------------------------+
+ *
+ * @version 1.0
+ * @package grn.common
+ */
+
+require_once('fw/lock.csp');
+require_once('fw/module.csp');
+require_once('grn/server_file.csp');
+require_once('grn/error_code.csp');
+require_once('grn/inspection.csp');
+
+// ファイル操作の種類
+define('GRN_FILE_OPERATION_CREATE', 1);
+define('GRN_FILE_OPERATION_UPDATE', 2);
+define('GRN_FILE_OPERATION_ROLLBACK', 3);
+define('GRN_FILE_OPERATION_RESTORE', 4);
+define('GRN_FILE_NUMERIC_MAX_VERSION', 10);
+
+// 無制限にバージョンを保持する設定値
+define('GRN_FILE_CONFIG_VERSION_INFINITE', -1);
+
+define('GRN_FILE_UNLIMITED_MAX_SIZE', 0);
+define('GRN_FILE_UNLIMITED_LOCK_TIME', 0);
+
+/**
+ * Configuration for the file manager.
+ *
+ * @package grn.common
+ */
+class GRN_FileManagerConfig extends CB_ModuleBase
+{
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_FileManagerConfig
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    function __construct()
+    {
+        parent::__construct('grn.common.file');
+    }
+
+    function initialize()
+    {
+        $profile = $this->getSystemProfile();
+        $profile->createAttribute('max_filesize', 0);
+        $profile->createAttribute('max_version',
+            GRN_FILE_CONFIG_VERSION_INFINITE);
+        $profile->createAttribute('lock_timeout', 0);
+    }
+
+    /**
+     * @access private
+     */
+    var $_settings = [];
+
+    /**
+     * @access private
+     */
+    function _get($name)
+    {
+        if (array_key_exists($name, $this->_settings)) {
+            return $this->_settings[$name];
+        }
+
+        $setting = null;
+        $profile = $this->getSystemProfile();
+        $profile->getAttribute($name, $setting);
+        $this->_settings[$name] = $setting;
+
+        return $setting;
+    }
+
+    /**
+     * @access private
+     */
+    function _set($name, $value)
+    {
+        $this->_settings[$name] = $value;
+        $profile = $this->getSystemProfile();
+        $dummy = null;
+        if ($profile->getAttribute($name, $dummy)) {
+            $profile->updateAttribute($name, $value);
+        } else {
+            $profile->createAttribute($name, $value);
+        }
+    }
+
+    /**
+     * 保存するファイルの最大サイズ(バイト)を設定する.
+     * 0 を指定すると無制限.
+     *
+     * @param int $size 最大サイズをバイト単位で指定する.
+     *
+     * @return 成功の場合でTRUE、それ以外でFALSE.
+     */
+    public function setMaxFileSize($size)
+    {
+        $this->_set('max_filesize', $size);
+    }
+
+    /**
+     * @return int
+     */
+    public function getMaxFileSize()
+    {
+        $max_filesize = $this->_get('max_filesize');
+        if (is_null($max_filesize)) {
+            // default
+            $max_filesize = GRN_FILE_UNLIMITED_MAX_SIZE;
+        }
+
+        return $max_filesize;
+    }
+
+    /**
+     * 保存する履歴の最大数を設定する.
+     * 0 を指定すると 0 個、すなわち保存しない。
+     * GRN_FILE_CONFIG_VERSION_INFINITE を指定すると無制限.
+     *
+     * @param int $max_version
+     */
+    public function setMaxVersion($max_version)
+    {
+        $this->_set('max_version', $max_version);
+    }
+
+    /**
+     * @return int
+     */
+    public function getMaxVersion()
+    {
+        $max_version = $this->_get('max_version');
+        if (is_null($max_version)) {
+            // default
+            $max_version = GRN_FILE_CONFIG_VERSION_INFINITE;
+        }
+
+        return $max_version;
+    }
+
+    /**
+     * ロックする最大「分」数を設定する. 0 なら無期限.
+     *
+     * @param int $minutes
+     */
+    public function setLockTimeout($minutes)
+    {
+        $this->_set('lock_timeout', $minutes);
+    }
+
+    /**
+     * @return int
+     */
+    public function getLockTimeout()
+    {
+        $timeout = $this->_get('lock_timeout');
+        if (is_null($timeout)) {
+            // default
+            $timeout = GRN_FILE_UNLIMITED_LOCK_TIME;
+        }
+
+        return $timeout;
+    }
+}
+
+
+/**
+ * ファイルの 1 バージョンの中身を表す.
+ *
+ * @param grn.common
+ */
+class GRN_FileBody extends GRN_ServerFile
+{
+    // GRN_File
+    var $col_file
+        = [
+            'type' => 'weak_relation',
+            'to'   => 'GRN_File',
+            'lazy' => true
+        ];
+    // これが表すバージョン
+    var $col_version = ['type' => 'int', 'notnull' => true, 'lazy' => true];
+
+    var $idx_fv = ['cols' => ['file', 'version'], 'unique' => true];
+
+    // メンテナンス用途に利用するカラム
+    // 作成タイムスタンプ
+    var $col_timestamp = ['type' => 'timestamp', 'notnull' => true];
+    // 最新であれば 1, それ以外(過去のバージョン)では 0
+    var $col_latest = ['type' => 'int', 'notnull' => true, 'lazy' => true];
+
+    var $idx_tl = ['cols' => ['timestamp', 'latest']];
+
+    function __construct($row)
+    {
+        parent::__construct($row);
+    }
+
+    function copy($file, $detect_encoding = true)
+    {
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+        $this->set('timestamp', $ts);
+
+        self::validateFileSize($file);
+
+        return parent::copy($file, $detect_encoding);
+    }
+}
+
+/**
+ * ファイルの履歴クラス.
+ *
+ * @package grn.common
+ */
+class GRN_FileLog extends CB_PersistentBase
+{
+    // ログ対象ファイル
+    var $col_file = ['type' => 'relation', 'to' => 'GRN_File', 'lazy' => true];
+
+    // ログ時点のバージョン (ロールバックしたらそのバージョン)
+    var $col_version = ['type' => 'int', 'notnull' => true];
+
+    // ファイル情報 (body は NULLになることあり、filename が名前を記憶)
+    var $col_body = ['type' => 'weak_relation', 'to' => 'GRN_FileBody'];
+    var $col_filename
+        = [
+            'type'    => 'char',
+            'length'  => CB_DATABASE_MAX_STRINDEX,
+            'notnull' => true
+        ];
+
+    // 操作情報
+    var $col_operation = ['type' => 'int'];
+    // リストアしたバージョン番号. operation がリストアでなければ null.
+    var $col_restore_version = ['type' => 'int', 'lazy' => true];
+    var $col_comment = ['type' => 'char', 'length' => 65535];
+
+    // 更新情報
+    var $col_recorder = ['type' => 'weak_relation', 'to' => 'CB_User'];
+    var $col_recorder_name = ['type' => 'char'];
+    var $col_recorder_foreign_key
+        = [
+            'type'   => 'char',
+            'length' => CB_DATABASE_MAX_STRINDEX
+        ];
+    var $col_record_time = ['type' => 'timestamp'];
+
+    function __construct($row)
+    {
+        parent::__construct($row);
+    }
+
+    /**
+     * @access private
+     */
+    function _record($version, $user, $comment, $operation)
+    {
+        $this->set('version', $version);
+        $this->set('comment', $comment);
+        $this->set('operation', $operation);
+        if ($user) {
+            $this->set('recorder', $user);
+            $this->set('recorder_name', $user->get('display_name'));
+            $this->set('recorder_foreign_key', $user->get('foreign_key'));
+        }
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+        $this->set('record_time', $ts);
+    }
+
+    /**
+     * @param int    $version The current version.
+     * @param mixed  $user    {@link CB_User}, or NULL.
+     * @param object GRN_FileBody $file  new file body.
+     * @param string $comment comment on this operation.
+     */
+    function create($version, $user, $file, $comment)
+    {
+        $this->set('body', $file);
+        $this->set('filename', $file->get('name'));
+        $ret = $this->_record($version, $user, $comment,
+            GRN_FILE_OPERATION_CREATE);
+
+        return $ret;
+    }
+
+    /**
+     * @param int    $version The current version.
+     * @param mixed  $user    {@link CB_User}, or NULL.
+     * @param object GRN_FileBody $file  new file body.
+     * @param string $comment comment on this operation.
+     */
+    function update($version, $user, $file, $comment)
+    {
+        $this->set('body', $file);
+        $this->set('filename', $file->get('name'));
+        $this->_record($version, $user, $comment, GRN_FILE_OPERATION_UPDATE);
+    }
+
+    /**
+     * Rollback to the previous file body.
+     *
+     * @param mixed  $user    {@link CB_User}, or NULL.
+     * @param object GRN_FileBody $file  rollback to this point.
+     * @param string $comment comment on this operation.
+     */
+    function rollback($user, $file, $comment)
+    {
+        $this->set('body', $file);
+        $this->set('filename', $file->get('name'));
+        $version = $file->get('version');
+        $this->_record($version, $user, $comment, GRN_FILE_OPERATION_ROLLBACK);
+    }
+
+    /**
+     * Restore from a previous version.
+     *
+     * @param int    $version            The current version.
+     * @param int    $restore_version    The version number from which $file
+     *                                   is restored.
+     * @param mixed  $user               {@link CB_User}, or NULL.
+     * @param object GRN_FileBody $file  restored file body.
+     * @param string $comment            comment on this operation.
+     */
+    function restore($version, $restore_version, $user, $file, $comment)
+    {
+        $this->set('body', $file);
+        $this->set('filename', $file->get('name'));
+        $this->set('restore_version', $restore_version);
+        $this->_record($version, $user, $comment, GRN_FILE_OPERATION_RESTORE);
+    }
+
+    /**
+     * GRN_FileBody は管理者によって消されたり、最大バージョン数制限で
+     * 消されていることがある.
+     *
+     * @return bool
+     */
+    function fileExists()
+    {
+        return ($this->get('body')) ? true : false;
+    }
+}
+
+
+/**
+ * ファイルの永続ロック管理クラス.
+ * GRN_File のヘルパー.  HTTPのUI用であるため、分離.
+ *
+ * GRN_FileManagerConfig にてロックを使用することになっていると、
+ * このオブジェクトをロックしてから update しないと失敗する.
+ *
+ * @package grn.common
+ */
+class GRN_FileLock extends CB_Lockable
+{
+    var $col_file
+        = [
+            'type'   => 'relation',
+            'to'     => 'GRN_File',
+            'unique' => true
+        ];
+
+    function __construct($row)
+    {
+        parent::__construct($row);
+    }
+
+    /**
+     * タイムアウト時間を GRN_FileManagerConfig で指定された
+     * 値で行うように override した acquireLock().
+     *
+     * @param int $lifetime
+     *
+     * @return bool
+     */
+    function acquireLock($lifetime = 0)
+    {
+        $config = GRN_FileManagerConfig::getInstance();
+        $minutes = $config->getLockTimeout();
+        if (parent::acquireLock($minutes) === false) {
+            cb_throw_error(E_GRN_FILE_LOCKED);
+        }
+
+        return true;
+    }
+
+    /**
+     * testLock() の詳細情報バージョン.
+     * コマンドライン時には、ロック無視.
+     *
+     * @return int  0:非ロック
+     *              1:ログインユーザー以外がロック
+     *              2:ログインユーザーがロック
+     */
+    function isLocked()
+    {
+        global $G_state_set;
+        if ($G_state_set->get('command_line')) {
+            return 0;
+        }
+
+        $owner = $this->get('lock_owner');
+        if (is_null($owner)) {
+            return 0;
+        }
+
+        if ($this->__login === false) {
+            return 1;
+        }
+
+        $endtime = $this->get('lock_timeout');
+        if ($owner->getOID() === $this->__login->getOID()) {
+            if ($endtime == -1) {
+                return 2;
+            }
+            if (time() < $endtime) {
+                return 2;
+            }
+
+            return 0;
+        }
+
+        if ($endtime == -1) {
+            return 1;
+        }
+
+        if (time() < $endtime) {
+            return 1;
+        }
+
+        return 0;
+    }
+}
+
+
+/**
+ * ファイル情報クラス.
+ * 精密なバージョン管理のためロックを取るが、永続ロックではない.
+ * 監査オブジェクトである.
+ *
+ * 永続ロックの使用はオプションなので、別テーブルに切っている.
+ * 実装を埋め込まないのは、ログインユーザー以外でも更新操作を可能
+ * にしておくため(コマンドラインからのメンテナンス等).
+ *
+ * @package grn.common
+ */
+class GRN_File extends GRN_InspectionBase
+{
+    // タイトル
+    var $col_title = ['type' => 'char', 'length' => 100];
+
+    // ファイルの説明
+    var $col_description = ['type' => 'char', 'length' => 65535];
+
+    // 現在のバージョン (最初は 1, 増えていく. ロールバックで戻る)
+    var $col_version = ['type' => 'int', 'notnull' => true];
+
+    // 保持する最大バージョン数
+    var $col_max_version = ['type' => 'int', 'notnull' => true];
+
+    // システム用フラグ
+    var $col_mark = ['type' => 'int'];
+
+    // ソートキー
+    var $col_title_sort_key
+        = [
+            'type'    => 'char',
+            'length'  => CB_DATABASE_MAX_STRINDEX,
+            'notnull' => true
+        ];
+    var $idx_title_sort_key = ['cols' => 'title_sort_key'];
+
+    // インデックス
+    var $idx_mtime = ['cols' => 'mtime'];
+    var $idx_mark = ['cols' => 'mark'];
+
+    var $_body_table_name = 'GRN_FileBody';
+    var $_log_table_name = 'GRN_FileLog';
+    var $_lock_table_name = 'GRN_FileLock';
+
+    function __construct($row, $module_id = 'grn.common')
+    {
+        parent::__construct($row, $module_id);
+    }
+
+    /**
+     * @access private
+     */
+    var $_current = null;
+
+    /**
+     * 現在のファイル内容オブジェクトを返す.
+     * そっちからダウンロードなどできる(GRN_ServerFileなので).
+     *
+     * @return GRN_FileBody
+     */
+    function getCurrentBody()
+    {
+        if (is_null($this->_current)) {
+            $this->_current = $this->getBody($this->get('version'));
+        }
+        assert('$this->_current');
+
+        return $this->_current;
+    }
+
+    /**
+     * 指定されたバージョンのボディを返す. なければ NULL.
+     *
+     * @param string $version
+     *
+     * @return GRN_FileBody    NULL or {@link GRN_FileBody}
+     */
+    function getBody($version)
+    {
+        global $G_container_base;
+        $dbconn = $G_container_base->getInstance('dbconn');
+
+        $rowset = new CB_RowSet(cb_class2table($this->_body_table_name));
+
+        $tmp_file = "'" . $dbconn->escape($this->getOID()) . "'";
+        $tmp_version = "'" . $dbconn->escape($version) . "'";
+
+        $rowset->addCondition('col_file=' . $tmp_file . ' AND col_version='
+                              . $tmp_version);
+        $ret = $rowset->iterate();
+
+        return $ret;
+    }
+
+    function setTitle($title)
+    {
+        $this->set('title', $title);
+
+        if (is_null($title) || strlen($title) < 1) {
+            $body = $this->getCurrentBody();
+            if ($body) {
+                $title = $body->get('name');
+            }
+        }
+
+        $this->set('title_sort_key', $title);
+    }
+
+    function getTitle()
+    {
+        return $this->get('title');
+    }
+
+    function setDescription($description)
+    {
+        $this->set('description', $description);
+    }
+
+    function getDescription()
+    {
+        return $this->get('description');
+    }
+
+    function getVersion()
+    {
+        return $this->get('version');
+    }
+
+    function setMaxVersion($max_version)
+    {
+        if (($max_version < 0)
+            && ($max_version != GRN_FILE_CONFIG_VERSION_INFINITE)
+        ) {
+            $max_version = 0;
+        }
+
+        $config = GRN_FileManagerConfig::getInstance();
+        $system_max_version = $config->getMaxVersion();
+        if (($system_max_version != GRN_FILE_CONFIG_VERSION_INFINITE)
+            && ($max_version > $system_max_version)
+        ) {
+            $max_version = $system_max_version;
+        }
+
+        $this->set('max_version', $max_version);
+
+        if ($max_version == GRN_FILE_CONFIG_VERSION_INFINITE) {
+            return;
+        }
+
+        // remove before
+        $current_version = $this->get('version');
+        if ( ! $current_version) {
+            return;
+        } // 未初期化
+
+        // 最新版は必ず残すので、-1
+        $before_version = $current_version - $max_version - 1;
+        if ($before_version < 1) {
+            return;
+        }
+
+        // はみでたバージョンを削除
+        $rowset = new CB_RowSet(cb_class2table($this->_body_table_name));
+
+        $tmp_file = "'" . $this->getOID() . "'";
+        $tmp_before_version = "'" . $before_version . "'";
+
+        $rowset->addCondition('col_file=' . $tmp_file);
+        $rowset->addCondition('col_version <= ' . $tmp_before_version);
+
+        while ( ! is_null($row = $rowset->iterate())) {
+            $row->delete();
+        }
+    }
+
+    function getMaxVersion()
+    {
+        return $this->get('max_version');
+    }
+
+    /**
+     * ログ一覧を取得するための {@link CB_RowSet}.
+     *
+     * ソート順序は通常 OID 順とすべきなので、取得後に以下のように指定する.
+     *     addOrderColumn( null, TRUE)
+     * (タイムスタンプは秒単位だし、バージョン番号はロールバックの可能性あり)
+     *
+     * 件数を制限したければ、適宜 limit() などして使う.
+     *
+     * @return object CB_RowSet
+     */
+    function getLogSet()
+    {
+        $rowset = new CB_RowSet(cb_class2table($this->_log_table_name));
+
+        $tmp_file = "'" . $this->getOID() . "'";
+
+        $rowset->addCondition('col_file=' . $tmp_file);
+
+        //$rowset->addOrderColumn( null, TRUE );
+        return $rowset;
+    }
+
+    //
+    // =================== 排他的操作 =================
+    //
+
+    /**
+     * @access private
+     */
+    var $_lock = null;
+
+    /**
+     * UIで排他操作を実現したい場合には、
+     *
+     * @return GRN_FileLock
+     */
+    function getLockObject()
+    {
+        if (is_null($this->_lock)) {
+            $rowset = new CB_RowSet(cb_class2table($this->_lock_table_name));
+
+            $tmp_file = "'" . $this->getOID() . "'";
+
+            $rowset->addCondition('col_file=' . $tmp_file);
+            $this->_lock = $rowset->iterate();
+        }
+        assert('$this->_lock');
+
+        return $this->_lock;
+    }
+
+    /**
+     * 新たなファイルオブジェクトをセットアップする.
+     *
+     * @param mixed  $user    {@link CB_User}, or NULL.
+     * @param mixed  $file    {@link GRN_ServerFile}, or an element of
+     *                          $_FILES, or a path string of a file.
+     * @param string $comment comment on this operation.
+     *
+     * @return bool             TRUE if success, FALSE otherwise.
+     */
+    function create($user, $file, $comment)
+    {
+        // in process 排他処理、作成時なので必要ないはずだが
+        $this->lock();
+        $this->set('version', 1);
+
+        $body_table = cb_class2table($this->_body_table_name);
+        $body = $body_table->newRow();
+        $log_table = cb_class2table($this->_log_table_name);
+        $log = $log_table->newRow();
+
+        $body->copy($file);
+        $body->set('file', $this);
+        $body->set('version', 1);
+        $body->set('latest', 1);
+
+        $log->set('file', $this);
+        $log->create(1, $user, $body, $comment);
+
+        //GTM-1136
+        if ( ! $this->isScheduleApi()) {
+            $lock_table = cb_class2table($this->_lock_table_name);
+            $lock = $lock_table->newRow();
+            $lock->set('file', $this);
+        }
+        //End GTM-1136
+
+        // ソートキーを更新
+        $title = $this->getTitle();
+        if (is_null($title) || strlen($title) < 1) {
+            $this->set('title_sort_key', $body->get('name'));
+        }
+
+        $body->registerNow();
+        $log->registerNow();
+        //GTM-1136
+        if ( ! $this->isScheduleApi()) {
+            $lock->registerNow();
+        }
+        //End GTM-1136
+
+        $this->onCreate($user);
+        $ret = true;
+
+        return $ret;
+    }
+
+
+    /**
+     * ファイルボディを更新してバージョンを上げる.
+     *
+     * @param mixed  $user    {@link CB_User}, or NULL.
+     * @param mixed  $file    {@link GRN_ServerFile}, or an element of
+     *                          $_FILES, or a path string of a file.
+     * @param string $comment comment on this operation.
+     *
+     * @return bool             TRUE if success, FALSE otherwise.
+     */
+    function update($user, $file, $comment)
+    {
+        // in process 排他処理
+        $this->lock();
+
+        // 永続ロック処理
+        //GTM-1136
+        if ( ! $this->isScheduleApi()) {
+            $lock = $this->getLockObject();
+            if ($lock->isLocked() === 1) {
+                cb_throw_error(E_GRN_FILE_LOCKED);
+            }
+        }
+        //End GTM-1136
+
+        $current = $this->getCurrentBody();
+        $current->set('latest', 0);
+
+        $version = $this->get('version') + 1;
+        $this->set('version', $version);
+
+        $body_table = cb_class2table($this->_body_table_name);
+        $body = $body_table->newRow();
+        $log_table = cb_class2table($this->_log_table_name);
+        $log = $log_table->newRow();
+
+        $body->copy($file);
+        $body->set('file', $this);
+        $body->set('version', $version);
+        $body->set('latest', 1);
+        $this->_current = $body;
+
+        $log->set('file', $this);
+        $log->update($version, $user, $body, $comment);
+
+        // ソートキーを更新
+        $title = $this->getTitle();
+        if (is_null($title) || strlen($title) < 1) {
+            $this->set('title_sort_key', $body->get('name'));
+        }
+
+        $body->registerNow();
+        $log->registerNow();
+
+        // はみでた body を削除
+        $max_version = $this->get('max_version');
+        if ($max_version != GRN_FILE_CONFIG_VERSION_INFINITE) {
+            $keep = $version - $max_version - 1;
+            if ($keep > 0) {
+                $rowset = new CB_RowSet($body_table);
+
+                $tmp_file = "'" . $this->getOID() . "'";
+                $tmp_version = "'" . $keep . "'";
+
+                $rowset->addCondition('col_file=' . $tmp_file);
+                $rowset->addCondition('col_version <= ' . $tmp_version);
+                while ( ! is_null($row = $rowset->iterate())) {
+                    $row->delete();
+                }
+            }
+        }
+
+        $this->onUpdate($user);
+
+        return true;
+    }
+
+    /**
+     * ファイル実体を過去のバージョンへ戻す.
+     *
+     * @param mixed  $user    {@link CB_User}, or NULL.
+     * @param int    $version 戻すべきバージョン
+     * @param string $comment comment on this operation.
+     *
+     * @return bool             TRUE if success, FALSE otherwise.
+     */
+    function rollback($user, $version, $comment)
+    {
+        // in process 排他処理
+        $this->lock();
+
+        // 永続ロック処理
+        //GTM-1136
+        if ( ! $this->isScheduleApi()) {
+            $lock = $this->getLockObject();
+            if ($lock->isLocked() === 1) {
+                cb_throw_error(E_GRN_FILE_LOCKED);
+            }
+        }
+
+        //End GTM-1136
+
+        $body = $this->getBody($version);
+        if (is_null($body)) {
+            return false;
+        }
+
+        $this->set('version', $version);
+
+        // 最新版フラグを立てる
+        $body->set('latest', 1);
+        $body->updateNow();
+        $this->_current = $body;
+
+        // ソートキーを更新
+        $title = $this->getTitle();
+        if (is_null($title) || strlen($title) < 1) {
+            $this->set('title_sort_key', $body->get('name'));
+        }
+
+
+        // ロールバックして上側のボディを破棄
+        // (しないとユニーク制約に違反する)
+        $rowset = new CB_RowSet(cb_class2table($this->_body_table_name));
+
+        $tmp_file = "'" . $this->getOID() . "'";
+
+        $rowset->addCondition('col_file=' . $tmp_file);
+        $rowset->addCondition($rowset->queryf("col_version > '@S'", $version));
+        while ( ! is_null($row = $rowset->iterate())) {
+            $row->delete();
+        }
+
+        $log_table = cb_class2table($this->_log_table_name);
+        $log = $log_table->newRow();
+        $log->set('file', $this);
+        $log->rollback($user, $body, $comment);
+        $log->registerNow();
+
+        $this->onRollback($user);
+
+        return true;
+    }
+
+    /**
+     * ファイル実体を過去のバージョンから復活させる.
+     *
+     * @param mixed  $user            {@link CB_User}, or NULL.
+     * @param int    $restore_version 復活するバージョン
+     * @param string $comment         comment on this operation.
+     *
+     * @return bool             TRUE if success, FALSE otherwise.
+     */
+    function restore($user, $restore_version, $comment)
+    {
+        // in process 排他処理
+        $this->lock();
+
+        // 永続ロック処理
+        //GTM-1136
+        if ( ! $this->isScheduleApi()) {
+            $lock = $this->getLockObject();
+            if ($lock->isLocked() === 1) {
+                cb_throw_error(E_GRN_FILE_LOCKED);
+            }
+        }
+
+        //End GTM-1136
+
+        $current_version = $this->get('version');
+        if ($restore_version == $current_version) {
+            return false;
+        }
+
+        $restore_body = $this->getBody($restore_version);
+        if (is_null($restore_body)) {
+            return false;
+        }
+
+        if ( ! $restore_body->exists()) {
+            cb_throw_error(E_GRN_USERS_FILE_NOT_FOUND);
+        }
+
+        $current = $this->getCurrentBody();
+        $current->set('latest', 0);
+
+        $version = $current_version + 1;
+        $this->set('version', $version);
+
+        $body_table = cb_class2table($this->_body_table_name);
+        $body = $body_table->newRow();
+        $log_table = cb_class2table($this->_log_table_name);
+        $log = $log_table->newRow();
+
+        $body->copy($restore_body);
+        $body->set('file', $this);
+        $body->set('version', $version);
+        $body->set('latest', 1);
+        $this->_current = $body;
+
+        $log->set('file', $this);
+        $log->restore($version, $restore_version, $user, $body, $comment);
+
+        // ソートキーを更新
+        $title = $this->getTitle();
+        if (is_null($title) || strlen($title) < 1) {
+            $this->set('title_sort_key', $body->get('name'));
+        }
+
+        $body->registerNow();
+        $log->registerNow();
+
+        // はみでた body を削除
+        $max_version = $this->get('max_version');
+        if ($max_version != GRN_FILE_CONFIG_VERSION_INFINITE) {
+            $keep = $version - $max_version - 1;
+            if ($keep > 0) {
+                $rowset = new CB_RowSet($body_table);
+
+                $tmp_file = "'" . $this->getOID() . "'";
+                $tmp_version = "'" . $keep . "'";
+
+                $rowset->addCondition('col_file=' . $tmp_file);
+                $rowset->addCondition('col_version <= ' . $tmp_version);
+                while ( ! is_null($row = $rowset->iterate())) {
+                    $row->delete();
+                }
+            }
+        }
+
+        $this->onRestore($user);
+
+        return true;
+    }
+
+    function delete()
+    {
+        // in process 排他処理
+        $this->lock();
+
+        // 永続ロック処理
+        //GTM-1136
+        if ( ! $this->isScheduleApi()) {
+            $lock = $this->getLockObject();
+            if ($lock->isLocked() === 1) {
+                cb_throw_error(E_GRN_FILE_LOCKED);
+            }
+        }
+
+        //End GTM-1136
+
+        $this->onDelete();
+
+        $rowset = new CB_RowSet(cb_class2table($this->_body_table_name));
+
+        $tmp_file = "'" . $this->getOID() . "'";
+
+        $rowset->addCondition('col_file=' . $tmp_file);
+
+        while ( ! is_null($row = $rowset->iterate())) {
+            $row->delete();
+        }
+
+        return parent::delete();
+    }
+
+    //
+    // ================ INSPECTION SUPPORT =============
+    //
+
+    function onRollback($user)
+    {
+        if ($user) {
+            $this->set('modifier', $user);
+            $this->set('modifier_name', $user->get('display_name'));
+            $this->set('modifier_foreign_key', $user->get('foreign_key'));
+        } else {
+            $this->set('modifier', null);
+            $this->set('modifier_name', null);
+            $this->set('modifier_foreign_key', null);
+        }
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+        $this->set('mtime', $ts);
+
+        $this->onAction('rollback');
+    }
+
+    function onRestore($user)
+    {
+        if ($user) {
+            $this->set('modifier', $user);
+            $this->set('modifier_name', $user->get('display_name'));
+            $this->set('modifier_foreign_key', $user->get('foreign_key'));
+        } else {
+            $this->set('modifier', null);
+            $this->set('modifier_name', null);
+            $this->set('modifier_foreign_key', null);
+        }
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+        $this->set('mtime', $ts);
+
+        $this->onAction('restore');
+    }
+
+    /**
+     * @param string $action
+     */
+    function onAction($action)
+    {
+        // do nothing
+
+    }
+
+    /**
+     * @param string $action
+     *
+     * @return string
+     */
+    function getInspectionMessage($action)
+    {
+        $current = $this->getCurrentBody();
+        $filename = $current->get('name');
+        $oid = $this->getOID();
+        $version = $this->get('version');
+
+        switch ($action) {
+            case 'create':
+                return "Create a " . strtolower(get_class($this))
+                       . " (id: ${oid}, file: ${filename}, version: 1)";
+
+            case 'update':
+                return "Update a " . strtolower(get_class($this))
+                       . " (id: ${oid}, file: ${filename}, version: ${version})";
+
+            case 'rollback':
+                return "Rollback a " . strtolower(get_class($this))
+                       . " (id: ${oid}, file: ${filename}, version: ${version})";
+
+            case 'restore':
+                return "Restore a " . strtolower(get_class($this))
+                       . " (id: ${oid}, file: ${filename}, version: ${version})";
+
+            case 'delete':
+                return "Delete a " . strtolower(get_class($this))
+                       . " (id: ${oid}, file: ${filename}, version: ${version})";
+        }
+
+        return parent::getInspectionMessage($action);
+    }
+
+    /**
+     * @return bool
+     */
+    private function isScheduleApi(): bool
+    {
+        if (get_class($this) === 'GRN_Schedule_File') {
+            return true;
+        }
+
+        $page_name = cb_get_pagename();
+
+        // pattern of ui
+        if (strpos($page_name, 'schedule/') === 0) {
+            return true;
+        }
+
+        // pattern of soap api
+        if (strpos($page_name, 'cbpapi/schedule/') === 0) {
+            return true;
+        }
+
+        // pattern of rest api
+        if (preg_match('/^api\/v(\d+)\/schedule\//', $page_name, $matches)) {
+            return true;
+        }
+
+        return false;
+    }
+}
+
+
+/**
+ * Manage {@link GRN_File} objects.
+ *
+ * @package grn.common
+ */
+class GRN_FileManager
+{
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_FileManager
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+    }
+
+    /**
+     * @access private
+     */
+    var $_file_table = null;
+    /**
+     * @access private
+     */
+    var $_body_table = null;
+
+    /**
+     * GRN_File オブジェクトの格納テーブル
+     *
+     * @return CB_TableInfo
+     */
+    function getFileTable()
+    {
+        if (is_null($this->_file_table)) {
+            $this->_file_table = cb_class2table('GRN_File');
+        }
+
+        return $this->_file_table;
+    }
+
+    /**
+     * メンテナンス用途でボディテーブルを直接参照するため.
+     *
+     * @return CB_TableInfo
+     */
+    function getBodyTable()
+    {
+        if (is_null($this->_body_table)) {
+            $this->_body_table = cb_class2table('GRN_FileBody');
+        }
+
+        return $this->_body_table;
+    }
+
+    /**
+     * @access private
+     * @return GRN_File
+     */
+    function _newFile()
+    {
+        $table = $this->getFileTable();
+        $config = GRN_FileManagerConfig::getInstance();
+        $row = $table->newRow();
+        /* @var GRN_File $row */
+        //$row->setMaxVersion( $config->getMaxVersion() );
+        $row->setMaxVersion(0);
+        $row->registerNow();
+
+        return $row;
+    }
+
+    /**
+     * @param CB_User        $user    {@link CB_User}, or NULL.
+     * @param GRN_ServerFile $file    {@link GRN_ServerFile}, or an element of
+     *                          $_FILES, or a path string of a file.
+     * @param string         $comment comment on this operation.
+     *
+     * @return GRN_File
+     */
+    function createFile($user, $file, $comment)
+    {
+        $row = $this->_newFile();
+        $row->create($user, $file, $comment);
+
+        return $row;
+    }
+
+    /**
+     * Duplicate file contents of a {@link GRN_File}.
+     *
+     * @param mixed    $user     {@link CB_User}, or NULL.
+     * @param GRN_File $original original
+     * @param string   $comment  comment on this operation.
+     *
+     * @return GRN_File
+     */
+    function duplicateFile($user, $original, $comment)
+    {
+        $row = $this->_newFile();
+        $row->create($user, $original->getCurrentBody(), $comment);
+
+        return $row;
+    }
+}
+
+require_once('PEAR.php');
+
+class GRN_ZipFile
+{
+    var $_zipped_data_buff = '';
+    var $_zipped_data_size = 0;
+    /**
+     * File descriptor of the opened Zip file.
+     *
+     * @var int Internal zip file descriptor
+     */
+    var $_zip_fd = 0;
+
+    /**
+     * The filename of the zip archive.
+     *
+     * @var string Name of the Zip file
+     */
+    var $_zipname = null;
+
+    /**
+     * The header list infomation of the files into zipped .
+     *
+     * @var array header of the Zip file
+     */
+    var $p_header_list = [];
+
+    function __construct($p_zipname = null)
+    {
+    }
+
+    /**
+     * @access private
+     */
+    function _makeTempFile()
+    {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login = $uum->getLoginUser();
+
+        $tmp_dir = cb_tmpdir() . '/grn_zip_file_' . time() . '_'
+                   . $login->getOID();
+
+        return $tmp_dir;
+    }
+
+    /**
+     * GRN_ZipFile::openFd()
+     *
+     * @param
+     */
+    function _openFd($p_mode)
+    {
+        $v_result = 1;
+        // ----- Look if already open
+        if ($this->_zip_fd != 0) {
+            return;
+        }
+        // ----- Open the zip file
+        if (($this->_zip_fd = @fopen($this->_zipname, $p_mode)) == 0) {
+            require_once('fw/error_code.csp');
+            cb_throw_error(E_COMMON_FOPEN_WRITE, null,
+                ['file' => $this->_zipname]);
+        }
+
+
+        // ----- Return
+        return $v_result;
+    }
+
+
+    /**
+     * Function to add file to the specified directory in the archive
+     *
+     * @param string $data    content of file
+     * @param string $store_filename
+     * @param string $add_dir optionnal add the directory into zip archive
+     * @param bool   $replaceBackSlash
+     *
+     * @return int
+     *
+     */
+    function addFile(
+        $data,
+        $store_filename,
+        $add_dir = "",
+        $replaceBackSlash = true
+    ) {
+        $v_result = 1;
+
+        if ($replaceBackSlash) {
+            $store_filename = str_replace("\\", "/", $store_filename);
+        }
+
+        // ----- Look for path to add
+        if ($add_dir != "") {
+            if (substr($add_dir, -1) == "/") {
+                $store_filename = $add_dir . $store_filename;
+            } else {
+                $store_filename = $add_dir . "/" . $store_filename;
+            }
+        }
+
+        clearstatcache();
+        $p_header = [];
+        $p_header['version'] = 20;
+        $p_header['version_extracted'] = 10;
+        $p_header['flag'] = 0;
+        $p_header['compression'] = 0;
+        $p_header['mtime'] = time();
+        $p_header['crc'] = 0;
+        $p_header['compressed_size'] = 0;
+        $p_header['size'] = strlen($data);
+        $p_header['filename_len'] = strlen($store_filename);
+        $p_header['extra_len'] = 0;
+        $p_header['comment_len'] = 0;
+        $p_header['disk'] = 0;
+        $p_header['internal'] = 0;
+        $p_header['external'] = 0xFE49FFE0;
+        $p_header['offset'] = 0;
+        $p_header['filename'] = $store_filename;
+        $p_header['stored_filename'] = $store_filename;
+        $p_header['extra'] = '';
+        $p_header['comment'] = '';
+        $p_header['status'] = 'ok';
+        $p_header['index'] = -1;
+
+        // ----- Check the path length
+        if (strlen($p_header['stored_filename']) > 0xFF) {
+            $p_header['status'] = 'filename_too_long';
+        }
+
+        // ----- Calculate the CRC
+        $p_header['crc'] = crc32($data);
+
+        // ----- Compress the file
+        $v_content_compressed = gzdeflate($data);
+
+        // ----- Set header parameters
+        $p_header['compressed_size'] = strlen($v_content_compressed);
+
+        $p_header['compression'] = 8;
+
+        // ----- Call the header generation
+        if (($v_result = $this->_writeFileHeader($p_header)) != 1) {
+            return $v_result;
+        }
+
+        // ----- Write the compressed content
+        $v_binary_data = pack('a' . $p_header['compressed_size'],
+            $v_content_compressed);
+        // write data to buffer
+        $this->_zipped_data_buff .= $v_binary_data;
+
+        // update data size
+        $this->_zipped_data_size += strlen($v_binary_data);
+
+        $h_count = sizeof($this->p_header_list);
+
+        $this->p_header_list[$h_count++] = $p_header;
+
+        return $v_result;
+
+    }
+
+
+    /**
+     *  Finalize zip process
+     */
+    function close()
+    {
+        $p_result_list = [];
+
+        // ----- Store the offset of the central dir
+        $v_offset = intval($this->_zipped_data_size);
+
+        // ----- Create the Central Dir files header
+        for ($i = 0, $v_count = 0; $i < sizeof($this->p_header_list); $i++) {
+            // ----- Create the file header
+            if ($this->p_header_list[$i]['status'] == 'ok') {
+                if (($v_result
+                        = $this->_writeCentralFileHeader($this->p_header_list[$i]))
+                    != 1
+                ) {
+                    return $v_result;
+                }
+                $v_count++;
+            }
+            // ----- Transform the header to a 'usable' info
+            $this->_convertHeader2FileInfo($this->p_header_list[$i],
+                $p_result_list[$i]);
+        }
+
+        // ----- Zip file comment
+        $v_comment = '';
+
+        // ----- Calculate the size of the central header
+        $v_size = intval($this->_zipped_data_size) - $v_offset;
+
+        // ----- Create the central dir footer
+        if (($v_result = $this->_writeCentralHeader($v_count, $v_size,
+                $v_offset,
+                $v_comment)) != 1
+        ) {
+            // ----- Reset the file list
+            unset($this->p_header_list);
+
+            // ----- Return
+            return $v_result;
+        }
+
+        return $this->_zipped_data_buff;
+    }
+
+    /**
+     * @access private
+     */
+    function _writeFileHeader(&$p_header)
+    {
+        $v_result = 1;
+
+        // ----- Store the offset position of the file
+        $p_header['offset'] = intval($this->_zipped_data_size);
+
+        // ----- Transform UNIX mtime to DOS format mdate/mtime
+        $v_date = getdate($p_header['mtime']);
+        $v_mtime = ($v_date['hours'] << 11) + ($v_date['minutes'] << 5)
+                   + $v_date['seconds'] / 2;
+        $v_mdate = (($v_date['year'] - 1980) << 9) + ($v_date['mon'] << 5)
+                   + $v_date['mday'];
+
+        // ----- Packed data
+        $v_binary_data = pack("VvvvvvVVVvv", 0x04034b50, $p_header['version'],
+            $p_header['flag'],
+            $p_header['compression'], $v_mtime, $v_mdate,
+            $p_header['crc'], $p_header['compressed_size'], $p_header['size'],
+            strlen($p_header['stored_filename']), $p_header['extra_len']);
+
+        // ----- Write the first 148 bytes of the header in the archive
+        // add this entry to buffer
+        $this->_zipped_data_buff .= $v_binary_data;
+
+        $this->_zipped_data_size += strlen($v_binary_data);
+
+        // ----- Write the variable fields
+        if (strlen($p_header['stored_filename']) != 0) {
+            $this->_zipped_data_buff .= $p_header['stored_filename'];
+            $this->_zipped_data_size += strlen($p_header['stored_filename']);
+        }
+        if ($p_header['extra_len'] != 0) {
+            $this->_zipped_data_buff .= $p_header['extra'];
+            $this->_zipped_data_size += strlen($p_header['extra']);
+        }
+
+        // ----- Return
+        return $v_result;
+    }
+
+    /**
+     * @access private
+     */
+    function _writeCentralFileHeader(&$p_header)
+    {
+        $v_result = 1;
+
+        // ----- Transform UNIX mtime to DOS format mdate/mtime
+        $v_date = getdate($p_header['mtime']);
+        $v_mtime = ($v_date['hours'] << 11) + ($v_date['minutes'] << 5)
+                   + $v_date['seconds'] / 2;
+        $v_mdate = (($v_date['year'] - 1980) << 9) + ($v_date['mon'] << 5)
+                   + $v_date['mday'];
+
+        $p_header['external'] = 32;
+        // ----- Packed data
+        $v_binary_data = pack("VvvvvvvVVVvvvvvVV", 0x02014b50,
+            $p_header['version'], $p_header['version_extracted'],
+            $p_header['flag'], $p_header['compression'], $v_mtime, $v_mdate,
+            $p_header['crc'],
+            $p_header['compressed_size'], $p_header['size'],
+            strlen($p_header['stored_filename']), $p_header['extra_len'],
+            $p_header['comment_len'],
+            $p_header['disk'], $p_header['internal'], $p_header['external'],
+            $p_header['offset']);
+
+        // ----- Write the 42 bytes of the header in the zip file
+        $this->_zipped_data_buff .= $v_binary_data;
+
+        $this->_zipped_data_size += strlen($v_binary_data);
+
+        // ----- Write the variable fields
+        if (strlen($p_header['stored_filename']) != 0) {
+            $this->_zipped_data_buff .= $p_header['stored_filename'];
+            $this->_zipped_data_size += strlen($p_header['stored_filename']);
+        }
+        if ($p_header['extra_len'] != 0) {
+            $this->_zipped_data_buff .= $p_header['extra'];
+            $this->_zipped_data_size += strlen($p_header['extra']);
+        }
+        if ($p_header['comment_len'] != 0) {
+            $this->_zipped_data_buff .= $p_header['comment'];
+            $this->_zipped_data_size += strlen($p_header['comment']);
+        }
+
+        // ----- Return
+        return $v_result;
+    }
+
+    /**
+     * @access private
+     */
+    function _writeCentralHeader($p_nb_entries, $p_size, $p_offset, $p_comment)
+    {
+        $v_result = 1;
+
+        // ----- Packed data
+        $v_binary_data = pack("VvvvvVVv", 0x06054b50, 0, 0, $p_nb_entries,
+            $p_nb_entries, $p_size, $p_offset, strlen($p_comment));
+
+        // ----- Write the 22 bytes of the header in the zip file
+        $this->_zipped_data_buff .= $v_binary_data;
+
+        $this->_zipped_data_size += strlen($v_binary_data);
+
+        // ----- Write the variable fields
+        if (strlen($p_comment) != 0) {
+            $this->_zipped_data_buff .= $p_comment;
+            $this->_zipped_data_size += strlen($p_comment);
+        }
+
+        // ----- Return
+        return $v_result;
+    }
+
+    /**
+     * @access private
+     */
+    function _convertHeader2FileInfo($p_header, &$p_info)
+    {
+        $v_result = 1;
+
+        // ----- Get the interesting attributes
+        $p_info['filename'] = $p_header['filename'];
+        $p_info['stored_filename'] = $p_header['stored_filename'];
+        $p_info['size'] = $p_header['size'];
+        $p_info['compressed_size'] = $p_header['compressed_size'];
+        $p_info['mtime'] = $p_header['mtime'];
+        $p_info['comment'] = $p_header['comment'];
+        $p_info['folder'] = (($p_header['external'] & 0x00000010)
+                             == 0x00000010);
+        $p_info['index'] = $p_header['index'];
+        $p_info['status'] = $p_header['status'];
+
+        // ----- Return
+        return $v_result;
+    }
+
+    /**
+     *  Retrieve buffer
+     */
+    function getBuffer()
+    {
+        return $this->_zipped_data_buff;
+    }
+
+    /**
+     *  Clearn buffer
+     */
+    function clearBuffer()
+    {
+        $this->_zipped_data_buff = '';
+    }
+
+    function _closeFd()
+    {
+        $v_result = 1;
+
+        if ($this->_zip_fd != 0) {
+            @fclose($this->_zip_fd);
+        }
+        $this->_zip_fd = 0;
+
+        // ----- Return
+        return $v_result;
+    }
+
+    /*
+     * Clear zip temp file at {garoon_id}/tmp/grn_zip_file_{userid}
+     */
+    function getFile()
+    {
+        readfile($this->_zipname);
+    }
+
+    /*
+     * Clear zip temp file at {garoon_id}/tmp/grn_zip_file_{userid}
+     */
+    function _clearTemp()
+    {
+        if (file_exists($this->_zipname)) {
+            unlink($this->_zipname);
+        }
+    }
+}
+
+function grn_create_simple_file($user, $value, $message, $is_image = false)
+{
+    if ($value['error'] !== UPLOAD_ERR_OK) {
+        cb_throw_error(E_GRN_UPLOADING_FAILED);
+    }
+    if ($is_image && @getimagesize($value['tmp_name']) === false) {
+        cb_throw_error(E_GRN_INVALID_IMAGE_FILE);
+    }
+    $file_manager = GRN_FileManager::getInstance();
+    $__ret = $file_manager->createFile(
+        $user,
+        $value,
+        $message
+    );
+
+    return $__ret;
+}
+
+/**
+ * ファイルサイズをフォーマットする
+ *
+ * @param int    $size      ファイルサイズ
+ * @param string $unit      単位( KB, MB, ... )
+ * @param int    $precision 小数点以下の精度(省略時=0)
+ * @param mixed  $round     小数点以下切り上げ("ceil")または切り下げ("floor") precision=0の場合のみ有効
+ */
+function grn_get_filesize_format(
+    $size,
+    $unit = null,
+    $precision = 0,
+    $round = null
+) {
+    static $_units = [
+        'TB'   => 1099511627776.0,
+        'GB'   => 1073741824.0,
+        'MB'   => 1048576.0,
+        'KB'   => 1024.0,
+        'byte' => 1.0
+    ];
+
+    $select_unit = 'KB';
+
+    if ( ! is_null($unit)) {
+        if ( ! array_key_exists($unit, $_units)) {
+            return false;
+        }
+        $select_unit = $unit;
+    } else {
+        // auto detect
+        foreach ($_units as $k => $v) {
+            if ($size >= $v) {
+                $select_unit = $k;
+                break;
+            }
+        }
+    }
+
+    $v = floatval($size) / $_units[$select_unit];
+
+    if ( ! $precision && $round) {
+        switch ($round) {
+            case 'ceil':
+                $v = ceil($v);
+                break;
+            case 'floor':
+                $v = floor($v);
+                break;
+        }
+    }
+
+    return number_format($v, $precision) . ' ' . $select_unit;
+}
+
+/**
+ * ファイルサイズをフォーマットする（小数点N位まで切り捨て）
+ *
+ * @param int    $size      ファイルサイズ
+ * @param string $unit      単位( KB, MB, ... )
+ * @param int    $precision 小数点以下の精度(省略時=0)
+ */
+function grn_get_filesize_format_for_mail($size, $unit = null, $precision = 0)
+{
+    static $_units = [
+        'TB'   => 1099511627776.0,
+        'GB'   => 1073741824.0,
+        'MB'   => 1048576.0,
+        'KB'   => 1024.0,
+        'byte' => 1.0
+    ];
+
+    $select_unit = 'KB';
+
+    if ( ! is_null($unit)) {
+        if ( ! array_key_exists($unit, $_units)) {
+            return false;
+        }
+        $select_unit = $unit;
+    } else {
+        // auto detect
+        foreach ($_units as $k => $v) {
+            if ($size >= $v) {
+                $select_unit = $k;
+                break;
+            }
+        }
+    }
+
+    $v = floatval($size) / $_units[$select_unit];
+
+    if ($precision) {
+
+        $cut = 5;
+        for ($i = 0; $i <= $precision; $i++) {
+            $cut = $cut / 10;
+        }
+        if ($v >= $cut) {
+            $v = $v - $cut;
+        }
+    } else {
+        $v = floor($v);
+    }
+
+    return number_format($v, $precision) . ' ' . $select_unit;
+}
+
+/**
+ * $G_config_common->get('Files', 'dir')/$app_id ディレクトリ以下を初期化する
+ *
+ * @param string $app_id アプリケーションID
+ */
+function grn_initialize_files($app_id)
+{
+    global $G_config_common;
+    $files_dir = $G_config_common->get('Files', 'dir');
+    if ( ! is_writable($files_dir)) {
+        cb_throw_error(E_COMMON_FILES_DIR_NO_WRITE_PRIV,
+            null, ['dir' => $files_dir]);
+    }
+
+    $app_files_dir = $files_dir . '/' . $app_id;
+
+    // インストーラーで作られるが念のため
+    cb_mkdir($app_files_dir, 0755, true, true);
+    if ( ! is_writable($app_files_dir)) {
+        cb_throw_error(E_COMMON_FILES_DIR_NO_WRITE_PRIV,
+            null, ['dir' => $app_files_dir]);
+    }
+
+    require_once('grn/filesystem.csp');
+    $filesystem = GRN_FileSystem::getInstance();
+
+    // ディレクトリ以下のファイルを削除
+    grn_delete_directory($app_files_dir, false);
+}
+
+/**
+ * ディレクトリを削除する。
+ *
+ * @param string $dir         削除ディレクトリ
+ * @param string $root_delete ルートディレクトリを削除するか( TRUE = 削除する )
+ */
+function grn_delete_directory($dir, $root_delete)
+{
+    if ($dh = @opendir($dir)) {
+        while (($r = @readdir($dh)) !== false) {
+            if (($r != '.') && ($r != '..')) {
+                $child = "$dir/$r";
+                if (is_dir($child)) {
+                    grn_delete_directory($child, true);
+                } else {
+                    @unlink($child);
+                }
+            }
+        }
+        @closedir($dh);
+
+        $is_empty = true;
+        if ($dh = @opendir($dir)) {
+            while ($file = @readdir($dh)) {
+                if (($file != '.') && ($file != '..')) {
+                    $is_empty = false;
+                    break;
+                }
+            }
+            @closedir($dh);
+        }
+
+        if ($is_empty && $root_delete) {
+            @rmdir($dir);
+        }
+    }
+}
+
+//ファイル名として使用可能な安全な名前に変換する
+function grn_get_safe_filename($filename)
+{
+    // replace special character that can not create file name
+    $pattern = '/["\?\*\/\\:|<>]/';
+    $filename = preg_replace($pattern, '_', $filename);
+    $filename = str_replace('\\', '_', $filename);
+
+    return $filename;
+}
+
+function grn_get_extension_fileMimeType($mimeType)
+{
+    global $G_container_base;
+    $extension = null;
+    $dbconn = $G_container_base->getInstance('dbconn');
+    $query
+        = sprintf("Select col_extension from tab_grn_mimetype where col_mime='%s' ORDER BY _id DESC LIMIT 1",
+        $dbconn->escape($mimeType));
+    $result = $dbconn->query($query);
+    $ret = $dbconn->fetch_assoc($result);
+    if (is_array($ret) && count($ret) > 0) {
+        $extension = $ret['col_extension'];
+    }
+
+    return $extension;
+
+}
+
+function grn_get_mail_filename($name, $mime)
+{
+
+    require_once('mail/resources.csp');
+    if (is_null($name) || strlen($name) == 0) {
+        if ( ! is_null($mime) && strlen($mime) > 0) {
+            $extension = grn_get_extension_fileMimeType($mime);
+            if (is_null($extension)) {
+                $name = cb_msg(GRN_MAIL_MODULE_ID, 'no_filename');
+            } else {
+                $name = "notitle." . $extension;
+            }
+        } else {
+            $name = cb_msg(GRN_MAIL_MODULE_ID, 'no_filename');
+        }
+    }
+
+    return $name;
+}
+
+/**
+ * Search files
+ *
+ * @param string $target    file name to search
+ * @param string $root_path directory where beginning to search
+ * @param array  $results   list of found files
+ */
+function grn_find_file($target, $root_path, &$results)
+{
+    if ($handle = opendir($root_path)) {
+        while (false !== ($file = readdir($handle))) {
+            if (strcmp($file, "..") == 0 || strcmp($file, ".") == 0) {
+                continue;
+            } elseif (is_dir($root_path . DIRECTORY_SEPARATOR . $file)) {
+                grn_find_file($target, $root_path . DIRECTORY_SEPARATOR . $file,
+                    $results);
+            } elseif (strcmp($target, $file) == 0) {
+                array_push($results, $root_path . DIRECTORY_SEPARATOR . $file);
+            }
+        }
+    }
+    closedir($handle);
+}
+

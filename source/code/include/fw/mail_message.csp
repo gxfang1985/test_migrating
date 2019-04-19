@@ -1,0 +1,3781 @@
+<?php
+
+/**
+ * On memory representation of mail messages.
+ */
+
+require_once('PEAR.php');
+require_once('fw/string_util.csp');
+
+define('CB_MAIL_ENC_7BIT', '7bit');
+define('CB_MAIL_ENC_8BIT', '8bit');
+define('CB_MAIL_ENC_Q', 'quoted-printable');
+define('CB_MAIL_ENC_B', 'base64');
+define('CB_MAIL_ENC_UUENCODE', 'x-uuencode');
+
+define('CB_MAIL_CRLF', "\r\n");
+
+// Only ASCII Character.
+define('CB_MAIL_SAFETY_SUBSTITUTION', '?');
+
+/**
+ * Mail composing utility.
+ *
+ * @package fw.mail
+ */
+class CB_MailComposer
+{
+    const CHARSETS_NECESSARY_KANA_ESCAPING = ['GB2312'];
+
+    /**
+     * @access private
+     * @var CB_MailMessage
+     */
+    var $_message;
+
+    /**
+     * @access private
+     * @var CB_MailSinglePart
+     */
+    var $_textpart = null;
+
+    /**
+     * @access private
+     * @var CB_MailSinglePart
+     */
+    var $_htmlpart = null;
+
+    /** @access private */
+    var $_attachments = [];
+
+    /**
+     * @access private
+     * @var CB_MailSinglePart
+     */
+    var $_notification_part = null;
+
+    /**
+     * Constructor.
+     */
+    function __construct()
+    {
+        $this->_message = new CB_MailMessage();
+        $this->_message->setHeader($this->_createDateHeader());
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $name
+     * @param string $value
+     * @param bool   $replace
+     */
+    function _setHeader($name, $value, $replace = true)
+    {
+        assert('!is_null($name)');
+        if ($replace) {
+            $header = new CB_MailHeader($name, $value);
+            $this->_message->setHeader($header, true);
+        } else {
+            $lvalue = $this->_message->getHeaderValue($name);
+            if (is_null($lvalue)) {
+                $header = new CB_MailHeader($name, $value);
+            } else {
+                $header = new CB_MailHeader($name, "$lvalue,$value");
+            }
+            $this->_message->setHeader($header, true);
+        }
+    }
+
+    /**
+     * Set Identification Fields: header.
+     *
+     * @param   string $name        識別フィールド名   Identification Fields Name (Message-ID,In-Reply-To,References)
+     * @param   string $identifiers メッセージ識別子   Message identifiers
+     */
+    function setIdentificationFields($name, $identifiers)
+    {
+        $value = "";
+        $identifiers_list = preg_split("/[ \t\n\r,]/", $identifiers);
+
+        if (is_array($identifiers_list)) {
+            foreach (array_keys($identifiers_list) as $key) {
+                $identifiers_list[$key] = trim($identifiers_list[$key], "<>");
+                $value .= "<" . $identifiers_list[$key]
+                          . ">\r\n";
+            }
+            $value = rtrim($value, "\r\n");
+        }
+
+        $this->_message->setHeader(new CB_MailHeader($name, $value), true);
+    }
+
+    /**
+     * Set From: header.
+     *
+     * @param CB_MailAddress $address
+     */
+    function setFrom($address)
+    {
+        assert('is_a($address, "CB_MailAddress")');
+
+        return $this->_setHeader('From',
+            CB_MailAddress::static_format($address));
+    }
+
+    /**
+     * Add Reply-To: header.
+     *
+     * @param CB_MailAddress|CB_MailAddress[] $address
+     */
+    function addReplyTo($address)
+    {
+        assert('is_a($address, "CB_MailAddress") || is_array($address)');
+
+        return $this->_setHeader('Reply-To',
+            CB_MailAddress::static_format($address), false);
+    }
+
+    /**
+     * Add To: header.
+     *
+     * @param CB_MailAddress|CB_MailAddress[] $address
+     */
+    function addTo($address)
+    {
+        assert('is_a($address, "CB_MailAddress") || is_array($address)');
+
+        return $this->_setHeader('To', CB_MailAddress::static_format($address),
+            false);
+    }
+
+    /**
+     * Add Cc: header.
+     *
+     * @param CB_MailAddress|CB_MailAddress[] $address
+     */
+    function addCc($address)
+    {
+        assert('is_a($address, "CB_MailAddress") || is_array($address)');
+
+        return $this->_setHeader('Cc', CB_MailAddress::static_format($address),
+            false);
+    }
+
+    /**
+     * Add Bcc: header.
+     *
+     * @param CB_MailAddress|CB_MailAddress[] $address
+     */
+    function addBcc($address)
+    {
+        assert('is_a($address, "CB_MailAddress") || is_array($address)');
+
+        return $this->_setHeader('Bcc', CB_MailAddress::static_format($address),
+            false);
+    }
+
+    /**
+     * Set Subject: header.
+     *
+     * @param string $subject
+     */
+    function setSubject($subject)
+    {
+        assert('!is_null($subject)');
+        //countermeasure for mail header injection GRN2-7033
+        $subject = str_replace("\r\n", "%0d%0a", $subject);
+
+        return $this->_setHeader('Subject', $subject);
+    }
+
+    /**
+     * Set Disposition-Notification-To Header.
+     *
+     * MDN request
+     *
+     * @param CB_MailAddress $address
+     *
+     * @access public
+     */
+    function setDispositionNotificationTo($address)
+    {
+        assert('is_a($address, "CB_MailAddress")');
+
+        return $this->_setHeader('Disposition-Notification-To',
+            CB_MailAddress::static_format($address));
+    }
+
+    /**
+     * @access private
+     * @return \CB_MailHeader
+     */
+    function _createDateHeader()
+    {
+        $header = new CB_MailHeader('Date', date('r'));
+
+        return $header;
+    }
+
+    /**
+     * Sets, adds, or replaces a header object.
+     *
+     * @param CB_MailHeader $header
+     * @param bool          $replace true to replace the header
+     *                               of the same name; false to allow multiple
+     *                               headers of the same name.
+     */
+    function setHeader($header, $replace = true)
+    {
+        assert('is_a($header, "CB_MailHeader")');
+
+        return $this->_message->setHeader($header, $replace);
+    }
+
+    /**
+     * Sets a plain text as the mail body or
+     * if a html body was added, both parts are added as a multipart/alternative.
+     *
+     * <p>
+     *   Note that the text will be converted to ISO-2022-JP-MS at Japanese locale.
+     *   So some characters (e.g. "hankaku-katakana") may be garbled.
+     *   Please use mb_convert_kana() before passing the text to this function.
+     * </p>
+     *
+     * @param string $body
+     */
+    function setTextBody($body)
+    {
+        assert('is_string($body)');
+        if (is_null($this->_textpart)) {
+            $this->_textpart = new CB_MailSinglePart();
+        }
+        $this->_textpart->setPlainText($body);
+    }
+
+    /**
+     * Sets an HTML text as the mail body or
+     * if a plain text body was added, both parts are added as a multipart/alternative.
+     *
+     * @param string $body
+     */
+    function setHtmlBody($body)
+    {
+        assert('is_string($body)');
+
+        if (is_null($this->_htmlpart)) {
+            $this->_htmlpart = new CB_MailSinglePart();
+        }
+        $this->_htmlpart->setHtmlText($body);
+    }
+
+    /**
+     * @param string        $string
+     * @param string | NULL $charset
+     *
+     * @return string
+     */
+    public static function escapeHalfWidthKana($string, $charset = null)
+    {
+        if (self::isEscapingKanaNecessary($charset)) {
+            return mb_convert_kana($string);
+        }
+
+        return $string;
+    }
+
+    /**
+     * @param string $charset
+     *
+     * @return bool
+     */
+    public static function isEscapingKanaNecessary($charset)
+    {
+        if (is_null($charset)) {
+            return false;
+        }
+
+        return in_array($charset, self::CHARSETS_NECESSARY_KANA_ESCAPING);
+    }
+
+    /**
+     * Sets an disposition-notification-content
+     *
+     * @param string $final_recipient
+     * @param array  $disposition
+     *                action-mode
+     *                sending-mode
+     *                disposition-type
+     * @param array  $option_field
+     */
+    function setDispositionNotification(
+        $final_recipient,
+        $disposition,
+        $option_field
+    ) {
+        assert('is_a($final_recipient, "CB_MailAddress")');
+        assert('is_array($disposition)');
+
+        if (is_null($this->_notification_part)) {
+            $this->_notification_part = new CB_MailSinglePart();
+        }
+        $content = [
+            'final-recipient' => $final_recipient,
+            'disposition'     => $disposition,
+            'option_field'    => $option_field
+        ];
+        $this->_notification_part->setNotificationContent($content);
+    }
+
+    /**
+     * Adds attachment file.
+     *
+     * @param string $filename file name.
+     * @param string $data     file contents.
+     * @param string $c_type   content type is distingushed by file extension
+     * @param bool   $inline   true to allow contents inlining.
+     */
+    function addAttachFile(
+        $filename,
+        $data,
+        $c_type = 'application/octet-stream',
+        $inline = false
+    ) {
+        $c_type = strtolower($c_type);
+        assert('strncmp($c_type, "multipart/", 10) != 0');
+        $part = new CB_MailSinglePart();
+        $part->setFileContent($data, $filename, $c_type, $inline);
+        $this->_attachments[] = $part;
+    }
+
+    /**
+     * Adds attachment mail.
+     *
+     * @param CB_MailMessage $msg
+     */
+    function addAttachMessage($msg)
+    {
+        assert('is_a($msg, "CB_MailMessage")');
+        $part = new CB_MailSinglePart();
+        $part->setRFC822Message($msg);
+        $this->_attachments[] = $part;
+    }
+
+    /**
+     * Returns the mail as a result of composition.
+     *
+     * @return CB_MailMessage
+     */
+    function getMailMessage()
+    {
+        if ( ! is_null($this->_htmlpart) && ! is_null($this->_textpart)) {
+            $mainpart = new CB_MailMultipart();
+            $mainpart->_content_type = 'multipart/alternative';
+            $mainpart->addMailPart($this->_textpart);
+            $mainpart->addMailPart($this->_htmlpart);
+        } // MDN
+        elseif ( ! is_null($this->_notification_part)) {
+            $mainpart = new CB_MailMultipart();
+            $mainpart->_content_type
+                = 'multipart/report; report-type="disposition-notification"';
+            if ( ! is_null($this->_textpart)) {
+                $mainpart->addMailPart($this->_textpart);
+            }
+            $mainpart->addMailPart($this->_notification_part);
+        } elseif ( ! is_null($this->_htmlpart)) {
+            $mainpart = $this->_htmlpart;
+        } elseif ( ! is_null($this->_textpart)) {
+            $mainpart = $this->_textpart;
+        } else {
+            $mainpart = new CB_MailSinglePart();
+            $mainpart->setPlainText('');
+        }
+
+        if (empty($this->_attachments)) {
+            if (isset($mainpart)) {
+                $this->_message->_setBody($mainpart);
+            }
+        } else {
+            $this->_message->_setBody(new CB_MailMultipart());
+            $this->_message->_body->_content_type = 'multipart/mixed';
+            if (isset($mainpart)) {
+                $this->_message->_body->addMailPart($mainpart);
+            }
+            for ($i = 0; $i < count($this->_attachments); ++$i) {
+                $this->_message->_body->addMailPart($this->_attachments[$i]);
+            }
+        }
+
+        // if ( is_a( $this->_message->_body, 'CB_MailMultipart' ) ) {
+        $mime_header = new CB_MailHeader('mime-version', '1.0');
+        $this->_message->setHeader($mime_header);
+
+        //}
+
+        return $this->_message;
+    }
+
+    /**
+     * Set X-Mailer header string
+     */
+    public function setXMailer()
+    {
+        global $G_config_grn;
+        $version = $G_config_grn->get('System', 'version');
+        $x_mailer = "Cybozu(R) Garoon(R) Version ${version}";
+
+        $this->setHeader(new CB_MailHeader('X-Mailer', $x_mailer));
+    }
+}
+
+/**
+ * Create Message-ID
+ *
+ */
+function cb_mail_create_message_id()
+{
+    $message_id = '';
+    $host_domain = '';
+
+    if (array_key_exists('HTTP_REFERER', $_SERVER)) {
+        $parsed_url = parse_url($_SERVER['HTTP_REFERER']);
+        $host_domain = $parsed_url['host'];
+    } else {
+        $host_domain = gethostname();
+    }
+
+    global $G_config_common;
+    $app_name = $G_config_common->get('Global', 'app_name');
+    $tt = str_replace('.', '_', str_replace(' ', '_', microtime()));
+    $message_id = $tt . '.' . getmypid() . '.' . $app_name . '@' . $host_domain;
+
+    return $message_id;
+}
+
+/**
+ * Mail parser.
+ * Parse RFC 2822 message to generate a {@link CB_MailMessage}.
+ *
+ * @package fw.mail
+ */
+class CB_MailParser
+{
+    /**
+     * Parse the RFC2822 message.
+     *
+     * @param   string $data    filename or mail source.
+     * @param   string $type    'file' or 'var'
+     * @param   array  $options parse options. Option ('delete_uuencode' => false) to uuencode data remains.
+     *
+     * @return  CB_MailMessage
+     */
+    static function static_parse($data, $type = 'file', $options = null)
+    {
+        assert('!is_null($data)');
+        assert('$type == \'file\' || $type == \'var\'');
+
+        $mm = new CB_MailLazyMessage();
+
+        $filename = null;
+        if ($type == 'file') {
+            $filename = $data;
+            $data = CB_ServerFileUtil::fileGetContents($filename);
+            $mime = new MimeMessage('file', $filename);
+            $mm->setSourceData($data);
+        } else {
+            $dir = cb_tmpdir();
+            $filename = tempnam($dir, 'mail');
+            $fd = fopen($filename, 'w');
+            if ($fd === false) {
+                require_once('fw/error_code.csp');
+                cb_throw_error(E_COMMON_FOPEN_WRITE, null,
+                    ['file' => $filename]);
+            }
+            if (fwrite($fd, $data) === false) {
+                require_once('fw/error_code.csp');
+                cb_throw_error(E_COMMON_TOO_SHORT_STORAGE, null,
+                    ['required' => strlen($data)],
+                    ['dir' => $dir]);
+            }
+            if (fclose($fd) === false) {
+                require_once('fw/error_code.csp');
+                cb_throw_error(E_COMMON_TOO_SHORT_STORAGE, null,
+                    ['required' => strlen($data)],
+                    ['dir' => $dir]);
+            }
+            $mime = new MimeMessage('file', $filename);
+            $mm->setSourceData($data);
+        }
+
+        $mm->_name_to_headers = [];
+        if (isset($mime->data['raw-headers'])) {
+            foreach ($mime->data['raw-headers'] as $name => $value) {
+                if (is_array($value)) {
+                    foreach ($value as $val) {
+                        $header = new CB_MailHeader($name, $val);
+                        $mm->setHeader($header, false);
+                    }
+                } else {
+                    $header = new CB_MailHeader($name, $value);
+                    $mm->setHeader($header);
+                }
+            }
+        }
+
+        CB_MailParser::_static_body_parse($mime, $mm, $options);
+        unset($mime);
+
+        if ($type == 'var') {
+            unlink($filename);
+        }
+
+        return $mm;
+    }
+
+    /**
+     * decode content of text string by its charset
+     *
+     * @param string $data encoded string
+     * @param string $charset
+     *
+     * @return string
+     * @access private
+     */
+    function _decodeTextByCharset($data, $charset = null)
+    {
+        if ( ! $charset) {
+            return $data;
+        }
+
+        if (mb_is_support_encoding($charset) === false) {
+            require_once('fw/i18n.csp');
+            $i18n = CB_I18N::getInstance();
+            $encoder = $i18n->getEncoder($charset);
+            if ($encoder === null) {
+                $charset = null;
+            }
+        }
+
+        // mb_convert_encoding not support ms932 charset
+        if ( ! is_null($charset) && strtolower($charset) === 'ms932') {
+            $charset = null;
+        }
+
+        if (is_null($charset)) {
+            global $G_config_common;
+            $ret = $G_config_common->get('Mail',
+                'mail_encoding_order');
+            $encoding_order = explode(' ', $ret);
+            if (is_null($encoding_order)) {
+                $encoding_order = 'auto';
+            }
+            $charset = mb_detect_encoding($data, $encoding_order);
+        }
+
+        $internal = mb_internal_encoding();
+
+        return cb_encode($data, $internal, $charset);
+    }
+
+    /**
+     * @param string $content
+     *
+     * @return string
+     */
+    public static function parseBinhexContent($content)
+    {
+        if (empty($content)) {
+            return null;
+        }
+
+        $len = strlen($content);
+        $name_len = ord($content{0});
+        $header_len = $name_len + 22;
+        if ($len > $header_len) {
+            $data_len = substr($content, $header_len - 10, 4);
+            $data_len = (ord($data_len{0}) << 24) |
+                        (ord($data_len{1}) << 16) |
+                        (ord($data_len{2}) << 8) |
+                        ord($data_len{3});
+
+            if ($len > $header_len + $data_len) {
+                $content = substr($content, $header_len, $data_len);
+            } else {
+                $content = null;
+            }
+
+        } else {
+            $content = null;
+        }
+
+        return $content;
+    }
+
+    /**
+     * @param MimeMessage $mime_part
+     *
+     * @return string of mail part content.
+     */
+    public static function getBinhexPartContent(MimeMessage $mime_part)
+    {
+        $tmp_dir = cb_tmpdir();
+        $tmp_filename = tempnam($tmp_dir, 'mail');
+        $tmp_fp = fopen($tmp_filename, 'w');
+        $mime_part->extract_binhex(MAILPARSE_EXTRACT_STREAM, $tmp_fp);
+        fclose($tmp_fp);
+        $content = file_get_contents($tmp_filename);
+        unlink($tmp_filename);
+
+        return $content;
+    }
+
+    /**
+     * Generate body from MimeMessage object.
+     *
+     * @param MimeMessage                     $mimepart
+     * @param CB_MailMessage|CB_MailMultiPart $mailpart
+     * @param array|null                      $options
+     */
+    public static function _static_body_parse(
+        $mimepart,
+        $mailpart,
+        $options = null
+    ) {
+        assert('is_a($mimepart, "MimeMessage")');
+        assert('is_a($mailpart, "CB_MailMessage") || is_a($mailpart, "CB_MailMultipart")');
+        $content_type = strtolower(trim(@$mimepart->data['content-type'])) or
+        $content_type = 'application/octet-stream';
+        if ($content_type == "text/plain; (error)") {
+            return;
+        }
+
+        // ignore Mac binary
+        if (is_a($mailpart, 'CB_MailMultipart')
+            && $mailpart->_content_type == 'multipart/appledouble'
+            && $content_type == 'application/applefile'
+        ) {
+            return;
+        }
+
+        if (strncmp($content_type, 'multipart/', 10) == 0) {
+            //multipart
+            $new_mailpart = new CB_MailMultipart();
+            $new_mailpart->_content_type = $content_type;
+            $count = $mimepart->get_child_count();
+            for ($i = 1; $i < $count; ++$i) {
+                $child_mailpart = $mimepart->get_child($i);
+                $child_mailpart->order = $i;
+                $child_mailpart->parent_content_type
+                    = strtolower(trim(@$mimepart->data['content-type']));
+                CB_MailParser::_static_body_parse($child_mailpart,
+                    $new_mailpart);
+            }
+        } else {
+            //singlepart
+            $new_mailpart = new CB_MailSinglePart();
+
+            $content_id = self::getMimeHeaderValue($mimepart, 'content-id');
+            if ( ! is_null($content_id)) {
+                $content_id = trim($content_id, '<>');
+                $new_mailpart->setContentId($content_id);
+            }
+
+            $encoding_headers
+                = @$mimepart->data['headers']['content-transfer-encoding'];
+            if (is_array($encoding_headers)) {
+                $encoding_headers = $encoding_headers[0];
+            } elseif (is_null($encoding_headers)) {
+                $encoding_headers = '';
+            }
+            assert('is_string($encoding_headers)');
+            $encoding = strtolower(trim($encoding_headers));
+            if (strlen($encoding) === 0) {
+                $encoding = null;
+            }
+            $new_mailpart->_charset = isset($mimepart->data['charset'])
+                ? strtolower(trim($mimepart->data['charset'])) : null;
+            $content = null;
+            if (strcasecmp($content_type, 'application/mac-binhex40') == 0) {
+                $encoding = 'x-binhex';
+            }
+
+            if ( ! is_null($encoding)) {
+                if (strcasecmp($encoding, 'base64') == 0) {
+                    // base64 part
+                    //@$content = $mimepart->extract_body( MAILPARSE_EXTRACT_RETURN );
+                    $tmp_dir = cb_tmpdir();
+                    $tmp_filename = tempnam($tmp_dir, 'mail');
+                    $tmp_fp = fopen($tmp_filename, 'w');
+                    $mimepart->extract_body(MAILPARSE_EXTRACT_STREAM, $tmp_fp);
+                    fclose($tmp_fp);
+                    $content = file_get_contents($tmp_filename);
+                    unlink($tmp_filename);
+
+                    $content = base64_decode($content);
+                } elseif ((strcasecmp($encoding, 'x-uuencode') == 0)
+                          || (strcasecmp($encoding, 'x-uue') == 0)
+                          || (strcasecmp($encoding, 'x-uu') == 0)
+                          || (strcasecmp($encoding, 'uuencode') == 0)
+                          || (strcasecmp($encoding, 'uue') == 0)
+                          || (strcasecmp($encoding, 'uu') == 0)
+                ) {
+                    // a uuencode part
+                    //$content = $mimepart->extract_uue( 0, MAILPARSE_EXTRACT_RETURN, MAILPARSE_UUE_U );
+                    $tmp_dir = cb_tmpdir();
+                    $tmp_filename = tempnam($tmp_dir, 'mail');
+                    $tmp_fp = fopen($tmp_filename, 'w');
+                    $mimepart->extract_uue(0, MAILPARSE_EXTRACT_STREAM,
+                        MAILPARSE_UUE_U, $tmp_fp);
+                    fclose($tmp_fp);
+                    $content = file_get_contents($tmp_filename);
+                    unlink($tmp_filename);
+                } elseif ((strcasecmp($encoding, 'x-xxencode') == 0)
+                          || (strcasecmp($encoding, 'x-xxe') == 0)
+                          || (strcasecmp($encoding, 'x-xx') == 0)
+                          || (strcasecmp($encoding, 'xxencode') == 0)
+                          || (strcasecmp($encoding, 'xxe') == 0)
+                          || (strcasecmp($encoding, 'xx') == 0)
+                ) {
+                    // a xxencode part
+                    //$content = $mimepart->extract_uue( 0, MAILPARSE_EXTRACT_RETURN, MAILPARSE_UUE_X );
+                    $tmp_dir = cb_tmpdir();
+                    $tmp_filename = tempnam($tmp_dir, 'mail');
+                    $tmp_fp = fopen($tmp_filename, 'w');
+                    $mimepart->extract_uue(0, MAILPARSE_EXTRACT_STREAM,
+                        MAILPARSE_UUE_X, $tmp_fp);
+                    fclose($tmp_fp);
+                    $content = file_get_contents($tmp_filename);
+                    unlink($tmp_filename);
+                } elseif (strcasecmp($encoding, 'x-binhex') == 0) {
+                    $raw_content = self::getBinhexPartContent($mimepart);
+                    $content = self::parseBinhexContent($raw_content);
+                }
+            }
+            if (is_null($content)) {
+                // otherwise
+                //@$content = $mimepart->extract_body( MAILPARSE_EXTRACT_RETURN );
+                $tmp_dir = cb_tmpdir();
+                $tmp_filename = tempnam($tmp_dir, 'mail');
+                $tmp_fp = fopen($tmp_filename, 'w');
+                @$mimepart->extract_body(MAILPARSE_EXTRACT_STREAM, $tmp_fp);
+                fclose($tmp_fp);
+                $content = file_get_contents($tmp_filename);
+                unlink($tmp_filename);
+
+                if (($content == "\n" || $content == CB_MAIL_CRLF)
+                    && @$mimepart->data['body-line-count'] === 0
+                ) {
+                    $content = '';
+                }
+                // uuencode
+                if (is_a($mailpart, 'CB_MailMessage')
+                    && isset($mimepart->data['content-type'])
+                    && strcasecmp(trim($mimepart->data['content-type']),
+                        'text/plain') == 0
+                ) {
+                    $uue = $mimepart->enum_uue();
+                    if ($uue !== false && ! empty($uue)) {
+                        //delete uuencode data
+                        if (is_null($options)
+                            || ! isset($options['delete_uuencode'])
+                            || $options['delete_uuencode'] === true
+                        ) {
+                            $start_pos = $uue[0]['start-pos'];
+                            $content = substr($content, 0, $start_pos);
+                        }
+
+                        $files = [];
+                        foreach ($uue as $index => $data) {
+                            $part = new CB_MailSinglePart();
+                            $filename = $data["filename"];
+                            $part->_parent = $new_mailpart;
+                            //$part->_content = $mimepart->extract_uue( $index, MAILPARSE_EXTRACT_RETURN );
+                            $tmp_dir = cb_tmpdir();
+                            $tmp_filename = tempnam($tmp_dir, 'mail');
+                            $tmp_fp = fopen($tmp_filename, 'w');
+                            $mimepart->extract_uue($index,
+                                MAILPARSE_EXTRACT_STREAM, MAILPARSE_UUE_AUTO,
+                                $tmp_fp);
+                            fclose($tmp_fp);
+                            $part->_content = file_get_contents($tmp_filename);
+                            unlink($tmp_filename);
+
+                            $part->_content_type = 'application/octet-stream';
+                            $part->_filename = $filename;
+                            $files[] = $part;
+                        }
+                        $new_mailpart->_embedded_parts = $files;
+                    }
+                }
+            }
+
+            //if ($content == "\n") $content = '';
+            $new_mailpart->_content =& $content;
+            $new_mailpart->_content_type = $content_type;
+
+            if (strcmp($content_type, 'message/partial') === 0) {
+                if (isset($mimepart->data['content-id'])) {
+                    $new_mailpart->_partial_params['id']
+                        = strtolower(trim($mimepart->data['content-id']));
+                }
+                if (isset($mimepart->data['content-number'])) {
+                    $new_mailpart->_partial_params['number']
+                        = strtolower(trim($mimepart->data['content-number']));
+                } else {
+                    $new_mailpart->_partial_params['number'] = 0;
+                }
+                if (isset($mimepart->data['content-total'])) {
+                    $new_mailpart->_partial_params['total']
+                        = strtolower(trim($mimepart->data['content-total']));
+                }
+            }
+            // MDN
+            if (strcmp($content_type, 'message/disposition-notification')
+                === 0
+            ) {
+                $new_mailpart->_notification
+                    = CB_MailParser::_static_parseMDNContent($content);
+            }
+            if (isset($mimepart->data['content-disposition'])) {
+                $new_mailpart->_disposition
+                    = strtolower(trim($mimepart->data['content-disposition']));
+            } else {
+                $new_mailpart->_disposition = null;
+            }
+            $real_filename = false;
+            $filename
+                = CB_MailParser::_static_getHeaderAttribute($mimepart->data,
+                'disposition-filename');
+            if ( ! is_null($filename)) {
+                $real_filename = true;
+                $new_mailpart->_filename = $filename;
+            } else {
+                $filename
+                    = CB_MailParser::_static_getHeaderAttribute($mimepart->data,
+                    'content-name');
+                if ( ! is_null($filename)) {
+                    $real_filename = true;
+                    $new_mailpart->_filename = $filename;
+                } else {
+                    if (isset($mimepart->data['headers']['content-description'])) {
+                        $new_mailpart->_filename
+                            = trim($mimepart->data['headers']['content-description']);
+                    }
+                }
+            }
+
+            // force disposition is 'attachment' when missing Content-Disposition field
+            if ( ! $new_mailpart->_disposition) {
+                $is_attachment = false;
+
+                // check content_type
+                $content_type_list = [
+                    'image/',
+                    'audio/',
+                    'video/',
+                    'application/'
+                ];
+
+                foreach ($content_type_list as $content_type_item) {
+                    if (stristr($content_type, $content_type_item) !== false) {
+                        $is_attachment = true;
+                        break;
+                    }
+                }
+
+                // check file name
+                if ( ! $is_attachment && $real_filename) {
+                    $is_attachment = true;
+                }
+
+                // force message/rfc822 is attachment
+                if ( ! $is_attachment && $content_type == 'message/rfc822') {
+                    $is_attachment = true;
+                }
+
+                // if content-type isn't multipart/alternative then the second part to part n is attach file.
+                if (( ! $is_attachment && $mailpart instanceof CB_MailMultipart
+                      && @$mimepart->order > 1
+                      && @$mimepart->parent_content_type
+                         !== 'multipart/alternative'
+                      && $mimepart->data['content-type'] != "text/plain"
+                      && $mimepart->data['content-type'] != "text/html")
+                    || (isset($mimepart->data['Content-Transfer-Encoding'])
+                        && ($mimepart->data['Content-Transfer-Encoding']
+                            == "base64"
+                            && @$mimepart->parent_content_type
+                               !== 'multipart/alternative'))
+                ) {
+                    $is_attachment = true;
+                }
+
+                // force disposition is 'attachment'
+                if ($is_attachment) {
+                    $new_mailpart->_disposition = 'attachment';
+                }
+            }
+        }
+
+        if ($mailpart instanceof CB_MailMessage) {
+            /** @var $mailpart CB_MailMessage */
+            $mailpart->_setBody($new_mailpart);
+        } else {
+            $mailpart->addMailPart($new_mailpart);
+        }
+    }
+
+    /**
+     * Parse disposition-notification-content
+     *
+     * @param  string $content
+     *
+     * @return array
+     * @access private
+     */
+    public static function _static_parseMDNContent($content)
+    {
+        $fds = explode(CB_MAIL_CRLF, cb_trim($content));
+
+        $fields = [];
+        foreach ($fds as $value) {
+            $name = substr($value, 0, $pos = strpos($value, ':'));
+            $value = cb_trim(substr($value, $pos + 1));
+            $fields[] = [
+                'name'  => $name,
+                'value' => $value
+            ];
+        }
+
+        $ret = [];
+        foreach ($fields as $f) {
+            if (strcasecmp('Final-Recipient', $f['name']) === 0) {
+                $address = null;
+                if (($pos = strpos($f['value'], ';')) !== false) {
+                    $address = substr($f['value'], $pos + 1);
+                } else {
+                    $address = $f['value'];
+                }
+
+                $ret['final-recipient'] = $address;
+            }
+
+            if (strcasecmp('Disposition', $f['name']) === 0) {
+                $action_mode = null;
+                $sending_mode = null;
+                $disposition_type = null;
+                $params = explode(';', cb_trim($f['value']));
+
+                $mode_params = explode('/', $params[0]);
+                if (isset($mode_params[0])) {
+                    $ret['disposition-field']['action-mode'] = $mode_params[0];
+                }
+                if (isset($mode_params[1])) {
+                    $ret['disposition-field']['sending-mode'] = $mode_params[1];
+                }
+
+                if (isset($params[1])) {
+                    $ret['disposition-field']['disposition-type']
+                        = cb_trim($params[1]);
+                }
+            }
+
+            if (strcasecmp('Original-Message-ID', $f['name']) === 0) {
+                $pattern = '/[<>]/';
+                $ret['option-fields']['original-message-id']
+                    = preg_replace($pattern, '', $f['value']);
+            }
+
+        }
+
+        return $ret;
+    }
+
+    /**
+     * Detects header attribute encoding and decode or null.
+     *
+     * @param array  $data
+     * @param string $name
+     *
+     * @return null|string
+     * @access private
+     */
+    public static function _static_getHeaderAttribute($data, $name)
+    {
+        if (isset($data[$name])) {
+            return $data[$name];
+        }
+
+        //try to decode RFC2231
+        $charset = null;
+        if (isset ($data["$name*"])) {
+            return CB_MailParser::_static_decode_RFC2231($data["$name*"],
+                $charset);
+        }
+
+        $key = "$name*0";
+        if ( ! isset($data[$key])) {
+            $key = "$name*0*";
+        }
+        if ( ! isset($data[$key])) {
+            return null;
+        }
+
+        // Huy modified @ 2008/04/29
+        $j = 0;
+        $value = '';
+        $fragments = [];
+        for ($i = 0; $i < count($data); $i++)        // join fragments
+        {
+            $key = "$name*$i*";                 // need decode
+            if (isset($data[$key])) {
+                if (isset($fragments[$j]) && $fragments[$j]['encode'] == true) {
+                    $fragments[$j]['data'] .= $data[$key];
+                } elseif (isset($fragments[$j])
+                          && $fragments[$j]['encode'] == false
+                ) {
+                    $j++;
+                    $fragments[$j]['data'] = $data[$key];
+                } else {
+                    $fragments[$j]['data'] = $data[$key];
+                }
+                $fragments[$j]['encode'] = true;
+            }
+
+            $key = "$name*$i";                  // not need decode
+            if (isset($data[$key])) {
+                $j++;
+                $fragments[$j]['data'] = $data[$key];
+                $fragments[$j]['encode'] = false;
+            }
+        }
+
+        foreach ($fragments as $item)           // decode fragments
+        {
+            if ($item['encode'] == true) {
+                $fragment = CB_MailParser::_static_decode_RFC2231($item['data'],
+                    $charset);
+            } else {
+                $fragment = $item['data'];
+            }
+            $value .= $fragment;
+        }
+
+        // End: Huy modified @ 2008/04/29
+
+        return $value;
+    }
+
+    /**
+     * Decodes a part of RFC2231 attribute.
+     * If $charset is NULL, regards $fragment is the first fragment and $charset will be set to detected charset.
+     *
+     * @param string $fragment
+     * @param string $charset
+     *
+     * @return string
+     * @access private
+     */
+    static function _static_decode_RFC2231($fragment, &$charset)
+    {
+        if (is_null($charset)) {
+            $result = preg_match("/([^\']*)\'([^\']*)\'(.*)/", $fragment,
+                $matches);
+            if ($result) {
+                $charset = $matches[1];
+                //$lang = $matches[2];
+                $fragment = $matches[3];
+            }
+            if (mb_is_support_encoding($charset) === false) {
+                require_once('fw/i18n.csp');
+                $i18n = CB_I18N::getInstance();
+                $encoder = $i18n->getEncoder($charset);
+
+                if ($encoder === false) {
+                    $charset = null;
+                }
+            }
+        }
+        $fragment = urldecode($fragment);
+        if (is_null($charset)) {
+            global $G_config_common;
+            $ret = $G_config_common->get('Mail',
+                'mail_encoding_order');
+            $encoding_order = explode(' ', $ret);
+
+            if (is_null($encoding_order)) {
+                $encoding_order = 'auto';
+            }
+
+            $charset = mb_detect_encoding($fragment, $encoding_order);
+        }
+        $internal = mb_internal_encoding();
+
+        return cb_encode($fragment, $internal, $charset);
+    }
+
+    /**
+     * @param MimeMessage $mimepart
+     * @param string      $header_name
+     *
+     * @return string|null
+     */
+    private static function getMimeHeaderValue(
+        MimeMessage $mimepart,
+        $header_name
+    ) {
+        if ( ! is_array($mimepart->data)) {
+            return null;
+        }
+        $headers = cb_at($mimepart->data, 'headers', []);
+        $header_values = cb_at($headers, $header_name);
+        if (is_array($header_values) && ! empty($header_values)) {
+            return $header_values[0];
+        } elseif (is_string($header_values)) {
+            return $header_values;
+        }
+
+        return null;
+    }
+}
+
+/**
+ * The addresses in a message.
+ *
+ * @package fw.mail
+ */
+class CB_MailAddress
+{
+    /**
+     * The address string.
+     *
+     * @var string
+     * @access public
+     */
+    var $address;
+
+    /**
+     * The name string.
+     *
+     * @var string
+     * @access public
+     */
+    var $name;
+
+    /**
+     * Raw address string that contains comment, etc.
+     *
+     * @var string
+     * @access public
+     */
+    var $raw_address;
+
+    /**
+     * Creates address with the internet mail address and the personal name.
+     * The personal name can be omitted.
+     *
+     * @param $address    string address part
+     * @param $name       string name part
+     * @param $rawaddress string raw address string
+     *
+     * @access public
+     */
+    function __construct($address, $name = null, $rawaddress = null)
+    {
+        $this->address = trim($address);
+        $this->name = is_null($name) ? null : trim($name);
+        $this->raw_address = is_null($rawaddress) ? null : trim($rawaddress);
+    }
+
+    /**
+     * Formats address for the address headers.
+     * Note that it won't be mime-header-encoded.
+     *
+     * @param string $locale
+     * @param string $force_encoding
+     *
+     * @return string
+     * @access public
+     */
+    function format($locale = null, $force_encoding = null)
+    {
+        $address = preg_replace(['/</', '/>/', '/\\\\/'],
+            ['\\<', '\\>', '\\\\'],
+            $this->address);
+
+        if (is_null($this->name)) {
+            return $address;
+        }
+        $name = preg_replace(['/\\\\/', '/"/'],
+            ['\\\\\\\\', '\\"'],
+            $this->name);
+
+        if (preg_match("/[,<>\\(\\)\\[\\]:;@\\\\.]/", $name)) {
+            $name = '"' . $name . '"';
+        }
+
+        if ( ! is_null($locale)) {
+            $_encoding = null;
+            $_transfer_encoding = null;
+            if ( ! is_null($force_encoding)) {
+                $_encoding = $force_encoding;
+            } else {
+                $_encoding = cb_mail_get_charset($locale);
+                if (cb_test_charset_validity($name, $_encoding) === false) {
+                    $_encoding = mb_internal_encoding();
+                }
+            }
+            switch (cb_mail_get_encoding($locale)) {
+                case CB_MAIL_ENC_Q:
+                    $_transfer_encoding = 'Q';
+                    break;
+
+                case CB_MAIL_ENC_B:
+                default:
+                    $_transfer_encoding = 'B';
+                    break;
+            }
+            $name = cb_mail_encode_mimeheader($name, $_encoding,
+                $_transfer_encoding);
+        }
+
+        return "$name <$address>";
+    }
+
+    /**
+     * Formats single CB_MailAddress or its array.
+     *
+     * @param CB_MailAddress|CB_MailAddress[] $address
+     * @param string                          $locale
+     * @param string                          $force_encoding
+     *
+     * @return string
+     * @access public
+     */
+    static public function static_format(
+        $address,
+        $locale = null,
+        $force_encoding = null
+    ) {
+        if (is_null($address)) {
+            return null;
+        }
+        if (is_array($address)) {
+            $result = [];
+            /** @var CB_MailAddress $a */
+            foreach ($address as $a) {
+                assert('$a instanceof CB_MailAddress');
+                $result[] = $a->format($locale, $force_encoding);
+            }
+
+            return implode(', ', $result);
+        } else {
+            assert('$address instanceof CB_MailAddress');
+
+            return $address->format($locale, $force_encoding);
+        }
+    }
+
+    /**
+     * Parses single address and returns a CB_MailAddress object.
+     *
+     * @param string $rawaddress
+     * @param string $force_encoding
+     *
+     * @return CB_MailAddress
+     * @access public
+     */
+    static public function static_parse($rawaddress, $force_encoding = null)
+    {
+        assert('!is_null($rawaddress)');
+        $rawaddress = cb_mail_decode_mimeheader($rawaddress, $force_encoding);
+
+        $address_obj = CB_MailAddress::_static_parse($rawaddress);
+
+        return $address_obj;
+    }
+
+    /**
+     * Parses comma-separated address list string or its array.
+     *
+     * @param string|string[] $rawaddressLists
+     * @param string          $force_encoding
+     * @param bool            $mime_decode
+     * @param bool            $display_escape
+     * @param bool            $display_colon
+     *
+     * @return CB_MailAddress[]
+     * @access public
+     */
+    static public function &static_parse_list(
+        $rawaddressLists,
+        $force_encoding = null,
+        $mime_decode = true,
+        $display_escape = false,
+        $display_colon = false
+    ) {
+        if ( ! is_array($rawaddressLists)) {
+            $rawaddressLists = [$rawaddressLists];
+        }
+        $result = [];
+        foreach ($rawaddressLists as $rawaddressList) {
+            if (strlen(trim($rawaddressList)) > 0) {
+                if ($mime_decode) {
+                    $rawaddressList = cb_mail_decode_mimeheader($rawaddressList,
+                        $force_encoding);
+                }
+                $rawaddressList = trim($rawaddressList);
+            }
+            while (strlen(trim($rawaddressList)) > 0) {
+                $rawaddressList = trim($rawaddressList);
+                $address_obj = CB_MailAddress::_static_parse($rawaddressList,
+                    $display_escape, $display_colon);
+                if (strlen($address_obj->address) > 0) {
+                    $result[] = $address_obj;
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Parses comma-separated address list for next comma or end of line.
+     *
+     * @param string $rawaddress comma-separated address list to be chopped first address.
+     * @param bool   $display_escape
+     * @param bool   $display_colon
+     *
+     * @return CB_MailAddress
+     * @access private
+     */
+    static private function _static_parse(
+        &$rawaddress,
+        $display_escape = false,
+        $display_colon = false
+    ) {
+        $raw = '';
+        $name = null;
+        $address = '';
+        $comment = null;
+
+        $addr_s = 0;
+        $quot_s = 0;
+        $comment_s = 0;
+        for ($i = 0; $i < strlen($rawaddress); $i++) {
+            $c = substr($rawaddress, $i, 1);
+            switch ($quot_s) {
+                case 0:
+                    if ($c == '\\') {
+                        $quot_s = 1;
+                        if ($display_escape) {
+                            $raw .= $c;
+                            $address .= $c;
+                        }
+                        continue 2;
+                    }
+                    break;
+
+                case 1:
+                    $quot_s = 0;
+                    $raw .= $c;
+                    $address .= $c;
+                    continue 2;
+            }
+
+            if ($addr_s != 1) {
+                switch ($comment_s) {
+                    case 0:
+                        if ($c == '(') {
+                            $comment_s = 1;
+                            $comment = '';
+                            continue 2;
+                        }
+                        break;
+
+                    case 1:
+                        if ($c == ')') {
+                            $comment_s = 0;
+                        } elseif ($c == '<') {
+                            $comment_s = 0;
+                            $raw .= $c;
+                            $name = $address . '(' . $comment;
+                            $comment = '';
+                            $address = '';
+                            $addr_s = 2;
+                        } else {
+                            $comment .= $c;
+                        }
+                        continue 2;
+                }
+            }
+
+            switch ($addr_s) {
+                case 0:
+                    if ($c == '"') {
+                        $raw .= $c;
+                        $addr_s = 1;
+                    } elseif ($c == ':' && ( ! $display_colon)) {
+                        $raw = '';
+                        $address = '';
+                    } elseif ($c == ',' || $c == ';') {
+                        break 2;
+                    } elseif ($c == '<') {
+                        $raw .= $c;
+                        $name = $address;
+                        $address = '';
+                        $addr_s = 2;
+                    } else {
+                        $raw .= $c;
+                        $address .= $c;
+                    }
+                    break;
+
+                case 1:
+                    if ($c == '"') {
+                        $raw .= $c;
+                        $addr_s = 0;
+                    } else {
+                        $raw .= $c;
+                        $address .= $c;
+                    }
+                    break;
+
+                case 2:
+                    if ($c == '>') {
+                        $addr_s = 3;
+                    } else {
+                        $raw .= $c;
+                        $address .= $c;
+                    }
+                    break;
+
+                case 3:
+                    if ($c == ',' || $c == ';') {
+                        break 2;
+                    }
+                    break;
+            }
+        }
+        $raw = substr($rawaddress, 0, $i);
+        $rawaddress = substr($rawaddress, $i + 1);
+
+        $address_obj = new CB_MailAddress(trim($address),
+            is_null($name) ? (is_null($comment) ? null : trim($comment))
+                : trim($name), $raw);
+
+        return $address_obj;
+    }
+}
+
+/**
+ * Represent a mail header.
+ *
+ * @package fw.mail
+ */
+class CB_MailHeader
+{
+    /**
+     * Header name.
+     */
+    var $name;
+
+    /**
+     * Header value (has been decoded).
+     */
+    var $value;
+
+    /**
+     * @param string $name
+     * @param string $value
+     */
+    function __construct($name, $value)
+    {
+        $this->name = $name;
+        $this->value = $value;
+    }
+
+    /**
+     * Generates a header of mail source data then return it.
+     *
+     * @param string $locale
+     * @param string $preferred_encoding
+     * @param string $force_encoding
+     *
+     * @return string  $locale
+     */
+    function formatHeader(
+        $locale,
+        $preferred_encoding = CB_MAIL_ENC_B,
+        $force_encoding = null
+    ) {
+        $value = $this->value;
+
+        $_encoding = null;
+        $_transfer_encoding = null;
+        if ( ! is_null($force_encoding)) {
+            $_encoding = $force_encoding;
+        } else {
+            $_encoding = cb_mail_get_charset($locale);
+            if (cb_test_charset_validity($value, $_encoding) === false) {
+                $_encoding = mb_internal_encoding();
+            }
+        }
+        switch (cb_mail_get_encoding($locale)) {
+            case CB_MAIL_ENC_Q:
+                $_transfer_encoding = 'Q';
+                break;
+
+            case CB_MAIL_ENC_B:
+            default:
+                $_transfer_encoding = 'B';
+                break;
+        }
+        if (strcasecmp($this->name, 'From') == 0
+            || strcasecmp($this->name, 'Sender') == 0
+            || strcasecmp($this->name, 'To') == 0
+            || strcasecmp($this->name, 'Cc') == 0
+            || strcasecmp($this->name, 'Reply-To') == 0
+            || strcasecmp($this->name, 'Disposition-Notification-To') == 0
+        ) {
+            $value = CB_MailAddress::static_parse_list($value);
+            $value = CB_MailAddress::static_format($value, $locale, $_encoding);
+        } else {
+            $value = cb_mail_encode_mimeheader($value, $_encoding,
+                $_transfer_encoding);
+        }
+        $value = cb_mail_limit_line($value);
+
+        // must change
+        return $this->name . ': ' . $value;
+    }
+}
+
+/**
+ * Interface for all mail parts.
+ *
+ * @abstract
+ * @package fw.mail
+ */
+class CB_MailPart
+{
+    /**
+     * @access private
+     * @var CB_MailPart|CB_MailSinglePart|CB_MailMultiPart
+     */
+    var $_parent;
+
+    function __construct()
+    {
+    }
+
+    /**
+     * @access protected
+     */
+    function _getMessage()
+    {
+        $message = $this->_parent->_getMessage();
+
+        return $message;
+    }
+
+    /**
+     * Generate mail body data.
+     *
+     * @param string $locale             Locale code.
+     * @param string $preferred_encoding Preferred encoding (like Base64).
+     * @param string $force_encoding
+     *
+     * @return string                      Mail body data.
+     */
+    function formatBody(
+        $locale,
+        $preferred_encoding = CB_MAIL_ENC_B,
+        $force_encoding = null
+    ) {
+    }
+
+    /**
+     * Generate mail header data.
+     *
+     * @param string $locale             Locale code.
+     * @param string $preferred_encoding Preferred encoding (like Base64).
+     * @param string $force_encoding
+     *
+     * @return string                      Mail header data.
+     */
+    function formatHeader(
+        $locale,
+        $preferred_encoding = CB_MAIL_ENC_B,
+        $force_encoding = null
+    ) {
+    }
+}
+
+/**
+ * Interface for a mail message
+ *
+ * @package fw.mail
+ */
+class CB_MailMessage extends CB_MailPart
+{
+    /**
+     * A CB_MailPart that represents the entire mail body.
+     * This may or may not be the same as $this->_main_part .
+     *
+     * @access private
+     * @var CB_MailPart|CB_MailMultiPart|CB_MailSinglePart
+     */
+    var $_body = null;
+
+    /**
+     * @access private
+     * @var CB_MailHeader[][]
+     */
+    var $_name_to_headers;
+
+    /**
+     * @access private
+     */
+    var $_source_data = null;
+
+    /**
+     * @access private
+     */
+    var $_force_encoding = null;
+
+    /**
+     */
+    function __construct()
+    {
+    }
+
+    /**
+     * @access private
+     * @return \CB_MailMessage
+     */
+    function _getMessage()
+    {
+        return $this;
+    }
+
+    /**
+     * @param CB_MailPart $body
+     *
+     * @access private
+     */
+    function _setBody($body)
+    {
+        $body->_parent = $this;
+        $this->_body = $body;
+    }
+
+    /**
+     * @access public
+     */
+    public function unsetMailContents()
+    {
+        unset($this->_source_data);
+        unset($this->_body);
+    }
+
+    /**
+     * Sets encoding name to force to decode part of mail data.
+     * Set null to turn default charset detection mechanism.
+     *
+     * @param string $force_encoding the encoding name or null.
+     *
+     * @access public
+     */
+    function setForceEncoding($force_encoding)
+    {
+        $this->_force_encoding = $force_encoding;
+    }
+
+    /**
+     * Adds a mail part object.
+     *
+     * @param CB_MailPart $part
+     */
+    function addMailPart(CB_MailPart $part)
+    {
+        // if mainpart isn't a multi part, create multi part.
+        if ( ! is_a($this->_body, 'CB_MailMultiPart')) {
+            if (is_null($this->getHeader('mime-version'))) {
+                $mime_header = new CB_MailHeader('mime-version', '1.0');
+                $this->setHeader($mime_header);
+            }
+
+            // create multipart
+            $multi_part = new CB_MailMultiPart();
+
+            // if _body has content, CB_MailMessage has to keep it.
+            if ( ! is_null($this->_body->getContent())) {
+                $multi_part->addMailPart($this->_body);
+            }
+
+            $this->_setBody($multi_part);
+        }
+
+        $this->_body->addMailPart($part);
+    }
+
+    /**
+     * Sets, adds, or replaces a header object.
+     *
+     * @param CB_MailHeader $header
+     * @param bool          $replace TRUE to replace the header
+     *                               of the same name; FALSE to allow multiple
+     *                               headers of the same name.
+     */
+    function setHeader($header, $replace = true)
+    {
+        assert('is_a($header, "CB_MailHeader")');
+
+        $name = strtolower($header->name);
+        if ($replace) {
+            $this->_name_to_headers[$name] = [$header];
+        } else {
+            $this->_name_to_headers[$name][] = $header;
+        }
+    }
+
+    /**
+     * Checks message/partial or not
+     *
+     * @return bool
+     */
+    function isPartial()
+    {
+        return (is_a($this->_body, 'CB_MailSinglePart')
+                && strcasecmp($this->_body->getContentType(), 'message/partial')
+                   == 0);
+    }
+
+    /**
+     * Checks massage/report; report-type="disposition-notification" or not
+     *
+     * @return bool
+     */
+    function isDispositionNotification()
+    {
+        $value = $this->getHeaderValue('Content-Type');
+
+        return preg_match('/multipart\/report/', $value)
+               && preg_match('/report-type/', $value)
+               && preg_match('/disposition-notification/', $value);
+    }
+
+    /**
+     * Sets Mail source
+     *
+     * @param string $source_data
+     *
+     * @return string   the raw source data.
+     */
+    function setSourceData($source_data)
+    {
+        $this->_source_data = $source_data;
+    }
+
+    /**
+     * Gets mail source data.
+     *
+     * @param string $locale
+     * @param string $preferred_encoding
+     * @param bool   $with_bcc
+     *
+     * @return string   the raw source data.
+     */
+    function &getSourceData(
+        $locale = null,
+        $preferred_encoding = CB_MAIL_ENC_B,
+        $with_bcc = false
+    ) {
+        if (is_null($this->_source_data)) {
+            $ret = $this->formatHeader($locale,
+                    $preferred_encoding,
+                    $this->_force_encoding, $with_bcc) .
+                   CB_MAIL_CRLF .
+                   $this->formatBody($locale,
+                       $preferred_encoding,
+                       $this->_force_encoding);
+
+            return $ret;
+        }
+
+        return $this->_source_data;
+    }
+
+    /**
+     * Returns the main part of this mail.
+     * Main part is the first single part or multipart/alternative.
+     *
+     * @return CB_MailPart
+     */
+    function getMainPart()
+    {
+        if ( ! isset($this->_body) || $this->_body instanceof stdClass) {
+            $this->_setBody(new CB_MailSinglePart());
+        }
+
+        $part = $this->_getMainPart($this->_body);
+
+        return $part;
+    }
+
+    /**
+     * @param CB_MailMultiPart|CB_MailSinglePart $part
+     *
+     * @return bool
+     */
+    function _getMainPart($part)
+    {
+        $main_content_types = ['text', 'text/plain', 'text/html'];
+        if ((is_a($part, 'CB_MailSinglePart')
+             && in_array($part->getContentType(), $main_content_types)
+             && strcasecmp($part->getDisposition(), 'attachment') !== 0)
+            || strcmp($part->_content_type, 'multipart/alternative') == 0
+        ) {
+            return $part;
+        } elseif ($part instanceof CB_MailMultiPart) {
+            $parts = $part->getMailParts();
+            $count = count($parts);
+            for ($i = 0; $i < $count; ++$i) {
+                if (($result = $this->_getMainPart($parts[$i])) !== false) {
+                    return $result;
+                }
+            }
+        }
+        $ret = false;
+
+        return $ret;
+    }
+
+    /**
+     * Returns all attachment, inline and non-text parts.
+     *
+     * @param bool $decode_tnef
+     *
+     * @return CB_MailSinglePart[]
+     */
+    function &getAttachedParts($decode_tnef)
+    {
+        $result = [];
+        if ( ! $this->isPartial()) {
+            $main_part = $this->getMainPart();
+            if ($main_part) {
+                $dummy_body = $dummy_html_body = null;
+                GRN_Mail_Message::static_getPartContent($main_part, $dummy_body,
+                    $dummy_html_body);
+            }
+
+            $this->_getAttachedParts($result, $this->_body, $decode_tnef);
+        }
+
+        return $result;
+    }
+
+    /**
+     * @access private
+     *
+     * @param CB_MailSinglePart[]           $result
+     * @param CB_MailSinglePart|CB_MailPart $part
+     * @param bool                          $decode_tnef
+     */
+    function _getAttachedParts(&$result, $part, $decode_tnef)
+    {
+        if (is_a($part, 'CB_MailSinglePart')) {
+            if ($decode_tnef
+                && $part->_content_type === 'application/ms-tnef'
+            ) {
+                $attachment_parts = $part->getTnefAttachmentParts();
+                if ($attachment_parts !== false) {
+                    foreach ($attachment_parts as $attachment_part) {
+                        $result[] = $attachment_part;
+                    }
+                } else {
+                    $result[] = $part;
+                }
+            } else {
+                //add uu/xx encode parts.
+                if ( ! is_null($part->_embedded_parts)) {
+                    for ($i = 0; $i < count($part->_embedded_parts); ++$i) {
+                        $result[] = $part->_embedded_parts[$i];
+                    }
+                }
+                if ($part->_isAttachedPart()) {
+                    if ( ! is_null($part->getDisposition())) {
+                        $result[] = $part;
+                    }
+                }
+            }
+        } else {
+            $parts = $part->getMailParts();
+            $count = count($parts);
+            for ($i = 0; $i < $count; ++$i) {
+                $this->_getAttachedParts($result, $parts[$i], $decode_tnef);
+            }
+        }
+    }
+
+    /**
+     * Returns all the header objects.
+     *
+     * Must implement that get only header data from mail server.
+     *
+     * @return CB_MailHeader[]|false
+     */
+    function getAllRawHeaders()
+    {
+        return false;
+    }
+
+    /**
+     * Returns all headers of the specified name.
+     *
+     * @param  string $name
+     *
+     * @return CB_MailHeader[]
+     */
+    function getHeaders($name)
+    {
+        $name = strtolower($name);
+
+        return array_key_exists($name, $this->_name_to_headers) ?
+            $this->_name_to_headers[$name] : [];
+    }
+
+    /**
+     * Returns all the header objects.
+     *
+     * @return CB_MailHeader[][]
+     */
+    function getAllHeaders()
+    {
+        $result = [];
+
+        foreach ($this->_name_to_headers as $headers) {
+            foreach ($headers as $header) {
+                $result[] = $header;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Returns all values of the headers that specified by the name.
+     *
+     * @param string $name
+     *
+     * @return array
+     */
+    function getHeaderValues($name)
+    {
+        $name = strtolower($name);
+        if ( ! array_key_exists($name, $this->_name_to_headers)) {
+            return [];
+        }
+
+        $result = [];
+        foreach ($this->_name_to_headers[$name] as $header) {
+            $result[] = $header->value;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Returns first value of the headers that specified by the name.
+     *
+     * @param string $name
+     *
+     * @return string|null NULL if named header does not exist;
+     *                     otherwise the header string.
+     */
+    function getHeaderValue($name)
+    {
+        $name = strtolower($name);
+        if ( ! array_key_exists($name, $this->_name_to_headers)) {
+            return null;
+        }
+
+        $header = $this->_name_to_headers[$name][0];
+
+        return $header->value;
+    }
+
+    /**
+     * Returns the first header that specified by the name.
+     *
+     * @param string $name
+     *
+     * @return CB_MailHeader|null NULL if named header does not exist;
+     *                            otherwise CB_MailHeader object.
+     */
+    function getHeader($name)
+    {
+        $name = strtolower($name);
+        if ( ! array_key_exists($name, $this->_name_to_headers)) {
+            return null;
+        }
+
+        return $this->_name_to_headers[$name][0];
+    }
+
+    /**
+     * Returns From header value.
+     *
+     * @return CB_MailAddress|null
+     */
+    function getFrom()
+    {
+        if ( ! array_key_exists('from', $this->_name_to_headers)) {
+            return null;
+        }
+
+        return CB_MailAddress::static_parse_list($this->getHeaderValues('from'));
+    }
+
+    /**
+     * Returns Sender header values.
+     *
+     * @return CB_MailAddress|null
+     */
+    function getSender()
+    {
+        if ( ! array_key_exists('sender', $this->_name_to_headers)) {
+            return null;
+        }
+
+        return CB_MailAddress::static_parse($this->getHeaderValue('sender'));
+    }
+
+    /**
+     * Returns Reply-To header values.
+     *
+     * @return CB_MailAddress[]|null
+     */
+    function getReplyTo()
+    {
+        if ( ! array_key_exists('reply-to', $this->_name_to_headers)) {
+            return null;
+        }
+
+        return CB_MailAddress::static_parse_list($this->getHeaderValues('reply-to'));
+    }
+
+    /**
+     * Returns To header values.
+     *
+     * @return CB_MailAddress[]|null
+     */
+    function getTo()
+    {
+        if ( ! array_key_exists('to', $this->_name_to_headers)) {
+            return null;
+        }
+
+        return CB_MailAddress::static_parse_list($this->getHeaderValues('to'));
+    }
+
+    /**
+     * Returns Cc header values.
+     *
+     * @return CB_MailAddress[]|null
+     */
+    function getCc()
+    {
+        if ( ! array_key_exists('cc', $this->_name_to_headers)) {
+            return null;
+        }
+
+        return CB_MailAddress::static_parse_list($this->getHeaderValues('cc'));
+    }
+
+    /**
+     * Returns Bcc header values.
+     *
+     * @return CB_MailAddress[]|null
+     */
+    function getBcc()
+    {
+        if ( ! array_key_exists('bcc', $this->_name_to_headers)) {
+            return null;
+        }
+
+        return CB_MailAddress::static_parse_list($this->getHeaderValues('bcc'));
+    }
+
+    /**
+     * Returns Date header value.
+     *
+     * @return string|null
+     */
+    function &getDate()
+    {
+        $ret = $this->getHeaderValue('date');
+
+        return $ret;
+    }
+
+    /**
+     * Returns Subject header value.
+     *
+     * @return string|null
+     */
+    function getSubject()
+    {
+        return $this->getHeaderValue('subject');
+    }
+
+    /**
+     * Generates mail body data.
+     *
+     * @param string $locale             Locale code.
+     * @param string $preferred_encoding Preferred encoding (like Base64).
+     * @param string $force_encoding
+     *
+     * @return string                      Mail body data.
+     */
+    function formatBody(
+        $locale,
+        $preferred_encoding = CB_MAIL_ENC_B,
+        $force_encoding = null
+    ) {
+        $data = $this->_body->formatBody($locale, $preferred_encoding,
+            $force_encoding);
+        if (substr($data, strlen($data) - 1) != "\n") {
+            $data .= CB_MAIL_CRLF;
+        }
+
+        return $data;
+    }
+
+    /**
+     * Generates mail header data.
+     *
+     * @param string $locale             Locale code.
+     * @param string $preferred_encoding Preferred encoding (like Base64).
+     * @param string $force_encoding
+     * @param bool   $with_bcc
+     *
+     * @return string                      Mail header data.
+     */
+    function formatHeader(
+        $locale,
+        $preferred_encoding = CB_MAIL_ENC_B,
+        $force_encoding = null,
+        $with_bcc = false
+    ) {
+        $retval = '';
+        $denied_headers = ['content-type', 'content-disposition'];
+        if ($with_bcc === false) {
+            $denied_headers[] = 'bcc';
+        }
+        foreach ($this->_name_to_headers as $name => $headers) {
+            if (in_array($name, $denied_headers) === false) {
+                foreach ($headers as $header) {
+                    // CB_MailSinglePart::formatHeader() creates
+                    // 'content-type' header from 'CB_MailSinglePart::_content' property.
+                    // 'content-disiposition' is the same as 'content-type' too.
+                    // setText(),setHtml() etc. set '_content' property.
+                    // content-type and boundary are formatted by CB_MailMultiPart.
+                    // so, it doesn't need to format content-type header here.
+                    $retval .= $header->formatHeader($locale,
+                            $preferred_encoding, $force_encoding)
+                               . CB_MAIL_CRLF;
+                }
+            }
+        }
+
+        $retval .= $this->_body->formatHeader($locale, $preferred_encoding,
+            $force_encoding);
+
+        return $retval;
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $name
+     *
+     * @return string[]
+     */
+    function &_getAddressList($name)
+    {
+        $result = [];
+        $headers = $this->getHeaders($name);
+        foreach ($headers as $header) {
+            $addresses = explode(',', $header->value);
+            foreach ($addresses as $address) {
+                $result[] = trim($address);
+            }
+        }
+
+        return $result;
+    }
+}
+
+/**
+ * Represent a single part of a mail body.
+ *
+ * @package fw.mail
+ */
+class CB_MailSinglePart extends CB_MailPart
+{
+    /**
+     * @access private
+     */
+    var $_content_type = null;
+    /**
+     * @access private
+     */
+    var $_charset = null;
+    /**
+     * @access private
+     * @var string|CB_MailMessage
+     */
+    var $_content = null;
+    /**
+     * @access private
+     */
+    var $_disposition = null;
+    /**
+     * @access private
+     */
+    var $_filename = null;
+
+    /**
+     * for embedded uuencode parts.
+     *
+     * @access private
+     */
+    var $_embedded_parts = null;
+
+    /**
+     * for message/partial
+     *
+     * @access private
+     */
+    var $_partial_params = [];
+
+    /**
+     * for message/disposition-notification
+     *
+     */
+    var $_notification = [];
+
+    /**
+     * @access   private
+     */
+    var $_is_body = null;
+
+    /**
+     * The value of Content-ID header
+     *
+     * @var string|null
+     */
+    private $_content_id = null;
+
+    function __construct()
+    {
+        parent::__construct();
+    }
+
+    /**
+     * Get parts count its parts.
+     *
+     * @return CB_MailPart[]
+     */
+    function getMailParts()
+    {
+        return [];
+    }
+
+    /**
+     * Return mime type of the content.
+     *
+     * @return string
+     */
+    function getContentType()
+    {
+        return $this->_content_type;
+    }
+
+    /**
+     * Return Charset.
+     *
+     * @return string
+     */
+    function getCharset()
+    {
+        return $this->_charset;
+    }
+
+    /**
+     * Return disposition-notification.
+     *
+     * @return array
+     */
+    function getDispositionNotification()
+    {
+        return $this->_notification;
+    }
+
+    /**
+     * Return body content.
+     *
+     * @return string
+     */
+    function getContent()
+    {
+        if ($this->_isInlinePart()
+            && strncasecmp($this->getContentType(), 'text/', 5) === 0
+        ) {
+            // Convert main text to the internal encoding.
+            $message = $this->_getMessage();
+            if (is_null($message->_force_encoding)) {
+                $charset = $this->_charset;
+                if (mb_is_support_encoding($charset) === false) {
+                    require_once('fw/i18n.csp');
+                    $i18n = CB_I18N::getInstance();
+                    $encoder = $i18n->getEncoder($charset);
+
+                    if ($encoder === false) {
+                        $charset = null;
+                    }
+                }
+            } else {
+                if ($message->_force_encoding == 'auto') {
+                    $charset = null;
+                } else {
+                    $charset = $message->_force_encoding;
+                }
+            }
+
+            // Fix for http://issues.dev.cybozu.co.jp/browse/GRN31-447
+            // mb_convert_encoding not support ms932 charset
+            if ( ! is_null($charset) && strtolower($charset) === 'ms932') {
+                $charset = null;
+            }
+
+            if (is_null($charset)) {
+                global $G_config_common;
+                $ret = $G_config_common->get('Mail',
+                    'mail_encoding_order');
+                $encoding_order = explode(' ', $ret);
+
+                if (is_null($encoding_order)) {
+                    $encoding_order = 'auto';
+                }
+
+                $charset = mb_detect_encoding($this->_content, $encoding_order);
+            }
+            $internal = mb_internal_encoding();
+
+            return cb_encode($this->_content, $internal, $charset);
+        }
+
+        return $this->_content;
+    }
+
+    /**
+     * Return filename, or NULL if not set.
+     *
+     * @return string
+     */
+    function getFilename()
+    {
+        $message = $this->_getMessage();
+        $filename = cb_mail_decode_mimeheader($this->_filename,
+            $message->_force_encoding);
+        if ( ! is_null($filename)) {
+            $filename = str_replace("\t", '', $filename);
+        }
+
+        return $filename;
+    }
+
+    /**
+     * Return content disposition, or NULL if not set.
+     *
+     * @return string
+     */
+    function getDisposition()
+    {
+        $message = $this->_getMessage();
+
+        return cb_mail_decode_mimeheader($this->_disposition,
+            $message->_force_encoding);
+    }
+
+    /**
+     * Return PartialParameters
+     *
+     * @return array content-id, total, number
+     */
+    function getPartialParams()
+    {
+        return $this->_partial_params;
+    }
+
+    /**
+     * @param $is_body
+     */
+    function setIsBody($is_body)
+    {
+        $this->_is_body = $is_body;
+    }
+
+    function getIsBody()
+    {
+        return $this->_is_body;
+    }
+
+    /**
+     * @param string|null $id
+     */
+    public function setContentId($id)
+    {
+        $this->_content_id = $id;
+    }
+
+    /**
+     * @return string|null
+     */
+    public function getContentId()
+    {
+        return $this->_content_id;
+    }
+
+    /**
+     * set plain text to the body
+     *
+     * @param string $text
+     */
+    function setPlainText($text)
+    {
+        assert('is_string($text)');
+        $this->_content_type = 'text/plain';
+        $this->_content = $text;
+        $this->_filename = null;
+        $this->_disposition = null;
+    }
+
+    /**
+     * set html text to the body
+     *
+     * @param string $text
+     */
+    function setHtmlText($text)
+    {
+        assert('is_string($text)');
+        $this->_content_type = 'text/html';
+        $this->_content = $text;
+        $this->_filename = null;
+        $this->_disposition = null;
+    }
+
+    /**
+     * set notification content
+     *
+     * @param array $content
+     */
+    function setNotificationContent($content)
+    {
+        $this->_content_type = 'message/disposition-notification';
+        $this->_disposition = 'inline';
+        $this->_content = $this->_composeNotificationContent($content);
+    }
+
+    /**
+     * compose notification-disposition content
+     *
+     * @param  array $content
+     *
+     * @return string
+     * @access private
+     */
+    function _composeNotificationContent($content)
+    {
+        $mdn = null;
+        if (isset($content['final-recipient'])) {
+            $mdn .= 'Final-Recipient' . ': ' . 'rfc822;'
+                    . CB_MailAddress::static_format($content['final-recipient'])
+                    . CB_MAIL_CRLF;
+        }
+
+        if (isset($content['disposition'])) {
+            // disposition-mode
+            $action_mode = null;
+            if (isset($content['disposition']['action-mode'])) {
+                $action_mode = $content['disposition']['action-mode'];
+            } else {
+                $action_mode = 'manual-action';
+            }
+
+            $sending_mode = null;
+            if (isset($content['disposition']['sending-mode'])) {
+                $sending_mode = $content['disposition']['sending-mode'];
+            } else {
+                $sending_mode = 'MDN-sent-manually';
+            }
+            $disposition_mode = $action_mode . '/' . $sending_mode;
+
+            // disposition-type
+            $disposition_type = null;
+            if (isset($content['disposition']['disposition-type'])) {
+                $disposition_type = $content['disposition']['disposition-type'];
+            } else {
+                $disposition_type = 'displayed';
+            }
+
+            $mdn .= 'Disposition' . ': ' . $disposition_mode . '; '
+                    . $disposition_type . CB_MAIL_CRLF;
+        }
+
+        if (isset($content['option_field']['original-message-id'])) {
+            $mdn .= 'Original-Message-ID' . ': ' . '<'
+                    . $content['option_field']['original-message-id'] . '>'
+                    . CB_MAIL_CRLF;
+        }
+
+        return $mdn;
+    }
+
+    /**
+     * set file content to the body
+     *
+     * @param string $file_content
+     * @param string $filename
+     * @param string $c_type
+     * @param bool   $inline
+     */
+    function setFileContent(
+        $file_content,
+        $filename,
+        $c_type = 'application/octet-stream',
+        $inline = false
+    ) {
+        assert('strlen($filename) > 0');
+
+        $this->_content_type = $c_type;
+        $this->_content = $file_content;
+        // remove \/:*?"<>|
+        $this->_filename = preg_replace('[\\\\\\/:\\*\\?"<>\\|]', '',
+            $filename);
+        $this->_disposition = $inline ? 'inline' : 'attachment';
+    }
+
+    /**
+     * Enclosed mail.
+     *
+     * @param string $text
+     */
+    function setRFC822Text($text)
+    {
+        assert('is_string($text)');
+        $this->_content_type = 'message/rfc822';
+        $this->_content = $text;
+        $this->_source_encoding = null;
+    }
+
+    function setMessagePartial($body, $id, $total, $number)
+    {
+        $this->_source_encoding = CB_MAIL_ENC_7BIT;
+
+        $this->_content_type = 'message/partial';
+        $this->_content = $body;
+
+        $this->_partial_params['id'] = $id;
+        $this->_partial_params['total'] = $total;
+        $this->_partial_params['number'] = $number;
+    }
+
+    /**
+     * Enclosed mail.
+     *
+     * @param CB_MailMessage $message
+     */
+    function setRFC822Message($message)
+    {
+        assert('is_a($message, "CB_MailMessage")');
+        $this->_content_type = 'message/rfc822';
+        $this->_content = $message;
+        $this->_source_encoding = null;
+    }
+
+    /**
+     * @access private
+     */
+    var $_source_charset = null;
+    /**
+     * @access private
+     */
+    var $_source_encoding = null;
+    /**
+     * @access private
+     */
+    var $_source_body = null;
+
+    /**
+     *
+     * @access private
+     * @return boolean
+     */
+    function _isAttachedPart()
+    {
+        return (( ! $this->getIsBody() && strlen($this->getContent()) > 0)
+                || strncasecmp($this->getContentType(), 'text/', 5) != 0
+                ||
+                ! is_null($this->getDisposition())
+                ||
+                ! is_null($this->getFilename()));
+    }
+
+    /**
+     * @access private
+     * @return boolean
+     **/
+    function _isInlinePart()
+    {
+        return is_null($this->getDisposition())
+               || (strcasecmp($this->getDisposition(), 'inline') == 0);
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $locale
+     * @param string $preferred_encoding
+     * @param string $force_encoding
+     */
+    function _determineSourceEncoding(
+        $locale,
+        $preferred_encoding = CB_MAIL_ENC_B,
+        $force_encoding = null
+    ) {
+        if (strncasecmp('text/', $this->_content_type, 5) === 0) {
+            if ($this->_isInlinePart()) {
+
+                $_encoding = null;
+                if ( ! is_null($force_encoding)) {
+                    $_encoding = $force_encoding;
+                } else {
+                    $_encoding = cb_mail_get_charset($locale);
+                    if (cb_test_charset_validity($this->_content, $_encoding)
+                        === false
+                    ) {
+                        $_encoding = null;
+                    }
+                }
+                if ( ! is_null($_encoding)) {
+                    $this->_source_charset
+                        = cb_mail_preferred_mime_name($_encoding);
+                    $this->_source_encoding = cb_mail_get_encoding($locale,
+                        $this->_source_charset);
+                    $this->_source_body
+                        = cb_mail_convert_encoding($this->_content,
+                        $_encoding);
+                } else {
+                    $this->_source_charset
+                        = cb_mail_preferred_mime_name(mb_internal_encoding());
+                    $this->_source_encoding = cb_mail_get_encoding($locale,
+                        $this->_source_charset);
+                    $this->_source_body = $this->_content;
+                }
+            } else {
+                $this->_source_charset = null;
+                $this->_source_encoding = cb_mail_get_encoding($locale);
+                $this->_source_body = $this->_content;
+            }
+            $source_utf_encoding = detect_utf_bom_encoding($this->_source_body);
+            if ($source_utf_encoding == 'UTF-16BE'
+                || $source_utf_encoding == 'UTF-16LE'
+            ) {
+                return;
+            }
+            $this->_source_body = str_replace(
+                ["\r\n", "\n", "\r"],
+                ["\r", "\r", "\r\n"]
+                , $this->_source_body);
+
+            return;
+        }
+
+        if (is_a($this->_content, 'CB_MailMessage')) {
+            $this->_source_charset = null;
+            $this->_source_encoding = CB_MAIL_ENC_7BIT;
+            $this->_source_body = $this->_content->getSourceData($locale);
+
+            return;
+        }
+
+        if (strcasecmp('message/rfc822', $this->_content_type) === 0) {
+            $this->_source_charset = null;
+            $this->_source_encoding = CB_MAIL_ENC_7BIT;
+            $this->_source_body = $this->_content;
+
+            return;
+        }
+
+        if (strcasecmp('message/partial', $this->_content_type) === 0) {
+            $this->_source_charset = null;
+            $this->_source_encoding = CB_MAIL_ENC_7BIT;
+            $this->_source_body = $this->_content;
+
+            return;
+        }
+
+        // MDN
+        if (strcasecmp('message/disposition-notification', $this->_content_type)
+            === 0
+        ) {
+            $this->_source_charset = null;
+            $this->_source_encoding = CB_MAIL_ENC_7BIT;
+            $this->_source_body = $this->_content;
+
+            return;
+        }
+
+        // regard the content as binary
+        $this->_source_charset = null;
+        $this->_source_encoding = $preferred_encoding;
+        $this->_source_body = $this->_content;
+    }
+
+    /**
+     * Generate mail source data then return it.
+     *
+     * @param string $locale             Locale code.
+     * @param string $preferred_encoding Preferred encoding method.
+     * @param string $force_encoding
+     *
+     * @return string       Mail source data of the mail part.
+     */
+    function formatBody(
+        $locale,
+        $preferred_encoding = CB_MAIL_ENC_B,
+        $force_encoding = null
+    ) {
+        $this->_determineSourceEncoding($locale, $preferred_encoding,
+            $force_encoding);
+        switch ($this->_source_encoding) {
+            case CB_MAIL_ENC_B:
+                return chunk_split(base64_encode($this->_source_body));
+
+            case CB_MAIL_ENC_Q:
+                return quoted_printable_encode($this->_source_body);
+
+            case CB_MAIL_ENC_UUENCODE:
+                return 'begin 755 foo' . CB_MAIL_CRLF .
+                       convert_uuencode($this->_source_body) .
+                       'end' . CB_MAIL_CRLF;
+
+            case CB_MAIL_ENC_8BIT:
+            case CB_MAIL_ENC_7BIT:
+            default:
+                return $this->_source_body;
+        }
+    }
+
+    /**
+     * Generate mail header data.
+     *
+     * @param string $locale             Locale code.
+     * @param string $preferred_encoding Preferred encoding (like Base64).
+     * @param string $force_encoding
+     *
+     * @return string                      Mail header data.
+     */
+    function formatHeader(
+        $locale,
+        $preferred_encoding = CB_MAIL_ENC_B,
+        $force_encoding = null
+    ) {
+        $this->_determineSourceEncoding($locale, $preferred_encoding,
+            $force_encoding);
+        $header = 'Content-Type: ' . $this->_content_type;
+
+        if (strcasecmp('message/partial', $this->_content_type) === 0) {
+            $header .= '; total=' . $this->_partial_params['total'] .
+                       '; id="' . $this->_partial_params['id'] .
+                       '"; number=' . $this->_partial_params['number'];
+        }
+
+        if ( ! is_null($this->_source_charset)) {
+            $header .= '; charset=' . $this->_source_charset;
+        }
+
+        // attach file
+        if (is_null($this->_filename)) {
+            $filename = null;
+            $header .= CB_MAIL_CRLF;
+        } else {
+            // TODO: does not follow RFC2231 for compatibility.
+            $filename = cb_basename($this->_filename);
+            $_encoding = null;
+            if ( ! is_null($force_encoding)) {
+                $_encoding = $force_encoding;
+            } else {
+                $_encoding = cb_mail_get_charset($locale);
+                if (cb_test_charset_validity($filename, $_encoding) === false) {
+                    $_encoding = mb_internal_encoding();
+                }
+            }
+
+            $filename = cb_mail_encode_mimeheader($filename, $_encoding);
+            $header .= '; name="' . $filename . '"' . CB_MAIL_CRLF;
+        }
+
+        if ( ! is_null($this->_disposition)) {
+            $header .= 'Content-Disposition' . ': ' . $this->_disposition;
+            if (is_null($this->_filename)) {
+                $header .= CB_MAIL_CRLF;
+            } else {
+                $header .= '; filename="' . $filename . '"' . CB_MAIL_CRLF;
+            }
+        }
+
+        if ( ! is_null($this->_source_encoding)) {
+            $header .= 'Content-Transfer-Encoding' . ': '
+                       . $this->_source_encoding . CB_MAIL_CRLF;
+        }
+
+        return $header;
+    }
+
+    /** @var \grn\mail\tnef\Tnef|null */
+    private $_tnef = null;
+    /** @var \grn\mail\tnef\TnefFormatException|null */
+    private $_tnef_exception = null;
+
+    /**
+     * @return CB_MailSinglePart[]|false FALSE if decoding is failed.
+     */
+    public function getTnefAttachmentParts()
+    {
+        if ( ! is_null($this->_tnef_exception)) {
+            return false;
+        }
+
+        if (is_null($this->_tnef)) {
+            try {
+                $decoder = new \grn\mail\tnef\Decoder($this->_content);
+                $this->_tnef = $decoder->decode();
+            } catch (\grn\mail\tnef\TnefFormatException $e) {
+                $this->_tnef_exception = $e;
+
+                return false;
+            }
+        }
+
+        $parts = [];
+        foreach ($this->_tnef->getAttachments() as $attachment) {
+            if ($attachment->getAttachMethod()
+                !== \grn\mail\tnef\AttachMethod::ATTACH_BY_VALUE
+            ) {
+                continue;
+            }
+
+            $part = new CB_MailSinglePart();
+            $parts[] = $part;
+            $part->_parent = $this;
+            $part->_filename = $attachment->getFilename();
+            $part->_content = $attachment->getData();
+            $part->_content_type = 'application/octet-stream';
+            $files[] = $part;
+        }
+
+        return $parts;
+    }
+}
+
+/**
+ * Represent multi-part mail object.
+ *
+ * @package fw.mail
+ */
+class CB_MailMultiPart extends CB_MailPart
+{
+    var $_content_type = 'multipart/mixed';
+
+    /**
+     * @access private
+     * @var CB_MailPart[]
+     */
+    var $_parts = [];
+
+    /**
+     * @param CB_MailPart $part
+     */
+    function addMailPart($part)
+    {
+        assert('is_a($part, "CB_MailPart")');
+        $part->_parent = $this;
+        $this->_parts[] = $part;
+    }
+
+    /**
+     * Get parts count its parts.
+     *
+     * @return int
+     */
+    function countMailParts()
+    {
+        return count($this->_parts);
+    }
+
+    /**
+     * Get parts count its parts.
+     *
+     * @return array     Array of {@link CB_MailPart}.
+     */
+    function &getMailParts()
+    {
+        return $this->_parts;
+    }
+
+    /**
+     * @access private
+     */
+    var $_boundary;
+    private static $count = 0;
+
+    /**
+     * Constructor.
+     */
+    function __construct()
+    {
+        parent::__construct();
+
+        // create boundary
+        global $G_config_common;
+        $app_name = $G_config_common->get('Global', 'app_name');
+        $tt = str_replace('.', '_', str_replace(' ', '_', microtime()));
+        $boundary = '=_cb_' . $app_name . '_' . $tt . '_'
+                    . CB_MailMultiPart::$count++ . '_' . getmypid();
+
+        $this->_boundary = $boundary;
+    }
+
+    /**
+     * Generate mail source data then return it.
+     *
+     * @param string $locale             Locale code.
+     * @param string $preferred_encoding Preferred encoding method.
+     * @param string $force_encoding
+     *
+     * @return string       Mail source data of the mail part.
+     */
+    function formatBody(
+        $locale,
+        $preferred_encoding = CB_MAIL_ENC_B,
+        $force_encoding = null
+    ) {
+        $body = '';
+        foreach ($this->_parts as $part) {
+            $body .= '--' . $this->_boundary . CB_MAIL_CRLF;
+            $body .= $part->formatHeader($locale, $preferred_encoding,
+                    $force_encoding) . CB_MAIL_CRLF;
+            $body .= $part->formatBody($locale, $preferred_encoding,
+                    $force_encoding) . CB_MAIL_CRLF;
+        }
+        $body .= '--' . $this->_boundary . '--' . CB_MAIL_CRLF;
+
+        return $body;
+    }
+
+    /**
+     * Generate mail header data.
+     *
+     * @param string $locale             Locale code.
+     * @param string $preferred_encoding Preferred encoding (like Base64).
+     * @param string $force_encoding
+     *
+     * @return string                      Mail header data.
+     */
+    function formatHeader(
+        $locale,
+        $preferred_encoding = CB_MAIL_ENC_B,
+        $force_encoding = null
+    ) {
+        return 'Content-Type: ' . $this->_content_type . '; boundary="'
+               . $this->_boundary . '"' . CB_MAIL_CRLF;
+    }
+}
+
+function &cb_mail_limit_line(&$value)
+{
+    //limit line length to 78
+    $lines = explode(CB_MAIL_CRLF, $value);
+    if (strlen($value) > 80 || count($lines) > 1) {
+        $value = '';
+        $firstline = true;
+        foreach ($lines as $line) {
+            if (strlen($line) == 0) {
+                continue;
+            }
+            while (strlen($line) > 77) {
+                $head = substr($line, 0, 77);
+                $pos = strrpos($head, ' ');
+                if ($pos === false) {
+                    $pos = strrpos($head, "\t");
+                }
+                if ($pos === false || $pos == 0) {
+                    $head = substr($line, 0, 997);
+                    $pos = strpos($head, ' ', 77);
+                    if ($pos === false) {
+                        $pos = strpos($head, "\t", 77);
+                    }
+                    if ($pos === false) {
+                        $pos = strlen($head);
+                    }
+                }
+                if ($firstline) {
+                    $value .= substr($line, 0, $pos);
+                    $firstline = false;
+                } else {
+                    $value .= CB_MAIL_CRLF . ' ' . substr($line, 0, $pos);
+                }
+                $line = substr($line, $pos, strlen($line) - $pos);
+            }
+            if ($firstline) {
+                $value .= $line;
+                $firstline = false;
+            } else {
+                if ($line != '') {
+                    $head = substr($line, 0, 1);
+                    if ($head == ' ' || $head == '\t') {
+                        $value .= CB_MAIL_CRLF . $line;
+                    } else {
+                        $value .= CB_MAIL_CRLF . ' ' . $line;
+                    }
+                }
+            }
+        }
+    }
+
+    return $value;
+}
+
+function cb_mail_get_encoding($locale, $charset = null)
+{
+    if (is_string($charset)
+        && (strcasecmp('us-ascii', $charset) === 0
+            || strcasecmp('iso-2022-jp-ms', $charset) === 0
+            || strcasecmp('iso-2022-jp', $charset) === 0
+            || strcasecmp('iso-2022-kr', $charset) === 0)
+    ) {
+        return CB_MAIL_ENC_7BIT;
+    }
+
+    /*
+    switch( $locale ) {
+    case 'ja':
+        return CB_MAIL_ENC_B;
+
+    default:
+        return CB_MAIL_ENC_Q;
+    }
+    */
+
+    return CB_MAIL_ENC_B;
+}
+
+/**
+ * Return a preferable character encoding for the named locale.
+ *
+ * @param   string $locale
+ *
+ * @return  string
+ */
+function cb_mail_get_charset($locale)
+{
+    // ISO639-1 (language) code optionally with ISO3166 (country) code.
+    $table = ['ja' => 'ISO-2022-JP-MS'];
+
+    if (array_key_exists($locale, $table)) {
+        return $table[$locale];
+    }
+
+    // check language part if $locale is in "(language)_(country)" style.
+    $pos = strpos($locale, '_');
+    if ($pos !== false) {
+        $locale = substr($locale, 0, $pos);
+        if (array_key_exists($locale, $table)) {
+            return $table[$locale];
+        }
+    }
+
+    return 'ISO-8859-1';
+}
+
+/**
+ * Encode MIME header.
+ *
+ * @param string $value             source text.
+ * @param string $charset
+ * @param string $transfer_encoding target transfer encoding name.
+ * @param string $linefeed          linefeed string.
+ *
+ * @return string
+ */
+function cb_mail_encode_mimeheader(
+    $value,
+    $charset = "ISO-2022-JP-MS",
+    $transfer_encoding = "B",
+    $linefeed = "\r\n"
+) {
+    if (strlen($value) === mb_strlen($value)) {
+        return $value;
+    }
+    if (is_null($charset)) {
+        return $value;
+    }
+
+    //split
+    $len = strlen($value);
+    $lines = [];
+    $begin = 0;
+    $linecount = 0;
+    while ($begin < $len) {
+        if ($begin + 25 < $len) {
+            $lines[$linecount] = mb_strcut($value, $begin, 25);
+            $begin += strlen($lines[$linecount]);
+            $linecount++;
+        } else {
+            $lines[] = substr($value, $begin);
+            break;
+        }
+    }
+
+    $_value = '';
+
+    if ($transfer_encoding === 'B') {
+        $linecount = count($lines);
+        for ($i = 0; $i < $linecount; $i++) {
+            $line = $lines[$i];
+            $line = cb_mail_convert_encoding($line, $charset);
+            $line = base64_encode($line);
+            $headerline = '=?';
+            $headerline .= cb_mail_preferred_mime_name($charset);
+            $headerline .= '?' . $transfer_encoding . '?';
+            $headerline .= $line;
+            $headerline .= '?=';
+            if ($i > 0) {
+                $_value .= $linefeed . ' ' . $headerline;
+            } else {
+                $_value = $headerline;
+            }
+        }
+    } elseif ($transfer_encoding === 'Q') {
+        $linecount = count($lines);
+        for ($i = 0; $i < $linecount; $i++) {
+            $line = $lines[$i];
+            $line = cb_mail_convert_encoding($line, $charset);
+            $line = mb_convert_encoding($line, 'quoted-printable',
+                '8bit');
+            $headerline = '=?';
+            $headerline .= cb_mail_preferred_mime_name($charset);
+            $headerline .= '?' . $transfer_encoding . '?';
+            $headerline .= $line;
+            $headerline .= '?=';
+            if ($i > 0) {
+                $_value .= $linefeed . ' ' . $headerline;
+            } else {
+                $_value = $headerline;
+            }
+        }
+    } else {
+        return $value;
+    }
+
+    return $_value;
+}
+
+
+/**
+ * Decodes MIME header with charset detection.
+ *
+ * @param string $value
+ * @param string $force_encoding
+ *
+ * @return string
+ */
+function cb_mail_decode_mimeheader($value, $force_encoding = null)
+{
+    if (is_null($value)) {
+        return null;
+    }
+
+    global $G_config_common;
+    $ret = $G_config_common->get('Mail', 'mail_encoding_order');
+    $encoding_order = explode(' ', $ret);
+
+    if (is_null($encoding_order)) {
+        $encoding_order = 'auto';
+    }
+
+    if (strpos($value, '=?') !== false && strpos($value, '?=') !== false
+        && (strpos($value, '?Q?') !== false || strpos($value, '?B?') !== false
+            || strpos($value, '?q?') !== false
+            || strpos($value, '?b?') !== false)
+    ) {
+        $str = $value;
+        $result = '';
+        $encoded_words = [];
+        while (($pos = strpos($str, '=?')) !== false) {
+            $s = substr($str, 0, $pos);
+            if ( ! is_null($force_encoding)) {
+                $encoding = ($force_encoding == 'auto') ?
+                    mb_detect_encoding($s, $encoding_order) : $force_encoding;
+
+                $internal = mb_internal_encoding();
+                $s = cb_encode($s, $internal, $encoding);
+            }
+
+            //When displaying a particular header field that contains multiple
+            //'encoded-word's, any 'linear-white-space' that separates a pair of
+            //adjacent 'encoded-word's is ignored.
+            //  Section 6.2 of http://www.faqs.org/rfcs/rfc2047.html
+            $ss = cb_trim($s);
+            if ($ss != '') {
+                $result .= _cb_mail_decode_encoded_words($encoded_words, $encoding_order, $force_encoding);
+                $encoded_words = [];
+
+                $result .= $s;
+            }
+            $str = substr($str, $pos);
+
+            // encoded-word = "=?" charset "?" encoding "?" encoded-text "?="
+            $matches = [];
+            if (preg_match('/^=\?([^?]+)\?([^?]+)\?([^?]*)\?=/', $str, $matches)) {
+                $encoded_words[] = [
+                    'charset'  => $matches[1],
+                    'encoding' => $matches[2],
+                    'text'     => $matches[3]
+                ];
+
+                $str = substr($str, strlen($matches[0]));
+            } else {
+                break;
+            }
+        }
+
+        $result .= _cb_mail_decode_encoded_words($encoded_words, $encoding_order, $force_encoding);
+
+        if ($pos === false) {
+            if ( ! is_null($force_encoding)) {
+                $encoding = ($force_encoding == 'auto') ?
+                    mb_detect_encoding($str, $encoding_order) : $force_encoding;
+
+                $internal = mb_internal_encoding();
+                $str = cb_encode($str, $internal, $encoding);
+            }
+
+            return $result . $str;
+        }
+    }
+
+    if (strlen((string)$force_encoding) === 0) {
+        $detect_charset = mb_detect_encoding($value, $encoding_order);
+    } else {
+        $detect_charset = $force_encoding;
+    }
+
+    $internal = mb_internal_encoding();
+
+    return cb_encode($value, $internal, $detect_charset);
+}
+
+/**
+ * used privately in cb_mail_decode_encoded_word function
+ *
+ * @param array  $encoded_words
+ * @param array  $encoding_order
+ * @param string $force_encoding
+ *
+ * @return string
+ */
+function _cb_mail_decode_encoded_words($encoded_words, $encoding_order, $force_encoding)
+{
+
+    $encoded_words_instance = new \grn\fw\EncodedWords($encoded_words);
+
+    return $encoded_words_instance->encodeToInternalEncoding($encoding_order, $force_encoding);
+}
+
+
+/**
+ * Decodes MIME header ( mail address ) with charset detection.
+ *
+ * @param string $value
+ * @param string $force_encoding
+ *
+ * @return string
+ */
+function cb_mail_decode_mimeheader_address($value, $force_encoding = null)
+{
+    if (is_null($value)) {
+        return null;
+    }
+
+    global $G_config_common;
+    $ret = $G_config_common->get('Mail', 'mail_encoding_order');
+    $encoding_order = explode(' ', $ret);
+
+    if (is_null($encoding_order)) {
+        $encoding_order = 'auto';
+    }
+
+    if (strpos($value, '=?') !== false
+        && strpos($value, '?=') !== false
+        && (strpos($value, '?Q?') !== false
+            || strpos($value, '?B?') !== false
+            || strpos($value, '?q?') !== false
+            || strpos($value, '?b?') !== false
+        )
+    ) {
+        $result = '';
+        $delim = '';
+
+        $address_list = CB_MailAddress::static_parse_list($value,
+            $force_encoding, false);
+        $address_keys = array_keys($address_list);
+        foreach ($address_keys as $address_key) {
+            $address_string = '';
+
+            $address = $address_list[$address_key];
+
+            $address->name = cb_mail_decode_mimeheader($address->name,
+                $force_encoding);
+            $address->address = cb_mail_decode_mimeheader($address->address,
+                $force_encoding);
+
+            if ( ! is_string($address->address)
+                 && strlen($address->address) < 1
+            ) {
+                continue;
+            } else {
+                $address_string = $address->address;
+            }
+
+            if (is_string($address->name) && strlen($address->name) > 0) {
+                $name = preg_replace('/^(["”])(.+)\\1$/', '\\2', $address->name,
+                    1, $count);
+                if ($count == 1) {
+                    $name = preg_replace('/\\\\(["”\\\\])/', '\\1', $name);
+                }
+                $name = GRN_Mail_Utility::static_escapeDisplayName($name);
+                $address_string = '"' . $name . '"<' . $address_string . '>';
+            }
+
+            $result .= $delim . $address_string;
+            $delim = ', ';
+        }
+
+        return $result;
+    }
+
+    $detect_charset = is_null($force_encoding) ?
+        mb_detect_encoding($value, $encoding_order) : $force_encoding;
+
+    $internal = mb_internal_encoding();
+
+    return cb_encode($value, $internal, $detect_charset);
+}
+
+/**
+ * Convert encoding mail header or body.
+ * If default substitute character (setting in php.ini) does not exist in output encoding,
+ * invalid characters may be substituted CB_MAIL_SAFETY_SUBSTITUTION.
+ *
+ * @param string $str
+ * @param string $to_encoding
+ *
+ * @return string
+ */
+function cb_mail_convert_encoding($str, $to_encoding)
+{
+    $allowed = ["JIS", "JIS-MS", "UTF-8", "EUC-JP", "SJIS-win"];
+
+    if ( ! in_array($to_encoding, $allowed)) {
+        $substitute_char = ord(CB_MAIL_SAFETY_SUBSTITUTION);
+        $default_substitute = mb_substitute_character();
+        mb_substitute_character($substitute_char);
+        require_once('fw/i18n.csp');
+        $ret = cb_encode($str, $to_encoding);
+        mb_substitute_character($default_substitute);
+    } else {
+        $ret = mb_convert_encoding($str, $to_encoding);
+    }
+
+    return $ret;
+}
+
+/**
+ * get preferred mime name.
+ * Check $encodings array first, next check the language pack plug-in, If the
+ * plug-in exist, use the language pack encoding.
+ *
+ * @param string $to_encoding
+ *
+ * @return string
+ */
+function cb_mail_preferred_mime_name($to_encoding)
+{
+    $encodings = [
+        'CP936'  => 'GB2312',
+        'JIS-MS' => 'ISO-2022-JP',    // GRN2-8286
+    ];
+    $ret = '';
+
+    require_once('fw/i18n.csp');
+    $i18n = CB_I18N::getInstance();
+    $encoder = $i18n->getEncoder($to_encoding);
+    if (array_key_exists($to_encoding, $encodings)) {
+        $ret = $encodings[$to_encoding];
+    } elseif ($encoder !== false) {
+        $ret = $to_encoding;
+    } else {
+        $ret = mb_preferred_mime_name($to_encoding);
+    }
+
+    return $ret;
+}
+
+/**
+ * A Implementation of mail message using "lazy fetching".
+ *
+ * @package fw.mail
+ */
+class CB_MailLazyMessage extends CB_MailMessage
+{
+    /**
+     * @access protected
+     */
+    function __construct()
+    {
+        parent::__construct();
+    }
+
+    /**
+     * @param  array $headers
+     *
+     * @return CB_MailHeader[]
+     * @access private
+     */
+    function _decodeHeaders(&$headers)
+    {
+        for ($i = 0; $i < count($headers); ++$i) {
+            $headers[$i] = $this->_decodeHeader($headers[$i]);
+        }
+
+        return $headers;
+    }
+
+    /**
+     * @param CB_MailHeader
+     *
+     * @return CB_MailHeader
+     * @access private
+     */
+    function _decodeHeader($header)
+    {
+        return new CB_MailHeader($header->name,
+            cb_mail_decode_mimeheader($header->value, $this->_force_encoding));
+    }
+
+    /**
+     * Returns all headers of the specified name.
+     *
+     * @param  string $name
+     *
+     * @return CB_MailHeader[]|null
+     */
+    function getHeaders($name)
+    {
+        if (PEAR::isError($err = $this->_fetchHeaders())) {
+            return false;
+        }
+        $header = parent::getHeaders($name);
+
+        return $this->_decodeHeaders($header);
+    }
+
+    /**
+     * Returns all the header objects.
+     *
+     * @return CB_MailHeader[]|null
+     */
+    function getAllHeaders()
+    {
+        if (PEAR::isError($err = $this->_fetchHeaders())) {
+            return false;
+        }
+        $allHeader = parent::getAllHeaders();
+
+        return $this->_decodeHeaders($allHeader);
+    }
+
+    /**
+     * Returns all values of the headers that specified by the name.
+     *
+     * @param string $name
+     *
+     * @return CB_MailHeader[]|null
+     */
+    function getHeaderValues($name)
+    {
+        if (PEAR::isError($err = $this->_fetchHeaders())) {
+            return false;
+        }
+        $values = parent::getHeaderValues($name);
+        if ($name == 'from' || $name == 'reply-to' || $name == 'to'
+            || $name == 'cc'
+            || $name == 'bcc'
+        ) {
+            for ($i = 0; $i < count($values); ++$i) {
+                $values[$i] = cb_mail_decode_mimeheader_address($values[$i],
+                    $this->_force_encoding);
+            }
+        } else {
+            for ($i = 0; $i < count($values); ++$i) {
+                $values[$i] = cb_mail_decode_mimeheader($values[$i],
+                    $this->_force_encoding);
+            }
+        }
+
+        return $values;
+    }
+
+    /**
+     * Returns first value of the headers that specified by the name.
+     *
+     * @param string $name
+     *
+     * @return string|null NULL if named header does not exist;
+     *                     otherwise the header string.
+     */
+    function getHeaderValue($name)
+    {
+        if (PEAR::isError($err = $this->_fetchHeaders())) {
+            return false;
+        }
+        if ($name == 'from' || $name == 'reply-to' || $name == 'to'
+            || $name == 'cc'
+            || $name == 'bcc'
+        ) {
+            return cb_mail_decode_mimeheader_address(parent::getHeaderValue($name),
+                $this->_force_encoding);
+        } else {
+            return cb_mail_decode_mimeheader(parent::getHeaderValue($name),
+                $this->_force_encoding);
+        }
+    }
+
+    /**
+     * Returns the first header that specified by the name.
+     *
+     * @param string $name
+     *
+     * @return CB_MailHeader|null NULL if named header does not exist;
+     *                            otherwise {@link CB_MailHeader} object.
+     */
+    function getHeader($name)
+    {
+        if (PEAR::isError($err = $this->_fetchHeaders())) {
+            return false;
+        }
+
+        return $this->_decodeHeader(parent::getHeader($name));
+    }
+
+    /**
+     * Returns From header value.
+     *
+     * @return CB_MailAddress[]|null
+     */
+    function getFrom()
+    {
+        if (PEAR::isError($err = $this->_fetchHeaders())) {
+            return false;
+        }
+        if ( ! array_key_exists('from', $this->_name_to_headers)) {
+            return null;
+        }
+
+        return CB_MailAddress::static_parse_list(parent::getHeaderValues('from'),
+            $this->_force_encoding);
+    }
+
+    /**
+     * @return CB_MailAddress|null
+     */
+    function getSender()
+    {
+        if (PEAR::isError($err = $this->_fetchHeaders())) {
+            return false;
+        }
+        if ( ! array_key_exists('sender', $this->_name_to_headers)) {
+            return null;
+        }
+
+        return CB_MailAddress::static_parse(parent::getHeaderValue('sender'),
+            $this->_force_encoding);
+    }
+
+    /**
+     * @return CB_MailAddress[]|null
+     */
+    function getReplyTo()
+    {
+        if (PEAR::isError($err = $this->_fetchHeaders())) {
+            return false;
+        }
+        if ( ! array_key_exists('reply-to', $this->_name_to_headers)) {
+            return null;
+        }
+
+        return CB_MailAddress::static_parse_list(parent::getHeaderValues('reply-to'),
+            $this->_force_encoding);
+    }
+
+    /**
+     * @return CB_MailAddress[]|null
+     */
+    function getTo()
+    {
+        if (PEAR::isError($err = $this->_fetchHeaders())) {
+            return false;
+        }
+        if ( ! array_key_exists('to', $this->_name_to_headers)) {
+            return null;
+        }
+
+        return CB_MailAddress::static_parse_list(parent::getHeaderValues('to'),
+            $this->_force_encoding);
+    }
+
+    /**
+     * @return CB_MailAddress[]|null
+     */
+    function getCc()
+    {
+        if (PEAR::isError($err = $this->_fetchHeaders())) {
+            return false;
+        }
+        if ( ! array_key_exists('cc', $this->_name_to_headers)) {
+            return null;
+        }
+
+        return CB_MailAddress::static_parse_list(parent::getHeaderValues('cc'),
+            $this->_force_encoding);
+    }
+
+    /**
+     * @return CB_MailAddress[]|null
+     */
+    function getBcc()
+    {
+        if (PEAR::isError($err = $this->_fetchHeaders())) {
+            return false;
+        }
+        if ( ! array_key_exists('bcc', $this->_name_to_headers)) {
+            return null;
+        }
+
+        return CB_MailAddress::static_parse_list(parent::getHeaderValues('bcc'),
+            $this->_force_encoding);
+    }
+
+    /**
+     * @return bool
+     */
+    function isPartial()
+    {
+        if (PEAR::isError($err = $this->_fetchSource())) {
+            return false;
+        }
+
+        return parent::isPartial();
+    }
+
+    /**
+     * Gets mail source data
+     *
+     * @param null       $locale
+     * @param string     $preferred_encoding
+     * @param bool|FALSE $with_bcc
+     *
+     * @return string|bool Return the raw source data, FALSE if an error found.
+     */
+    function &getSourceData(
+        $locale = null,
+        $preferred_encoding = CB_MAIL_ENC_B,
+        $with_bcc = false
+    ) {
+        if (PEAR::isError($err = $this->_fetchSource())) {
+            $ret = false;
+
+            return $ret;
+        }
+        $ret = parent::getSourceData($locale, $preferred_encoding);
+
+        return $ret;
+    }
+
+    /**
+     * @return CB_MailPart|false
+     */
+    function getMainPart()
+    {
+        if (PEAR::isError($err = $this->_fetchSource())) {
+            $ret = false;
+
+            return $ret;
+        }
+        $ret = parent::getMainPart();
+
+        return $ret;
+    }
+
+    /**
+     * @param bool $decode_tnef
+     *
+     * @return CB_MailSinglePart[]|false
+     */
+    function &getAttachedParts($decode_tnef)
+    {
+        if (PEAR::isError($err = $this->_fetchSource())) {
+            $ret = false;
+
+            return $ret;
+        }
+        $ret =& parent::getAttachedParts($decode_tnef);
+
+        return $ret;
+    }
+
+    /**
+     * Abstract method to fetch headers from the server and parse.
+     *
+     * @access private
+     * @return bool
+     */
+    function _fetchHeaders()
+    {
+    }
+
+    /**
+     * Abstract method to fetch all source data from the server.
+     *
+     * @access private
+     * @return bool
+     */
+    function _fetchSource()
+    {
+    }
+}

@@ -1,0 +1,1 @@
+{include file='grn/_popup_access_notification_list.tpl' classification='access' display_model=true}

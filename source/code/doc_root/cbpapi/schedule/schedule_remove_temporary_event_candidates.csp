@@ -1,0 +1,220 @@
+<?php
+
+if (isset($cbpapi_service)) {
+    $node_parameters = $cbpapi_service->getRequestParameters();
+    $candidate_list = $cbpapi_service->selectNodes($node_parameters,
+        'candidate');
+    if ( ! $candidate_list) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'candidate']);
+    }
+
+    $candidate_map = ['event_id', 'start', 'end'];
+    $candidates = [];
+    // check for valid input
+    foreach ($candidate_list as $candidate) {
+        $params = [];
+        if (array_key_exists('attributes', $candidate)) {
+            $params = $candidate['attributes'];
+        }
+
+        foreach ($candidate_map as $model_name) {
+            if ( ! array_key_exists($model_name, $params)) {
+                require_once('cbpapi/error_code.csp');
+                cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                    ['param' => $model_name]);
+            }
+        }
+        $candidates[] = $params;
+    }
+
+    require_once('schedule/application.csp');
+    $app = GRN_Schedule_Application::getInstance();
+
+    require_once('schedule/temporary_event_logic.csp');
+    $temporary_logic = GRN_Schedule_TemporaryEventLogic::getInstance();
+
+    require_once('schedule/access_logic.csp');
+    $access_logic = GRN_Schedule_Access_Logic::getInstance();
+
+    require_once('cbpapi/schedule_logic.csp');
+    $logic = GRN_CBPApi_Schedule_Logic::getInstance();
+
+    //Get user login
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    $login_id = $login->getOID();
+    $dynamic_role = $uum->listGrantedRoles();
+
+    $event_id_list = [];
+    foreach ($candidates as $candidate) {
+        $event_id = $candidate['event_id'];
+
+        $setdatetime = grn_cbpapi_parse_iso8601($candidate['start']);
+        if ( ! is_object($setdatetime) || ! is_a($setdatetime, 'CB_DateTime')) {
+            cb_throw_error(E_GRN_SCHD_API_INVALID_STARTDATETIME);
+        }
+        $setdatetime = schedule_parse_datetime($setdatetime);
+        $bdate = $setdatetime;
+
+        $enddatetime = grn_cbpapi_parse_iso8601($candidate['end']);
+        if ( ! is_object($enddatetime) || ! is_a($enddatetime, 'CB_DateTime')) {
+            cb_throw_error(E_GRN_SCHD_API_INVALID_ENDDATETIME);
+        }
+        $enddatetime = schedule_parse_datetime($enddatetime);
+        // compare setdatetime and enddatetime
+        if (cb_date_compare($setdatetime, $enddatetime) > 0) {
+            cb_throw_error(E_GRN_SCHD_INVALID_DATETIME);
+        }
+        if ( ! is_numeric($event_id)) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        // Logic
+        $event = $app->getEvent($login, $event_id);
+        if ( ! $event || ! is_a($event, 'GRN_Schedule_TemporaryEvent')) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        // check access permission
+        $access = $access_logic->getEventAccess($login, $event,
+            ['read', 'delete'], $dynamic_role);
+        if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+        }
+        if ($access['delete'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_DELETE);
+        }
+        require_once('schedule/facility_system_logic.csp');
+        $facility_logic = GRN_Facility_SystemLogic::getInstance();
+        if (is_array($event->facilities) && count($event->facilities) > 0) {
+            $f_settings
+                = $facility_logic->getFacilitySetting(array_keys($event->facilities));
+            foreach (array_keys($event->facilities) as $key) {
+                $object = $event->facilities[$key];
+                $faid = $object->getOID();
+                $modify_user
+                    = $facility_logic->getModifyUserByPriority($f_settings,
+                    $faid);
+                // 登録者にのみ変更を許可する
+                if ($modify_user === 'creator') {
+                    // 施設で登録者しか変更を許していない場合
+                    if ((is_array($event->facilities)
+                         && count($event->facilities) > 0)
+                        || is_a($event, 'GRN_Schedule_TemporaryEvent')
+                           && $event->isORSearch()
+                    ) {
+                        require_once('schedule/facility_privilege.csp');
+                        $privilege_logic
+                            = GRN_Facility_Privilege_Logic::getInstance();
+                        if ( ! $privilege_logic->hasPrivilegeOfFacilities($login,
+                                $event->facilities, 'OR')
+                             && ((is_a($event->creator, 'CB_User')
+                                  && $login_id != $event->creator->getOID())
+                                 || is_string($event->creator))
+                        ) {
+                            cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+                        }
+                    }
+                } // 登録者と共有メンバーに変更を許可する
+                elseif ($modify_user === 'member') {
+                    // 施設で登録者と共有メンバーしか変更を許していない場合
+                    if ((is_array($event->facilities)
+                         && count($event->facilities) > 0)
+                        || is_a($event, 'GRN_Schedule_TemporaryEvent')
+                           && $event->isORSearch()
+                    ) {
+                        require_once('schedule/facility_privilege.csp');
+                        $privilege_logic
+                            = GRN_Facility_Privilege_Logic::getInstance();
+                        if ( ! $privilege_logic->hasPrivilegeOfFacilities($login,
+                                $event->facilities, 'OR')
+                             && (
+                                 (is_array($event->users)
+                                  && ! array_key_exists($login_id,
+                                         $event->users))
+                                 || is_null($event->users)
+                             )
+                             && ((is_a($event->creator, 'CB_User')
+                                  && $login_id !== $event->creator->getOID())
+                                 || is_string($event->creator))
+                        ) {
+                            cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+                        }
+                    }
+                }
+            }
+        }
+        $checkDIDs = false;
+        if ($event->isORSearch() && isset($candidate['facility_id'])) {
+            $checkDIDs = $logic->getTempraryEventDateID($event->id,
+                $candidate['facility_id']);
+            if (0 === count($checkDIDs)) {
+                cb_throw_error(E_GRN_SCHD_NOT_FOUND_TEMPORARY_DATE);
+            }
+        }
+
+        $did = null;
+        $datetime_table = $temporary_logic->_getDateTimeTable();
+        $rowset = new CB_RowSet($datetime_table);
+        $rowset->addCondition($rowset->queryf('col_event=\'@S\' AND col_event_type=4',
+            $event->id));
+        while (($row = $rowset->iterate())) {
+            $ts = new CB_TimeStampEx($row->get('setdatetime'));
+            $ts = $ts->getDateTime();
+            if ($ts->compare($setdatetime) == 0) {
+                $ts = new CB_TimeStampEx($row->get('enddatetime'));
+                $ts = $ts->getDateTime();
+                if ($ts->compare($enddatetime) == 0) {
+                    if (is_array($checkDIDs)
+                        && ! isset($checkDIDs[$row->getOID()])
+                    ) {
+                        continue;
+                    }
+
+                    $did = $row->getOID();
+                    break;
+                }
+            }
+        }
+        $number_of_candidate = $rowset->count();
+        $rowset->destroy();
+
+        if (is_null($did) && ($number_of_candidate > 0)) {
+            cb_throw_error(E_GRN_SCHD_NOT_TEMPORARY_DELET_DATE);
+        }
+
+        // Notification before delete
+        $logic->createNotification($login, $event, null, $bdate,
+            GRN_SCHEDULE_NOTIFY_DELETE);
+
+        // Delete
+        $event_type = $event->getEventType();
+        $result = $app->deleteEvent($login, $event_id, $event_type, $did);
+        if ($result && ($number_of_candidate > 1)) {
+            $event_id_list[$event_id] = $event_id;
+        }
+        if (($number_of_candidate == 1)
+            && array_key_exists($event_id, $event_id_list)
+        ) {
+            unset($event_id_list[$event_id]);
+        }
+    }
+    // Commit
+    $logic->saveNow();
+
+    // Get Event for view
+    $schedule_events = $logic->getEventsForViewByIds($login, $event_id_list);
+
+    //response SOAP message
+    require_once("grn/smarty.csp");
+    $t = new GRN_Smarty;
+    $t->assign('xml_namespaces', [
+        grn_cbpapi_get_namespace('common'),
+        grn_cbpapi_get_namespace('schedule')
+    ]);
+    $t->assign('events', $schedule_events);
+    grn_cbpapi_response($t, __FILE__);
+}
+

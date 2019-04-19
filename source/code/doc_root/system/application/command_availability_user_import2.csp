@@ -1,0 +1,205 @@
+<?php
+
+require_once('grn/application.csp');
+
+use grn\grn\access\utility\AppAvailabilityUtil;
+use grn\grn\access\logic\AvailabilitySettingLogic;
+use grn\grn\access\bean\Availability;
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    global $G_INPUT;
+
+    $charset = null;
+
+    if (array_key_exists('charset', $G_INPUT)) {
+        $charset = $G_INPUT['charset'];
+    }
+
+    if (0 == strlen($charset)) {
+        global $G_config_common;
+        $charset = $G_config_common->get('I18N', 'default_external_encoding');
+    }
+
+    $skip = null;
+
+    if (array_key_exists('skip', $G_INPUT)) {
+        $skip = $G_INPUT['skip'];
+    }
+
+    $file_id = null;
+
+    if (array_key_exists('file_id', $G_INPUT)) {
+        $file_id = $G_INPUT['file_id'];
+    }
+
+    if (0 == strlen($file_id)) {
+        cb_throw_error(E_GRN_CSV_FILE_NOT_FOUND);
+    }
+
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session
+        = $session_manager->getSession('system/application/availability_user_import1');
+    $files = $session->getFiles('import_files');
+
+    if ( ! array_key_exists($file_id, $files)) {
+        cb_throw_error(E_GRN_CSV_FILE_NOT_FOUND);
+    }
+
+    require_once('fw/csv.csp');
+    $csv_reader = new CB_CSVReader($charset, $files[$file_id]->getPath());
+
+    if ($skip) {
+        $csv_reader->readLine();
+    }
+
+    $availability_setting_logic = new AvailabilitySettingLogic();
+
+    $line = $csv_reader->readLine();
+
+    $targets = [
+        'dynamic_role' => Availability::DYNAMIC_ROLE,
+        'static_role'  => Availability::STATIC_ROLE,
+        'group'        => Availability::GROUP,
+        'user'         => Availability::USER
+    ];
+
+    if (false !== $line) {
+        foreach ($targets as $item => $target) {
+            $availability_setting_logic->deleteAll($target);
+        }
+    }
+
+    $activated_app_ids = AppAvailabilityUtil::getActiveAppIds();
+    $activated_app_ids = array_values($activated_app_ids);
+    $number_column = count($activated_app_ids) + 2;
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+
+    require_once('grn/uum_util.csp');
+    $uum_util = GRN_UumUtil::getInstance();
+    $dynamic_roles = $uum_util->listDynamicRoles();
+
+    $external_access_setting
+        = AvailabilitySettingLogic::getExternalAccessSetting();
+
+    $app_user_settings = [
+        AppAvailabilityUtil::APP_USE_PROHIBITED,
+        AppAvailabilityUtil::APP_USE_UNPROHIBITED,
+        AppAvailabilityUtil::APP_USE_EXTERNAL_PROHIBITED
+    ];
+
+    do {
+        if ($line === false) {
+            break;
+        }
+
+        if ( ! is_array($line) || $number_column != count($line)) {
+            cb_throw_error(E_GRN_CSV_INCORRECT_COLUMNS);
+        }
+
+        $target = null;
+        $item_type = $line[0];
+        $target_type = cb_at($targets, $item_type);
+
+        switch ($target_type) {
+            case Availability::DYNAMIC_ROLE:
+                if ( ! array_key_exists($line[1], $dynamic_roles)) {
+                    cb_throw_error(E_GRN_CSV_TARGET_INVALID);
+                }
+
+                $target = $line[1];
+                break;
+            case Availability::STATIC_ROLE:
+                $target = $uum->getStaticRolebyForeignKey($line[1]);
+                break;
+            case Availability::GROUP:
+                $target = $uum->getGroupbyForeignKey($line[1]);
+                break;
+            case Availability::USER:
+                $target = $uum->getUserbyForeignKey($line[1]);
+                break;
+            default:
+                cb_throw_error(E_GRN_CSV_ITEM_INVALID);
+        }
+
+        if ( ! $target) {
+            cb_throw_error(E_GRN_CSV_TARGET_INVALID);
+        }
+
+        if (is_object($target)) {
+            $target_id = $target->getOID();
+        } else {
+            $target_id = $target;
+        }
+
+        $apps = [];
+
+        for ($i = 2, $j = 0; $i < $number_column; $i++, $j++) {
+            $access_value = $line[$i];
+
+            if ($external_access_setting
+                === AvailabilitySettingLogic::ACCESS_TYPE_UNRESTRICTED
+                && $access_value
+                   == AppAvailabilityUtil::APP_USE_EXTERNAL_PROHIBITED
+            ) {
+                cb_throw_error(E_GRN_CSV_VALUE_INVALID);
+            }
+
+            if (($external_access_setting
+                 === AvailabilitySettingLogic::ACCESS_TYPE_REMOTE_SERVICE
+                 || $external_access_setting
+                    === AvailabilitySettingLogic::ACCESS_TYPE_INTERNAL)
+                && false === cb_at($app_user_settings, $access_value, false)
+            ) {
+                cb_throw_error(E_GRN_CSV_VALUE_INVALID);
+            }
+
+            if ($access_value == AppAvailabilityUtil::APP_USE_UNPROHIBITED) {
+                $internal = AppAvailabilityUtil::ACCESS_ALLOWED;
+                $external = AppAvailabilityUtil::ACCESS_ALLOWED;
+            } elseif ($access_value
+                      == AppAvailabilityUtil::APP_USE_EXTERNAL_PROHIBITED
+            ) {
+                $internal = AppAvailabilityUtil::ACCESS_ALLOWED;
+                $external = AppAvailabilityUtil::ACCESS_DENIED;
+            } else {
+                $internal = AppAvailabilityUtil::ACCESS_DENIED;
+                $external = AppAvailabilityUtil::ACCESS_DENIED;
+            }
+
+            $apps[$activated_app_ids[$j]] = [
+                'internal' => $internal,
+                'external' => $external
+            ];
+        }
+
+        $apps_availability = ['availability' => $apps];
+
+        $availability = new Availability();
+        $availability->setTarget($target_id);
+        $availability->setCreationTime(time());
+        $availability->setAppsAvailability($apps_availability);
+
+        $availability_setting_logic->insert($availability, $target_type);
+
+    } while (false !== ($line = $csv_reader->readLine()));
+
+    require_once('grn/logger.csp');
+    $logger_manager = CB_LoggerManager::getInstance();
+    $logger = $logger_manager->getLogger('grn.common');
+    $log_params = [];
+    $logger->noticeEx('import', 'availability_user_import', $log_params);
+
+    require_once('fw/error_handler.csp');
+    $error_handler = CB_ErrorHandler::getInstance();
+    $error_handler->removeHook('cb_csv_error_hook');
+    unset($error_handler);
+
+    foreach (array_keys($files) as $file_id) {
+        $session->unsetFile('import_files', $file_id);
+    }
+
+    cb_redirect('system/common_list', ['id' => 'application']);
+}

@@ -1,0 +1,543 @@
+<?php
+global $G_INPUT;
+global $G_container_base;
+$uum = $G_container_base->getInstance('uum');
+$user = $uum->getLoginUser();
+$user_id = $user->getOID();
+
+if ( ! is_object($user)) {
+    cb_throw_error(E_COMMON_AUTHENTICATION_FAILED);
+}
+
+// Smarty をインスタンス化
+require_once("grn/smarty.csp");
+$t = new GRN_Smarty;
+
+require_once('mail/utility.csp');
+$utility = GRN_Mail_Utility::getInstance();
+$system_config = $utility->getSystemConfig();
+$personal_config = $utility->getPersonalConfig($user);
+$address_history_logic = $utility->getAddressHistoryLogic();
+
+// 送受信記録機能の使用が許可されているか
+if ( ! $system_config->canUserUseHistory()) {
+    cb_throw_error(E_GRN_MAIL_CANNOT_USE_ADDRESS_HISTORY);
+}
+
+// メールの使用が許可されているか
+$system_config->getGeneralSetting($general_settings);
+$t->assign('disable_mail', $general_settings['disable_mail']);
+
+// 送受信記録を使用する設定
+$use_address_history = $system_config->canUserUseHistory();
+
+// 開封確認設定使用権限
+$can_use_confirm = $system_config->canUserUseConfirm();
+
+// ステータス管理使用権限
+$use_status = $system_config->canUserUseStatus()
+              && $personal_config->useStatus();
+
+// 総メールサイズ上限を取得
+$system_config->getSizeUserLimitSetting($size_settings, $user_id);
+
+// ユーザーの総メールサイズを取得
+$mail_size = $personal_config->getMailSize(null);
+
+// 総サイズチェック
+$size_over = false;
+if (($size_settings['user_limit_' . $user_id] >= 0)
+    && ($mail_size >= $size_settings['user_limit_' . $user_id] * 1024 * 1024)
+) {
+    $size_over = true;
+}
+$t->assign('size_over', $size_over);
+
+//------------------
+require_once("grn/controller.csp");
+$controller_util = new GRN_ControllerUtil();
+assert('! is_null( $controller_util )');
+
+$account_id = @ $G_INPUT['aid'];
+$category_id = @ $G_INPUT['cid'];
+
+$t->assign('category', ['aid' => $account_id, 'cid' => $category_id]);
+
+if ( ! is_string($account_id) || (strlen($account_id) == 0)) {
+    if (is_string($category_id) && (strlen($category_id) > 0)) {
+        // フォルダから逆引き
+        $folder_logic = $utility->getFolderLogic();
+        $folder_data = $folder_logic->getFolderData($category_id, false,
+            false);
+        if (is_array($folder_data)) {
+            $account_id = $folder_data['account_id'];
+        }
+    } else {
+        // デフォルトアカウントID
+        $account_id = $personal_config->getDefaultAccountId();
+    }
+}
+
+$selected_account = $personal_config->getAccountData($account_id, false, false);
+if (is_array($selected_account)) {
+    $t->assign('account_deleted', $selected_account['deleted']);
+    $t->assign('account_disabled', $selected_account['disabled']);
+}
+
+$sf = (isset($G_INPUT['sf']) && $G_INPUT['sf']);
+
+// 表示する件数取得
+require_once("grn/ui.csp");
+$ui_config_manager = GRN_UIConfigManager::getInstance();
+$ui_config = $ui_config_manager->getUserConfig($user);
+$subject_cols = $ui_config->getSubjectWidth();
+$name_cols = $ui_config->getNameWidth();
+
+$name_type = null;
+$name_format = $personal_config->getListNameFormatSetting();
+
+// N件ナビゲーション
+// 現在位置
+$current_start_position = $controller_util->getNaviStartPosition();
+// 表示する件数
+$number_on_page = $ui_config->getListMax();
+
+$mid = null;
+if (isset($G_INPUT['mid'])) {
+    $mid = $G_INPUT['mid'];
+}
+
+if (isset($G_INPUT['sid']) && strlen($G_INPUT['sid']) > 0) {
+    $status_id = $G_INPUT['sid'];
+} else {
+    require_once('mail/resources.csp');
+    $status_id = GRN_MAIL_STATUS_CODE_ALL;
+}
+$t->assign('status_id', $status_id);
+
+// sort
+$session = $controller_util->getSession();
+$sort = $controller_util->getSortParameter();
+if ( ! is_string($sort) || (strlen($sort) == 0)) {
+    $sort = 'time';
+}
+$controller_util->setSortParameter($sort);
+
+// reverse
+$reverse = true;
+if (isset($G_INPUT['reverse'])) {
+    $reverse = ((int)$G_INPUT['reverse'] != 0);
+} elseif ($sf) {
+    $reverse = $session->get('current_sort_reverse');
+}
+$session->set('current_sort_reverse', $reverse);
+unset($session);
+
+$email = null;
+if (isset($G_INPUT['email'])) {
+    $email = $G_INPUT['email'];
+    if (is_string($email) && (strlen($email) > 0)) {
+        $email = urldecode($G_INPUT['email']);
+        $email = GRN_Mail_Utility::static_addEmailBracket($email, 'remove');
+
+        // 指定されたE-Mailのアドレス情報を取得
+        $address_info_data
+            = $address_history_logic->getAddressInfoDataByEmailFromMessage($user,
+            $email,
+            $status_id,
+            $sort,
+            $reverse,
+            $current_start_position,
+            $number_on_page
+        );
+        $escaped_address_info_data
+            = $address_history_logic->getAddressInfoDataByEmailFromMessage($user,
+            $email,
+            $status_id,
+            $sort,
+            $reverse,
+            $current_start_position,
+            $number_on_page,
+            true
+        );
+    } else {
+        $email = null;
+    }
+}
+$t->assign('email', htmlspecialchars(urlencode($email)));
+
+//------------------
+
+
+// セッションに保存
+$controller_util->setNaviStartPosition($current_start_position);
+
+// n件ナビゲーション情報を取得する
+$navigation_info = [
+    'count'       => -1,
+    'offset'      => 0,
+    'limit'       => $number_on_page,
+    'start_count' => 0,
+    'end_count'   => 0,
+    'navi'        => [
+        'number_on_page'               => $number_on_page,
+        'previous_page_start_position' => -1,
+        'next_page_start_position'     => -1,
+    ]
+];
+$page_title = grn_get_current_page_display_name();
+
+//------------------
+
+if (is_null($address_info_data)) {
+    // データが見つからない
+    $address_info_data_for_view = [
+        'aid'      => $account_id,
+        'cid'      => $category_id,
+        'name'     => $email,
+        'email'    => $email,
+        'disabled' => true
+    ];
+    $history_list_for_view = null;
+} else {
+    $from = '';
+    $escaped_from = '';
+    $from_name = $address_info_data['name'];
+    $escaped_from_name = $escaped_address_info_data['name'];
+    $from_email
+        = GRN_Mail_Utility::static_addNameQuotation($address_info_data['email'],
+        'remove');
+    $escaped_from_email
+        = GRN_Mail_Utility::static_addNameQuotation($escaped_address_info_data['email'],
+        'remove');
+    if (strlen($from_name) > 0) {
+        $from = GRN_Mail_Utility::static_addNameQuotation($from_name, 'add');
+        $escaped_from
+            = GRN_Mail_Utility::static_addNameQuotation($escaped_from_name,
+            'add');
+        if (strlen($from_email) > 0) {
+            $from .= ' ';
+            $escaped_from .= ' ';
+        }
+    }
+    if (strlen($from_email) > 0) {
+        $from .= GRN_Mail_Utility::static_addEmailBracket($from_email,
+            'add');
+        $escaped_from .= GRN_Mail_Utility::static_addEmailBracket($escaped_from_email,
+            'add');
+    }
+
+    // 名前付きだったら名前ごとsend.cspに渡すようにする
+    if (strlen($from_name) > 0) {
+        $email_for_send = $escaped_from;
+    } else {
+        $email_for_send = $escaped_from_email;
+    }
+
+    $address_info_data_for_view = [
+        'mid'            => $mid,
+        'aid'            => $account_id,
+        'cid'            => $category_id,
+        'name'           => $from,
+        'email'          => $from_email,
+        'email_for_send' => $email_for_send
+    ];
+
+    // 一覧
+    $sort_time = 'send_ts';
+    if ($sort === 'time') {
+        $sort_key = $sort_time;
+    } elseif ($sort === 'name') {
+        if ($name_format == 'name') {
+            $sort_key = $disp_name . '_name';
+        } elseif ($name_format == 'email') {
+            $sort_key = $disp_name . '_email';
+        } else {
+            $sort_key = $disp_name;
+        }
+    } else {
+        $sort_key = $sort;
+    }
+
+    // 履歴データ一覧を取得
+    $history_list = $address_history_logic->getAddressHistoryDataList($user,
+        $address_info_data['email'], $sort_key, $reverse,
+        $current_start_position, $number_on_page, $status_id);
+
+    // n件ナビゲーション情報を取得する
+    $isExistsNextPage
+        = $address_history_logic->hasNextPage($address_info_data['email']);
+    $email_url = is_string($email) ? urlencode($email) : null;
+    $navigation_info = $controller_util->makeSimpleNaviInformation(
+        $current_start_position,
+        $number_on_page,
+        count($history_list),
+        $isExistsNextPage,
+        [
+            'mid'     => $mid,
+            'email'   => $email_url,
+            'aid'     => $account_id,
+            'cid'     => $category_id,
+            'sort'    => $sort,
+            'reverse' => $reverse,
+            'sid'     => $status_id
+        ]
+    );
+
+    $history_list_for_view = [];
+    if (is_array($history_list)) {
+        foreach (array_keys($history_list) as $key) {
+            $history_data =& $history_list[$key];
+
+            $mail_id = $history_data['mail_id'];
+
+            $history_list_for_view[$key] = [
+                'type'           => $history_data['sent'], //受信0 送信1
+                'mid'            => $mail_id,
+                'name'           => $from,
+                'ctime'          => $history_data['send_ts'],
+                'attached_files' => $history_data['attached'],
+                'status_name'    => $history_data['status_name'],
+                'status_color'   => $history_data['status_color'],
+            ];
+
+            $subject = $history_data['subject'];
+            if (strlen($subject) == 0) {
+                require_once('fw/i18n.csp');
+                require_once('mail/resources.csp');
+                $subject = cb_msg(GRN_MAIL_MODULE_ID, 'no_title');
+            }
+            $history_list_for_view[$key]['subject'] = $subject;
+
+            if ( ! $history_data['sent']) {
+                // 受信メール
+                if ($history_data['confirmation_response']) {
+                    // 開封通知
+                    $history_list_for_view[$key]['open'] = '4';    // 開封通知
+                } else {
+                    // 受信メール
+                    if (is_null($history_data['confirmation_status'])
+                        || ($history_data['confirmation_status'] == 'none')
+                    ) {
+                        // 無視した
+                        $history_list_for_view[$key]['open'] = '1';
+                    } elseif (strncasecmp($history_data['confirmation_status'],
+                            'sent', 4) == 0
+                    ) {
+                        // 開封確認返信済み
+                        $history_list_for_view[$key]['open'] = '2';
+                    }
+                }
+            } else {
+                // 送信メール
+                if ($history_data['confirmation_request']) {
+                    // 開封確認要求
+                    $history_list_for_view[$key]['open'] = '3';
+                } elseif ($history_data['confirmation_response']) {
+                    // 開封確認
+                    $history_list_for_view[$key]['open'] = '4';
+                }
+            }
+
+            $history_account_id = $history_data['account_id'];
+            if ( ! is_null($mail_id) && ! is_null($history_account_id)) {
+                $size = (int)$history_data['size'];
+                if (($size > 0) && ($size < 1024)) {
+                    // 1KB未満の場合は1KBと表示させる
+                    $history_list_for_view[$key]['size'] = 1024;
+                } else {
+                    $history_list_for_view[$key]['size'] = $size;
+                }
+
+                $temp_account_id = $history_data['account_id'];
+                $account_data
+                    = $personal_config->getAccountData($temp_account_id,
+                    false, false);
+                if (is_array($account_data)) {
+                    $history_list_for_view[$key]['account']
+                        = $account_data['title'];
+                }
+
+                $read_ts = $history_data['read_ts'];
+                $history_list_for_view[$key]['unread'] = ( ! is_object($read_ts)
+                                                           || ! $read_ts->unix_ts);
+                $history_list_for_view[$key]['aid'] = $history_account_id;
+                $history_list_for_view[$key]['cid']
+                    = $history_data['folder_id'];
+
+                // 操作した内容（1:返信 2:全員に返信 3:転送）
+                switch ($history_data['action']) {
+                    case 'reply':
+                        $history_list_for_view[$key]['action'] = '1';
+                        break;
+                    case 'reply-all':
+                        $history_list_for_view[$key]['action'] = '2';
+                        break;
+                    case 'forward':
+                        $history_list_for_view[$key]['action'] = '3';
+                        break;
+                }
+            } else {
+                $history_list_for_view[$key]['size'] = 0;
+                $history_list_for_view[$key]['disabled'] = true;
+            }
+        }
+    }
+}
+
+//------------------
+
+$t->assign('page_title', $page_title);
+$t->assign('sort_col', $sort);
+$t->assign('reverse', $reverse);
+
+// site_position
+$site_position = [];
+$site_position[] = $utility->getIndexSitePosition($user, $account_id);
+if (is_string($category_id) && (strlen($category_id) > 0)) {
+    // 指定されたフォルダ
+    $folder_logic = $utility->getFolderLogic();
+    $folder_data = $folder_logic->getFolderData($category_id,
+        isset($folder_detail) && $folder_detail, true);
+    $folder_code = is_array($folder_data) ? $folder_data['code'] : '';
+
+    // site position
+    $page_index = 'mail/index';
+    $page_inbox = 'mail/inbox';
+    $page_outbox = 'mail/outbox';
+    $page_draftbox = 'mail/draftbox';
+    $page_garbagebox = 'mail/garbagebox';
+    $page_category_list = 'mail/category_list';
+
+    switch ($folder_code) {
+        case GRN_MAIL_FOLDER_CODE_ROOT:
+            $folder_type = '0';
+            $page_folder = grn_get_page_display_name($page_root);
+            break;
+        case GRN_MAIL_FOLDER_CODE_INBOX:
+            $folder_type = '1';
+            $page_folder = grn_get_page_display_name($page_inbox);
+            break;
+        case GRN_MAIL_FOLDER_CODE_SENTBOX:
+            $folder_type = '2';
+            $page_folder = grn_get_page_display_name($page_outbox);
+            break;
+        case GRN_MAIL_FOLDER_CODE_UNSENT:
+            $folder_type = '3';
+            $page_folder = grn_get_page_display_name($page_draftbox);
+            break;
+        case GRN_MAIL_FOLDER_CODE_TRASH:
+            $folder_type = '4';
+            $page_folder = grn_get_page_display_name($page_garbagebox);
+            break;
+        default:
+            $folder_type = '5';
+            $page_folder = grn_get_page_display_name($page_category_list);
+            break;
+    }
+
+    $site_position[] = [
+        'page' => $page_index,
+        'name' => $page_folder,
+        'aid'  => $account_id,
+        'cid'  => $category_id
+    ];
+} else {
+    $site_position[] = [
+        'page' => 'mail/index',
+        'name' => grn_get_page_display_name('mail/inbox'),
+        'aid'  => $account_id,
+    ];
+}
+
+$site_position[] = [
+    'page' => '',
+    'name' => $page_title
+];
+
+$t->assign('site_position', $site_position);
+
+// set_data
+$t->assign('set', $address_info_data_for_view);
+
+$t->assign('mails', $history_list_for_view);
+
+// データ一覧
+$t->assign('navi_info', $navigation_info);
+
+// 表示文字数
+$t->assign(
+    'characters', [
+        'subject' => $subject_cols, //表題
+        'data'    => $name_cols //本文
+    ]
+);
+
+// ソート選択状態のフラグ
+$t->assign(
+    'sort', [
+        'ctime'   => [ // 送信日時
+                       'id'      => 'time',
+                       'reverse' => ! $reverse || ($sort != 'time'),
+                       'disable' => $sort != 'time'
+        ],
+        'account' => [ // アカウント
+                       'id'      => 'account',
+                       'reverse' => ! $reverse || ($sort != 'account'),
+                       'disable' => $sort != 'account'
+        ],
+        'subject' => [ // 標題
+                       'id'      => 'subject',
+                       'reverse' => ! $reverse || ($sort != 'subject'),
+                       'disable' => $sort != 'subject'
+        ],
+        'size'    => [ // サイズ
+                       'id'      => 'size',
+                       'reverse' => ! $reverse || ($sort != 'size'),
+                       'disable' => $sort != 'size'
+        ],
+    ]
+);
+
+// statuses
+if ($use_status) {
+    require_once('fw/i18n.csp');
+    require_once('mail/resources.csp');
+    require_once('mail/status.csp');
+    $status_list = grn_mail_get_status_list($user);
+    $status_infos_for_view = [];
+    foreach ($status_list as $status_oid => $status) {
+        $status_info = [];
+        $status_info['value'] = $status_oid;
+        $status_info['label'] = $status['name'];
+        $status_info['selected'] = ($status_id == $status_oid);
+        $status_info['color'] = $status['color'];
+        if ($status_oid == 1) {
+            $status_info['class'] = "mail-statusNormal-grn";
+        } elseif ($status_oid == 2) {
+            $status_info['class'] = "mail-statusUnCheck-grn";
+        } elseif ($status_oid == 3) {
+            $status_info['class'] = "mail-statusNeedSend-grn";
+        } elseif ($status_oid == 4) {
+            $status_info['class'] = "mail-statusCheck-grn";
+        } elseif ($status_oid == 5) {
+            $status_info['class'] = "mail-statusHold-grn";
+        } elseif ($status_oid == 6) {
+            $status_info['class'] = "mail-statusWaitSend-grn";
+        }
+        $status_infos_for_view[] = $status_info;
+    }
+    $t->assign('status_infos', $status_infos_for_view);
+}
+
+$t->assign('name_format', $name_format);
+$t->assign('name_type', $name_type);
+
+$t->assign('use_confirm', $can_use_confirm);  // 開封確認使用権限
+$t->assign('use_status', $use_status);        // ステータス管理使用権限
+
+// Smarty実行
+$doc_name = cb_get_pagename();
+$t->display("{$doc_name}.tpl");
+
+

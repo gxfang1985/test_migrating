@@ -1,0 +1,475 @@
+<?php
+
+/**
+ * RSS Reader Logic
+ *
+ * @author  Eiji TAEN    2005/06
+ * @version 1.0
+ * @package grn.rss
+ */
+
+require_once('rss/resources.csp');
+require_once('grn/application.csp');
+
+/**
+ * RSS Reader logic class
+ *
+ * @author  Eiji TAEN    2005/06
+ * @version 1.0
+ * @package grn.rss
+ */
+class GRN_RSS_ReaderLogic
+{
+    /**
+     * constructor
+     */
+    function __construct()
+    {
+        //
+    }
+
+    /**
+     * get new item number
+     *
+     * @param    object $user         CB_User
+     * @param    array  $channel_oids channel OID list
+     *
+     * @return   array   the numbers of new items
+     */
+    function getNewItemNumber(& $user, $channel_oids)
+    {
+        if (count($channel_oids) === 0) {
+            return [];
+        }
+
+        $user_id = $user->getOID();
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('rss');
+
+        // get channel list which $user already has read
+        //$query = 'SELECT col_channel FROM tab_grn_rss_accesstime WHERE col_user = \'' . $user_id . '\'';
+        $query = cb_queryf($db,
+            "SELECT a.col_channel FROM tab_grn_rss_accesstime AS a INNER JOIN tab_cb_user AS u ON a.col_user = u._id AND u.col_deleted IS NULL WHERE a.col_user = '@S'",
+            $user_id);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $read_channels = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $read_channels[] = $row['col_channel'];
+        }
+        $unread_channels = array_diff($channel_oids, $read_channels);
+        $readed_channels = array_diff($channel_oids, $unread_channels);
+
+        // get a number of unread items
+        $counts = [];
+
+        // unread channels
+        if (count($unread_channels) > 0) {
+            //$query = 'SELECT COUNT(*) count, i.col_channel channel FROM tab_grn_rss_item i WHERE i.col_channel IN (\'' . implode( '\',\'', $unread_channels ) . '\')  AND col_ptime <= ' . time() . ' GROUP BY i.col_channel';
+
+            $strunread = "";
+            foreach ($unread_channels as $channel) {
+                $strunread .= cb_queryf($db, "'@S',", $channel);
+            }
+            $strunread = substr($strunread, 0, strlen($strunread) - 1);
+
+            $query
+                = "SELECT COUNT(*) count, i.col_channel channel FROM tab_grn_rss_item i WHERE i.col_channel IN ("
+                  . $strunread;
+            $query .= cb_queryf($db,
+                ")  AND col_ptime <= '@S' GROUP BY i.col_channel", time());
+
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError([
+                    'query' => 'failed query on SELECT: ' . $query
+                ]);
+            }
+
+            while ($row = $db->fetch_assoc($result)) {
+                $counts[$row['channel']] = $row['count'];
+            }
+        }
+
+        // readed channels
+        if (count($readed_channels) > 0) {
+            //$query = 'SELECT COUNT(*) count, a.col_channel channel FROM tab_grn_rss_item i, tab_grn_rss_accesstime a WHERE a.col_user = \'' . $user_id . '\' AND a.col_channel IN (\'' . implode( '\',\'', $readed_channels ) . '\') AND i.col_channel = a.col_channel AND col_utime > col_time AND col_ptime <= ' . time() . ' GROUP BY a.col_channel';
+
+            $strread = "";
+            foreach ($readed_channels as $channel) {
+                $strread .= cb_queryf($db, "'@S',", $channel);
+            }
+            $strread = substr($strread, 0, strlen($strread) - 1);
+
+            $query = cb_queryf($db,
+                "SELECT COUNT(*) count, a.col_channel channel FROM tab_grn_rss_item i, tab_grn_rss_accesstime a INNER JOIN tab_cb_user AS u ON a.col_user = u._id AND u.col_deleted IS NULL WHERE a.col_user = '@S'",
+                $user_id);
+            $query .= " AND a.col_channel IN (" . $strread;
+            $query .= cb_queryf($db,
+                ") AND i.col_channel = a.col_channel AND col_utime > col_time AND col_ptime <= '@S' GROUP BY a.col_channel",
+                time());
+
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError([
+                    'query' => 'failed query on SELECT: ' . $query
+                ]);
+            }
+
+            while ($row = $db->fetch_assoc($result)) {
+                $counts[$row['channel']] = $row['count'];
+            }
+        }
+
+        return $counts;
+    }
+
+    /**
+     * get channel information
+     *
+     * @param    string $channel_id channel oid
+     *
+     * @return   mixed    channel information array
+     *                    if specified channel doesn't exist, return FALSE.
+     *
+     * return['oid']         => string   channel oid
+     *       ['id']          => string   channel id
+     *       ['title']       => string   original channel title
+     *       ['url']         => string   channel url
+     *       ['description'] => string   channel description
+     *       ['utime']       => object   CB_TimeStamp update time
+     */
+    function getChannelInfo($channel_oid)
+    {
+        require_once('rss/tables.csp');
+        $tbl_manager = GRN_RSS_TableManager::getInstance();
+        $table =& $tbl_manager->getTableInfo('GRN_RSS_Channel');
+        $table->setLock(CB_DATABASE_NO_LOCK);
+
+        $row = $table->getRow($channel_oid);
+        if ( ! $row) {
+            return false;
+        }
+
+        $channel = [];
+        $channel['oid'] = $channel_oid;
+        $channel['id'] = $row->get('id');
+        $channel['title'] = $row->get('title');
+        $channel['url'] = $row->get('channel_url');
+        $channel['description'] = $row->get('description');
+        $channel['utime'] = $row->get('utime');
+
+        return $channel;
+    }
+
+    /**
+     * sync RSS data
+     *
+     * @param    string $url channel url
+     *
+     * @return   object   GRN_RSS_Channel
+     */
+    function onDemandSyncDataByURL(
+        $url,
+        $throw_conn_err = false,
+        $shared_site = false
+    ) {
+        require_once('rss/system.csp');
+        $system = GRN_RSS_SystemLogic::getInstance();
+        $timeout = intval($system->getTimeoutAttribute());
+
+        require_once('grn/rss.csp');
+        $manager = GRN_RSS_Manager::getInstance();
+        $service = GRN_RSS_Service::getInstance();
+
+        $row = $manager->getChannel($url);
+        if ($row) {
+            require_once('rss/system.csp');
+            $system = GRN_RSS_SystemLogic::getInstance();
+            $interval = intval($system->getCacheIntervalAttribute()) * 60;
+            $utime = $row->get('utime');
+            if ($utime->unix_ts < time() - $interval) // passed update time
+            {
+                $row = $service->syncData($url, $timeout, '', -1,
+                    $throw_conn_err, $shared_site);
+            }
+        } else {
+            $row = $service->syncData($url, $timeout, '', -1, $throw_conn_err,
+                $shared_site);
+        }
+
+        return $row;
+    }
+
+    /**
+     * set scheduling service
+     */
+    function setSchedulingDate()
+    {
+        require_once('rss/system.csp');
+        $system = GRN_RSS_SystemLogic::getInstance();
+
+        // each 30min, 1hour, 2hour, 6hour, 12hour, 1day
+        $interval = intval($system->getCacheIntervalAttribute());
+        $max_channel_num = intval($system->getMaxChannelNumAttribute());
+        $subscribed_user_num = $system->getMaxUserNumAttribute();
+
+        require_once('rss/tables.csp');
+        $tbl_manager = GRN_RSS_TableManager::getInstance();
+        $tbl_channel = $tbl_manager->getTableInfo('GRN_RSS_Channel');
+        //for escape
+        $db = $tbl_channel->getDBConnection();
+        $rowset = new CB_RowSet($tbl_channel);
+
+        $rowset->addJoin($tbl_manager->getTableInfo('GRN_RSS_SharedChannelInfo'),
+            //for escape
+            //'(tab_grn_rss_channel._id = col_channel) OR (col_user_num > ' . $subscribed_user_num . ')',
+            "(tab_grn_rss_channel._id = col_channel) OR (col_user_num > '"
+            . $db->escape($subscribed_user_num) . "')",
+            CB_DATABASE_INNER_JOIN,
+            's'
+        );
+        $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+        $rowset->setLock(CB_DATABASE_NO_LOCK);
+        $result = $rowset->iterate();
+        $rowset->destroy();
+
+        require_once('fw/schedule.csp');
+        $ss = CB_SchedulingService::getInstance();
+        $ss->unregisterEvent(GRN_RSS_SCHEDULING_NAME);
+
+        if ($result['count'] > 0) {
+            // 1分間に更新すべきチャネル数
+            $target_channel_num = $result['count'] / $interval;
+            if ($target_channel_num >= 1) {
+                // 毎分更新
+                $scheduling_minute = '*';
+                $scheduling_hour = '*';
+
+                // 最大更新チャネル数のみ更新
+                if ($target_channel_num > $max_channel_num) {
+                    $target_channel_num = $max_channel_num;
+                }
+            } else // 数分/時間おきに更新
+            {
+                // 更新間隔(分単位)
+                $scheduling_minute_span = floor(1 / $target_channel_num);
+                if ($scheduling_minute_span < 60) // 1時間未満で更新
+                {
+                    // 更新間隔30分以上の場合は30分おきに更新
+                    if ($scheduling_minute_span > 30) {
+                        $scheduling_minute_span = 30;
+                    }
+
+                    $minute = mt_rand(0,
+                        $scheduling_minute_span - 1);
+                    $scheduling_minute = strval($minute);
+                    $end = 60 - $scheduling_minute_span;
+                    while ($minute < $end) {
+                        $minute += $scheduling_minute_span;
+                        $scheduling_minute .= ',' . strval($minute);
+                    }
+
+                    $scheduling_hour = '*';
+                } elseif ($scheduling_minute_span < 1440) // 数時間おきに更新
+                {
+                    $scheduling_minute = strval(mt_rand(0, 59));
+
+                    // 更新間隔(時間単位)
+                    $scheduling_hour_span = floor($scheduling_minute_span / 60);
+                    if ($scheduling_hour_span == 1) // 1時間に1回
+                    {
+                        $scheduling_hour = '*';
+                    } else                            // 数時間に1回
+                    {
+                        $hour = mt_rand(0,
+                            $scheduling_hour_span - 1);
+                        $scheduling_hour = strval($hour);
+                        $end = 24 - $scheduling_hour_span;
+                        while ($hour < $end) {
+                            $hour += $scheduling_hour_span;
+                            $scheduling_hour .= ',' . strval($hour);
+                        }
+                    }
+                } else // 1日1回更新
+                {
+                    $scheduling_minute = strval(mt_rand(0, 59));
+                    $scheduling_hour = strval(mt_rand(0, 23));
+                }
+            }
+
+            $scheduling_command = $scheduling_minute . ' ' . $scheduling_hour
+                                  . ' * * *';
+
+            $target_channel_num = ceil($target_channel_num);
+
+            $system->setTargetChannelNumAttribute($target_channel_num);
+            $ss->registerRepeatEvent(GRN_RSS_SCHEDULING_NAME,
+                GRN_RSS_SCHEDULING_FILE,
+                $scheduling_command);
+        }
+    }
+
+    /**
+     * on demand fetch
+     *
+     * @param   object $user CB_User
+     */
+    function onDemandSyncData(& $user)
+    {
+        require_once('rss/system.csp');
+        $system = GRN_RSS_SystemLogic::getInstance();
+
+        // parameters
+        $interval = intval($system->getCacheIntervalAttribute())
+                    * 60;
+        $max_channel_num = intval($system->getMaxChannelNumAttribute());
+        $subscribed_user_num = $system->getMaxUserNumAttribute();
+
+        require_once('rss/tables.csp');
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('rss');
+
+        $tables = [
+            'tab_grn_rss_channel c force index (idx_utime_user_num__id)',
+            'tab_grn_rss_personalchannelinfo p'
+        ];
+
+        //$conditions = array( 'p.col_user = ' . $user->getOID(),
+        //                     'p.col_channel = c._id',
+        //                     'c.col_user_num <= ' . $subscribed_user_num,
+        //                     'c.col_utime < ' . time() - $interval );
+
+        $conditions = [
+            cb_queryf($db, "p.col_user = '@S'", $user->getOID()),
+            'p.col_channel = c._id',
+            cb_queryf($db, "c.col_user_num <= '@S'", $subscribed_user_num),
+            cb_queryf($db, "c.col_utime < '@S'", time() - $interval)
+        ];
+
+        $join
+            = ' INNER JOIN tab_cb_user AS u ON p.col_user = u._id AND u.col_deleted IS NULL ';
+        $query = 'SELECT c.col_id id FROM ' . implode(', ', $tables) . $join
+                 . ' WHERE ' . implode(' AND ', $conditions)
+                 . ' ORDER BY c.col_utime';
+        $query = $db->select_format($query, 0, $max_channel_num,
+            CB_DATABASE_NO_LOCK);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $timeout = intval($system->getTimeoutAttribute());
+        require_once('grn/rss.csp');
+        $service = GRN_RSS_Service::getInstance();
+        while ($row = $db->fetch_assoc($result)) {
+            $service->syncData($row['id'], $timeout);
+        }
+    }
+
+    /**
+     * @param    object $user       CB_User
+     * @param    string $channel_id channel id (xml URL)
+     *
+     * @return   int      timestamp
+     */
+    function getChannelAccessTime(& $user, $channel_id)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('rss');
+
+
+        //$query = 'SELECT col_time FROM tab_grn_rss_accesstime a, tab_grn_rss_channel c WHERE col_user = \'' . $user->getOID() . '\' AND col_id = \'' . $channel_id . '\' AND col_channel = c._id';
+        $query = cb_queryf($db,
+            "SELECT col_time FROM tab_grn_rss_accesstime a INNER JOIN tab_cb_user AS u ON a.col_user = u._id AND u.col_deleted IS NULL, tab_grn_rss_channel c WHERE col_user = '@S' AND col_id = '@S' AND col_channel = c._id",
+            $user->getOID(), $channel_id);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $row = $db->fetch_assoc($result);
+
+        if ( ! $row) {
+            return 0;
+        }
+
+        return intval($row['col_time']);
+    }
+
+    /**
+     * update channel access time
+     *
+     * @param    object $user       CB_User
+     * @param    string $channel_id channel id (xml URL)
+     *
+     * @return   mixed    object    GRN_RSS_AccessTime
+     *                    boolean   return FALSE if specified channel doesn't exist
+     */
+    function updateChannelAccessTime(& $user, $channel_id)
+    {
+        require_once('grn/rss.csp');
+        $rss_manager = GRN_RSS_Manager::getInstance();
+        $channel = $rss_manager->getChannel($channel_id);
+
+        if ($channel === false) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        require_once('rss/tables.csp');
+        $tbl_manager = GRN_RSS_TableManager::getInstance();
+        $table = $tbl_manager->getTableInfo('GRN_RSS_AccessTime');
+        //for escape!
+        $db = $table->getDBConnection();
+        $rowset = new CB_RowSet($table);
+        //for escape!
+        //$rowset->addCondition( 'col_user = ' . $user->getOID() . ' AND col_channel = ' . $channel->getOID() );
+        $rowset->addCondition("col_user = '" . $db->escape($user->getOID())
+                              . "' AND col_channel = '"
+                              . $db->escape($channel->getOID()) . "'");
+        $rowset->limit(0, 1);
+        $rowset->setLock(CB_DATABASE_NO_LOCK);
+
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        if (is_null($row)) {
+            $row = $table->newRow();
+            $row->set('user', $user);
+            $row->set('channel', $channel);
+        }
+
+        $now = new CB_TimeStamp();
+        $now->unix_ts = time();
+        $row->set('time', $now);
+
+        return $row;
+    }
+
+    function getErrorMessage($error_code)
+    {
+        require_once('fw/i18n.csp');
+        if (strpos($error_code, 'connection_error') === 0
+            || strpos($error_code, 'http_error') === 0
+        ) {
+            return cb_msg(GRN_RSS_APP_MODULEID, 'connection_error');
+        }
+        if (strpos($error_code, 'parse_error') === 0
+            || strpos($error_code, 'no_parser') === 0
+        ) {
+            return cb_msg(GRN_RSS_APP_MODULEID, 'parse_error');
+        }
+    }
+
+}
+
+

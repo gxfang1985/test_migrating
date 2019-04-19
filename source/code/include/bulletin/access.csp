@@ -1,0 +1,915 @@
+<?php
+
+require_once('bulletin/uum_evaluation.csp');
+require_once('grn/application.csp');
+
+define('GRN_BULLETIN_ACCESS_CSV_FOREINKEY', 0);
+define('GRN_BULLETIN_ACCESS_CSV_ITEM', 1);
+define('GRN_BULLETIN_ACCESS_CSV_VALUE', 2);
+define('GRN_BULLETIN_ACCESS_CSV_TARGET', 3);
+
+
+/**
+ * アクセス権管理クラス
+ *
+ * @package grn.bulletin
+ */
+class GRN_Bulletin_AccessManager extends GRN_Bulletin_UumEvaluation
+{
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Bulletin_AccessManager
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * コンストラクタ
+     */
+    function __construct()
+    {
+        parent::__construct();
+
+        $this->_table_prefix = 'acl';
+        $this->_column_prefix = 'authority_';
+        $this->_auth_columns = ['read' => 0, 'write' => 0, 'follow' => 0];
+    }
+
+    /**
+     * レコードイベント処理
+     */
+    function onAction($action, & $object, & $target, $authorities)
+    {
+        require_once('inspection.csp');
+        $inspection = GRN_Bulletin_Inspection::getInstance();
+        $inspection->writeLogSystem($action, $object, $target, 'access',
+            $authorities);
+    }
+
+    /**
+     * @access private
+     */
+    var $_admin_mode = null;
+
+    function isSuperAdminMode()
+    {
+        if (is_null($this->_admin_mode)) {
+            $current_page = strtolower(cb_get_pagename());
+            $page_parts = explode('/', $current_page);
+            if (@ $page_parts[1] === 'system'
+                && $current_page !== 'portal/system/preview'
+            ) {
+                $this->_admin_mode = true;
+            } else {
+                $this->_admin_mode = false;
+            }
+        }
+
+        return $this->_admin_mode;
+    }
+
+    function isSuperAdmin($user)
+    {
+        if ( ! $this->isSuperAdminMode()) {
+            return false;
+        }
+
+        // システム管理画面に入れていれば管理者とみなす
+        return true;
+
+        require_once('grn/system_logic.csp');
+        $system = GRN_System::getInstance();
+
+        return $system->isSuperAdmin($user);
+    }
+
+    /**
+     * ユーザーが管理者かどうか判定する
+     * カテゴリごとに管理者設定可能なように、引数にカテゴリを持つ
+     *
+     * @param object CB_User               $user      ユーザー
+     * @param object GRN_Bulletin_Category $category  カテゴリ
+     *
+     * @return bool
+     */
+    function isAdmin(& $user, & $category)
+    {
+        if ($this->isSuperAdmin($user)) {
+            return true;
+        }
+
+        assert('$user');
+        assert('!is_null($category) && $category !== FALSE');
+
+        if ( ! $category) {
+            return false;
+        }
+
+        require_once('bulletin/privilege.csp');
+        $pm = GRN_Bulletin_PrivilegeManager::getInstance();
+
+        return $pm->privileged($user, $category, ['operation']);
+    }
+
+
+    /**
+     * セキュリティ・モデルの取得
+     */
+    function getSecurityModel(& $object)
+    {
+        return $object ? $object->get('security_model') : null;
+    }
+
+    function getSecurityModelString(& $object)
+    {
+        return $this->getSecurityModel($object)
+               == GRN_BULLETIN_SECURITY_MODEL_REVOKE ? 'revoke' : 'grant';
+    }
+
+    /**
+     * セキュリティ・モデルの設定
+     */
+    function setSecurityModel(& $user, & $object, $model)
+    {
+        $current = $this->getSecurityModel($object);
+
+        if ($current == $model) {
+            return true;
+        }
+
+        if ($model != GRN_BULLETIN_SECURITY_MODEL_REVOKE
+            && $model != GRN_BULLETIN_SECURITY_MODEL_GRANT
+        ) {
+            cb_throw_error(E_GRN_BULLETIN_INVALID_SECURITY_MODEL);
+        }
+
+        if (is_null(($object_row =& $this->_getObjectRow($object)))) {
+            require_once('bulletin/error_code.csp');
+            cb_throw_error(E_GRN_BULLETIN_CATEGORY_NOT_FOUND);
+        }
+
+        // 全アクセス権設定を削除
+        if ( ! $this->deleteTargets($object, null)) {
+            return false;
+        }
+
+        $object_row->prepareLogging();
+
+        $object_row->set('security_model', $model);
+
+        $object_row->onUpdate($user);
+        $object_row->updateNow();
+
+        $this->_cacher->clear();
+
+        $object->runHook('update');
+
+        return true;
+    }
+
+    /**
+     * セキュリティ・モデルがREVOKEかどうか問い合わせる
+     */
+    function isRevoke(& $object)
+    {
+        return $this->getSecurityModel($object)
+               == GRN_BULLETIN_SECURITY_MODEL_REVOKE;
+    }
+
+
+    /**
+     * override
+     *
+     * @access private
+     */
+    function isValidAuthorities($action, & $object, $authorities)
+    {
+        if ($action == 'add') {
+            // 追加の場合には閲覧を許可してその他を許可する設定はできない
+
+            if ( ! array_key_exists('read', $authorities)) {
+                cb_throw_error(E_GRN_BULLETIN_INVALID_ACCESS_VALUE);
+            }
+
+            if ($this->isRevoke($object)) {
+                if ($authorities['read']) {
+                    if ( ! @ $authorities['write']
+                         || ! @ $authorities['follow']
+                    ) {
+                        cb_throw_error(E_GRN_BULLETIN_INVALID_ACCESS_VALUE);
+                    }
+                }
+            } else {
+                if ( ! $authorities['read']) {
+                    if (@ $authorities['write'] || @ $authorities['follow']) {
+                        cb_throw_error(E_GRN_BULLETIN_INVALID_ACCESS_VALUE);
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 指定オブジェクトに対する権限を変更する
+     *
+     * @param object $object      権限設定するオブジェクト
+     * @param array  $targets     設定対象リスト
+     * @param array  $authorities 権限
+     * @param bool   $create_flag TRUEの場合に未設定時自動追加が行われる
+     *
+     * @return bool
+     */
+    function modifyTargets(
+        & $object,
+        $targets,
+        $authorities,
+        $create_flag = false
+    ) {
+        if ($authorities && array_key_exists('read', $authorities)) {
+            // 閲覧権限を奪う場合にはその他の権限も剥奪
+
+            if ($this->isRevoke($object)) {
+                if ($authorities['read']) {
+                    $authorities['write'] = 1;
+                    $authorities['follow'] = 1;
+                }
+            } else {
+                if ( ! $authorities['read']) {
+                    return $this->deleteTargets($object, $targets);
+                }
+            }
+        }
+
+        return parent::modifyTargets($object, $targets, $authorities,
+            $create_flag);
+    }
+
+    /**
+     * override
+     *
+     * @access private
+     */
+    function _evaluate($object_ids, $uid, $groups, $roles, $dynamic_roles)
+    {
+        $authorities = parent::_evaluate($object_ids, $uid, $groups, $roles,
+            $dynamic_roles);
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+
+        $escape_oids = [];
+        foreach (array_keys($object_ids) as $key) {
+            $id = cb_queryf($db, "'@S'", $key);
+            $escape_oids[$id] = $id;
+        }
+
+        $query = "SELECT _id, col_security_model FROM tab_"
+                 . $this->_object_class_name . " WHERE ";
+        $query .= " _id IN (" . implode(',', array_keys($escape_oids)) . ");";
+
+        $result = $db->query($query);
+
+        if (cb_is_db_result($result)) {
+            $n = $db->num_rows($result);
+            for ($i = 0; $i < $n; $i++) {
+                $row = $db->fetch_row($result);
+
+                if (array_key_exists($row[0], $authorities)
+                    && $row[1] == GRN_BULLETIN_SECURITY_MODEL_REVOKE
+                ) {
+                    foreach (array_keys($authorities[$row[0]]) as $key) {
+                        $authorities[$row[0]][$key]
+                            = $authorities[$row[0]][$key] ? 0 : 1;
+                    }
+                }
+            }
+            $db->free_result($result);
+        }
+
+        return $authorities;
+    }
+
+
+    /**
+     * @access private
+     */
+    var $_parent_cache = [];
+
+    /**
+     * カテゴリのアクセス権限を取得する
+     *
+     * @param object $user     アクセスするユーザー
+     * @param object $category カテゴリ
+     *
+     * @return array  array( 'read'=>[0,1], 'write'=>[0,1], 'follow'=>[0,1] )
+     */
+    function getAuthorities(& $user, & $category)
+    {
+        if ( ! is_object($category) && ! is_string($category)
+             && ! is_numeric($category)
+        ) {
+            assert('FALSE');
+
+            return ['read' => 0, 'write' => 0, 'follow' => 0];
+        }
+
+        if ($this->isSuperAdmin($user)) {
+            return ['read' => 1, 'write' => 1, 'follow' => 1];
+        }
+
+        $hierarchy = [];
+
+        $current = is_object($category) ? $category->getOID() : $category;
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+
+        while ( ! is_null($current)) {
+            $hierarchy = [$current => 1] + $hierarchy;
+            if (array_key_exists($current, $this->_parent_cache)) {
+                $current = $this->_parent_cache[$current];
+            } else {
+                $query = cb_queryf($db,
+                    "SELECT col_parent FROM tab_@S WHERE _id ='@S';",
+                    $this->_object_class_name, $current);
+                $result = $db->query($query);
+                if (cb_is_db_result($result)) {
+                    $row = $db->fetch_row($result);
+                    $this->_parent_cache[$current] = $row[0];
+                    $current = $row[0];
+                    $db->free_result($result);
+                } else {
+                    $current = null;
+                }
+            }
+        }
+
+        $authorities = $this->evaluateUserObjects($user, $hierarchy);
+
+        if ( ! $authorities) {
+            return ['read' => 0, 'write' => 0, 'follow' => 0];
+        }
+
+        $authorities_keys = array_keys($authorities);
+        $last = array_pop($authorities_keys);
+        $result = $authorities[$last];
+        unset($authorities[$last]);
+
+        foreach (array_keys($authorities) as $oid) {
+            if ( ! $result['read']) {
+                break;
+            }
+
+            $result['read'] = ($authorities[$oid]['read'] & $result['read']);
+        }
+
+        return $result;
+    }
+
+    /**
+     * カテゴリへのアクセスが許可されるか調べる
+     *
+     * @param object  $user     アクセスするユーザー
+     * @param object  $category カテゴリ
+     * @param integer $acc_mode アクセスモード
+     *
+     * @return bool
+     */
+    function access(& $user, & $category, $acc_mode)
+    {
+        if ($this->isSuperAdmin($user)) {
+            return true;
+        }
+
+        if ( ! $user || ! $category || ! $acc_mode) {
+            return false;
+        }
+
+        $aint = intval($acc_mode);
+
+        if ( ! ($aint & GRN_BULLETIN_ACCESS_R)
+             && ! ($aint & GRN_BULLETIN_ACCESS_W)
+             && ! ($aint & GRN_BULLETIN_ACCESS_F)
+        ) {
+            return false;
+        }
+
+        $auth = $this->getAuthorities($user, $category);
+        if ($aint & GRN_BULLETIN_ACCESS_R) {
+            if ( ! $auth['read']) {
+                return false;
+            }
+        }
+        if ($aint & GRN_BULLETIN_ACCESS_W) {
+            if ( ! $auth['write']) {
+                return false;
+            }
+        }
+        if ($aint & GRN_BULLETIN_ACCESS_F) {
+            if ( ! $auth['follow']) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * カテゴリのアクセス権を評価して、アクセス可能なカテゴリリストを取得
+     *
+     * @param object  $user       アクセスするユーザー
+     * @param array   $categories 評価するカテゴリのリスト
+     * @param integer $acc_mode   アクセスモード
+     *
+     * @return array
+     */
+    function evaluateCategories(
+        & $user,
+        $categories,
+        $acc_mode,
+        $parent_id = null
+    ) {
+        if ($this->isSuperAdmin($user)) {
+            return $categories;
+        }
+
+        if ( ! $user || ! $categories || ! $acc_mode) {
+            return [];
+        }
+
+        if ( ! is_null($parent_id)) {
+            $auth = $this->getAuthorities($user, $parent_id);
+            if ( ! $auth['read']) {
+                return [];
+            }
+        }
+
+        // cache authorities
+        $authorities = $this->evaluateUserObjects($user, $categories);
+
+        $acc_mode = intval($acc_mode);
+
+        foreach (array_keys($categories) as $id) {
+            if ( ! is_null($parent_id)) {
+                $this->_parent_cache[$id] = $parent_id;
+
+                if (($acc_mode & GRN_BULLETIN_ACCESS_R)
+                    && ! $authorities[$id]['read']
+                ) {
+                    unset($categories[$id]);
+                    continue;
+                }
+                if (($acc_mode & GRN_BULLETIN_ACCESS_W)
+                    && ! $authorities[$id]['write']
+                ) {
+                    unset($categories[$id]);
+                    continue;
+                }
+                if (($acc_mode & GRN_BULLETIN_ACCESS_F)
+                    && ! $authorities[$id]['follow']
+                ) {
+                    unset($categories[$id]);
+                    continue;
+                }
+            } else {
+                if ( ! $this->access($user, $id, $acc_mode)) {
+                    unset($categories[$id]);
+                }
+            }
+        }
+
+        return $categories;
+    }
+
+
+    /**
+     * CSVへのカテゴリアクセス権読み込み
+     *
+     * @param object $user     操作ユーザー
+     * @param object $category 対象カテゴリ
+     * @param array  $line     CSVから読み込んだ1行のデータ
+     *
+     * @return bool
+     */
+    function importCSV(& $user, & $category, $line)
+    {
+        if ($line[GRN_BULLETIN_ACCESS_CSV_ITEM] == 'security_model') {
+            if ($line[GRN_BULLETIN_ACCESS_CSV_VALUE] == 'revoke') {
+                return $this->setSecurityModel($user, $category,
+                    GRN_BULLETIN_SECURITY_MODEL_REVOKE);
+            } elseif ($line[GRN_BULLETIN_ACCESS_CSV_VALUE] == 'grant') {
+                return $this->setSecurityModel($user, $category,
+                    GRN_BULLETIN_SECURITY_MODEL_GRANT);
+            }
+
+            cb_throw_error(E_GRN_BULLETIN_INVALID_SECURITY_MODEL);
+        }
+
+        $target_class_name = $line[GRN_BULLETIN_ACCESS_CSV_ITEM];
+
+        if ( ! $this->isTargetClass($target_class_name)) {
+            $target_class_name = 'cb_' . $target_class_name;
+        }
+
+        if ( ! $this->isTargetClass($target_class_name)) {
+            cb_throw_error(E_GRN_BULLETIN_INVALID_ACCESS_TARGET);
+        }
+
+        $authorities = $this->_auth_columns;
+
+        $value = $line[GRN_BULLETIN_ACCESS_CSV_VALUE];
+
+        if (preg_match('/[^RWF]/i', $value)) {
+            cb_throw_error(E_GRN_BULLETIN_INVALID_ACCESS_VALUE);
+        }
+
+        if ($this->getSecurityModel($category)
+            == GRN_BULLETIN_SECURITY_MODEL_REVOKE
+        ) {
+            if (preg_match('/R/i', $value) === 0) {
+                $authorities['read'] = 1;
+            }
+            if (preg_match('/W/i', $value) === 0) {
+                $authorities['write'] = 1;
+            }
+            if (preg_match('/F/i', $value) === 0) {
+                $authorities['follow'] = 1;
+            }
+
+            if ( ! $authorities['write']) {
+                // 書き込みが許可なら読み取りも許可
+                $authorities['read'] = 0;
+            }
+            if ( ! $authorities['follow']) {
+                // フォローが許可なら読み取りも許可
+                $authorities['read'] = 0;
+            }
+        } else {
+            if (preg_match('/R/i', $value) !== 0) {
+                $authorities['read'] = 1;
+            }
+            if (preg_match('/W/i', $value) !== 0) {
+                $authorities['write'] = 1;
+            }
+            if (preg_match('/F/i', $value) !== 0) {
+                $authorities['follow'] = 1;
+            }
+
+            if ($authorities['write']) {
+                // 書き込みが許可なら読み取りも許可
+                $authorities['read'] = 1;
+            }
+            if ($authorities['follow']) {
+                // フォローが許可なら読み取りも許可
+                $authorities['read'] = 1;
+            }
+        }
+
+        $target = $line[GRN_BULLETIN_ACCESS_CSV_TARGET];
+
+        if ( ! $this->isStringTargetClass($target_class_name)) {
+            global $G_container_base;
+            $uum =& $G_container_base->getInstance('uum');
+
+            if ($target_class_name == 'cb_user') {
+                $target =& $uum->getUserByForeignKey($target);
+            } elseif ($target_class_name == 'cb_group') {
+                $target =& $uum->getGroupByForeignKey($target);
+            } elseif ($target_class_name == 'cb_role') {
+                $target =& $uum->getStaticRoleByForeignKey($target);
+            } else {
+                return false;
+            }
+
+            if (is_null($target)) {
+                return false;
+            }
+        }
+        if ($target_class_name === 'dynamic_role') {
+            require_once('grn/uum_util.csp');
+            $uum_util = GRN_UumUtil::getInstance();
+            $dynamic_roles = $uum_util->listDynamicRoles();
+            if ( ! array_key_exists($target, $dynamic_roles)) {
+                require_once('bulletin/error_code.csp');
+                cb_throw_error(E_GRN_BULLETIN_INVALID_ACCESS_TARGET);
+            }
+        }
+
+        return $this->modifyTarget($category, $target, $authorities, true);
+    }
+
+
+    /**
+     * CSVへのカテゴリアクセス権書き出し
+     *
+     * @param object $category 対象カテゴリ
+     * @param object $csv      CB_CSVWriter
+     *
+     * @return bool
+     */
+    function exportCSV(& $category, & $csv)
+    {
+        if ( ! ($accesses = $this->getTargets($category, null))) {
+            return false;
+        }
+
+        $line = [];
+
+        $line[GRN_BULLETIN_ACCESS_CSV_FOREINKEY]
+            = $category->get('foreign_key');
+
+        $columns = $this->_auth_columns;
+
+        $security_model = $this->getSecurityModel($category);
+
+        $line[GRN_BULLETIN_ACCESS_CSV_ITEM] = 'security_model';
+        $line[GRN_BULLETIN_ACCESS_CSV_VALUE] = $security_model
+                                               == GRN_BULLETIN_SECURITY_MODEL_REVOKE
+            ? 'revoke' : 'grant';
+        $line[GRN_BULLETIN_ACCESS_CSV_TARGET] = null;
+
+        $csv->writeLine($line);
+
+        foreach (array_keys($this->_targets) as $target_class_name) {
+            if ( ! array_key_exists($target_class_name, $accesses)) {
+                continue;
+            }
+
+            $targets = $accesses[$target_class_name];
+
+            foreach (array_keys($targets) as $id) {
+                $line[GRN_BULLETIN_ACCESS_CSV_ITEM] = null;
+                $line[GRN_BULLETIN_ACCESS_CSV_VALUE] = null;
+                $line[GRN_BULLETIN_ACCESS_CSV_TARGET] = null;
+
+                $target_access = $targets[$id];
+
+                $value = '';
+
+                if ($security_model == GRN_BULLETIN_SECURITY_MODEL_REVOKE) {
+                    if ( ! @ $target_access['read']) {
+                        $value .= 'R';
+                    }
+                    if ( ! @ $target_access['write']) {
+                        $value .= 'W';
+                    }
+                    if ( ! @ $target_access['follow']) {
+                        $value .= 'F';
+                    }
+                } else {
+                    if (@ $target_access['read']) {
+                        $value .= 'R';
+                    }
+                    if (@ $target_access['write']) {
+                        $value .= 'W';
+                    }
+                    if (@ $target_access['follow']) {
+                        $value .= 'F';
+                    }
+                }
+
+                if ($this->isStringTargetClass($target_class_name)) {
+                    $line[GRN_BULLETIN_ACCESS_CSV_ITEM] = $target_class_name;
+                } else {
+                    $line[GRN_BULLETIN_ACCESS_CSV_ITEM]
+                        = substr($target_class_name, 3);
+                }
+
+                $line[GRN_BULLETIN_ACCESS_CSV_VALUE] = $value;
+
+                if ( ! $this->isStringTargetClass($target_class_name)) {
+                    global $G_container_base;
+                    $uum =& $G_container_base->getInstance('uum');
+
+                    $target = null;
+
+                    if ($target_class_name == 'cb_user') {
+                        $target =& $uum->getUser($id);
+                    } elseif ($target_class_name == 'cb_group') {
+                        $target =& $uum->getGroup($id);
+                    } elseif ($target_class_name == 'cb_role') {
+                        $target =& $uum->getStaticRole($id);
+                    } else {
+                        return false;
+                    }
+
+                    if ( ! $target) {
+                        return false;
+                    }
+
+                    $id = $target->get('foreign_key');
+                }
+
+                $line[GRN_BULLETIN_ACCESS_CSV_TARGET] = $id;
+
+                $csv->writeLine($line);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * カテゴリのアクセス権コピー
+     *
+     * @param int   $src_id     コピー元カテゴリID
+     * @param array $target_ids コピー先カテゴリID
+     *
+     * @return bool
+     */
+    function copyAccess($src_id, $target_ids)
+    {
+        if ( ! $src_id) {
+            return false;
+        }
+        if ( ! is_array($target_ids) || 0 == count($target_ids)) {
+            return false;
+        }
+
+        require_once('grn/application.csp');
+        global $G_bulletin, $G_bulletin_login;
+        if ( ! ($src_category = $G_bulletin->getCategory($G_bulletin_login,
+            $src_id))
+        ) {
+            cb_throw_error(E_GRN_BULLETIN_CATEGORY_NOT_FOUND);
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        require_once('grn/uum_util.csp');
+        $uum_util = GRN_UumUtil::getInstance();
+        $dynamic_roles = $uum_util->listDynamicRoles();
+
+        // コピー元のカテゴリのアクセス権情報を取得
+        $security_model = $this->isRevoke($src_category)
+            ? GRN_BULLETIN_SECURITY_MODEL_REVOKE
+            : GRN_BULLETIN_SECURITY_MODEL_GRANT;
+        $target_classes = [
+            'dynamic_role' => null,
+            'cb_role'      => null,
+            'cb_group'     => null,
+            'cb_user'      => null
+        ];
+        $targets = $this->getTargets($src_category, $target_classes);
+
+        $access_list = [];
+        require_once('grn/access_resources.csp');
+        foreach ($targets as $class_type => $accesses) {
+            switch ($class_type) {
+                case 'cb_user':
+                    $type = GRN_ACCESS_TARGET_TYPE_USER;
+                    break;
+                case 'cb_group':
+                    $type = GRN_ACCESS_TARGET_TYPE_GROUP;
+                    break;
+                case 'cb_role':
+                    $type = GRN_ACCESS_TARGET_TYPE_STATIC_ROLE;
+                    break;
+                default:
+                    $type = GRN_ACCESS_TARGET_TYPE_DYNAMIC_ROLE;
+                    break;
+            }
+
+            foreach ($accesses as $key => $authorities) {
+                $mixed = null;
+                switch ($type) {
+                    case 'user':
+                        if (($user = $uum->getUser($key))) {
+                            $mixed = $user;
+                        }
+                        break;
+                    case 'group':
+                        if (($group = $uum->getGroup($key))) {
+                            $mixed = $group;
+                        }
+                        break;
+                    case 'static_role':
+                        if (($role = $uum->getStaticRole($key))) {
+                            $mixed = $role;
+                        }
+                        break;
+                    case 'dynamic_role':
+                        if (array_key_exists($key, $dynamic_roles)) {
+                            $mixed = $key;
+                        }
+                        break;
+                }
+                $access_list[] = [
+                    'type'        => $type,
+                    'tid'         => $key,
+                    'authorities' => $authorities,
+                    'mixed'       => $mixed
+                ];
+            }
+        }
+
+        // 対象カテゴリへコピー
+        foreach ($target_ids as $id) {
+            $category = $G_bulletin->getCategory($G_bulletin_login, $id);
+            if ( ! $category) {
+                cb_throw_error(E_GRN_BULLETIN_CATEGORY_NOT_FOUND);
+            }
+
+            // ルートは適用先として設定できないが念のためチェックしておく
+            if ($id == GRN_BULLETIN_ROOT_CATEGORY_ID) {
+                continue;
+            }
+
+            // 登録されているアクセス権一覧をすべて削除
+            $this->deleteTargets($category, null);
+            // セキュリティモデルをセット
+            $this->setSecurityModel($G_bulletin_login, $category,
+                $security_model);
+            // アクセス権をセット
+            foreach ($access_list as $access) {
+                if ( ! is_null($access['mixed'])) {
+                    $this->addTarget($category, $access['mixed'],
+                        $access['authorities']);
+                }
+            }
+        }
+
+        return true;
+    }
+}
+
+class GRN_Bulletin_CategoryEntity_ACL_Base extends CB_PersistentBase
+{
+    var $col_authority_follow = ['type' => 'int'];
+    var $col_authority_read = ['type' => 'int'];
+    var $col_authority_write = ['type' => 'int'];
+    var $col_object
+        = [
+            'type' => 'relation',
+            'to'   => 'grn_bulletin_categoryentity'
+        ];
+}
+
+class GRN_Bulletin_CategoryEntity_ACL_CB_User
+    extends GRN_Bulletin_CategoryEntity_ACL_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_user'];
+}
+
+class GRN_Bulletin_CategoryEntity_ACL_CB_Group
+    extends GRN_Bulletin_CategoryEntity_ACL_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_group'];
+}
+
+class GRN_Bulletin_CategoryEntity_ACL_Dynamic_Role
+    extends GRN_Bulletin_CategoryEntity_ACL_Base
+{
+    var $col_target = ['type' => 'char', 'length' => 100];
+}
+
+class GRN_Bulletin_CategoryEntity_ACL_CB_Role
+    extends GRN_Bulletin_CategoryEntity_ACL_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_role'];
+}
+
+class GRN_Bulletin_CategoryEntity_Prv_Base extends CB_PersistentBase
+{
+    var $col_authority_operation = ['type' => 'int'];
+    var $col_object
+        = [
+            'type' => 'relation',
+            'to'   => 'grn_bulletin_categoryentity'
+        ];
+}
+
+class GRN_Bulletin_CategoryEntity_Prv_CB_User
+    extends GRN_Bulletin_CategoryEntity_Prv_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_user'];
+}
+
+class GRN_Bulletin_CategoryEntity_Prv_CB_Group
+    extends GRN_Bulletin_CategoryEntity_Prv_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_group'];
+}
+
+class GRN_Bulletin_CategoryEntity_Prv_Dynamic_Role
+    extends GRN_Bulletin_CategoryEntity_Prv_Base
+{
+    var $col_target = ['type' => 'char', 'length' => 100];
+}
+
+class GRN_Bulletin_CategoryEntity_Prv_CB_Role
+    extends GRN_Bulletin_CategoryEntity_Prv_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_role'];
+}

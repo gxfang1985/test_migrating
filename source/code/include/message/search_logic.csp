@@ -1,0 +1,1233 @@
+<?php
+
+/**
+ * Message Search Logic
+ *
+ * @author  Mizuno, Kuniaki     2005/01
+ * @version 1.0
+ * @package grn.message
+ */
+
+require_once('grn/application.csp');
+
+
+class GRN_Message_SearchLogic
+{
+    private $_db;
+    private $_target_omids;
+    private $_target_smids;
+    private $_target_fids;
+    private $_target_hids;
+    private $_keyword_list;
+    private $_num_of_target_mids;
+    private $_escaped_keywords;
+    private $_time_conditions;
+    private $_folder_condition;
+
+    private $__hids;
+
+    function __construct()
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $this->_db = $app_locator->getConnection('message');
+
+        $this->_target_omids = [];
+        $this->_target_smids = [];
+        $this->_target_fids = ['original' => [], 'snapshot' => []];
+        $this->_target_hids = [];
+        $this->_keyword_list = null;
+        $this->_num_of_target_mids = 0;
+        $this->_escaped_keywords = [];
+        $this->_time_conditions = null;
+        $this->_folder_condition = null;
+    }
+
+    /**
+     * @access  private
+     *
+     * @param   string $keyword
+     *
+     * @return  null
+     */
+    function _getParsedKeywordList($keyword)
+    {
+        if (is_null($this->_keyword_list)) {
+            require_once('fw/string_util.csp');
+            $this->_keyword_list = cb_parse_search_text($keyword);
+        }
+
+        return $this->_keyword_list;
+    }
+
+    /**
+     * @access  private
+     *
+     * @param   CB_User $user
+     *
+     * @return  array
+     */
+    function _getAllFolders($user)
+    {
+        $query = 'SELECT _id FROM tab_grn_message_folders WHERE col_user = \''
+                 . $this->_db->escape($user->getOID()) . '\'';
+
+        $result = $this->_db->query($query);
+        if ($result === false) {
+            $this->_db->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+
+        $hids = [];
+        while ($row = $this->_db->fetch_assoc($result)) {
+            $hids[] = $row['_id'];
+        }
+        $this->_db->free_result($result);
+
+        return $hids;
+    }
+
+    /**
+     * @access  private
+     *
+     * @param   CB_User $user
+     * @param   string  $hid
+     * @param           $subfolder
+     *
+     * @return  array
+     */
+    function _getFoldersByID($user, $hid, $subfolder)
+    {
+        $uid = $user->getOID();
+        $hid = $this->_db->escape($hid);
+        //escape!
+        $query = 'SELECT _id FROM tab_grn_message_folders WHERE _id = \'' . $hid
+                 . '\' AND col_user = \'' . $this->_db->escape($uid) . '\'';
+
+        $result = $this->_db->query($query);
+        if ($result === false) {
+            $this->_db->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+
+        $row = $this->_db->fetch_assoc($result);
+        $this->_db->free_result($result);
+
+        if ( ! $row) {
+            return [];
+        }
+
+        $folders = [$row['_id']];
+
+        if ($subfolder) {
+            $hids = [$hid];
+            $this->_getSubFolders($uid, $hids, $folders);
+        }
+
+        return $folders;
+    }
+
+    /**
+     * @access  private
+     *
+     * @param   string $uid
+     * @param   array  $hids
+     * @param          $folders
+     *
+     * @return  null
+     */
+    function _getSubFolders($uid, $hids, & $folders)
+    {
+        if ( ! is_array($hids) || count($hids) === 0) {
+            return null;
+        }
+        //escape!
+        $escaped_hids = [];
+        foreach ($hids as $hid) {
+            $escaped_hids[] = $this->_db->escape($hid);
+        }
+        $query
+            = 'SELECT f._id FROM tab_grn_message_folders AS f INNER JOIN tab_cb_user AS u ON f.col_user = u._id AND u.col_deleted IS NULL WHERE col_parent_folder IN (\''
+              . implode('\',\'', $escaped_hids) . '\') AND col_user = \''
+              . $this->_db->escape($uid) . '\'';
+
+        $result = $this->_db->query($query);
+        if ($result === false) {
+            $this->_db->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+
+        $children = [];
+        while ($row = $this->_db->fetch_assoc($result)) {
+            $folders[] = $row['_id'];
+            $children[] = $row['_id'];
+        }
+        $this->_db->free_result($result);
+
+        $this->_getSubFolders($uid, $children, $folders);
+
+        return null;
+    }
+
+    /**
+     * @access  private
+     *
+     * @param   CB_User $user
+     * @param   string  $hid
+     * @param           $subfolder
+     *
+     * @return  array
+     */
+    function _getTargetFolders($user, $hid, $subfolder)
+    {
+        if (count($this->_target_hids) > 0) {
+            return $this->_target_hids;
+        }
+
+        $ret = [];
+        if ($hid === '-1') {
+            $ret = $this->_getAllFolders($user);
+        } else {
+            $ret = $this->_getFoldersByID($user, $hid, $subfolder);
+        }
+
+        if ( ! is_array($ret)) {
+            return [];
+        }
+
+        $this->_target_hids = $ret;
+
+        return $ret;
+    }
+
+    /**
+     * @access  private
+     *
+     * @param   $user
+     * @param   $items
+     * @param   $keyword_list
+     * @param   $start_ts
+     * @param   $last_ts
+     * @param   $hids
+     * @param   $subfolder
+     *
+     * @return  bool
+     */
+    function _prepend(
+        $user,
+        $items,
+        $keyword_list,
+        $start_ts,
+        $last_ts,
+        $hids,
+        $subfolder
+    ) {
+        // set this value to refactor ><
+        $this->__hids = $hids;
+        // check keyword
+        if (count($keyword_list) == 0) {
+            return false;
+        }
+
+        // check items
+        if (count($items) == 0) {
+            return false;
+        }
+
+        // check term
+        if ($last_ts && $start_ts && $last_ts->unix_ts < $start_ts->unix_ts) {
+            return false;
+        }
+
+        // check folders
+        if (count($hids) == 0) {
+            return false;
+        }
+
+        $folder_condition = $this->_getFolderCondition($hids);
+
+        // check addressees and follows
+        if (array_key_exists('addressee', $items)
+            || array_key_exists('follow', $items)
+        ) {
+            foreach ($keyword_list as $key) {
+                // for original messages
+                $mids = $this->_getMessageIDsFromOriginal($user,
+                    $items, $folder_condition, $key,
+                    $start_ts, $last_ts);
+                $this->_num_of_target_mids += count($mids);
+
+                // for snapshot messages
+                $mids = $this->_getMessageIDsFromSnapshot($user,
+                    $items, $folder_condition, $key,
+                    $start_ts, $last_ts);
+                $this->_num_of_target_mids += count($mids);
+            }
+
+            if ($this->_num_of_target_mids == 0) {
+                if (count($items) == 1
+                    || (count($items) == 2
+                        && array_key_exists('addressee', $items)
+                        && array_key_exists('follow', $items))
+                ) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     *
+     * @param object $user
+     * @param array  $items
+     * @param string $keyword
+     * @param int    $offset
+     * @param int    $limit
+     * @param object $start_ts
+     * @param object $last_ts
+     * @param string $hid
+     * @param bool   $subfolder
+     *
+     * @return array
+     * @access public
+     */
+    function getSearchItems(
+        $user,
+        $items,
+        $keyword,
+        $offset,
+        $limit,
+        $start_ts = null,
+        $last_ts = null,
+        $hid = '-1',
+        $subfolder = true
+    ) {
+        unset($items['sub']);
+
+        $keyword_list = $this->_getParsedKeywordList($keyword);
+        $hids = $this->_getTargetFolders($user, $hid, $subfolder);
+
+        $ret = $this->_prepend($user, $items, $keyword_list, $start_ts,
+            $last_ts, $hids,
+            $subfolder);
+        if ($ret === false) {
+            return [];
+        }
+
+        $query = $this->_getItemQuery($user, $hids, $items, $keyword_list,
+            $start_ts, $last_ts);
+        if ($query === false) {
+            return [];
+        }
+
+        $query = $this->_db->select_format($query, $offset, $limit,
+            CB_DATABASE_NO_LOCK);
+
+        $result = $this->_db->query($query);
+        if ($result === false) {
+            $this->_db->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+
+        $ret = [];
+        $id = 0;
+        while ($row = $this->_db->fetch_assoc($result)) {
+            $ret[$id] = $this->_setValueForView($row, $items);
+            $id++;
+        }
+        $this->_db->free_result($result);
+
+        return $ret;
+    }
+
+    /**
+     * @access  private
+     *
+     * @param   $row
+     * @param   $items
+     *
+     * @return  array
+     */
+    function _setValueForView($row, $items)
+    {
+        $ts = new CB_TimeStamp();
+
+        $cid = $row['hid'];
+
+        $ts->unix_ts = intval($row['rlast_vtime']);
+        $last_vtime = $ts;
+
+        // if follow ID is 1, the object is MESSAGE
+        $result = [];
+
+        $ts->unix_ts = intval($row['mlast_mtime']);
+        $last_mtime = $ts;
+
+        $ts->unix_ts = intval($row['mctime']);
+        $ctime = $ts;
+
+        $unread = null;
+        $update = null;
+        if ($last_vtime->unix_ts >= $last_mtime->unix_ts) {
+            $unread = '0';
+            $update = '0';
+        } else {
+            $unread = '1';
+
+            if ($last_vtime->unix_ts > $ctime->unix_ts) {
+                $update = '1';
+            }
+        }
+
+        require_once('message/file.csp');
+        $fm = new GRN_Message_FileManager();
+        $has_files = $fm->getMessageFileNum($row['rmessage'], false);
+
+        $mcreator_uid = is_null($row['mcreator_deleted']) ? $row['mcreator']
+            : null;
+
+        $result = [
+            'mid'          => $row['rmessage'],
+            'cid'          => $cid,
+            'rid'          => $row['rid'],
+            'subject'      => $row['msubject'],
+            'data'         => $row['mdata'],
+            'creator_uid'  => $mcreator_uid,
+            'creator_name' => $row['mcreator_name'],
+            //'attached'     => $row['mfile_num'],
+            'attached'     => $has_files,
+            'type'         => $row['rsent_message_flag'],
+            'unread'       => $unread,
+            'update'       => $update,
+            'is_sender'    => strcmp($row['rsent_message_flag'], '1') === 0
+                ? true : false,
+        ];
+
+        $ts->unix_ts = intval($row['mlast_mtime']);
+        $result['mtime'] = $ts;
+
+        if (array_key_exists('follow', $items) && $items['follow']) {
+            if ($row['foid'] !== GRN_MESSAGE_DUMMY_FOLLOW_ID) {
+                // follow
+                $ts->unix_ts = intval($row['fctime']);
+                $ctime = $ts;
+
+                if ($last_vtime->unix_ts >= $ctime->unix_ts) {
+                    $unread = '0';
+                    $update = '0';
+                }
+
+                if ($ctime->unix_ts > $last_vtime->unix_ts) {
+                    $unread = '1';
+                    $update = '1';
+                }
+
+                $fcreator_uid = is_null($row['fcreator_deleted'])
+                    ? $row['fcreator'] : null;
+
+                // Follow
+                $result['fid'] = $row['foid'];
+                // $result['follower_uid']  = $row['fcreator'];
+                $result['follower_uid'] = $fcreator_uid;
+                $result['follower_name'] = $row['fcreator_name'];
+                $result['follow'] = $row['fdata'];
+                $result['unread'] = $unread;
+                $result['update'] = $update;
+                $result['follow_id'] = $row['fid'];
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param object $user
+     * @param array  $items
+     * @param string $keyword
+     * @param object $start_ts
+     * @param object $last_ts
+     * @param string $hid
+     * @param bool   $subfolder
+     *
+     * @return object CB_MultRowSet
+     */
+    function getSearchItemCount(
+        $user,
+        $items,
+        $keyword,
+        $start_ts = null,
+        $last_ts = null,
+        $hid = '-1',
+        $subfolder = true
+    ) {
+        unset($items['sub']);
+
+        $keyword_list = $this->_getParsedKeywordList($keyword);
+        $hids = $this->_getTargetFolders($user, $hid, $subfolder);
+
+        $ret = $this->_prepend($user, $items, $keyword_list, $start_ts,
+            $last_ts, $hids,
+            $subfolder);
+        if ($ret === false) {
+            return 0;
+        }
+
+        $query = $this->_getCountQuery($user, $hids, $items, $keyword_list,
+            $start_ts, $last_ts);
+        if ($query === false) {
+            return 0;
+        }
+
+        $result = $this->_db->query($query);
+        if ($result === false) {
+            $this->_db->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+
+        $count = 0;
+        while ($row = $this->_db->fetch_assoc($result)) {
+            $count += $row['count'];
+        }
+        $this->_db->free_result($result);
+
+        return $count;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $user
+     * @param $hids
+     * @param $items
+     * @param $keyword_list
+     * @param $start_ts
+     * @param $last_ts
+     *
+     * @return bool|string
+     */
+    function _getCountQuery(
+        $user,
+        $hids,
+        $items,
+        $keyword_list,
+        $start_ts,
+        $last_ts
+    ) {
+        $query = $this->_getQuery($user, $hids, $items, $keyword_list,
+            $start_ts, $last_ts, true);
+
+        return $query;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $user
+     * @param $hids
+     * @param $items
+     * @param $keyword_list
+     * @param $start_ts
+     * @param $last_ts
+     *
+     * @return bool|string
+     */
+    function _getItemQuery(
+        $user,
+        $hids,
+        $items,
+        $keyword_list,
+        $start_ts,
+        $last_ts
+    ) {
+        $query = $this->_getQuery($user, $hids, $items, $keyword_list,
+            $start_ts, $last_ts, false);
+
+        return $query;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $user
+     * @param $hids
+     * @param $items
+     * @param $keyword_list
+     * @param $start_ts
+     * @param $last_ts
+     * @param $for_count
+     *
+     * @return bool|string
+     */
+    function _getQuery(
+        $user,
+        $hids,
+        $items,
+        $keyword_list,
+        $start_ts,
+        $last_ts,
+        $for_count
+    ) {
+        $queries = [];
+
+        $only_follow = count($items) == 1
+                       && array_key_exists('follow', $items);
+        $target_follow = array_key_exists('follow', $items);
+
+        // for bodies
+        if ( ! $only_follow) {
+            $body_columns = $this->_getColumns($for_count);
+            $body_tables = $this->_getTables($user);
+            // for original bodies
+            $conditions = $this->_getConditions($user, $hids, $items,
+                $keyword_list,
+                $start_ts, $last_ts, false);
+            if ($this->_isTarget($items, false, false)) {
+                $queries[] = $this->_getSubQuery($body_columns, $body_tables,
+                    $conditions);
+            }
+
+            // for snapshot bodies
+            $conditions = $this->_getConditions($user, $hids, $items,
+                $keyword_list,
+                $start_ts, $last_ts, true);
+            if ($this->_isTarget($items, true, false)) {
+                $queries[] = $this->_getSubQuery($body_columns, $body_tables,
+                    $conditions);
+            }
+        }
+
+        // for follows
+        if ($target_follow) {
+            $follow_columns = $this->_getColumns($for_count, true);
+            $follow_tables = $this->_getTables($user, true);
+            // for original follows
+            if ($this->_isTarget($items, false, true)) {
+                $conditions = $this->_getConditions($user, $hids, $items,
+                    $keyword_list, $start_ts,
+                    $last_ts, false, true);
+                $queries[] = $this->_getSubQuery($follow_columns,
+                    $follow_tables, $conditions);
+            }
+
+            // for snapshot follows
+            if ($this->_isTarget($items, true, true)) {
+                $conditions = $this->_getConditions($user, $hids, $items,
+                    $keyword_list, $start_ts,
+                    $last_ts, true, true);
+                $queries[] = $this->_getSubQuery($follow_columns,
+                    $follow_tables, $conditions);
+            }
+        }
+
+        if (count($queries) == 0) {
+            return false;
+        }
+
+        $query = $this->_getUnionQuery($queries);
+
+        if ( ! $for_count) {
+            $query .= ' ORDER BY mlast_mtime DESC, rmessage DESC, fctime DESC';
+        }
+
+        return $query;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $items
+     * @param $for_snapshot
+     * @param $for_follow
+     *
+     * @return bool
+     */
+    function _isTarget($items, $for_snapshot, $for_follow)
+    {
+        $target_mids = $for_snapshot ? $this->_target_smids
+            : $this->_target_omids;
+
+        if (count($items) == 1 && array_key_exists('addressee', $items)) {
+            $is_target = true;
+            foreach ($target_mids as $mids) {
+                $is_target = $is_target
+                             && count($mids['addressees'])
+                                > 0; // 検索結果は、各キーワードで検索したものの積集合だからか？
+            }
+
+            return $is_target;
+        }
+        if (count($items) == 1 && array_key_exists('follow', $items)) {
+            $is_target = true;
+            foreach ($target_mids as $mids) {
+                $is_target = $is_target && count($mids['follows']) > 0;
+            }
+
+            return $is_target;
+        }
+        if (count($items) == 2 && array_key_exists('addressee', $items)
+            && array_key_exists('follow', $items)
+        ) {
+            if ($for_follow) {
+                $is_target = false;
+                foreach ($target_mids as $mids) {
+                    $is_target = $is_target || count($mids['follows']) > 0;
+                }
+            } else {
+                $is_target = true;
+                foreach ($target_mids as $mids) {
+                    $is_target = $is_target && count($mids['addressees']) > 0;
+                }
+            }
+
+            return $is_target;
+        }
+        if ($for_follow) {
+            $is_target = false;
+            foreach ($target_mids as $mids) {
+                $is_target = $is_target || count($mids['follows']) > 0;
+            }
+
+            return $is_target;
+        }
+
+        return true;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $queries
+     *
+     * @return string
+     */
+    function _getUnionQuery($queries)
+    {
+        $query = '(' . implode(') UNION ALL (', $queries) . ')';
+
+        return $query;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $columns
+     * @param $tables
+     * @param $conditions
+     *
+     * @return string
+     */
+    function _getSubQuery($columns, $tables, $conditions)
+    {
+        $query = 'SELECT ' . implode(', ', $columns) . ' FROM ' . implode(', ',
+                $tables) . ' WHERE ' . implode(' AND ', $conditions);
+
+        return $query;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param bool $for_count
+     * @param bool $for_follow
+     *
+     * @return array
+     */
+    function _getColumns($for_count = false, $for_follow = false)
+    {
+        if ($for_count) {
+            $columns = ['COUNT(*) count'];
+        } else {
+            $columns = [
+                'm._id mid',
+                'm.col_subject msubject',
+                'm.col_data mdata',
+                'm.col_creator mcreator',
+                'm.col_creator_name mcreator_name',
+                'm.col_last_mtime mlast_mtime',
+                'm.col_file_num mfile_num',
+                'm.col_ctime mctime',
+                'mu.col_deleted mcreator_deleted',
+                'h._id hid',
+                'r._id rid',
+                'r.col_message rmessage',
+                'r.col_sent_message_flag rsent_message_flag',
+                'r.col_last_vtime rlast_vtime'
+            ];
+
+            if ($for_follow) {
+                $columns[] = 'f._id foid';
+                $columns[] = 'f.col_ctime fctime';
+                $columns[] = 'f.col_creator fcreator';
+                $columns[] = 'f.col_creator_name fcreator_name';
+                $columns[] = 'f.col_data fdata';
+                $columns[] = 'f.col_id fid';
+                $columns[] = 'fu.col_deleted fcreator_deleted';
+            } else {
+                $columns[] = GRN_MESSAGE_DUMMY_FOLLOW_ID . ' foid';
+                $columns[] = '0 fctime';
+                $columns[] = 'NULL fcreator';
+                $columns[] = '\'\' fcreator_name';
+                $columns[] = '\'\' fdata';
+                $columns[] = 'NULL fid';
+                $columns[] = 'NULL fcreator_deleted';
+            }
+        }
+
+        return $columns;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param      $user
+     * @param bool $for_follow
+     *
+     * @return array
+     */
+    function _getTables($user, $for_follow = false)
+    {
+        $table_name = grn_get_personal_tablename_message($user->getOID(),
+            'tab_grn_message_foldermessagerelations');
+        $tables = [
+            "tab_grn_message_messages m LEFT JOIN tab_cb_user AS mu ON m.col_creator = mu._id",
+            "{$table_name} r",
+            "tab_grn_message_folders h INNER JOIN tab_cb_user AS hu ON h.col_user = hu._id AND hu.col_deleted IS NULL",
+        ];
+        if ($for_follow) {
+            $tables[]
+                = 'tab_grn_message_follows f LEFT JOIN tab_cb_user AS fu ON f.col_creator = fu._id';
+        }
+
+        return $tables;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param      $user
+     * @param      $hids
+     * @param      $items
+     * @param      $keyword_list
+     * @param      $start_ts
+     * @param      $last_ts
+     * @param bool $for_snapshot
+     * @param bool $for_follow
+     *
+     * @return array
+     */
+    function _getConditions(
+        $user,
+        $hids,
+        $items,
+        $keyword_list,
+        $start_ts,
+        $last_ts,
+        $for_snapshot = false,
+        $for_follow = false
+    ) {
+        $conditions = ['h._id = r.col_folder'];
+        $folder_condition = $this->_getFolderCondition($hids);
+        $conditions[] = $folder_condition;
+        $time_condition = $this->_getTimeCondition($start_ts, $last_ts);
+        if ($time_condition) {
+            $conditions[] = $time_condition;
+        }
+        if ($for_snapshot) {
+            $conditions[] = 'm._id = r.col_snapshot_message';
+        } else {
+            $conditions[] = 'm._id = r.col_message';
+            $conditions[] = 'r.col_snapshot_message IS NULL';
+        }
+        foreach ($keyword_list as $keyword) {
+            $condition = $this->_getKeywordConditions($user, $folder_condition,
+                $items, $keyword,
+                $start_ts, $last_ts,
+                $for_snapshot, $for_follow);
+            if ($condition !== false) {
+                $conditions[] = $condition;
+            }
+        }
+        if ($for_follow) {
+            $fid_key = $for_snapshot ? 'snapshot' : 'original';
+            $conditions[] = 'f.col_message = r.col_message';
+            if (count($this->_target_fids[$fid_key]) > 0) {
+                //$conditions[] = 'f._id IN (' . implode( ',', $this->_target_fids[$fid_key] ) . ')';
+                //escaped!
+                $after = [];
+                foreach ($this->_target_fids[$fid_key] as $item) {
+                    $after[] = "'" . $this->_db->escape($item) . "'";
+                }
+                $conditions[] = 'f._id IN (' . implode(',', $after) . ')';
+            }
+        }
+
+        return $conditions;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $user
+     * @param $folder_condition
+     * @param $items
+     * @param $key
+     * @param $start_ts
+     * @param $last_ts
+     * @param $for_snapshot
+     * @param $for_follow
+     *
+     * @return bool|string
+     */
+    function _getKeywordConditions(
+        $user,
+        $folder_condition,
+        $items,
+        $key,
+        $start_ts,
+        $last_ts,
+        $for_snapshot,
+        $for_follow
+    ) {
+        $conditions = [];
+        $item_list = array_keys($items);
+        foreach ($item_list as $item) {
+            switch ($item) {
+                case 'subject':
+                    $conditions[] = $this->_getLikeCondition('m.col_subject',
+                        $key);
+                    break;
+                case 'data':
+                    $conditions[] = $this->_getLikeCondition('m.col_data',
+                        $key);
+                    break;
+                case 'sender':
+                    $conditions[]
+                        = "( {$this->_getLikeCondition( 'm.col_creator_name', $key )} OR {$this->_getLikeCondition( 'mu.col_nickname', $key )} )";
+                    break;
+            }
+        }
+
+        if (array_key_exists('addressee', $items)
+            || array_key_exists('follow', $items)
+        ) {
+            if ($for_snapshot) {
+                $mids = $this->_getMessageIDsFromSnapshot($user, $items,
+                    $folder_condition, $key,
+                    $start_ts, $last_ts);
+            } else {
+                $mids = $this->_getMessageIDsFromOriginal($user, $items,
+                    $folder_condition, $key,
+                    $start_ts, $last_ts);
+            }
+
+            if ($for_follow) {
+                $mids = array_unique(array_merge($mids['addressees'],
+                    $mids['follows']));
+            } else {
+                $mids = array_unique($mids['addressees']);
+            }
+            if (count($mids) > 0) {
+
+                //escaped!
+                $after = [];
+                foreach ($mids as $mid) {
+                    $after[] = "'" . $this->_db->escape($mid) . "'";
+                }
+                $conditions[] = 'm._id IN (' . implode(',', $after) . ')';
+            }
+        }
+
+        $query = false;
+        if (count($conditions) > 0) {
+            $query = '(' . implode(' OR ', $conditions) . ')';
+        }
+
+        return $query;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $col_name
+     * @param $keyword
+     *
+     * @return string
+     */
+    function _getLikeCondition($col_name, $keyword)
+    {
+        if (array_key_exists($keyword, $this->_escaped_keywords)) {
+            return $col_name . $this->_escaped_keywords[$keyword];
+        }
+
+        $escaped_keyword = cb_queryf($this->_db,
+            " LIKE '%@L%'", $keyword);
+        $this->_escaped_keywords[$keyword] = $escaped_keyword;
+
+        return $col_name . $escaped_keyword;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $start_ts
+     * @param $last_ts
+     *
+     * @return bool|$this->_time_conditions
+     */
+    function _getTimeCondition($start_ts, $last_ts)
+    {
+        if ( ! is_null($this->_time_conditions)) {
+            return $this->_time_conditions;
+        }
+
+        $conditions = [];
+        if ( ! is_null($start_ts)) {
+
+            $conditions[] = 'm.col_last_mtime >= \''
+                            . $this->_db->escape($start_ts->unix_ts) . '\'';
+
+        }
+        if ( ! is_null($last_ts)) {
+
+            $conditions[] = 'm.col_last_mtime < \''
+                            . $this->_db->escape($last_ts->unix_ts) . '\'';
+        }
+
+        $query = false;
+        if (count($conditions) > 0) {
+            $query = implode(' AND ', $conditions);
+        }
+
+        $this->_time_conditions = $query;
+
+        return $query;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $hids
+     *
+     * @return null|string
+     */
+    function _getFolderCondition($hids)
+    {
+        if ( ! is_null($this->_folder_condition)) {
+            return $this->_folder_condition;
+        }
+
+
+        //escape!
+        $escaped_hids = [];
+        foreach ($hids as $hid) {
+            $escaped_hids[] = "'" . $this->_db->escape($hid) . "'";
+        }
+        $condition = 'h._id IN (' . implode(',', $escaped_hids)
+                     . ')';
+        $this->_folder_condition = $condition;
+
+        return $condition;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $user
+     * @param $items
+     * @param $folder_condition
+     * @param $keyword
+     * @param $start_ts
+     * @param $last_ts
+     *
+     * @return array
+     */
+    function _getMessageIDsFromOriginal(
+        $user,
+        $items,
+        $folder_condition,
+        $keyword,
+        $start_ts,
+        $last_ts
+    ) {
+        if (array_key_exists($keyword, $this->_target_omids)) {
+            // use cache
+            return $this->_target_omids[$keyword];
+        }
+
+        $mids = $this->_getMessageIDs($user, $items,
+            $folder_condition, $keyword, false,
+            $start_ts, $last_ts);
+        $this->_target_omids[$keyword] = $mids;
+
+        return $mids;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $user
+     * @param $items
+     * @param $folder_condition
+     * @param $keyword
+     * @param $start_ts
+     * @param $last_ts
+     *
+     * @return array
+     */
+    function _getMessageIDsFromSnapshot(
+        $user,
+        $items,
+        $folder_condition,
+        $keyword,
+        $start_ts,
+        $last_ts
+    ) {
+        if (array_key_exists($keyword, $this->_target_smids)) {
+            // use cache
+            return $this->_target_smids[$keyword];
+        }
+
+        $mids = $this->_getMessageIDs($user, $items,
+            $folder_condition, $keyword, true,
+            $start_ts, $last_ts);
+        $this->_target_smids[$keyword] = $mids;
+
+        return $mids;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param $user CB_User
+     * @param $items
+     * @param $folder_condition
+     * @param $keyword
+     * @param $for_snapshot
+     * @param $start_ts
+     * @param $last_ts
+     *
+     * @return array
+     */
+    private function _getMessageIDs(
+        $user,
+        $items,
+        $folder_condition,
+        $keyword,
+        $for_snapshot,
+        $start_ts,
+        $last_ts
+    ) {
+        $addressees = [];
+        $follows = [];
+        $fids = [];
+
+        // addressee
+        if (array_key_exists('addressee', $items)) {
+            $queryObject = $this->createQuerySearchByAddresesee($user->getOID(),
+                $keyword, $start_ts, $last_ts, $for_snapshot);
+            $result = $queryObject->execute();
+            foreach ($result as $row) {
+                $addressees[] = $row["mid"];
+            }
+        }
+
+        // follow
+        if (array_key_exists('follow', $items)) {
+            $queryObject = $this->createQuerySearchByFollow($user->getOID(),
+                $keyword, $start_ts, $last_ts, $for_snapshot);
+            $result = $queryObject->execute();
+            foreach ($result as $row) {
+                $follows[] = $row["mid"];
+                $fids[] = $row["fid"];
+            }
+        }
+        $mids = [
+            'addressees' => $addressees,
+            'follows'    => $follows
+        ];
+
+        $fid_key = $for_snapshot ? 'snapshot' : 'original';
+        $merged_fids
+            = array_merge($this->_target_fids[$fid_key],
+            $fids);
+        $this->_target_fids[$fid_key] = array_unique($merged_fids);
+
+        return $mids;
+    }
+
+    /**
+     * Create a query object which searches for messages by addressees.
+     *
+     * @param string         $inUserId
+     * @param string         $inKeyword
+     * @param CB_TimeStampEx $inStartTimestamp
+     * @param CB_TimeStampEx $inEndTimestamp
+     * @param boolean        $inIsSnapshot
+     *
+     * @return \GrnMessageSearchByAddresseeQuery
+     */
+    private function createQuerySearchByAddresesee(
+        $inUserId,
+        $inKeyword,
+        $inStartTimestamp,
+        $inEndTimestamp,
+        $inIsSnapshot
+    ) {
+        require_once("message/query/GrnMessageSearchByAddresseeQuery.csp");
+        $searchMessageByAddressee = new GrnMessageSearchByAddresseeQuery();
+        $searchMessageByAddressee->setUserId($inUserId);
+        $searchMessageByAddressee->setKeyword($inKeyword);
+        $searchMessageByAddressee->setSearchSnapshot($inIsSnapshot);
+        if ( ! is_null($inStartTimestamp)) {
+            $searchMessageByAddressee->setStartTimestamp($inStartTimestamp->unix_ts);
+        }
+        if ( ! is_null($inEndTimestamp)) {
+            $searchMessageByAddressee->setEndTimestamp($inEndTimestamp->unix_ts);
+        }
+        $searchMessageByAddressee->setCategoryIdList($this->_target_hids);
+        $searchMessageByAddressee->setDatabaseConnection($this->_db);
+
+        return $searchMessageByAddressee;
+    }
+
+    /**
+     * Create a query object which searches for messages by addressees.
+     *
+     * @param string         $inUserId
+     * @param string         $inKeyword
+     * @param CB_TimestampEx $inStartTimestamp
+     * @param CB_TimestampEx $inEndTimestamp
+     * @param boolean        $inIsSnapshot
+     *
+     * @return \GrnMessageSearchByFollowQuery
+     */
+    private function createQuerySearchByFollow(
+        $inUserId,
+        $inKeyword,
+        $inStartTimestamp,
+        $inEndTimestamp,
+        $inIsSnapshot
+    ) {
+        require_once("message/query/GrnMessageSearchByFollowQuery.csp");
+        $searchMessageByFollow = new GrnMessageSearchByFollowQuery();
+        $searchMessageByFollow->setUserId($inUserId);
+        $searchMessageByFollow->setKeyword($inKeyword);
+        $searchMessageByFollow->setSearchSnapshot($inIsSnapshot);
+        if ( ! is_null($inStartTimestamp)) {
+            $searchMessageByFollow->setStartTimestamp($inStartTimestamp->unix_ts);
+        }
+        if ( ! is_null($inEndTimestamp)) {
+            $searchMessageByFollow->setEndTimestamp($inEndTimestamp->unix_ts);
+        }
+        $searchMessageByFollow->setCategoryIdList($this->_target_hids);
+        $searchMessageByFollow->setDatabaseConnection($this->_db);
+
+        return $searchMessageByFollow;
+    }
+}

@@ -1,0 +1,203 @@
+<?php
+declare(strict_types=1);
+
+use grn\api\exception\authentication\InactiveUserException;
+use grn\api\exception\authentication\InvalidAuthorizationValueException;
+use grn\api\exception\authentication\PasswordExpiredException;
+use grn\cydec\slash\session\api\SlashSessionManagementAPI;
+use grn\grn\authentication\policy\LoginUserFindPolicyApi;
+use grn\grn\authentication\policy\LoginUserFindPolicyInterface;
+use grn\grn\authentication\policy\slash\SlashSessionManagementAPIRunner;
+
+require_once('grn/authentication.csp');
+require_once('fw/i18n/locale.csp');
+
+class plugin_grn_common_authentication_login_api extends GRN_Authentication_Login_DriverBase
+{
+    /** Configuration Parameters **/
+    var $driverSettings = null;
+
+    /** /** @var GRN_Authentication_Repository_DriverBase */
+    var $userRepository = null;
+
+    /** Configuration Complete Flag **/
+    var $configured = false;
+
+    /**
+     * Constructor
+     *
+     */
+    function __construct()
+    {
+        $no_page = null;
+        $driver_page = [
+            GRN_AUTH_PAGE_TYPE_LOGIN           => $no_page,
+            GRN_AUTH_PAGE_TYPE_VIEW_SYSTEM     => $no_page,
+            GRN_AUTH_PAGE_TYPE_ADD_SYSTEM      => $no_page,
+            GRN_AUTH_PAGE_TYPE_MODIFY_SYSTEM   => $no_page,
+            GRN_AUTH_PAGE_TYPE_VIEW_PERSONAL   => $no_page,
+            GRN_AUTH_PAGE_TYPE_ADD_PERSONAL    => $no_page,
+            GRN_AUTH_PAGE_TYPE_MODIFY_PERSONAL => $no_page,
+            GRN_AUTH_PAGE_TYPE_PWD_EXPIRED     => $no_page,
+        ];
+
+        parent::__construct(cb_msg(GRN_AUTH_LOGIN_REST_API_V1, 'name'), GRN_AUTH_LOGIN_REST_API_V1, $driver_page);
+    }
+
+    /**
+     * @param array                                     $driver_settings
+     * @param \GRN_Authentication_Repository_DriverBase $repository
+     *
+     * @return bool
+     */
+    function setConfig(& $driver_settings, $repository)
+    {
+        if ( ! is_object($repository)) {
+            return false;
+        }
+
+        $this->userRepository = $repository;
+
+        $this->configured = true;
+
+        return true;
+    }
+
+    /**
+     * @return array
+     */
+    function &getConfig()
+    {
+        return $this->driverSettings;//Always NULL
+    }
+
+    /**
+     * Login
+     *
+     * @return bool    $result
+     * @throws InactiveUserException
+     * @throws InvalidAuthorizationValueException
+     * @throws PasswordExpiredException
+     */
+    function login()
+    {
+        if (array_key_exists('HTTP_X_CYBOZU_AUTHORIZATION', $_SERVER)) {
+            return $this->passwordAuthenticate();
+        }
+
+        return false;
+    }
+
+    /**
+     * @return bool
+     * @throws InvalidAuthorizationValueException
+     * @throws InactiveUserException
+     * @throws PasswordExpiredException
+     */
+    private function passwordAuthenticate(): bool
+    {
+        $auth_info_arr = $this->decodeAuthorizationHeaderValue($_SERVER['HTTP_X_CYBOZU_AUTHORIZATION']);
+
+        $this->passwordLogin($auth_info_arr[0], $auth_info_arr[1]);
+        $login_user = cb_lwc_uum()->getUserByForeignKey($auth_info_arr[0]);
+
+        $this->checkUserStatus($login_user);
+        $this->checkPasswordExpirationDate($login_user);
+
+        parent::setAccount($login_user->get('foreign_key'));
+
+        return true;
+    }
+
+    /**
+     * @param string $x_cybozu_authorization
+     *
+     * @return array
+     * @throws InvalidAuthorizationValueException
+     */
+    private function decodeAuthorizationHeaderValue(string $x_cybozu_authorization): array
+    {
+        $decoded_raw_auth_data = base64_decode($x_cybozu_authorization, true);
+        if ($decoded_raw_auth_data === false || empty($decoded_raw_auth_data)) {
+            throw new InvalidAuthorizationValueException();
+        }
+
+        $auth_info_arr = explode(':', $decoded_raw_auth_data, 2);
+        if (count($auth_info_arr) !== 2) {
+            throw new InvalidAuthorizationValueException();
+        }
+
+        return $auth_info_arr;
+    }
+
+    /**
+     * @param \CB_User $login_user
+     *
+     * @throws PasswordExpiredException
+     */
+    private function checkPasswordExpirationDate(\CB_User $login_user)
+    {
+        $repository = $this->userRepository;
+        $days = $repository->getPasswordExpirationDays($login_user->getOID());
+        if (is_numeric($days) && $days <= 0) {
+            throw new PasswordExpiredException();
+        }
+    }
+
+    /**
+     * @param CB_User $login_user
+     *
+     * @throws InactiveUserException
+     */
+    private function checkUserStatus(CB_User $login_user)
+    {
+        if ( ! $login_user->isActive()) {
+            throw new InactiveUserException();
+        }
+    }
+
+    /**
+     * @param string $account
+     * @param string $password
+     *
+     * @throws InvalidAuthorizationValueException
+     */
+    private function passwordLogin(string $account, string $password)
+    {
+        $core_policy = $this->getUserFindPolicy($account, $password);
+        $repository = $this->userRepository;
+        if ($core_policy->findUser() === false || ! $repository->authenticate($account, $password)) {
+            throw new InvalidAuthorizationValueException();
+        }
+    }
+
+    /**
+     * @param string $account
+     * @param string $password
+     *
+     * @return LoginUserFindPolicyInterface
+     */
+    private function getUserFindPolicy(string $account, string $password): LoginUserFindPolicyInterface
+    {
+        $core_policy = LoginUserFindPolicyApi::getInstance($account, $password);
+
+        if ( ! cb_is_forest()) {
+            return $core_policy;
+        }
+
+        $slash_session_management_api = SlashSessionManagementAPI::getInstance(CB_LocaleManager::getCurrentLanguage());
+
+        return new SlashSessionManagementAPIRunner($core_policy, $slash_session_management_api);
+    }
+
+    /**
+     * Return whether the login driver can use multiple repository or not.
+     *
+     * @return bool
+     */
+    public function canUseMultipleRepository()
+    {
+        return true;
+    }
+}
+

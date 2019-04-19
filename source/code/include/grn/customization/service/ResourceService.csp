@@ -1,0 +1,336 @@
+<?php
+
+namespace grn\grn\customization\service;
+
+use grn\grn\customization\bean\Resource;
+use grn\grn\customization\bean\ResourceForm;
+use grn\grn\customization\logic\ResourceLogic;
+
+class ResourceService
+{
+    private $module;
+    private $resourceLogic;
+
+    const TYPE_JS = 'js';
+    const TYPE_CSS = 'css';
+
+    /**
+     * @param string $module
+     */
+    public function __construct($module)
+    {
+        $this->resourceLogic = new ResourceLogic($module);
+        $this->module = $module;
+    }
+
+    /**
+     * @param string $target
+     *
+     * @return \grn\grn\customization\bean\Resource[]
+     */
+    public function getResourcesByTarget($target)
+    {
+        return $this->resourceLogic->getByTarget($target);
+    }
+
+    /**
+     * @param string $target
+     *
+     * @return array
+     */
+    public function getJsCssResources($target)
+    {
+        $resources = $this->getResourcesByTarget($target);
+
+        require_once('grn/customization/file.csp');
+        $fm = \GRN_Customization_FileManager::getInstance($this->module);
+        $resource_js = [];
+        $resource_css = [];
+
+        $file_ids = [];
+        foreach ($resources as $resource) {
+            $fid = $resource->getFile();
+            if ($fid != null) {
+                $file_ids[] = $fid;
+            }
+        }
+
+        $files = $fm->getFiles($file_ids);
+
+        foreach ($resources as $resource) {
+            if ($resource->getFile() != null) {
+                $fid = $resource->getFile();
+                $file = $files[$fid];
+                $file_name = $file->get('name');
+                $resource_file = $resource->toArray();
+                $resource_file['file_name'] = $file_name;
+                $resource_file['file_url']
+                    = $this->createResourceFileUrl($resource,
+                    $file);
+                $resource_file['file_size'] = $file->get('size');
+            } else {
+                $resource_file = $resource->toArray();
+            }
+
+            if ($resource->getType() == self::TYPE_JS) {
+                $resource_js[] = $resource_file;
+            } elseif ($resource->getType() == self::TYPE_CSS) {
+                $resource_css[] = $resource_file;
+            }
+        }
+
+        return ['js' => $resource_js, 'css' => $resource_css];
+    }
+
+    /**
+     * @param \grn\grn\customization\bean\Resource $resource
+     * @param \CB_Row                              $file
+     *
+     * @return string
+     */
+    private function createResourceFileUrl($resource, $file)
+    {
+        $download_page = "{$this->module}/";
+        if (cb_is_system_page()) {
+            $download_page .= 'system/';
+        } elseif (cb_is_operation_page()) {
+            $download_page .= 'operation/';
+        }
+        $download_page .= "customization/file_download";
+        $file_name = $file->get('name');
+        $file_hash = $file->get('hash');
+        $url_params = [
+            'fid'  => $resource->getFile(),
+            'hash' => $file_hash
+        ];
+        if (cb_is_need_download_ticket()) {
+            require_once('grn/ticket.csp');
+            $uum = cb_lwc_uum();
+            $user = $uum->getLoginUser();
+            $url_params['ticket'] = \GRN_Ticket::create($user->getOID());
+        }
+
+        return cb_format_url($download_page, $url_params, null, $file_name);
+    }
+
+    /**
+     * @param string                                   $target
+     * @param \grn\grn\customization\bean\ResourceForm $form
+     *
+     * @return array
+     */
+    public function updateResources($target, ResourceForm $form)
+    {
+        $resources = $this->getResourcesByTarget($target);
+        $js_existing_file_ids = $this->getFileIdsFromResources($resources,
+            self::TYPE_JS);
+        $css_existing_file_ids = $this->getFileIdsFromResources($resources,
+            self::TYPE_CSS);
+        $js_new_file_ids = $this->createNewFiles(self::TYPE_JS,
+            $js_existing_file_ids, $form->getJsInputFileIds(),
+            $form->getUploadedFiles());
+
+        $js_file_ids_for_new_resources
+            = $this->createFileIdsForNewResources($form->getJsInputFileIds(),
+            $js_existing_file_ids, $js_new_file_ids);
+
+        $css_new_file_ids = $this->createNewFiles(self::TYPE_CSS,
+            $css_existing_file_ids, $form->getCssInputFileIds(),
+            $form->getUploadedFiles());
+
+        $css_file_ids_for_new_resources
+            = $this->createFileIdsForNewResources($form->getCssInputFileIds(),
+            $css_existing_file_ids,
+            $css_new_file_ids);
+
+        //delete resources
+        $this->resourceLogic->deleteByTarget($target);
+
+        //delete files
+        $js_file_ids_to_delete = array_diff(
+            array_values($js_existing_file_ids),
+            array_values($js_file_ids_for_new_resources));
+        $this->deleteFiles($js_file_ids_to_delete);
+        $css_file_ids_to_delete = array_diff(
+            array_values($css_existing_file_ids),
+            array_values($css_file_ids_for_new_resources));
+        $this->deleteFiles($css_file_ids_to_delete);
+
+        //create new resources
+        $js_new_resources = $this->createNewResources($target, self::TYPE_JS,
+            $js_file_ids_for_new_resources, $form->getJsLinks());
+        $css_new_resources = $this->createNewResources($target, self::TYPE_CSS,
+            $css_file_ids_for_new_resources, $form->getCssLinks());
+        $new_resources = array_merge(array_values($js_new_resources),
+            array_values($css_new_resources));
+
+        if (count($new_resources) > 0) {
+            $this->resourceLogic->insert($new_resources);
+        }
+
+        return $new_resources;
+    }
+
+    /**
+     * @param \grn\grn\customization\bean\Resource[] $resources
+     * @param string                                 $resource_type
+     *
+     * @return array
+     */
+    private function getFileIdsFromResources($resources, $resource_type)
+    {
+        $resource_file_ids = [];
+        foreach ($resources as $resource) {
+            if ($resource->getType() == $resource_type
+                && $resource->getFile() != null
+            ) {
+                $resource_file_ids[$resource->getFile()] = $resource->getFile();
+            }
+        }
+
+        return $resource_file_ids;
+    }
+
+    /**
+     * @param \grn\grn\customization\bean\Resource[] $resources
+     *
+     * @return array
+     */
+    public function getFileNamesFromResources($resources)
+    {
+        $file_names = [];
+        $file_ids = [];
+        foreach ($resources as $resource) {
+            if ( ! empty($resource->getFile())) {
+                $file_ids[] = $resource->getFile();
+            }
+        }
+
+        if (count($file_ids) > 0) {
+            require_once('grn/customization/file.csp');
+            $fm = \GRN_Customization_FileManager::getInstance($this->module);
+            $files = $fm->getFiles($file_ids);
+            foreach ($files as $file_id => $file) {
+                $file_names[$file_id] = $file->get("name");
+            }
+        }
+
+        return $file_names;
+    }
+
+    /**
+     * @param string            $resource_type
+     * @param array             $registered_file_ids
+     * @param array             $upload_target_file_ids
+     * @param \GRN_UploadFile[] $uploaded_files
+     *
+     * @return array
+     */
+    private function createNewFiles(
+        $resource_type,
+        $registered_file_ids,
+        $upload_target_file_ids,
+        array $uploaded_files
+    ) {
+        $mine_type = '';
+        if ($resource_type == self::TYPE_JS) {
+            $mine_type = 'application/javascript';
+        } elseif ($resource_type == self::TYPE_CSS) {
+            $mine_type = 'text/css';
+        }
+
+        require_once('grn/customization/file.csp');
+        $file_manager
+            = \GRN_Customization_FileManager::getInstance($this->module);
+
+        $new_uploaded_file_ids = [];
+        foreach ($upload_target_file_ids as $file_id) {
+            if ( ! isset($registered_file_ids[$file_id])
+                 && isset($uploaded_files[$file_id])
+            ) {
+                $file = $uploaded_files[$file_id];
+                $file->set('mime', $mine_type);
+                $new_file = $file_manager->addFile($file);
+                $new_uploaded_file_ids[$file_id] = $new_file->getOID();
+            }
+        }
+
+        return $new_uploaded_file_ids;
+    }
+
+    /**
+     * @param array $input_file_ids
+     * @param array $existing_file_ids
+     * @param array $new_file_ids
+     *
+     * @return array
+     */
+    private function createFileIdsForNewResources(
+        $input_file_ids,
+        $existing_file_ids,
+        $new_file_ids
+    ) {
+        foreach ($input_file_ids as $index => $input_file_id) {
+            if ( ! array_key_exists($input_file_id, $existing_file_ids)) {
+                if (array_key_exists($input_file_id, $new_file_ids)) {
+                    $input_file_ids[$index] = $new_file_ids[$input_file_id];
+                } else {
+                    unset($input_file_ids[$index]);
+                }
+            }
+        }
+
+        return $input_file_ids;
+    }
+
+    /**
+     * @param array $file_ids
+     */
+    private function deleteFiles($file_ids)
+    {
+        require_once('grn/customization/file.csp');
+        $fm = \GRN_Customization_FileManager::getInstance($this->module);
+        $fm->deleteFiles($file_ids);
+    }
+
+    /**
+     * @param string $target
+     * @param string $resource_type
+     * @param array  $file_ids
+     * @param array  $input_links
+     *
+     * @return array
+     */
+    private function createNewResources(
+        $target,
+        $resource_type,
+        $file_ids,
+        $input_links
+    ) {
+        $resources = [];
+        foreach ($file_ids as $index => $file_id) {
+            $resource = new Resource();
+            $resource->setTarget($target);
+            $resource->setFile($file_id);
+            $resource->setType($resource_type);
+            $resources[$index] = $resource;
+        }
+        foreach ($input_links as $index => $input_link) {
+            $url = grn_safe_url(cb_trim($input_link));
+            if ($url == '' || $url == 'https://'
+                || strpos($url, 'https://') !== 0
+            ) {
+                continue;
+            }
+            $resource = new Resource();
+            $resource->setTarget($target);
+            $resource->setURL($url);
+            $resource->setType($resource_type);
+            $resources[$index] = $resource;
+        }
+
+        ksort($resources);
+
+        return $resources;
+    }
+}

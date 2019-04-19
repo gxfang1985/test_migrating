@@ -1,0 +1,873 @@
+<?php
+
+require_once('cbpapi/util.csp');
+require_once('schedule/resources.csp');
+require_once('grn/application.csp');
+require_once('schedule/utility.csp');
+
+use grn\grn\MemberLogic;
+use grn\schedule\ScheduleMemberLogic;
+
+class GRN_Schedule_API_EventFactory
+{
+    protected function __construct()
+    {
+
+    }
+
+    /**
+     * @return GRN_Schedule_API_EventFactory
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_Schedule_API_EventFactory();
+        }
+
+        return $_instance;
+    }
+
+    private $_dbconn = null;
+
+    /**
+     * @return CB_DatabaseConnection
+     */
+    protected function _getDBConnection()
+    {
+        if (is_null($this->_dbconn)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->_dbconn = $app_locator->getConnection('schedule');
+        }
+
+        return $this->_dbconn;
+    }
+
+    /**
+     * @param array $event_ids
+     * @param bool  $high_compatible_with_event_factory Specify TRUE when you need event objects having high compatible with
+     *                                                  the objects returned by GRN_Schedule_EventFactory->getEvent().
+     *
+     * @return array
+     *
+     */
+    public function getEventsByIDs(
+        array $event_ids,
+        bool $high_compatible_with_event_factory
+    ) {
+        $events = $this->_getEventData($event_ids,
+            $high_compatible_with_event_factory);
+
+        $events = $this->_getEventDate($events,
+            $high_compatible_with_event_factory);
+
+        $events = $this->_getEventAddressData($events);
+
+        $events = $this->_getEventsMembers($events);
+
+        $events = $this->_getEventsNotifyAddress($events);
+
+        return $events;
+    }
+
+    /**
+     * @param array $event_ids
+     * @param bool  $high_compatible_with_event_factory
+     *
+     * @return array
+     */
+    private function _getEventData(
+        array $event_ids,
+        bool $high_compatible_with_event_factory
+    ) {
+        $db = $this->_getDBConnection();
+
+        $query_format
+            = <<<SQL
+SELECT event._id AS _id, col_eventmenu, col_reserve_int1, col_reserve_int3
+     , col_detail, col_memo, col_private, col_event_type
+     , col_creator, col_creator_name, col_ctime, col_modifier, col_modifier_name, col_mtime, col_using_purpose
+     , col_additional_items
+FROM tab_grn_schedule_event AS event
+LEFT OUTER JOIN tab_grn_schedule_event_facility_approval_using_purpose AS using_purpose ON using_purpose.col_event = event._id
+WHERE _id IN (@A)
+SQL;
+
+        $query = cb_queryf($db, $query_format, $event_ids);
+        $result = $db->query($query);
+
+        require_once('schedule/event_base_logic.csp');
+        $events = [];
+        $user_names = [];
+        while ($row = $db->fetch_assoc($result)) {
+            if ($row['col_event_type'] & GRN_SCHEDULE_EVENT_TYPE_NORMAL) {
+                $event = new GRN_Schedule_NormalEvent();
+            } elseif ($row['col_event_type'] & GRN_SCHEDULE_EVENT_TYPE_REPEAT) {
+                $event = new GRN_Schedule_RepeatEvent();
+            } elseif ($row['col_event_type']
+                      & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY
+            ) {
+                // 仮予定のみ単品処理を行う
+                require_once('schedule/temporary_event_logic.csp');
+                $logic = GRN_Schedule_TemporaryEventLogic::getInstance();
+                $events[$row['_id']] = $logic->getEvent($row['_id'], null,
+                    CB_DATABASE_NO_LOCK, GRN_SCHEDULE_GET_MEMBER_ID);
+
+                // このファイル内でしか使用しない特別なクラス変数
+                $events[$row['_id']]->event_type
+                    = GRN_SCHEDULE_EVENT_TYPE_TEMPORARY;
+                $events[$row['_id']]->members_data = [
+                    'users'      => $events[$row['_id']]->users,
+                    'groups'     => $events[$row['_id']]->groups,
+                    'facilities' => $events[$row['_id']]->facilities,
+                ];
+                continue;
+            } elseif ($row['col_event_type'] & GRN_SCHEDULE_EVENT_TYPE_BANNER) {
+                $event = new GRN_Schedule_BannerEvent();
+            }
+
+            $event->id = $row['_id'];
+            $event->menu = $row['col_eventmenu'];
+            $event->menucolor = $row['col_reserve_int1'];
+            $event->attendanceCheck = $row['col_reserve_int3'];
+            $event->detail = $row['col_detail'];
+            $event->memo = $row['col_memo'];
+            $event->private = $row['col_private'];
+            $event->creator = $row['col_creator'];
+            $event->ctime = $row['col_ctime'];
+            $event->modifier = $row['col_modifier'];
+            $event->mtime = $row['col_mtime'];
+            $event->usingPurpose = $row['col_using_purpose'];
+            $event->additional_items = $row['col_additional_items'];
+
+            if ($high_compatible_with_event_factory) {
+                $event->ctime = CB_TimeStamp::valueOf($event->ctime);
+                $event->mtime = CB_TimeStamp::valueOf($event->mtime);
+
+                $user_names[$event->id] = [
+                    'creator'  => $row['col_creator_name'],
+                    'modifier' => $row['col_modifier_name']
+                ];
+            }
+
+            // このファイル内でしか使用しない特別なクラス変数
+            $event->members_data = [
+                'users'      => [],
+                'groups'     => [],
+                'facilities' => []
+            ];
+            $event->event_type = $row['col_event_type'];
+
+            $events[$row['_id']] = $event;
+        }
+        $db->free_result($result);
+
+        if ($high_compatible_with_event_factory) {
+            $this->bindCreatorAndModifierObjects($events, $user_names);
+        }
+
+        return $events;
+    }
+
+    /**
+     * @param GRN_Schedule_EventBase[] $events
+     * @param array                    $user_names
+     */
+    private function bindCreatorAndModifierObjects(
+        array $events,
+        array $user_names
+    ) {
+        $user_ids = [];
+        foreach ($events as $event) {
+            if ($event->getEventType() & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY) {
+                continue;
+            }
+
+            $user_ids[] = $event->creator;
+            $user_ids[] = $event->modifier;
+        }
+
+        $users = cb_lwc_uum()->getUsersById(array_unique($user_ids));
+
+        foreach ($events as $event) {
+            if ($event->getEventType() & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY) {
+                continue;
+            }
+
+            if (array_key_exists($event->creator, $users)) {
+                $event->creator = $users[$event->creator];
+            } else {
+                $event->creator = $user_names[$event->id]['creator'];
+            }
+
+            if (array_key_exists($event->modifier, $users)) {
+                $event->modifier = $users[$event->modifier];
+            } else {
+                $event->modifier = $user_names[$event->id]['modifier'];
+            }
+        }
+    }
+
+    /**
+     * @param array $events
+     *
+     * @return array
+     */
+    private function _getEventAddressData($events)
+    {
+        $db = $this->_getDBConnection();
+        $query = cb_queryf($db,
+            'SELECT _id,col_company_name,col_zip_code,col_physical_address,col_map,col_route,col_route_time,col_route_fare,col_company_telephone_number,col_facsimile_number,col_url,col_event FROM tab_grn_schedule_addressdata WHERE col_event IN (@A)',
+            array_keys($events));
+        $result = $db->query($query);
+
+        while ($row = $db->fetch_assoc($result)) {
+            if ($events[$row['col_event']]->event_type
+                & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY
+            ) {
+                continue;
+            }
+
+            $events[$row['col_event']]->company_name = $row['col_company_name'];
+            $events[$row['col_event']]->zip_code
+                = $row['col_zip_code'];
+            $events[$row['col_event']]->physical_address
+                = $row['col_physical_address'];
+            $events[$row['col_event']]->map
+                = $row['col_map'];
+            $events[$row['col_event']]->route
+                = $row['col_route'];
+            $events[$row['col_event']]->route_time
+                = $row['col_route_time'];
+            $events[$row['col_event']]->route_fare
+                = $row['col_route_fare'];
+            $events[$row['col_event']]->company_telephone_number
+                = $row['col_company_telephone_number'];
+            $events[$row['col_event']]->facsimile_number
+                = $row['col_facsimile_number'];
+            $events[$row['col_event']]->company_url
+                = $row['col_url'];
+        }
+        $db->free_result($result);
+
+        return $events;
+    }
+
+    /**
+     * @param array $events
+     * @param bool  $high_compatible_with_event_factory
+     *
+     * @return array
+     */
+    private function _getEventDate($events, $high_compatible_with_event_factory)
+    {
+        $normal = [];
+        $allday = [];
+        $repeat = [];
+        $banner = [];
+
+        foreach ($events as $key => $event) {
+            if ($event->event_type & GRN_SCHEDULE_EVENT_TYPE_NORMAL) {
+                if ($event->event_type & GRN_SCHEDULE_EVENT_TYPE_ALLDAY) {
+                    $allday[] = $key;
+                } else {
+                    $normal[] = $key;
+                }
+            } elseif ($event->event_type & GRN_SCHEDULE_EVENT_TYPE_REPEAT) {
+                $repeat[] = $key;
+            } elseif ($event->event_type & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY) {
+                continue;
+            } elseif ($event->event_type & GRN_SCHEDULE_EVENT_TYPE_BANNER) {
+                $banner[] = $key;
+            }
+        }
+
+        // 通常
+        if (count($normal)) {
+            $this->_getNormalEventsDate($normal, $events,
+                $high_compatible_with_event_factory);
+        }
+
+        // 通常（終日）
+        if (count($allday)) {
+            $this->_getNormalAlldayEventsDate($allday, $events,
+                $high_compatible_with_event_factory);
+        }
+
+        // 繰り返し
+        if (count($repeat)) {
+            $this->_getRepeatEventsDate($repeat, $events,
+                $high_compatible_with_event_factory);
+        }
+
+        // 期間予定
+        if (count($banner)) {
+            $this->_getBannerEventsDate($banner, $events,
+                $high_compatible_with_event_factory);
+        }
+
+        return $events;
+    }
+
+    /**
+     * @param array $event_ids
+     * @param array $events
+     * @param bool  $high_compatible_with_event_factory
+     *
+     * @return array
+     */
+    private function _getNormalEventsDate(
+        $event_ids,
+        $events,
+        $high_compatible_with_event_factory
+    ) {
+        $db = $this->_getDBConnection();
+        $result = $this->_getEventDateTimeTableData($db, $event_ids);
+        $ts = new CB_TimeStampEx();
+        while ($row = $db->fetch_assoc($result)) {
+            if ( ! $high_compatible_with_event_factory) {
+                $ts->unix_ts = $row['col_setdatetime'];
+                $events[$row['col_event']]->setdatetime
+                    = grn_cbpapi_iso8601($ts);
+                if ( ! ($events[$row['col_event']]->getEventType()
+                        & GRN_SCHEDULE_EVENT_TYPE_START)
+                ) {
+                    $ts->unix_ts = $row['col_enddatetime'];
+                    $events[$row['col_event']]->enddatetime
+                        = grn_cbpapi_iso8601($ts);
+                }
+
+                $events[$row['col_event']]->timezone = $row['col_timezone'];
+                $events[$row['col_event']]->end_timezone
+                    = $row['col_end_timezone'];
+            } else {
+                $ts->unix_ts = $row['col_setdatetime'];
+                $events[$row['col_event']]->setdatetime
+                    = (new CB_TimeStampEx($ts))->getDateTime();
+
+                $event_type = $events[$row['col_event']]->event_type;
+                if ( ! ($event_type & GRN_SCHEDULE_EVENT_TYPE_START)) {
+                    $ts->unix_ts = $row['col_enddatetime'];
+                    $events[$row['col_event']]->enddatetime
+                        = (new CB_TimeStampEx($ts))->getDateTime();
+                }
+
+                $events[$row['col_event']]->timezone = $row['col_timezone'];
+                $events[$row['col_event']]->end_timezone
+                    = $row['col_end_timezone'];
+            }
+        }
+        $db->free_result($result);
+
+        return $events;
+    }
+
+    /**
+     * @param array $event_ids
+     * @param array $events
+     * @param bool  $high_compatible_with_event_factory
+     *
+     * @return array
+     */
+    private function _getNormalAlldayEventsDate(
+        $event_ids,
+        $events,
+        $high_compatible_with_event_factory
+    ) {
+        require_once('schedule/normal_event_logic.csp');
+        $db = $this->_getDBConnection();
+        $result = $this->_getEventDateTableData($db, $event_ids);
+        while ($row = $db->fetch_assoc($result)) {
+            $events[$row['col_event']]->setdatetime = $row['col_setdate'];
+            $events[$row['col_event']]->enddatetime = $row['col_enddate'];
+            if ($high_compatible_with_event_factory) {
+                require_once('schedule/view_util.csp');
+                $start_date
+                    = CB_Date::valueOf($events[$row['col_event']]->setdatetime);
+                $events[$row['col_event']]->setdatetime = $start_date;
+
+                $end_date
+                    = CB_Date::valueOf($events[$row['col_event']]->enddatetime);
+                $events[$row['col_event']]->enddatetime = $end_date;
+            }
+            $events[$row['col_event']]->timezone = $row['col_timezone'];
+            $events[$row['col_event']]->end_timezone = $row['col_end_timezone'];
+        }
+        $db->free_result($result);
+
+        return $events;
+    }
+
+    /**
+     * @param array $event_ids
+     * @param array $events
+     * @param bool  $high_compatible_with_event_factory
+     *
+     * @return mixed
+     */
+    private function _getRepeatEventsDate(
+        $event_ids,
+        $events,
+        bool $high_compatible_with_event_factory
+    ) {
+        require_once('schedule/repeat_event_logic.csp');
+        // 繰り返しの条件の取得
+        $db = $this->_getDBConnection();
+        $query = cb_queryf($db,
+            'SELECT _id,col_repeat_type,col_repeat_day,col_repeat_wday,col_settime,col_endtime,col_setdate,col_enddate,col_timezone,col_event FROM tab_grn_schedule_repeatcondition WHERE col_event IN (@A)',
+            $event_ids);
+        $result = $db->query($query);
+
+        while ($row = $db->fetch_assoc($result)) {
+            $events[$row['col_event']]->repeat_type = $row['col_repeat_type'];
+            $events[$row['col_event']]->wday = $row['col_repeat_wday'];
+            $events[$row['col_event']]->day = $row['col_repeat_day'];
+
+            if ($high_compatible_with_event_factory) {
+                $start_date = new CB_Date();
+                $start_date->parse($row['col_setdate']);
+                $end_date = new CB_Date();
+                $end_date->parse($row['col_enddate']);
+                $events[$row['col_event']]->setdate = $start_date;
+                $events[$row['col_event']]->enddate = $end_date;
+
+                $start_time = null;
+                if ($row['col_settime'] != null) {
+                    $start_time = new CB_Time();
+                    $start_time->parse($row['col_settime']);
+                }
+                $events[$row['col_event']]->settime = $start_time;
+
+                $end_time = null;
+                if ($row['col_endtime'] != null) {
+                    $end_time = new CB_Time();
+                    $end_time->parse($row['col_endtime']);
+                }
+                $events[$row['col_event']]->endtime = $end_time;
+            } else {
+                $events[$row['col_event']]->setdate = $row['col_setdate'];
+                $events[$row['col_event']]->enddate = $row['col_enddate'];
+                $events[$row['col_event']]->settime = $row['col_settime'];
+                $events[$row['col_event']]->endtime = $row['col_endtime'];
+            }
+
+            $events[$row['col_event']]->timezone = $row['col_timezone'];
+        }
+        $db->free_result($result);
+
+        // 例外日の取得
+        $query = cb_queryf($db,
+            'SELECT col_date,col_timezone,col_event FROM tab_grn_schedule_repeatexcept WHERE col_event IN (@A) ORDER BY col_event',
+            $event_ids);
+        $result = $db->query($query);
+        $end = new CB_Date();
+        while ($row = $db->fetch_assoc($result)) {
+            if ($row['col_date']) {
+                if ( ! isset($events[$row['col_event']]->except)) {
+                    $events[$row['col_event']]->except = [];
+                }
+                if ($high_compatible_with_event_factory) {
+                    $except_date = new CB_Date();
+                    $except_date->parse($row['col_date']);
+                    $events[$row['col_event']]->except[] = $except_date;
+                } else {
+                    // 例外日は、予定の現在のタイムゾーンから判定する
+                    $startdatetime
+                        = _cb_date_convert_to_datetime($row['col_date'],
+                        $events[$row['col_event']]->timezone);
+                    $end->parse($row['col_date']);
+                    $next_day = new CB_DateEx($end);
+                    $next_day->moveDays(1);
+                    $enddatetime = _cb_date_convert_to_datetime($next_day,
+                        $events[$row['col_event']]->timezone);
+                    $events[$row['col_event']]->except[] = [
+                        'start' => grn_cbpapi_iso8601($startdatetime, false,
+                            $events[$row['col_event']]->timezone),
+                        'end'   => grn_cbpapi_iso8601($enddatetime, false,
+                            $events[$row['col_event']]->timezone),
+                    ];
+                }
+
+            }
+        }
+
+        return $events;
+    }
+
+    /**
+     * @param array $event_ids
+     * @param array $events
+     * @param bool  $high_compatible_with_event_factory
+     *
+     * @return array
+     */
+    private function _getBannerEventsDate(
+        $event_ids,
+        $events,
+        $high_compatible_with_event_factory
+    ) {
+        require_once('schedule/banner_event_logic.csp');
+        $db = $this->_getDBConnection();
+        $result = $this->_getEventDateTableData($db, $event_ids);
+        while ($row = $db->fetch_assoc($result)) {
+            $events[$row['col_event']]->setdate = $row['col_setdate'];
+            $events[$row['col_event']]->enddate = $row['col_enddate'];
+            if ($high_compatible_with_event_factory) {
+                require_once('schedule/view_util.csp');
+                $start_date
+                    = CB_Date::valueOf($events[$row['col_event']]->setdate);
+                $events[$row['col_event']]->setdate = $start_date;
+
+                $end_date
+                    = CB_Date::valueOf($events[$row['col_event']]->enddate);
+                $events[$row['col_event']]->enddate = $end_date;
+            }
+            $events[$row['col_event']]->timezone = $row['col_timezone'];
+            $events[$row['col_event']]->end_timezone = $row['col_end_timezone'];
+        }
+        $db->free_result($result);
+
+        return $events;
+    }
+
+    /**
+     * @param CB_DatabaseConnection $db
+     * @param array                 $event_ids
+     *
+     * @return mysqli_result
+     */
+    private function _getEventDateTimeTableData($db, $event_ids)
+    {
+        $query = cb_queryf($db,
+            'SELECT _id,col_setdatetime,col_enddatetime,col_timezone,col_end_timezone,col_event FROM tab_grn_schedule_eventdatetime WHERE col_event IN (@A)',
+            $event_ids);
+        $result = $db->query($query);
+
+        return $result;
+    }
+
+    /**
+     * @param CB_DatabaseConnection $db
+     * @param array                 $event_ids
+     *
+     * @return mysqli_result
+     */
+    private function _getEventDateTableData($db, $event_ids)
+    {
+        $query = cb_queryf($db,
+            'SELECT _id,col_setdate,col_enddate,col_timezone,col_end_timezone,col_event FROM tab_grn_schedule_eventdate WHERE col_event IN (@A)',
+            $event_ids);
+        $result = $db->query($query);
+
+        return $result;
+    }
+
+    /**
+     * @param array $events
+     *
+     * @return array
+     */
+    private function _getEventsMembers($events)
+    {
+        $dbconn = $this->_getDBConnection();
+        $query = cb_queryf($dbconn,
+            "SELECT col_event,col_user, col_group, col_facility, col_single, col_member_list, u.col_deleted,u._id AS u_id,u.col_display_name AS u_display_name FROM tab_grn_schedule_eventmember AS m LEFT JOIN tab_cb_user AS u ON m.col_user = u._id WHERE col_event IN (@A) AND u.col_deleted IS NULL ORDER BY col_event,col_member_list,m._id",
+            array_keys($events));
+        $result = $dbconn->query($query);
+
+        $groups = [];
+        $facilities = [];
+        while ($row = $dbconn->fetch_assoc($result)) {
+            // 仮予定以外はここで参加者、利用施設のIDを保存（アクセス権評価のために使用される）
+            if ( ! ($events[$row['col_event']]->event_type
+                    & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY)
+            ) {
+                if ( ! is_null($row['u_id'])) {
+                    if ( ! is_array($events[$row['col_event']]->users)) {
+                        $events[$row['col_event']]->users = [];
+                    }
+                    $events[$row['col_event']]->users[$row['u_id']]
+                        = $row['u_id'];
+                } elseif ( ! is_null($row['col_group'])) {
+                    if ( ! is_array($events[$row['col_event']]->groups)) {
+                        $events[$row['col_event']]->groups = [];
+                    }
+                    $events[$row['col_event']]->groups[$row['col_group']]
+                        = $row['col_group'];
+                } elseif ( ! is_null($row['col_facility'])) {
+                    if ( ! is_array($events[$row['col_event']]->facilities)) {
+                        $events[$row['col_event']]->facilities = [];
+                    }
+                    $events[$row['col_event']]->facilities[$row['col_facility']]
+                        = $row['col_facility'];
+                }
+            }
+
+            // 表示用のデータの取得
+            if ( ! is_null($row['u_id'])) {
+                $events[$row['col_event']]->members_data['users'][$row['u_id']]
+                    = [
+                    'id'    => $row['u_id'],
+                    'name'  => $row['u_display_name'],
+                    'order' => $row['col_member_list'],
+                ];
+            } elseif ( ! is_null($row['col_group'])) {
+                // いったんIDのみを保存
+                $groups[$row['col_group']] = $row['col_group'];
+                $events[$row['col_event']]->members_data['groups'][$row['col_group']]
+                    = [
+                    'id'    => $row['col_group'],
+                    'order' => $row['col_member_list'],
+                ];
+            } elseif ( ! is_null($row['col_facility'])) {
+                // いったんIDと表示順位のみを保存
+                $facilities[$row['col_facility']] = $row['col_facility'];
+                $events[$row['col_event']]->members_data['facilities'][$row['col_facility']]
+                    = [
+                    'id'    => $row['col_facility'],
+                    'order' => $row['col_member_list'],
+                ];
+            }
+        }
+        $dbconn->free_result($result);
+
+        // 保存されたIDで一括取得
+        if (count($groups)) {
+            global $G_container_base;
+            $uum = $G_container_base->getInstance('uum');
+            $groupList = $uum->getGroupInfoList($groups);
+        } else {
+            $groupList = [];
+        }
+
+        // 保存されたIDで一括取得
+        if (count($facilities)) {
+            require_once('schedule/facility_system_logic.csp');
+            $facility_logic = GRN_Facility_SystemLogic::getInstance();
+            $facilityInfoList = $facility_logic->getFacilitiesInfo($facilities);
+            $approvalSettings
+                = $facility_logic->getApprovalSettingsOfFacilitiesByList($facilityInfoList);
+        } else {
+            $facilityInfoList = [];
+            $approvalSettings = [];
+        }
+
+        foreach ($events as $key => $event) {
+            if (isset($events[$key]->members_data['groups'])
+                && is_array($events[$key]->members_data['groups'])
+            ) {
+                foreach (
+                    $events[$key]->members_data['groups'] as $key2 => $group
+                ) {
+                    if (isset($groupList[$group['id']])) {
+                        $events[$key]->members_data['groups'][$key2]['name']
+                            = $groupList[$group['id']]['col_name'];
+                    } else {
+                        unset($events[$key]->members_data['groups'][$key2]);
+                    }
+                }
+
+            }
+            if (isset($events[$key]->members_data['facilities'])
+                && is_array($events[$key]->members_data['facilities'])
+            ) {
+                foreach (
+                    $events[$key]->members_data['facilities'] as $key2 =>
+                    $facility
+                ) {
+                    if (isset($facilityInfoList[$facility['id']])) {
+                        $events[$key]->members_data['facilities'][$key2]['name']
+                            = $facilityInfoList[$facility['id']]['col_name'];
+                        $events[$key]->members_data['facilities'][$key2]['approval']
+                            = $approvalSettings[$facility['id']]['approval'];
+                    } else {
+                        unset($events[$key]->members_data['facilities'][$key2]);
+                    }
+                }
+
+            }
+        }
+
+        return $events;
+    }
+
+    /**
+     * @param array $events
+     *
+     * @return array
+     */
+    private function _getEventsNotifyAddress($events)
+    {
+        $db = $this->_getDBConnection();
+        // ユーザー削除フラグをチェック
+        $query = cb_queryf($db,
+            "SELECT n.col_event, n.col_user, n.col_group, n.col_role, n.col_order, u.col_foreign_key, u.col_display_name FROM tab_grn_schedule_notifyaddress AS n"
+            . " LEFT JOIN tab_cb_user AS u ON n.col_user = u._id WHERE n.col_event IN (@A) AND u.col_deleted IS NULL ORDER BY n.col_order, n._id",
+            array_keys($events));
+        $result = $db->query($query);
+
+        $group_ids = [];
+        $role_ids = [];
+
+        while ($row = $db->fetch_assoc($result)) {
+            if ( ! isset($events[$row['col_event']]->notify_address)) {
+                $events[$row['col_event']]->notify_address = [];
+            }
+
+            if (($id = $row['col_user'])) {
+                $data_array = [];
+                $data_array[MemberLogic::MEMBER_ID] = $id;
+                $data_array[MemberLogic::MEMBER_TYPE] = MemberLogic::TYPE_USER;
+                $data_array["name"]
+                    = $row["col_display_name"];
+                $data_array["order"] = $row["col_order"];
+
+                $events[$row['col_event']]->notify_address[MemberLogic::PREFIX_USER
+                                                           . $id]
+                    = $data_array;
+            } elseif ($id = $row['col_group']) {
+                $data_array = [];
+                $data_array[MemberLogic::MEMBER_ID] = $id;
+                $data_array[MemberLogic::MEMBER_TYPE]
+                    = MemberLogic::TYPE_ORGANIZATION;
+                $data_array["order"] = $row['col_order'];
+
+                $events[$row['col_event']]->notify_address[MemberLogic::PREFIX_ORGANIZATION
+                                                           . $id]
+                    = $data_array;
+                $group_ids[] = $id;
+            } elseif ($id = $row['col_role']) {
+                $data_array = [];
+                $data_array[MemberLogic::MEMBER_ID] = $id;
+                $data_array[MemberLogic::MEMBER_TYPE]
+                    = MemberLogic::TYPE_STATIC_ROLE;
+                $data_array["order"] = $row["col_order"];
+
+                $events[$row['col_event']]->notify_address[MemberLogic::PREFIX_STATIC_ROLE
+                                                           . $id]
+                    = $data_array;
+                $role_ids[] = $id;
+            }
+        }
+        $db->free_result($result);
+
+        $uum = cb_lwc_uum();
+        $group_info = [];
+        if (count($group_ids) > 0) {
+            $group_info = $uum->getGroupInfoList($group_ids);
+        }
+        $static_role_info = [];
+        if (count($role_ids) > 0) {
+            $static_role_info = $uum->getStaticRoleInfoList($role_ids);
+        }
+
+        foreach ($events as $event_id => $event_info) {
+            if ( ! (is_array($event_info->notify_address)
+                    && $event_info->notify_address > 0)
+            ) {
+                continue;
+            }
+
+            foreach (
+                $event_info->notify_address as $notify_address_key =>
+                $notify_address_info
+            ) {
+                if ($notify_address_info[MemberLogic::MEMBER_TYPE]
+                    == MemberLogic::TYPE_ORGANIZATION
+                ) {
+                    $group_id = $notify_address_info[MemberLogic::MEMBER_ID];
+                    $events[$event_id]->notify_address[$notify_address_key]["name"]
+                        = $group_info[$group_id]["col_name"];
+                } elseif ($notify_address_info[MemberLogic::MEMBER_TYPE]
+                          == MemberLogic::TYPE_STATIC_ROLE
+                ) {
+                    $role_id = $notify_address_info[MemberLogic::MEMBER_ID];
+                    $events[$event_id]->notify_address[$notify_address_key]["name"]
+                        = $static_role_info[$role_id]["col_foreign_key"];
+                }
+            }
+        }
+
+        return $events;
+    }
+
+    /**
+     * @param array $events
+     *
+     * @return array
+     */
+    public function checkPrivateEvent($events)
+    {
+        $login_user = \cb_get_login_user();
+        foreach ($events as $key => $event) {
+            if ( ! $event->private) {
+                continue;
+            }
+
+            $is_event_available = ScheduleMemberLogic::getInstance()
+                                                     ->isEventAvailableForUser($login_user,
+                                                         $event,
+                                                         GRN_SCHEDULE_GET_MEMBER_ID);
+            if ($is_event_available) {
+                continue;
+            }
+
+            unset($events[$key]);
+        }
+
+        return $events;
+    }
+
+    /**
+     * @param string[] $event_ids
+     *
+     * @return array
+     */
+    public function getFilesByEventIDs(array $event_ids): array
+    {
+        $db = $this->_getDBConnection();
+
+        $sql_format
+            = <<<SQL
+SELECT rel.col_event
+     , filebody.col_file
+     , filebody.col_name
+     , filebody.col_size
+     , filebody.col_mime
+FROM tab_grn_schedule_filerelation rel
+  INNER JOIN tab_grn_schedule_file file ON rel.col_file = file._id
+  INNER JOIN tab_grn_schedule_filebody filebody
+    ON file._id = filebody.col_file AND file.col_version = filebody.col_version
+WHERE rel.col_event IN (@A)
+ORDER BY file._id;
+SQL;
+
+        $sql = $db->format($sql_format, [$event_ids]);
+        $result = $db->query($sql);
+
+        $files = [];
+
+        foreach ($event_ids as $event_id) {
+            $files[$event_id] = [];
+        }
+
+        require_once('grn/mime.csp');
+        $mcm = \GRN_MIMEConfigManager::getInstance();
+
+        while ($row = $db->fetch_assoc($result)) {
+            $ext = strtolower(substr(strrchr($row['col_name'], '.'), 1));
+            $mime = $mcm->getMIMEType($ext);
+
+            $files[$row['col_event']][] = [
+                'id'   => $row['col_file'],
+                'name' => $row['col_name'],
+                'size' => $row['col_size'],
+                'mime' => $mime ? $mime : $row['col_mime'],
+            ];
+        }
+
+        $db->free_result($result);
+
+        return $files;
+    }
+}

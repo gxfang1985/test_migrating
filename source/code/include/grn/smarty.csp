@@ -1,0 +1,545 @@
+<?php
+
+/**
+ * @package grn.common
+ */
+
+require_once('Smarty.class.php');
+
+/**
+ * Bridge class to call Smarty from Cybozu Framework.
+ * All Cybozu enhancement to Smarty will/should be done to this class
+ * because Smarty itself is licensed under LGPL.
+ *
+ * You may have a debugging window for smarty templates by adding
+ * a line "debug = 1" in section [Smarty] of "common.ini".
+ *
+ * Specifically, GRN_Smarty implements locale-specific template
+ * switching.  A locale-specific template is a template that lies
+ * in a sub-directory whose name is equal to the locale code.
+ *
+ * Example Usage:<br>
+ *  $smarty = new GRN_Smarty;<br>
+ *  $smarty->display('sample.tpl');
+ *
+ * @author  IKEDA, Atsushi      2004/09
+ * @version 1.0
+ * @package grn.common
+ */
+class GRN_Smarty extends Smarty
+{
+
+    /**
+     * Constructor.
+     */
+    public function __construct($skipDBAccess = false)
+    {
+        parent::__construct();
+        $this->_initialize_by_common_ini();
+
+        require_once('fw/csrf.csp');
+        $csrf_ticket = htmlspecialchars(cb_csrf_get_token());
+        $this->assign('csrf_ticket', $csrf_ticket);
+
+        $this->setVariablesForUrlBuilder();
+        $this->setLanguageVariables();
+        $this->setBrowserType();
+
+        $this->autoload_filters = ['pre' => ['grn_escape_variables']];
+
+        $this->initPageInfo();
+
+        // All actions that require DB connection must be added inside the IF below
+        // DB連携の作用はは以下のIF文に入れる必要があります
+        if ( ! $skipDBAccess) {
+            $this->setIsLicenseAvailable();
+            $this->initLoginInfo();
+            $this->initDownloadTicket();
+        }
+
+        global $G_config_common;
+        if ($G_config_common->get('Global', 'debug')) {
+            $this->force_compile = true;
+            $this->compile_check = true;
+        } else {
+            $this->force_compile = false;
+            $this->compile_check = false;
+        }
+    }
+
+    /**
+     * @access private
+     */
+    private $_skip_warning = false;
+
+    /**
+     * Skip license warning for this specific request.
+     */
+    function skipWarning()
+    {
+        $this->_skip_warning = true;
+    }
+
+    /**
+     * Do the same as Smarty::display(), except that this method
+     * may use locale-specific $tpl_file instead of normal (all-purpose)
+     * one.
+     *
+     * @param string $tpl_file The template file name.
+     * @param string $cache_id
+     * @param string $compile_id
+     */
+    function display($tpl_file, $cache_id = null, $compile_id = null)
+    {
+        // insert license warning template
+        if ( ! $this->_skip_warning) {
+            $lic = cb_get_license_driver();
+            if (($redirect = $lic->showWarning()) !== false) {
+                $this->_display($redirect, $cache_id, $compile_id);
+            }
+        }
+
+        // display body
+        $this->_display($tpl_file, $cache_id, $compile_id);
+    }
+
+    /**
+     * @access private
+     *
+     * @param $tpl_file
+     * @param $cache_id
+     * @param $compile_id
+     */
+    function _display($tpl_file, $cache_id, $compile_id)
+    {
+        $old_error_level = error_reporting(error_reporting());
+        parent::display($tpl_file, $cache_id, $compile_id);
+        error_reporting($old_error_level);
+    }
+
+    /**
+     * Execute and display the template results.
+     *
+     * @param string  $resource_name
+     * @param string  $cache_id
+     * @param string  $compile_id
+     * @param boolean $display
+     *
+     * @return mixed|string|void
+     */
+    function fetch(
+        $resource_name,
+        $cache_id = null,
+        $compile_id = null,
+        $display = false
+    ) {
+        $resolved = $this->_cb_resolve_template($resource_name);
+
+        return parent::fetch($resolved, $cache_id, $compile_id, $display);
+    }
+
+    /**
+     * Overload parent's _smarty_include to implement locale-dependent
+     * template switching in {include} tag.
+     *
+     * @access private
+     *
+     * @param array $params
+     */
+    function _smarty_include($params)
+    {
+        if (array_key_exists('smarty_include_tpl_file', $params)) {
+            $params['smarty_include_tpl_file']
+                = $this->_cb_resolve_template($params['smarty_include_tpl_file']);
+        }
+        parent::_smarty_include($params);
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $template_file
+     *
+     * @return string
+     */
+    function _cb_resolve_template($template_file)
+    {
+        // Determine which locale the template is expected to be found in.
+        global $G_config_common;
+        $is_develop = $G_config_common->get('Global', 'develop');
+
+        if ($is_develop) {
+            // In develop mode, fetch raw templates from the "master"
+            // directory for use in dynamic generation.
+            $container = 'master';
+        } else {
+            // When not in develop mode, retrieve pre-generated templates
+            // according to the current locale.
+            require_once('fw/i18n.csp');
+            $i18n = CB_I18N::getInstance();
+            $container = $i18n->getCurrentLanguage();
+        }
+
+        $targetdir = cb_basedir() . '/page/' . $container;
+        if (is_dir($targetdir) == false) {
+            echo "Could not find template directory of (" . $container
+                 . ").<br>";
+            die();
+        }
+
+        // Test our calculated path to the template
+        $resolved_path = $container . '/' . $template_file;
+        if ($this->template_exists($resolved_path)) {
+            return $resolved_path;
+        }
+
+        if ($is_develop) {
+            // Only in develop mode, retrieve pre-generated templates
+            // according to the current locale if the proper template file is not found in master directory.
+            require_once('fw/i18n.csp');
+            $i18n = CB_I18N::getInstance();
+            $container = $i18n->getCurrentLanguage();
+            $resolved_path = $container . '/' . $template_file;
+            if ($this->template_exists($resolved_path)) {
+                return $resolved_path;
+            }
+        }
+
+        // Error condition: The template wasn't found where we expected it to be
+        cb_throw_error(
+            E_SMARTY_TEMPLATE_NOT_FOUND,
+            null,
+            ['template' => $template_file]
+        );
+    }
+
+    /**
+     * Called automatically by the constructor to do initialization
+     * in accordance with settings in "common.ini".
+     *
+     * These standard template variables will be introduced.
+     * <ul>
+     * <li>is_debug  - TRUE iff azalea is running in debug mode.
+     * <li>app_path  - Location (URL) of static web resoruces including
+     *                 image files, JavaScript files, CSS files, etc.
+     * </ul>
+     *
+     * @access private
+     */
+    function _initialize_by_common_ini()
+    {
+        global $G_config_common;
+
+        // Assign template variables
+        require_once('fw/error_trace_log.csp');
+        $is_debug = cb_is_debug_mode();
+        $this->assign('is_debug', $is_debug);
+        $this->assign('show_backtrace', cb_is_display_error_details_mode());
+        $this->assign('app_path', $G_config_common->get('Global', 'app_path'));
+
+        global $G_config_grn;
+        if ( ! $G_config_grn || $is_debug) {
+            $build_date = time();
+        } else {
+            $build_date = $G_config_grn->get('System', 'build_date');
+        }
+
+        // リモート経由でアクセスした場合、URLの.以下が登録された拡張子でないとエラーになる
+        $build_date .= '.text';
+
+        $this->assign('build_date', $build_date);
+
+        // オーサリングツール対応等で、デリミタをデフォルト({ })から
+        // 変更したい場合、以下のように指定する
+        //      $this->left_delimiter = '<{';
+        //      $this->right_delimiter = '}>';
+        // さしあたり、Smarty関連の解説資料やIDE設定などとの親和性を
+        // 考えて、デリミタはデフォルトから変更しないという方針。
+
+        // テンプレートの位置
+        //GTM-129 for server side customization
+        $template_dir_list[0] = cb_basedir() . '/page';
+
+        $customutil = null;
+        if (defined('ON_FOREST')) {
+            require_once('grn/CustomUtil.csp');
+            $customutil = GRN_Custom_Util::getInstance();
+            $customutil->addCustomizedPageDir($template_dir_list);
+        }
+
+        $this->template_dir = $template_dir_list;
+
+        // サブディレクトリを使う (for 2.6.2 and later versions)
+        $this->use_sub_dirs = true;
+
+        // 中間ファイル(コンパイル済 php)の置き場は common.ini から設定
+        $compile_dir = $G_config_common->get('Smarty', 'compile_dir');
+        if ($compile_dir === false) {
+            $compile_dir = cb_tmpdir();
+        }
+        if (defined('ON_FOREST')) {
+            //GTM-129 for server side customization
+            $compile_dir .= '/' . $customutil->getDomainId() . '/';
+            cb_mkdir($compile_dir, 0777, true, true);
+        }
+
+        $this->compile_dir = $compile_dir;
+        if ( ! is_writable($this->compile_dir)) {
+            require_once('fw/i18n.csp');
+            echo cb_msg('fw.error', 'Unavailable template engine');
+            exit(CB_EXIT_ERROR_TEMPLATE_ENGINE);
+        }
+
+        $cache_dir = $G_config_common->get('Smarty', 'cache_dir');
+        if ($cache_dir === false) {
+            $cache_dir = cb_tmpdir();
+        }
+        if (defined('ON_FOREST')) {
+            //GTM-129 for server side customization
+            $cache_dir .= '/' . $customutil->getDomainId() . '/';
+            cb_mkdir($cache_dir, 0777, true, true);
+        }
+
+        $this->cache_dir = $cache_dir;
+        if ( ! is_writable($this->cache_dir)) {
+            require_once('fw/i18n.csp');
+            echo cb_msg('fw.error', 'Unavailable template engine');
+            exit(CB_EXIT_ERROR_TEMPLATE_ENGINE);
+        }
+
+        if ($is_debug && $G_config_common->get('Smarty', 'show_debug')) {
+            $this->turnOnDebug();
+        }
+
+        $this->force_compile = false;
+        $this->caching = 0;
+    }
+
+    private function initDownloadTicket()
+    {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $user = $uum->getLoginUser();
+
+        if ($user && cb_is_need_download_ticket()) {
+            require_once('grn/ticket.csp');
+            $this->assign('download_ticket',
+                GRN_Ticket::create($user->getOID()));
+        }
+    }
+
+    /**
+     * Override cache treatment for reloading mechanism.
+     *
+     * @param string $tpl_file
+     * @param string $cache_id
+     * @param string $compile_id
+     *
+     * @return bool|string
+     */
+    function is_cached($tpl_file, $cache_id = null, $compile_id = null)
+    {
+        global $G_INPUT;
+        if (array_key_exists('_reload', $G_INPUT)) {
+            return false;
+        }
+
+        global $G_config_common;
+        $enable = $G_config_common->get('Smarty', 'caching');
+
+        $resolved = $this->_cb_resolve_template($tpl_file);
+
+        if ($enable == '0') {
+            $this->clear_cache($resolved, $cache_id, $compile_id);
+
+            return false;
+        }
+
+        return parent::is_cached($resolved, $cache_id, $compile_id);
+    }
+
+    // ---------------------------------------------
+    // Smartyの動作設定を切り替えるメソッド
+    //
+    // デバッグ小窓が出ない場合のチェックポイント
+    // - fetch()ではデバッグ小窓は出ないことに注意。display()でのみ有効
+    // - Smartyに含まれる debug.tpl が見えていることが必要
+    // ---------------------------------------------
+    function turnOnDebug()
+    {
+        $this->debugging = true;
+    }
+
+    function turnOffDebug()
+    {
+        $this->debugging = false;
+    }
+
+    function isDebug()
+    {
+        return ($this->debugging == true);
+    }
+
+    /**
+     * @return string
+     */
+    public function getHtmlTagLanguage()
+    {
+        require_once('fw/i18n.csp');
+        $i18n = CB_I18N::getInstance();
+        $locale = strtolower($i18n->getCurrentLanguage());
+
+        return $locale;
+    }
+
+    private function setVariablesForUrlBuilder()
+    {
+        global $G_state_set;
+        if ($G_state_set->get('command_line')) {
+            return;
+        }
+
+        $this->assign('url_builder_page_prefix', cb_get_page_prefix());
+        $this->assign('url_builder_page_extension', cb_get_page_extension());
+    }
+
+    private function setLanguageVariables()
+    {
+        require_once('fw/i18n.csp');
+        $i18n = CB_I18N::getInstance();
+        $locale = strtolower($i18n->getCurrentLanguage());
+
+        $this->assign('html_lang', $locale);
+        $this->assign('html_tag_lang', $this->getHtmlTagLanguage());
+    }
+
+    private function setBrowserType()
+    {
+        require_once('fw/ui.csp');
+        $browser = cb_ui_get_browser();
+        $this->assign('browser', $browser);
+    }
+
+    private function setIsLicenseAvailable()
+    {
+        require_once('grn/license.csp');
+        $licence_manager = \GRN_LicenseManager::getInstance();
+        $is_license_available
+            = (bool)$licence_manager->hasEffectiveLicense(GRN_LICENSE_SERVICE_EXPIRED_OFFSET);
+        $this->assign('is_license_available', $is_license_available);
+    }
+
+    /**
+     * @access private
+     */
+    var $_login = null;
+
+    /**
+     * ログインユーザー情報を設定
+     */
+    function initLoginInfo()
+    {
+        $uum = cb_lwc_uum();
+        $login = $uum->getLoginUser();
+        require_once("grn/controller.csp");
+        if ( ! $login) {
+            $this->_login = null;
+        } else {
+            require_once("fw/i18n/locale.csp");
+            $this->_login = [
+                'id'       => $login->getOID(),
+                'name'     => GRN_ControllerUtil::getUserNameText($login->getOID(),
+                    $login->getOID()),
+                'slash'    => cb_is_forest() ? $login->get('slash') : '',
+                'timezone' => $login->get('timezone'),
+                'language' => CB_LocaleManager::getCurrentLanguage($login->getOID()),
+            ];
+
+            $item_values = $uum->getDefaultItemProperties();
+
+            if (isset($item_values['foreign_key']['use'])
+                && $item_values['foreign_key']['use']
+                && isset($item_values['foreign_key']['show'])
+                && $item_values['foreign_key']['show']
+            ) {
+                $this->_login['code'] = $login->get('foreign_key');
+            }
+            if (isset($item_values['email_address']['use'])
+                && $item_values['email_address']['use']
+                && isset($item_values['email_address']['show'])
+                && $item_values['email_address']['show']
+            ) {
+                $this->_login['email'] = $login->get('email_address');
+            }
+            if (isset($item_values['url']['use'])
+                && $item_values['url']['use']
+                && isset($item_values['url']['show'])
+                && $item_values['url']['show']
+            ) {
+                $this->_login['url'] = $login->get('url');
+            }
+            if (isset($item_values['telephone_number']['use'])
+                && $item_values['telephone_number']['use']
+                && isset($item_values['telephone_number']['show'])
+                && $item_values['telephone_number']['show']
+            ) {
+                $this->_login['phone'] = $login->get('telephone_number');
+            }
+        }
+        $this->assign('login', $this->_login);
+    }
+
+    function initPageInfo()
+    {
+        $page = cb_get_pagename();
+        $pages = explode('/', $page);
+
+        $param = ['all' => $page, 'last' => $pages[count($pages) - 1]];
+        $param['parts'] = $pages;
+
+        $this->assign('page_info', $param);
+    }
+
+    function setPageInfo($page)
+    {
+        $pages = explode('/', $page);
+        $param = ['all' => $page, 'last' => $pages[count($pages) - 1]];
+        $param['parts'] = $pages;
+
+        $this->assign('page_info', $param);
+    }
+
+    /**
+     * そのページがシステム管理画面かどうか調べる
+     *
+     * @return boolean
+     */
+    function isSystem()
+    {
+        $page_info = $this->get_template_vars('page_info');
+        $all_pageinfo = $page_info['all'];
+        if (preg_match('/system/', $all_pageinfo)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * そのページが運用管理画面かどうか調べる
+     *
+     * @return boolean
+     */
+    function isOperation()
+    {
+        $page_info = $this->get_template_vars('page_info');
+        $all_pageinfo = $page_info['all'];
+        if (preg_match('/operation/', $all_pageinfo)) {
+            return true;
+        }
+
+        return false;
+    }
+}
+
+

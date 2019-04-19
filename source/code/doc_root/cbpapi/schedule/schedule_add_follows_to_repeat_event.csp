@@ -1,0 +1,164 @@
+<?php
+
+if (isset($cbpapi_service)) {
+    // get parameters of SOAP message
+    $node_parameters = $cbpapi_service->getRequestParameters();
+    $follow_params = $cbpapi_service->selectNodes($node_parameters, 'follow');
+    if ( ! isset($follow_params)) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'follow']);
+    }
+    $event_id_original = [];
+    $required_fields = ['event_id', 'date', 'content'];
+    $operation_dates = [];
+    foreach ($follow_params as $follow) {
+        $follow_param = [];
+        if (array_key_exists('attributes', $follow)) {
+            $follow_param = $follow['attributes'];
+        }
+        foreach ($required_fields as $field) {
+            if ( ! array_key_exists($field, $follow_param)) {
+                require_once('cbpapi/error_code.csp');
+                cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                    ['param' => $field]);
+            }
+        }
+        $event_id = $follow_param['event_id'];
+        $operation_date = $follow_param['date'];
+        if (array_key_exists($event_id, $event_id_original)
+            && array_key_exists($operation_date, $operation_dates)
+        ) {
+            cb_throw_error(E_GRN_SCHD_DUPLICATE_EVENT);
+        }
+        $operation_dates[$operation_date] = $operation_date;
+        $event_id_original[$event_id] = $event_id;
+    }
+
+    require_once('cbpapi/schedule_logic.csp');
+    $api_base_logic = GRN_CBPApi_Schedule_Logic::getInstance();
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+
+    $event_id_modified = [];
+    $event_id_original = [];
+    foreach ($follow_params as $follow) {
+        $follow_param = [];
+        if (array_key_exists('attributes', $follow)) {
+            $follow_param = $follow['attributes'];
+        }
+        // イベントの取得
+        $event_id = $follow_param['event_id'];
+        //with repeat we must give a date
+        $date = new CB_Date();
+        if ( ! $date->parse($follow_param['date'])) {
+            $date = null;
+        }
+        $user_date = $api_base_logic->translateDateToUserTimezone($event_id,
+            $date);
+        require_once('fw/string_util.csp');
+        $follow = $follow_param['content'];
+        if (mb_strlen(cb_trim($follow)) == 0) {
+            cb_throw_error(E_GRN_SCHD_NOTINPUT_EVENTFOLLOW);
+        }
+
+        require_once('schedule/application.csp');
+        $app = GRN_Schedule_Application::getInstance();
+
+        if (is_null($date)) {
+            cb_throw_error(E_GRN_SCHD_NOT_SPECIFIED_DATE);
+        }
+        if ( ! is_numeric($event_id)) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        // 分離するためにイベントの取得
+        $event = $app->getEvent($login, $event_id, $user_date);
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        $app->readEvent($login, $event_id);
+
+        //check if it is a repeat event
+        $event_type = $event->getEventType();
+        if ( ! ($event_type & GRN_SCHEDULE_EVENT_TYPE_REPEAT)
+             == GRN_SCHEDULE_EVENT_TYPE_REPEAT
+        ) {
+            cb_throw_error(E_GRN_SCHD_IS_NOT_REPEAT_EVENT);
+        }
+
+        // アクセス権のチェック
+        require_once('schedule/access_logic.csp');
+        $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+        $dynamic_role = $uum->listGrantedRoles();
+        $access = $acc_logic->getEventAccess($login, $event,
+            ['read', 'add', 'modify', 'delete'], $dynamic_role);
+
+        if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+        }
+
+        if ($access['add'] == GRN_SCHD_ACCESS_DENY
+            && $access['modify'] == GRN_SCHD_ACCESS_DENY
+            && $access['delete'] == GRN_SCHD_ACCESS_DENY
+        ) {
+            cb_throw_error(E_GRN_SCHD_DENYENTRY_EVENTFOLLOW);
+        }
+
+        $old_eid = $event_id;
+        $event->setdate = $date;
+        $event->enddate = $date;
+        $event->modifier = &$login;
+        require_once('schedule/repeat_event_logic.csp');
+        $repeat_logic = GRN_Schedule_RepeatEventLogic::getInstance();
+        $user_date
+            = $repeat_logic->translateRepeatDateToUserTimezone($event,
+            $date);
+        $event_normal_id = $repeat_logic->modifyEvent($event, $user_date,
+            GRN_REPEAT_MODIFY_THIS);
+        if ($event_normal_id) {
+            $event_id_original[] = $event_id;
+            $event_id_modified[] = $event_normal_id;
+            $event->id = $event_normal_id;
+        }
+        // コンバートしてきた場合の対応
+        $repeat_logic->copyFollows($old_eid, $event_normal_id);
+
+        require_once('schedule/event_base_logic.csp');
+        $base_logic = new GRN_Schedule_EventBaseLogic();
+        $base_logic->writeScheduleFollow($event_normal_id, $login, $follow);
+
+        $api_base_logic->createFollowNotify($login, $event, $event_normal_id,
+            $follow, $date, GRN_SCHEDULE_NOTIFY_FOLLOWENTRY);
+
+    }
+    //commit to get info about new event
+    $api_base_logic->saveNow();
+
+    $events_for_view_original = [];
+    $events_for_view_original = $api_base_logic->getEventsForViewByIds($login,
+        $event_id_original);
+    $events_for_view_modify = [];
+    $events_for_view_modify = $api_base_logic->getEventsForViewByIds($login,
+        $event_id_modified);
+
+    $events_for_view = [];
+    foreach ($event_id_original as $index_key => $event_ori_key) {
+        $events_for_view_original[$event_ori_key]['root'] = 'original';
+        $events_for_view_modify[$event_id_modified[$index_key]]['root']
+            = 'modified';
+        $events_for_view[]
+            = [
+            $events_for_view_original[$event_ori_key],
+            $events_for_view_modify[$event_id_modified[$index_key]]
+        ];
+    }
+
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty;
+    $t->assign('events', $events_for_view);
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('schedule')]);
+    grn_cbpapi_response($t, __FILE__);
+}

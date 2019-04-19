@@ -1,0 +1,311 @@
+<?php
+
+namespace grn\space\screen;
+
+use grn\grn\GrnException;
+use grn\space\common\logic\legacy\SpaceLogLogic;
+use grn\space\common\exception\GrnDataNotFoundException;
+use grn\space\common\logic\IconLogic;
+use grn\space\data\bean\log\ModifySpaceLog;
+use grn\space\data\bean\SpaceUser;
+use grn\space\data\collection\SpaceUserCollection;
+use grn\space\service\SpaceService;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\data\bean\Authority;
+use grn\space\common\exception\GrnInvalidPermissionException;
+use grn\space\common\utility\SpaceMemberUtility;
+use grn\grn\MemberLogic;
+
+class JoinLeaveSpace extends SpaceBase
+{
+    const ACTION_JOIN = 'join';
+    const ACTION_LEAVE = 'leave';
+    const ARG_ACTION = 'action';
+
+    private $action = '';
+
+    /**
+     * @return mixed|string|void
+     * @throws GrnException
+     * @throws GrnInvalidPermissionException
+     */
+    public function fetch()
+    {
+        $this->hasSpaceAccess();
+        $this->setSpaceUsers();
+        $this->setOperators();
+        $this->setAction($this->getInput());
+        $this->checkIsAllowJoinLeave();
+
+        require_once('grn/smarty.csp');
+        $t = new \GRN_Smarty();
+        $t->assign('join_leave_space_page', $this);
+
+        return $t->fetch('space/application/join_leave_dialog.tpl');
+    }
+
+    /**
+     * @param $input
+     *
+     * @throws GrnException
+     * @throws GrnInvalidPermissionException
+     * @throws \grn\space\common\exception\GrnInvalidArgumentException
+     */
+    public function post($input)
+    {
+        $this->setInput($input);
+
+        $this->hasSpaceAccess();
+        $this->setSpaceUsers();
+        $this->setOperators();
+        $this->setAction($this->getInput());
+        $this->checkIsAllowJoinLeave();
+
+        $space_service = SpaceService::getInstance();
+        $space = $this->getSpace();
+        $current_space_user = new SpaceUser();
+        $current_space_user->setMemberID($this->getLoginUserId());
+        $current_space_user->setMemberType(MemberLogic::TYPE_USER);
+        $current_space_user->setSpaceId($space->getId());
+
+        $old_space_user_collection = $this->getSpaceUserCollection();
+        $space_user_collection = new SpaceUserCollection();
+        $space_operator_collection = $this->getSpaceOperatorCollection();
+
+        if ($this->getAction() === self::ACTION_LEAVE) {
+            foreach ($old_space_user_collection as $key => $user) {
+                /**
+                 * @var SpaceUser $user
+                 */
+                if ( ! $user->isEqualUser($this->getLoginUserId())) {
+                    $space_user_collection->appendBean($user);
+                }
+            }
+            foreach ($space_operator_collection as $key => $user) {
+                if ($user->isEqualUser($this->getLoginUserId())) {
+                    $space_operator_collection->remove($key);
+                }
+            }
+
+            $is_space_operator
+                = $space_service->hasSpaceAccessControl(Authority::AUTHORITY_CODE_OPERATION_PRIVILEGE,
+                $space->getId(), $this->getLoginUserId());
+            $space_service->removeSpaceUser($this->getSpace(),
+                $current_space_user, $is_space_operator,
+                $space_user_collection);
+        } else {
+            $space_service->addSpaceUser($this->getSpace(), $current_space_user,
+                $this->getLoginUserId());
+            $space_user_collection = $old_space_user_collection;
+        }
+
+        //When member of space has change , log ModifySpaceLog.
+        require_once('space/GrnSpaceApplication.csp');
+        $space_log_logic
+            = new SpaceLogLogic(\GrnSpaceApplication::GRN_SPACE_MODULE_ID);
+        $space_modify_log = new ModifySpaceLog();
+        $icon_logic = IconLogic::getInstance();
+
+        $icon = $icon_logic->getIcon($space->getBuiltinIconId());
+        $space_modify_log->setIcon($icon->getIconName());
+        $space_modify_log->setSpaceName($space->getSpaceName());
+        $space_modify_log->setCategoryName($space->getCategoryName());
+        $space_modify_log->setPrivacy($space->isPublic()
+            ? ModifySpaceLog::PRIVACY_PUBLIC
+            : ModifySpaceLog::PRIVACY_PRIVATE);
+        $space_modify_log->setJoinLeave($space->isAllowJoinLeave()
+            ? ModifySpaceLog::ALLOW_JOIN_LEAVE
+            : ModifySpaceLog::NOT_ALLOW_JOIN_LEAVE);
+
+        $space_member_names = [];
+        $space_service->addUserInfo(
+            $space_user_collection,
+            $this->getLoginUserId(),
+            SpaceMemberUtility::SYSTEM_DOESNT_USE_ENGLISH,
+            SpaceMemberUtility::ENGLISH_DOESNT_DISPLAY_AFTER_NAME,
+            SpaceMemberUtility::ORGANIZATION_DOESNT_DISPLAY_AFTER_NAME,
+            $this->getLanguageCode()
+        );
+        foreach ($space_user_collection as $eachSpaceUser) {
+            /**
+             * @var SpaceUser $eachSpaceUser
+             */
+            $space_member_names[] = $eachSpaceUser->getDisplayName();
+        }
+        $space_modify_log->setMemberNameList($space_member_names);
+        $space_operator_names = [];
+        $space_service->addUserInfo(
+            $space_operator_collection,
+            $this->getLoginUserId(),
+            SpaceMemberUtility::SYSTEM_DOESNT_USE_ENGLISH,
+            SpaceMemberUtility::ENGLISH_DOESNT_DISPLAY_AFTER_NAME,
+            SpaceMemberUtility::ORGANIZATION_DOESNT_DISPLAY_AFTER_NAME,
+            $this->getLanguageCode()
+        );
+
+        foreach ($space_operator_collection as $eachOperatorUser) {
+            /**
+             * @var SpaceUser $eachOperatorUser
+             */
+            $space_operator_names[] = $eachOperatorUser->getDisplayName();
+        }
+        $space_modify_log->setAdminNameList($space_operator_names);
+        $space_log_logic->info($space_modify_log);
+    }
+
+    /**
+     * @return string
+     */
+    public function getTitle()
+    {
+        require_once('fw/i18n.csp');
+
+        return cb_msg('grn.space', $this->getAction());
+    }
+
+    /**
+     * @param array $input
+     *
+     * @throws GrnDataNotFoundException
+     * @throws \grn\space\common\exception\GrnInvalidArgumentException
+     */
+    protected function setInput($input)
+    {
+        parent::setInput($input);
+        $this->checkArgFromInput([self::ARG_SPACE_ID], $input);
+        $this->verifySpaceIsNotExpired();
+        $space_service = SpaceService::getInstance();
+
+        try {
+            $space = $space_service->getSpace($this->getSpaceId(),
+                $this->getLoginUserId());
+        } catch (GrnDataNotFoundException $e) {
+            $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+            throw $e;
+        }
+
+        $this->setSpace($space);
+    }
+
+    /**
+     * @throws GrnInvalidPermissionException
+     */
+    protected function hasSpaceAccess()
+    {
+        $space_service = SpaceService::getInstance();
+        if ( ! $space_service->hasSpaceAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $this->getSpaceId(),
+            $this->getLoginUserId())
+        ) {
+            throw new GrnInvalidPermissionException(ErrorCode::GRN_NO_READ_PERMISSION);
+        }
+    }
+
+    /**
+     * set space user collection
+     */
+    protected function setSpaceUsers()
+    {
+        $space_service = SpaceService::getInstance();
+        $space_user_collection
+            = $space_service->getSpaceUserCollection($this->getSpaceId(),
+            $this->getLoginUserId());
+        $this->setSpaceUserCollection($space_user_collection);
+    }
+
+    /**
+     * To set space administrator collection
+     */
+    protected function setOperators()
+    {
+        $space_service = SpaceService::getInstance();
+        $space_operator_collection
+            = $space_service->getSpaceUserCollectionAccordingToAuthorityCode($this->getSpaceUserCollection(),
+            Authority::AUTHORITY_CODE_OPERATION_PRIVILEGE,
+            $this->getSpace()->getId());
+        $this->setSpaceOperatorCollection($space_operator_collection);
+    }
+
+    /**
+     * @throws GrnException
+     */
+    protected function checkIsAllowJoinLeave()
+    {
+
+        $is_allow_join_leave = $this->getSpace()->isAllowJoinLeave();
+        $space_service = SpaceService::getInstance();
+        $is_space_admin_or_operator
+            = $this->isSpaceAdminOrOperator($space_service,
+            $this->getSpaceId(), $this->getLoginUserId());
+
+        if ($is_allow_join_leave) {
+            switch ($this->getAction()) {
+                case self::ACTION_JOIN:
+                    if ($this->isMember()) {
+                        throw new GrnException(ErrorCode::GRN_HAS_JOINED_SPACE);
+                    }
+                    break;
+                case self::ACTION_LEAVE:
+                    if ( ! $this->isMember()) {
+                        throw new GrnException(ErrorCode::GRN_HAS_LEFT_SPACE);
+                    }
+
+                    if ($this->isUniqueSpaceMember()
+                        || $this->isUniqueSpaceOperatorWithCurrentUser()
+                    ) {
+                        throw new GrnException(ErrorCode::GRN_INVALID_MEMBER);
+                    }
+                    break;
+                default:
+                    break;
+            }
+        } else {
+            if ($this->getAction() === self::ACTION_LEAVE
+                && $this->isMember()
+                && $is_space_admin_or_operator
+                && ! $this->isUniqueSpaceMember()
+                && ! $this->isUniqueSpaceOperatorWithCurrentUser()
+            ) {
+            } else {
+                throw new GrnException(ErrorCode::GRN_JOIN_LEFT_OFF);
+            }
+        }
+    }
+
+    /**
+     * @param array $input
+     */
+    protected function setAction($input)
+    {
+        $action_value = cb_at($input, self::ARG_ACTION);
+
+        switch ($action_value) {
+            case self::ACTION_JOIN:
+                $this->action = self::ACTION_JOIN;
+                break;
+            case self::ACTION_LEAVE:
+                $this->action = self::ACTION_LEAVE;
+                break;
+            default:
+                $this->action = $this->isMember() ? self::ACTION_LEAVE
+                    : self::ACTION_JOIN;
+                break;
+        }
+    }
+
+    /**
+     * @return string
+     */
+    public function getAction()
+    {
+        return $this->action;
+    }
+
+    /**
+     * @return string
+     */
+    public function getSpaceNameForView()
+    {
+        return $this->getSpace()->getSpaceName();
+    }
+}

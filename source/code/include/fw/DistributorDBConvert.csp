@@ -1,0 +1,231 @@
+<?php
+declare(strict_types=1);
+
+namespace grn\fw;
+
+require_once('grn/table_util.csp');
+
+use \CB_DatabaseConnection;
+
+class DistributorDBConvert
+{
+    const APP_STAR = 'star';
+    const APP_SCHEDULE = 'schedule';
+    const APP_NOTIFICATION = 'notification';
+    const APP_OTHERS = 'others';
+
+    const TABLES
+        = [
+            'star'         => [
+                'tab_grn_star'
+            ],
+            'notification' => [
+                'tab_grn_notification_history',
+                'tab_grn_notification_notify',
+                'tab_grn_notification_to_me',
+                'tab_grn_notification_to_me_history'
+            ],
+            'schedule'     => [
+                'tab_grn_facility_oftenusedfacilitygroups',
+                'tab_grn_facility_facilitygrouphistory',
+                'tab_grn_facility_facilityhistory'
+            ],
+            'others'       => [
+                'tab_grn_user_oftenusedgroups',
+                'tab_grn_user_grouphistory',
+                'tab_grn_user_userhistory'
+            ],
+        ];
+
+    /** @var bool $is_largescale */
+    private $is_largescale;
+
+    /** @var bool $is_logging */
+    private $is_logging = false;
+
+    /** @var int $table_count */
+    private $table_count = 0;
+
+    /** @var array $table_counter */
+    private $table_counter
+        = [
+            'create table' => 0,
+            'copy'         => 0
+        ];
+
+    function __construct()
+    {
+        $this->is_largescale = ! grn_check_table_merged();
+    }
+
+    /**
+     * @param bool $is_logging
+     */
+    private function setIsLogging(bool $is_logging = false)
+    {
+        $this->is_logging = $is_logging;
+        if ($is_logging) {
+            foreach (self::TABLES as $app) {
+                $this->table_count += count($app);
+            }
+            $this->table_count = $this->table_count * cb_get_user_tables();
+        }
+    }
+
+    /**
+     * @param string $action_name
+     * @param string $table_name
+     */
+    private function log(string $action_name, string $table_name)
+    {
+        if ($this->is_logging) {
+            $counter = ++$this->table_counter[$action_name];
+            echo "{$action_name} ({$counter}/{$this->table_count}) : {$table_name}\n";
+        }
+    }
+
+    /**
+     * @param CB_DatabaseConnection $db
+     * @param string                $from_table
+     * @param string                $to_table_name
+     * @param int                   $mod
+     */
+    private function copy(
+        CB_DatabaseConnection $db,
+        string $from_table,
+        string $to_table_name,
+        int $mod
+    ) {
+        $db->query(cb_queryf($db,
+            sprintf('INSERT INTO %s SELECT * FROM %s WHERE MOD(col_user,50) = "@S"',
+                $to_table_name, $from_table), $mod));
+    }
+
+    /**
+     * @param CB_DatabaseConnection $db
+     * @param string                $target_table_name
+     */
+    private function drop(CB_DatabaseConnection $db, string $target_table_name)
+    {
+        $db->query("DROP TABLE IF EXISTS " . $target_table_name);
+    }
+
+    /**
+     * @param CB_DatabaseConnection $db
+     * @param string                $target_table_name
+     *
+     * @return bool
+     */
+    private function convert(
+        CB_DatabaseConnection $db,
+        string $target_table_name
+    ): bool {
+        $table_exists_sql = "show tables like '$target_table_name'";
+        $result = $db->query($table_exists_sql);
+        $grn_create_check = $db->fetch_row($result);
+        $db->free_result($result);
+        $table_exists = isset($grn_create_check[0]);
+
+        if ( ! $table_exists) {
+            return false;
+        }
+
+        $show_create_sql = "show create table " . $target_table_name;
+        $result = $db->query($show_create_sql);
+        $create_table_sql = $db->fetch_assoc($result)['Create Table'];
+        $db->free_result($result);
+
+        for ($i = 0; $i < cb_get_user_tables(); $i++) {
+            // Drop table
+            $new_table_name = $target_table_name . "___p" . $i;
+            $this->drop($db, $new_table_name);
+
+            // Create table
+            $real_table = substr($target_table_name, 3);
+            $create_table_sql___p = preg_replace("/`" . $target_table_name
+                                                 . "`/",
+                "`" . $new_table_name . "`", $create_table_sql);
+            $create_table_sql___p = preg_replace("/`cns" . $real_table . "/",
+                "`cns" . $real_table . "___p" . $i, $create_table_sql___p);
+            $db->query($create_table_sql___p);
+            $this->log('create table', $new_table_name);
+
+            // Copy data 
+            $this->copy($db, $target_table_name, $new_table_name, $i);
+            $this->log('copy', $new_table_name);
+        }
+
+        // Drop the original table
+        $this->drop($db, $target_table_name);
+
+        return true;
+    }
+
+    /**
+     * @param CB_DatabaseConnection $db
+     * @param array                 $tables
+     *
+     * @return bool
+     */
+    public function convertApplication(
+        CB_DatabaseConnection $db,
+        array $tables
+    ): bool {
+        if ( ! $this->is_largescale) {
+            return false;
+        }
+
+        foreach ($tables as $table) {
+            $this->convert($db, $table);
+        }
+
+        return true;
+    }
+
+    private function convertOthers()
+    {
+        $connection = cb_get_master_db();
+        $tables = self::TABLES[self::APP_OTHERS];
+        $this->convertApplication($connection, $tables);
+    }
+
+    public function convertStar()
+    {
+        $mail_id = self::APP_STAR;
+        $connection = cb_get_app_db($mail_id);
+        $tables = self::TABLES[$mail_id];
+        $this->convertApplication($connection, $tables);
+    }
+
+    public function convertSchedule()
+    {
+        $schedule_id = self::APP_SCHEDULE;
+        $connection = cb_get_app_db($schedule_id);
+        $tables = self::TABLES[$schedule_id];
+        $this->convertApplication($connection, $tables);
+    }
+
+    public function convertNotification()
+    {
+        require_once("grn/notification.csp");
+        $notification_connections = grn_notification_get_connections();
+
+        $notification_id = self::APP_NOTIFICATION;
+        $tables = self::TABLES[$notification_id];
+        foreach ($notification_connections as $db) {
+            $this->convertApplication($db, $tables);
+        }
+    }
+
+    /**
+     * @param bool $is_logging
+     */
+    public function convertAll(bool $is_logging = false)
+    {
+        $this->setIsLogging($is_logging);
+        $this->convertOthers();
+        $this->convertStar();
+        $this->convertSchedule();
+        $this->convertNotification();
+    }
+}

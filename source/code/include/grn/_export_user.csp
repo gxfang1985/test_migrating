@@ -1,0 +1,342 @@
+<?php
+
+class GrnExportUserCSV
+{
+    private $charSet = null;
+    private $title = null;
+    private $oldFormat = false;
+
+    private function setCharSet($charSet)
+    {
+        $this->charSet = $charSet;
+    }
+
+    private function getCharSet()
+    {
+        return $this->charSet;
+    }
+
+    private function setTitle($title)
+    {
+        $this->title = $title;
+    }
+
+    private function isTitle()
+    {
+        return $this->title;
+    }
+
+    private function setOldFormat($oldFormat)
+    {
+        $this->oldFormat = $oldFormat;
+    }
+
+    private function isOldFormat()
+    {
+        return $this->oldFormat;
+    }
+
+    public function execute($input)
+    {
+        $this->initWithInput($input);
+
+        // エラーフックの登録
+        require_once('fw/csv.csp');
+        $csv = $this->createCsvWriter($this->getCharSet());
+        $uum = $this->getUum();
+
+        if ($this->isTitle()) {
+            $csv->writeLine($this->getColumnNamesArray());
+        }
+
+        $defaultColumnList = $this->getExportDefaultColumnList();
+        $extensionColumnList = $this->getExportExtensionColumnList();
+        foreach ($this->getUsers() as $userId => $userRow) {
+            //Adminは出力しない
+            if ($userId == GRN_UUM_ADMINISTRATION_USER) {
+                continue;
+            }
+
+            $csv->writeLine($this->createUserLine($userId, $userRow,
+                $defaultColumnList, $extensionColumnList));
+
+            $uum->execInspection(
+                'user', 'export', [
+                'uid'     => $userRow->getOID(),
+                'name'    => $userRow->get('display_name'),
+                'account' => $userRow->get('foreign_key')
+            ]);
+        }
+        $csv->close();
+
+    }
+
+    private function createUserLine(
+        $userId,
+        $userRow,
+        $defaultColumnList,
+        $extensionColumnList
+    ) {
+        require_once("fw/i18n/system_config.csp");
+
+        $line = [];
+        $uum = $this->getUum();
+
+        // Login Name
+        $line[] = $userRow->get('foreign_key');
+
+        // Name
+        $line[] = $userRow->get('display_name');
+
+        if ( ! $this->isOldFormat() && CB_I18N_SystemConfig::isNickname()) {
+            // Name of Language
+            $line[]
+                = CB_LanguageManager::getLanguageCode($userRow->get('display_name_language'));
+
+            // NickName
+            $line[] = $userRow->get('nickname');
+        }
+
+        // New Login Name
+        $line[] = $userRow->get('foreign_key');
+
+        // Password
+        $line[] = '*';
+
+        if ( ! $this->isOldFormat()) {
+            // Locale
+            $line[] = $this->getLocaleCode($userRow->getOID());
+
+            // Office
+            $base = $uum->getDefaultItemData($userRow, 'base');
+            if (array_key_exists('code', $base['value'])) {
+                $line[] = $base['value']['code'];
+            } else {
+                $line[] = '';
+            }
+        }
+
+        // Position
+        $position = $userRow->get('position');
+        if (GRN_UUM_USER_MAX_POSITION == $position) {
+            $position = '';
+        }
+        $line[] = $position;
+
+        // Valid
+        $line[] = (is_null($userRow->get('valid'))) ? '1' : '0';
+
+        // Delete Flag
+        $line[] = '';
+
+        // Other Builtin Items
+        foreach (array_keys($defaultColumnList) as $id) {
+            $tmp = $uum->getDefaultItemData($userRow, $id);
+            $line[] = $tmp['value'];
+        }
+
+        // Extension Items
+        foreach (array_keys($extensionColumnList) as $id) {
+            $tmp = $uum->getExtensionItemData($userRow, $id, true);
+            if ($tmp['item']->get('type') === 'password') {
+                $line[] = '*'; //password
+            } else {
+                $line[] = $tmp['value'];
+            }
+        }
+
+        return $line;
+    }
+
+    private function getLocaleCode($userId)
+    {
+        $userLocaleSetting = CB_UserLocaleSetting::select($userId);
+        if (is_null($userLocaleSetting)) {
+            return "";
+        }
+        if (is_null($userLocaleSetting->getLocale())) {
+            return "";
+        }
+
+        $locale = CB_Locale::select($userLocaleSetting->getLocale());
+
+        return $locale->getCode();
+    }
+
+    private function getUsers()
+    {
+        $uumUtil = $this->getUumUtil();
+        $uum = $this->getUum();
+        $logic = $this->getOrganizationPrivilegeLogic();
+
+        if ($this->isAdmin()) {
+            return $uumUtil->getUsers();
+        } else {
+            $users = [];
+            $tmp_users = $uumUtil->getUsers();
+            $logged_in_user = $uum->getLoginUser();
+            foreach ($tmp_users as $key => $value) {
+                if ($logic->isPrivilegedUser($logged_in_user, $value)) {
+                    $users[$key] = $value;
+                }
+            }
+
+            return $users;
+        }
+    }
+
+    private function getColumnNamesArray()
+    {
+        $ret = [];
+
+        require_once("grn/uum_util.csp");
+        foreach (
+            get_user_import_column_list() as $columnNumber => $grnCsvColumn
+        ) {
+            if ($this->isOldFormat() && $grnCsvColumn->isNew()) {
+                continue;
+            }
+
+            $ret[$columnNumber] = $grnCsvColumn->getName();
+        }
+
+        return $ret;
+    }
+
+    private function getExportDefaultColumnList()
+    {
+        $uum = $this->getUum();
+
+        $ret = [];
+
+        $item_values = &$uum->getDefaultDisplayItemProperties();
+        foreach ($item_values as $id => $properties) {
+            if ($id === 'display_name' || $id === 'foreign_key'
+                || $id === 'locale'
+                || $id === 'base'
+            ) {
+                continue;
+            }
+
+            if ( ! $properties['use']) {
+                continue;
+            }
+
+            if ($properties['type'] === 'file'
+                || $properties['type'] === 'primary_group'
+                || $properties['type'] === 'usergroups'
+                || $properties['type'] === 'attendee'
+            ) {
+                continue;
+            }
+
+            $ret[$id] = $uum->getRealDefaultItemName($id);
+        }
+
+        return $ret;
+    }
+
+    private function getExportExtensionColumnList()
+    {
+        $uum = $this->getUum();
+
+        $ret = [];
+        foreach ($uum->listItems() as $id => $columnData) {
+            if ( ! $columnData->get('use')) {
+                continue;
+            }
+            if ($columnData->get('type') == 'file') {
+                continue;
+            }
+
+            $ret[$id] = $columnData->get('display_name');
+        }
+
+        return $ret;
+    }
+
+    private function initWithInput($input)
+    {
+        if (@$input['charset']) {
+            $this->setCharSet($input['charset']);
+        } else {
+            $this->setCharSet($this->getDefaultExternalEncoding());
+        }
+        $this->setTitle(@$input['title']);
+        $this->setOldFormat(@$input['old']);
+    }
+
+    private function isAdmin()
+    {
+        $logic = $this->getOrganizationPrivilegeLogic();
+
+        return $logic->isAdmin();
+    }
+
+    private function getDefaultExternalEncoding()
+    {
+        global $G_config_common;
+        $charset = $G_config_common->get('I18N', 'default_external_encoding');
+
+        return $charset;
+    }
+
+    private function createCsvWriter($charset, $filepath = null)
+    {
+        return new CB_CSVWriter($charset, $filepath);
+    }
+
+    private $uum = null;
+
+    /**
+     *
+     * @return GRN_Uum
+     */
+    private function getUum()
+    {
+        if (is_null($this->uum)) {
+            global $G_container_base;
+            $this->setUum($G_container_base->getInstance('uum'));
+        }
+
+        return $this->uum;
+    }
+
+    private function setUum($uum)
+    {
+        $this->uum = $uum;
+    }
+
+
+    private $uumUtil = null;
+
+    /**
+     *
+     * @return GRN_UumUtil
+     */
+    private function getUumUtil()
+    {
+        if (is_null($this->uumUtil)) {
+            require_once("grn/uum_util.csp");
+            $this->setUumUtil(GRN_UumUtil::getInstance());
+        }
+
+        return $this->uumUtil;
+    }
+
+    private function setUumUtil($uumUtil)
+    {
+        $this->uumUtil = $uumUtil;
+    }
+
+    /**
+     *
+     * @return GRN_OrganizationPrivilegeLogic
+     */
+    private function getOrganizationPrivilegeLogic()
+    {
+        require_once('grn/org_privilege.csp');
+
+        return GRN_OrganizationPrivilegeLogic::getInstance();
+    }
+}

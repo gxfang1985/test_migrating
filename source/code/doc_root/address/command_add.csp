@@ -1,0 +1,180 @@
+<?php
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    // GET/POSTされたパラメータを取得する
+    $bid = null;
+    if (array_key_exists('bid', $G_INPUT)) {
+        $bid = $G_INPUT['bid'];
+    }
+    if (0 == strlen($bid)) {
+        cb_throw_error(E_GRN_ADDRESS_INVALID_BOOK_ID);
+    }
+
+    if (array_key_exists('cid', $G_INPUT)) {
+        $cid = $G_INPUT['cid'];
+    }
+
+    // アドレス帳を取得する
+    require_once('address/application.csp');
+    $app_locator = GRN_ApplicationLocator::instance();
+    /** @var GRN_Address_Application $app */
+    $app = $app_locator->getInstance(GRN_ADDRESS_APPLICATION_ID);
+    if ( ! is_object($app) || ! is_a($app, 'GRN_Address_Application')) {
+        cb_throw_error(E_GRN_APPLICATION_NOT_AVAILABLE);
+    }
+    $book_manager = $app->getBookManager();
+
+    // ログインユーザーを取得する
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    if ( ! is_object($login) || ! is_a($login, 'CB_User')) {
+        cb_throw_error(E_GRN_USER_NOT_FOUND);
+    }
+    $login_id = $login->getOID();
+
+    // アドレス帳の設定を取得する
+    require_once('address/config.csp');
+    $config_manager = GRN_Address_ConfigManager::getInstance();
+    $personal_config = $config_manager->getPersonalConfig($login);
+
+    // 使用権限を取得する
+    require_once('address/access.csp');
+    $access_manager = GRN_Address_AccessManager::getInstance();
+    if ( ! ($row = $access_manager->getAbstractData(GRN_ADDRESS_AVAILABLE))) {
+        assert('FALSE');
+    }
+
+    // ダイナミックロールを取得する
+    $dynamic_roles = $uum->listGrantedRoles();
+
+    // 使用権限を評価する
+    $authorities = ['private_address', 'shared_address'];
+    $security_model = $access_manager->getSecurityModel($row);
+    $access = $access_manager->evaluateAccess($row, $login,
+        $dynamic_roles, $authorities, $security_model);
+
+    if (0 > $bid) {
+        // 個人アドレス帳の使用権限を評価する
+        $authorities = ['private_address'];
+        if ( ! $access_manager->isAllowedAccess($access, $authorities,
+            $security_model)
+        ) {
+            cb_throw_error(E_GRN_ADDRESS_ACCESS_DENY_PRIVATE_ADDRESS);
+        }
+
+        // 個人アドレスブックを取得する
+        if ( ! ($book
+            = $book_manager->getPrivateAddressBookByUserId($login_id))
+        ) {
+            if ( ! ($book =& $book_manager->addPrivateAddressBook('cyde',
+                $login_id, []))
+            ) {
+                cb_throw_error(E_GRN_ADDRESS_PRIVATE_ADDRESS_BOOK_NOT_FOUND);
+            }
+        }
+    } else {
+        // 共有アドレス帳の使用権限を評価する
+        $authorities = ['shared_address'];
+        if ( ! $access_manager->isAllowedAccess($access, $authorities,
+            $security_model)
+        ) {
+            cb_throw_error(E_GRN_ADDRESS_ACCESS_DENY_SHARED_ADDRESS);
+        }
+
+        // 共有アドレスブックを取得する
+        if ( ! ($book = $book_manager->getSharedAddressBook($bid))) {
+            cb_throw_error(E_GRN_ADDRESS_SHARED_ADDRESS_BOOK_NOT_FOUND);
+        }
+
+        // 共有アドレス帳の閲覧、編集権限を評価する
+        $row = $book->getRow();
+        $authorities = ['browse', 'editing'];
+        $access = $access_manager->evaluateAccess($row, $login,
+            $dynamic_roles, $authorities);
+        $security_model = $access_manager->getSecurityModel($row);
+        if ( ! $access_manager->isAllowedAccess($access, $authorities,
+            $security_model)
+        ) {
+            cb_throw_error(E_GRN_ADDRESS_ACCESS_DENY_EDITING);
+        }
+    }
+
+    // 組み込み項目情報一覧を取得する
+    require_once('address/view_util.csp');
+    $view_util = GRN_Address_ViewUtil::getInstance();
+    $builtin_items = $view_util->listBuiltinItems($book);
+    unset($builtin_items['map']); // remove the "map" item before save
+    // 拡張項目情報一覧を取得する
+    $extended_items = $view_util->listExtendedItems($book);
+
+    // 表示する項目情報一覧を取得する
+    $personal_config->getDisplayFlag($book, $builtin_items, $extended_items);
+
+    // 入力データからデータを取得
+    $properties = grn_address_wish_input_data($builtin_items, $extended_items);
+
+    if (is_numeric($cid)) {
+        $data = $book->getData($cid);
+
+        if ($data) {
+            $tmp = $data->getProperties('copy');
+            if (array_key_exists('file_exist', $properties)) {
+                foreach ($properties['file_exist'] as $key => $value) {
+                    if ( ! isset($properties[$key])
+                         || $properties[$key]['error'] === UPLOAD_ERR_NO_FILE
+                    ) {
+                        $properties[$key] = $tmp[$key];
+                    }
+                }
+            }
+        }
+    }
+
+    // SmartyValidateする項目を持っているかを検証する
+    if ($view_util->hasSmartyValidateItem($builtin_items, $extended_items)) {
+        require_once('grn/smarty.csp');
+        $t = new GRN_Smarty;
+
+        require_once('SmartyValidate.class.php');
+        SmartyValidate::connect($t);
+
+        $tmp_key = grn_get_temporary_key();
+        $t->assign('tmp_key', $tmp_key);
+
+        $target_name = 'address/add';
+        $session_target = $target_name . $tmp_key;
+        SmartyValidate::register_form($session_target);
+
+        if (SmartyValidate::is_valid($G_INPUT, $session_target)) {
+            // アドレスデータを追加する
+            $data = $book->addData($properties);
+
+            SmartyValidate::unregister_form($session_target);
+
+            $card_id = $data->getOID();
+            cb_redirect('address/view', ['bid' => $bid, 'cid' => $card_id]);
+        } else {
+            $t->setPageInfo($target_name);
+            $t->assign('book_id', $bid);
+            $t->assign('card', $G_INPUT);
+            $t->assign('builtin_items', $builtin_items);
+            $t->assign('extended_items', $extended_items);
+            // ブック情報一覧を取得する
+            $book_info = $view_util->getBook($book, 'view');
+            $t->assign('book_info', $book_info);
+            // リソース一覧を生成する
+            $resources = ['application_name' => $app->getName()];
+            $t->assign('resources', $resources);
+            include('_add.csp');
+            $t->display($target_name . '.tpl');
+        }
+    } else {
+        // アドレスデータを追加する
+        $data =& $book->addData($properties);
+
+        $card_id = $data->getOID();
+        cb_redirect('address/view', ['bid' => $bid, 'cid' => $card_id]);
+    }
+}
+

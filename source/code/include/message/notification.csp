@@ -1,0 +1,278 @@
+<?php
+
+use grn\grn\background\BackgroundJobName;
+use grn\notification\background\NotificationJobRegisterService;
+
+/**
+ * メッセージ通知リスナー
+ *
+ * @author   Eiji TAEN   2005/06
+ * @package  grn.message
+ */
+
+require_once('grn/notification.csp');
+require_once('grn/application.csp');
+require_once('message/resources.csp');
+require_once('message/table.csp');
+
+/**
+ * メッセージ通知リスナークラス
+ *
+ * @package  grn.message
+ */
+class GRN_Message_NotificationListener
+{
+    /**
+     * messages table
+     *
+     * @access   private
+     */
+    private $_messages;
+
+    /**
+     * follow table
+     *
+     * @access   private
+     */
+    private $_follows;
+
+    /**
+     * relations table
+     *
+     * @access   private
+     */
+    //var $_relations;
+
+    /**
+     * notification_service instance
+     *
+     * @access   private
+     * @var $_notify_service GRN_Notification_Service
+     */
+    private $_notify_service;
+
+    /**
+     * @var $notification_job_register_service \grn\notification\background\NotificationJobRegisterService
+     */
+    private $notification_job_register_service;
+
+    /**
+     * notify_propertyies cache
+     *
+     * @access   private
+     */
+    private $_notify_properties;
+
+    private $_manager;
+
+    /**
+     * constructor
+     */
+    function __construct()
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $manager
+            = $app_locator->getTableManager('message');
+        $this->_messages
+            = $manager->getTableInfo(GRN_MESSAGE_MESSAGES);
+        $this->_follows
+            = $manager->getTableInfo(GRN_MESSAGE_FOLLOWS);
+        $this->_notify_service
+            = GRN_Notification_Service::getInstance();
+        $this->notification_job_register_service
+            = NotificationJobRegisterService::create();
+        $this->_manager = $manager;
+    }
+
+
+    /**
+     * confirming notification data
+     *
+     * @param  CB_USer              $user user
+     * @param  GRN_Message_Messages $message
+     * @param  CB_TimeStamp         $time confirmed time
+     */
+    function confirmNotification($user, $message, & $time)
+    {
+        $unique_id = $this->getUniqueID($message);
+
+        $table_name = grn_get_personal_tablename_message($user->getOID(),
+            GRN_MESSAGE_FOLDERMESSAGERELATIONS);
+        $table = $this->_manager->getTableInfo($table_name);
+        $rowset = new CB_RowSet($table);
+        $rowset->addCondition($rowset->queryf("col_user = '@S' AND col_message = '@S'",
+            $user->getOID(), $unique_id));
+        //  $user は CB_User なので、UUMが削除フラグチェック済み。
+        $rowset->addOrderColumn('col_sent_message_flag');
+        $row = $rowset->iterate();
+
+        if ( ! $row) {
+            return;
+        }
+        /** @var $last_modifier CB_User */
+        $last_modifier = $message->get('last_modifier');
+        $last_modifier_id = '';
+        if ( ! is_null($last_modifier)) {
+            $last_modifier_id = $last_modifier->getOID();
+        }
+
+        $notify_properties
+            = $this->_notify_service->getNotifyDataPropertiesFast($user,
+            GRN_MESSAGE_MODULEID, $unique_id);
+
+        // 通知設定チェック
+        $subscribed = true;
+        if ($row->get('subscription_flag') == '1') // メッセージ本体が要通知
+        {
+            $folder = $row->get('folder');
+            if ($folder->get('subscription_flag') == '0') {
+                $subscribed = false;
+            }
+        } else                                          // メッセージ本体が非通知
+        {
+            $subscribed = false;
+        }
+
+        if ( ! is_null($notify_properties)) {
+            if ( ! isset($this->_notify_properties)
+                 || is_null($this->_notify_properties)
+            ) {
+                $this->_notify_properties = new GRN_Notification_Data;
+            }
+            $this->_notify_properties->import($notify_properties);
+
+            // confirming notification
+            if ($this->_notify_properties->isStatusConfirmed() === false) {
+                if ($user->getOID() == $last_modifier_id || ! $subscribed) {
+                    // 最終更新者が本人の場合もしくは通知解除されている場合はconfirmだけ
+                    $this->_notify_service->confirmNotifyData($user,
+                        GRN_MESSAGE_MODULEID,
+                        $unique_id, $time);
+                } else {
+                    $this->_notify_properties->setStatusToConfirm();
+                    $this->_notify_service->modifyNotifyData($user,
+                        $this->_notify_properties,
+                        false, false);
+                }
+            }
+        }
+    }
+
+    /**
+     * deleting notification data
+     *
+     * @param    object $user       user CB_User object
+     * @param    string $message_id message id
+     *
+     * @return   boolean   TRUE: success deleting notification data
+     */
+    function deleteNotification($user, $message_id)
+    {
+        $unique_id = $this->getUniqueID($this->_messages->getRow($message_id));
+
+        return $this->_notify_service->deleteNotifyData($user,
+            GRN_MESSAGE_MODULEID,
+            $unique_id);
+    }
+
+    /**
+     * getting unique id from message object
+     * unique id is a original message id. Not a snapshot id!
+     *
+     * @access   private
+     *
+     * @param    object $message message CB_Row object
+     *
+     * @return   string   unique id
+     */
+    function getUniqueID($message)
+    {
+        $unique_id = $message->getOID();
+        /** @var $original_message CB_Row */
+        $original_message = $message->get('original_message');
+
+        if ( ! is_null($original_message)) {
+            $unique_id = $original_message->getOID();
+        }
+
+        return $unique_id;
+    }
+
+    /**
+     * 指定の社内メールの通知について更新する。
+     *  DB: tab_grn_notification_notify___pX の、col_status が 'update' になる更新操作に該当する。
+     *
+     * @param string                    $action "update", "create" ...
+     * @param GRN_Message_Messages      $message
+     * @param CB_User                   $sender
+     * @param \GRN_Message_Addressees[] $addressees
+     * @param                           $subject
+     * @param                           $abstract
+     * @param                           $timestamp
+     * @param int | null                $follow_id
+     * @param array                     $notification_to_me_user_ids
+     *
+     */
+    function registerBackgroundNotification(
+        $action,
+        GRN_Message_Messages $message,
+        CB_User $sender,
+        array $addressees,
+        $subject,
+        $abstract,
+        $timestamp,
+        $follow_id = null,
+        array $notification_to_me_user_ids = []
+    ) {
+        if (empty($addressees)) {
+            return;
+        }
+        $folder_relation_dao
+            = new \grn\message\dao\GrnMessageFolderMessageRelationsDAO();
+        $subscribed_user_ids
+            = $folder_relation_dao->getSubscribedUserIds($message->getOID(),
+            $addressees);
+
+        $notification = new GRN_Notification_Data();
+        $notification->setUniqueId($message->getOID());
+        $notification->setModuleId(GRN_MESSAGE_MODULEID);
+        $org_data = ['mid' => $message->getOID()];
+        if ( ! is_null($follow_id)) {
+            $org_data["follow_id"] = $follow_id;
+        }
+
+        //  添付ファイルの有無を更新する
+        $org_data['file'] = 0 < $message->get('file_num');
+
+        $sender_id = $sender->getOID();
+        $sender_name = $sender->get('display_name');
+        $notification->setSubjectData($subject);
+        $notification->setSenderData($sender_name, $sender_id);
+        $notification->setAbstractData(mb_substr($abstract, 0,
+            GRN_MESSAGE_NOTIFICATIONABSTLEN));
+        $notification->setTimeStampData($timestamp);
+        $notification->setOrgData($org_data);
+        $notification->setActionId($action);
+        $notification->setStatusToUpdate();
+
+        $notification_all_user_ids
+            = array_unique(array_merge($subscribed_user_ids,
+            $notification_to_me_user_ids));
+        $this->notification_job_register_service->register(BackgroundJobName::SEND_NOTIFICATION,
+            $notification,
+            $sender, $notification_all_user_ids);
+
+        // Notification: To Me
+        if (count($notification_to_me_user_ids) === 0) {
+            return;
+        }
+
+        $to_me_data = clone $notification;
+        $to_me_data->setIsToMe(true);
+        $this->notification_job_register_service->register(BackgroundJobName::SEND_NOTIFICATION,
+            $to_me_data,
+            $sender, $notification_to_me_user_ids);
+    }
+}
+
+

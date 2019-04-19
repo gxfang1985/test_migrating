@@ -1,0 +1,410 @@
+<?php
+/**
+ * @param bool $is_draft_modify 下書きの編集の場合にTRUE
+ */
+
+global $G_INPUT;
+/** @var CB_User $G_bulletin_login */
+global $G_bulletin_login;
+/** @var GRN_Bulletin $G_bulletin */
+global $G_bulletin;
+$original = null;
+
+/** @var GRN_Smarty $t */
+global $t;
+
+if ( ! isset($article_id) && array_key_exists('aid', $G_INPUT)) {
+    $article_id = $G_INPUT['aid'];
+}
+
+if (isset($article_id) && $article_id) {
+    $t->assign('article_id', $article_id);
+
+    if ((isset($is_draft) && $is_draft)
+        || (isset($is_draft_modify)
+            && $is_draft_modify)
+    ) {
+        if ( ! ($original =& $G_bulletin->getDraft($G_bulletin_login,
+            $article_id))
+        ) {
+            require_once('bulletin/error_code.csp');
+            cb_throw_error(E_GRN_BULLETIN_DRAFT_NOT_FOUND);
+        }
+    } else {
+        if ( ! ($original =& $G_bulletin->getArticle($G_bulletin_login,
+            $article_id))
+        ) {
+            require_once('bulletin/error_code.csp');
+            cb_throw_error(E_GRN_BULLETIN_ARTICLE_NOT_FOUND);
+        }
+    }
+}
+
+$category = null;
+
+if ( ! isset($category_id)) {
+    if ( ! is_null($original)) {
+        $category_id = $original->getId('category');
+    } elseif (array_key_exists('cid', $G_INPUT)) {
+        $category_id = $G_INPUT['cid'];
+    }
+}
+
+if (isset($category_id) && $category_id) {
+    if (($category = $G_bulletin->getCategory($G_bulletin_login,
+        $category_id))
+    ) {
+        if ($category->access($G_bulletin_login, GRN_BULLETIN_ACCESS_W)) {
+            $t->assign('category_id', $category_id);
+            $t->assign('category_name', $category->get('name'));
+        }
+    }
+}
+
+$args = [
+    'subject'      => $G_INPUT['title'],
+    'can_follow'   => (array_key_exists('can_follow', $G_INPUT)
+        ? $G_INPUT['can_follow'] : 0),
+    'reserve_int1' => (array_key_exists('enable_acknowledgement', $G_INPUT)
+        ? $G_INPUT['enable_acknowledgement'] : 0)
+];
+
+if (array_key_exists('editor', $G_INPUT) && $G_INPUT['editor']) {
+    require_once('grn/controller.csp');
+    $args['data'] = grn_strip_tags($G_INPUT['data']);
+    $args['html'] = $G_INPUT['data'];
+} else {
+    $args['data'] = $G_INPUT['data'];
+    $args['html'] = null;
+}
+
+// 掲示期間の設定
+
+if ($G_INPUT['enable_term'] == 1) {
+    require_once('bulletin/functions.csp');
+
+    $timestamps = grn_bulletin_get_term('sterm', 'eterm');
+
+    $args['start_timestamp'] = $timestamps['start'];
+    $args['end_timestamp'] = $timestamps['end'];
+    $args['start_is_datetime'] = $timestamps['start_is_datetime'];
+    $args['end_is_datetime'] = $timestamps['end_is_datetime'];
+} else {
+    $args['start_timestamp'] = null;
+    $args['end_timestamp'] = null;
+    $args['start_is_datetime'] = null;
+    $args['end_is_datetime'] = null;
+}
+
+require_once('bulletin/resources.csp');
+// sender type
+$system_config = $G_bulletin->getSystemConfig($G_bulletin_login);
+$enable_manually_enter_sender = $system_config->getEnableManuallyEnterSender();
+$args['manually_enter_sender'] = null;
+if ($enable_manually_enter_sender) {
+    $sender_type = cb_at($G_INPUT, 'sender_set',
+        GRN_BULLETIN_SENDER_TYPE_CREATOR);
+    $manually_enter_sender = cb_at($G_INPUT, 'manually_sender');
+    if ($sender_type !== GRN_BULLETIN_SENDER_TYPE_CREATOR) {
+        $args['manually_enter_sender'] = $manually_enter_sender;
+    }
+}
+
+// maintainers
+$operator_type = cb_at($G_INPUT, 'operator_set',
+    GRN_BULLETIN_MAINTAINER_TYPE_SENDER);
+$maintainer_id_list = [];
+if ($operator_type !== GRN_BULLETIN_MAINTAINER_TYPE_SENDER) {
+    $maintainer_id_list = cb_at($G_INPUT, 'sUID', []);
+}
+$args['maintainer_id_list'] = $maintainer_id_list;
+
+//GRREQ-136 acknowledgement required
+if ($args['reserve_int1'] == 1 && array_key_exists('send', $G_INPUT)
+    && $G_INPUT['send']
+) {
+    require_once('bulletin/access.csp');
+    $am = GRN_Bulletin_AccessManager::getInstance();
+    require_once('grn/access_resources.csp');
+    $target_classes = [
+        'dynamic_role' => null,
+        'cb_role'      => null,
+        'cb_group'     => null,
+        'cb_user'      => null
+    ];
+    $access_list = [];
+    $user_id_tmp = [];
+    //Numbers total view
+    require_once('bulletin/notification.csp');
+    $notification = new GRN_Bulletin_NotificationManager();
+    $notification->getInstance();
+
+    $categoryIdParent = $category_id;
+    $userIdRight = [];
+    do {
+        if ( ! ($node_row = $G_bulletin->getCategory($G_bulletin_login,
+            $categoryIdParent))
+        ) {
+            cb_throw_error(E_GRN_BULLETIN_CATEGORY_NOT_FOUND);
+        }
+        $targets = $am->getTargets($node_row, $target_classes);
+        $access_list = [];
+        foreach ($targets as $class_type => $accesses) {
+            switch ($class_type) {
+                case 'cb_user':
+                    $type = GRN_ACCESS_TARGET_TYPE_USER;
+                    break;
+                case 'cb_group':
+                    $type = GRN_ACCESS_TARGET_TYPE_GROUP;
+                    break;
+                case 'cb_role':
+                    $type = GRN_ACCESS_TARGET_TYPE_STATIC_ROLE;
+                    break;
+                default:
+                    $type = GRN_ACCESS_TARGET_TYPE_DYNAMIC_ROLE;
+                    break;
+            }
+
+            foreach ($accesses as $key => $authorities) {
+                $access_list[] = [
+                    'type' => $type,
+                    'tid'  => $key,
+                    'data' => $authorities
+                ];
+            }
+        }
+        $security_model = $node_row->get('security_model');
+        $user_id_tmp = [];
+        foreach ($access_list as $item) {
+            switch ($item['type']) {
+                case 'user':
+                    if (($security_model == 1 && $item["data"]["read"] == 1
+                         && $item["data"]["write"] == 1
+                         && $item["data"]["follow"] == 1)
+                        || $security_model == 0
+                    )//revoke
+                    {
+                        array_push($user_id_tmp, $item['tid']);
+                    }
+                    break;
+                case 'group':
+                    unset($tmpArray);
+                    $tmpArray
+                        = array_values($notification->getUserIdByGroupCategory($categoryIdParent,
+                        $item['tid']));
+                    if (($security_model == 1 && $item["data"]["read"] == 1
+                         && $item["data"]["write"] == 1
+                         && $item["data"]["follow"] == 1)
+                        || $security_model == 0
+                    ) {
+                        foreach ($tmpArray as $itemTmp) {
+                            array_push($user_id_tmp, $itemTmp);
+                        }
+                    }
+                    break;
+                case 'static_role':
+                    unset($tmpArray);
+                    $tmpArray
+                        = array_values($notification->getUserIdByRoleCategory($categoryIdParent,
+                        $item['tid']));
+                    if (($security_model == 1 && $item["data"]["read"] == 1
+                         && $item["data"]["write"] == 1
+                         && $item["data"]["follow"] == 1)
+                        || $security_model == 0
+                    ) {
+                        foreach ($tmpArray as $itemTmp) {
+                            array_push($user_id_tmp, $itemTmp);
+                        }
+                    }
+                    break;
+                default:
+                    unset($tmpArray);
+                    $tmpArray
+                        = array_values($notification->getUserIdByDynamicRoleCategory($categoryIdParent,
+                        $item['tid']));
+                    if (($security_model == 1 && $item["data"]["read"] == 1
+                         && $item["data"]["write"] == 1
+                         && $item["data"]["follow"] == 1)
+                        || $security_model == 0
+                    ) {
+                        foreach ($tmpArray as $itemTmp) {
+                            array_push($user_id_tmp, $itemTmp);
+                        }
+                    }
+                    break;
+            }
+        }
+
+        $arrayUnique = array_unique($user_id_tmp);
+
+        if (count($userIdRight) == 0 && $security_model == 0)//grant
+        {
+            $userIdRight = $arrayUnique;
+        } elseif ($security_model == 0)// grant
+        {
+            $userIdRight = array_intersect($userIdRight, $arrayUnique);
+        } elseif (count($userIdRight) == 0 && $security_model == 1)//revoke
+        {
+            $userIdRight = array_diff($notification->getAllUserId(),
+                $arrayUnique);
+        } else //revoke
+        {
+            $userIdRight = array_diff($userIdRight, $arrayUnique);
+        }
+
+        $categoryIdParent = $node_row->getId('parent');
+    } while ( ! ($node_row->isRoot($node_row)));
+
+    $userIdRight = array_unique($userIdRight);
+    $userAcknowledgement
+        = array_unique($notification->getUserListRequriredConfirm($category_id,
+        $userIdRight));
+    $countUserAcknowledgement = count($userAcknowledgement);
+
+    if ($countUserAcknowledgement > 0) {
+        $args['acknowledgement_user_ids'] = $userAcknowledgement;
+    }
+}
+$args['creator_group'] = null;
+if (array_key_exists('select_group', $G_INPUT) && $G_INPUT['select_group']) {
+    $args['creator_group'] = $G_INPUT['select_group'];
+}
+require_once('grn/controller.csp');
+
+if (array_key_exists('save', $G_INPUT) && $G_INPUT['save']) {
+    // 下書き保存
+
+    if (isset($is_draft_modify) && $is_draft_modify) {
+        // 下書きの変更
+
+        if ( ! isset($original)) {
+            require_once('bulletin/error_code.csp');
+            cb_throw_error(E_GRN_BULLETIN_DRAFT_NOT_FOUND);
+        }
+
+        $original->setProperties($G_bulletin_login, $args);
+
+        // 添付ファイル
+
+        assert('isset($target_name)');
+
+        $files = getFiles($target_name);
+
+        $current_files = $original->getFiles();
+
+        foreach (array_keys($current_files) as $key) {
+            if ( ! array_key_exists($key, $files)) {
+                $original->deleteFile($G_bulletin_login, $key);
+            } else {
+                unset($files[$key]);
+            }
+        }
+
+        foreach (array_keys($files) as $key) {
+            $original->addFile($G_bulletin_login, $files[$key]);
+        }
+
+        // カテゴリを設定
+        $original->setCategory($G_bulletin_login, $category);
+    } else {
+        if ( ! $category) {
+            require_once('bulletin/error_code.csp');
+            cb_throw_error(E_GRN_BULLETIN_CATEGORY_NOT_FOUND);
+        }
+
+        $article =& $G_bulletin->createDraft($G_bulletin_login, $category,
+            $args, null);
+
+        // 添付ファイル
+
+        assert('isset($target_name)');
+
+        $files = getFiles($target_name);
+
+        foreach (array_keys($files) as $key) {
+            $article->addFile($G_bulletin_login, $files[$key]);
+        }
+    }
+} else {
+    if ( ! $category) {
+        require_once('bulletin/error_code.csp');
+        cb_throw_error(E_GRN_BULLETIN_CATEGORY_NOT_FOUND);
+    }
+
+    // acknowledgement
+    if ( ! isset($args['acknowledgement_user_ids'])) {
+        // If don't have acknowledgement users, except acknowledgement check
+        $args['reserve_int1'] = 0;
+    }
+
+    // 掲示送信
+    $article = $G_bulletin->sendArticle($G_bulletin_login, $category, $args,
+        null);
+
+    // 添付ファイル
+    assert('isset($target_name)');
+    $files = getFiles($target_name);
+
+    $original_files = [];
+    if (isset($original)) {
+        $original_files = $original->getFiles();
+    }
+
+    foreach (array_keys($files) as $key) {
+        if (array_key_exists($key, $original_files)) {
+            if (isset($is_draft_modify) && $is_draft_modify) {
+                // 下書きから送信の場合は下書きの添付ファイルを転用する
+                $article->attachFile($G_bulletin_login, $original_files[$key]);
+                unset($original_files[$key]);
+            } else {
+                $article->addFile($G_bulletin_login, $original_files[$key]);
+            }
+        } else {
+            $article->addFile($G_bulletin_login, $files[$key]);
+        }
+    }
+
+    // 下書き編集からの場合は送信後に自動削除
+    if (isset($is_draft_modify) && $is_draft_modify) {
+        // 下書きの添付ファイルを実体を消さずにクリア
+        $original->releaseFiles($G_bulletin_login);
+        $original->delete($G_bulletin_login);
+    }
+
+    //send notification
+    if ($article->isPublished()) {
+        require_once('bulletin/notification.csp');
+        $bulletin_notification_listener
+            = new GRN_Bulletin_NotificationListener();
+        $bulletin_notification_listener->registerBackgroundNotification('create',
+            $article,
+            $article->getSenderForNotification($G_bulletin_login),
+            $article->get('subject'),
+            $article->get('data'),
+            $article->get('ctime'));
+    } else {
+        //scheduling service, add record
+        $scheduling_event = new grn\bulletin\NotificationSchedulingEvent();
+        $scheduling_event->registerEvent($article->getOID(),
+            $article->get('start_timestamp'));
+    }
+}
+/**
+ * @param $target_name
+ *
+ * @return GRN_UploadFile
+ */
+function getFiles($target_name)
+{
+    global $G_INPUT;
+    $tmp_key = grn_get_temporary_key();
+    $files = grn_get_attached_files($target_name . $tmp_key, 'bulletin');
+    require_once('grn/upload.csp');
+    $upload_files = GRN_UploadFile::getUploadedFiles(@$G_INPUT['upload_ticket'],
+        @$G_INPUT['upload_fileids'], true);
+    foreach ($upload_files as $fid => $file) {
+        $files[$fid] = $file;
+    }
+
+    return $files;
+}

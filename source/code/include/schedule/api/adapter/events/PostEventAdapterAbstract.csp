@@ -1,0 +1,228 @@
+<?php
+
+declare(strict_types=1);
+
+namespace grn\schedule\api\adapter\events;
+
+use grn\schedule\FacilityApprovalLogic;
+use grn\schedule\ScheduleMemberLogic;
+
+require_once('cbpapi/schedule_logic.csp');
+require_once('schedule/application.csp');
+require_once('schedule/event_base_logic.csp');
+require_once('schedule/access_logic.csp');
+require_once('schedule/facility_system_logic.csp');
+require_once('schedule/facility_privilege.csp');
+require_once('schedule/file.csp');
+require_once("schedule/system_logic.csp");
+require_once('schedule/view_util.csp');
+require_once('cbpapi/error_code.csp');
+
+abstract class PostEventAdapterAbstract
+{
+    /**
+     * @param array $param
+     *
+     * @return \GRN_Schedule_EventBase|\GRN_Schedule_TemporaryEvent|null
+     */
+    public function createEvent(array $param)
+    {
+        $util = \GRN_Schedule_View_Util::getInstance();
+        $event = null;
+        if ( ! array_key_exists('temporary_adjust_search', $param)) {
+            $event = $util->createEvent($param);
+        } else {
+            $event = $util->createTemporaryEventForAdjustSearch($param);
+        }
+
+        $this->setUsingPurpose($event, $param);
+
+        return $event;
+    }
+
+    /**
+     * @param \GRN_Schedule_EventBase $event
+     * @param array $param
+     *
+     * @return \GRN_Schedule_EventBase
+     */
+    abstract protected function setUsingPurpose(\GRN_Schedule_EventBase $event, array $param);
+
+    /**
+     * @param \CB_User                $user
+     * @param \GRN_Schedule_EventBase $event
+     * @param array                   $authorities
+     */
+    public function checkAccess(\CB_User $user, $event, array $authorities)
+    {
+        $uum = cb_lwc_uum();
+        $dynamic_role = $uum->listGrantedRoles();
+        $acc_logic = \GRN_Schedule_Access_Logic::getInstance();
+        $access = $acc_logic->getEventAccess($user, $event, $authorities,
+            $dynamic_role, false);
+        if ($access['add'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_ENTRY);
+        }
+    }
+
+    /**
+     * @param \GRN_Schedule_EventBase $event
+     */
+    public function checkEventData($event)
+    {
+        $app = \GRN_Schedule_Application::getInstance();
+        $app->checkEventData($event);
+
+        ScheduleMemberLogic::getInstance()->checkAddPublicToUser($event);
+
+        if (is_a($event, 'GRN_Schedule_NormalEvent') || is_a($event, 'GRN_Schedule_TemporaryEvent')) {
+            /** @var \GRN_Schedule_NormalEvent|\GRN_Schedule_TemporaryEvent $event */
+            if (is_a($event->setdatetime, 'CB_DateTime') && is_a($event->enddatetime, 'CB_Date')) {
+                $event->enddatetime = null;
+            }
+        } elseif (is_a($event, 'GRN_Schedule_RepeatEvent')) {
+            /** @var \GRN_Schedule_RepeatEvent $event */
+            if ( ! $app->checkRepeatLimit($event->enddate, $event->setdate)) {
+                cb_throw_error(E_GRN_SCHD_REPEAT_LIMIT, ['limit' => $app->getRepeatLimitDate($event->setdate)]);
+            }
+        }
+    }
+
+    /**
+     * @param \CB_User                $user
+     * @param \GRN_Schedule_EventBase $event
+     */
+    public function checkFacilities(\CB_User $user, $event)
+    {
+        $facility_logic = \GRN_Facility_SystemLogic::getInstance();
+        // 施設の予約期間,最大時間をチェック(運用管理者は無制限)
+        $facility_privilege = \GRN_Facility_Privilege_Logic::getInstance();
+        if ($obj_facilities = $facility_privilege->getFacilitiesWithoutAuthority($user, $event->facilities)) {
+            if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+                /** @var \GRN_Schedule_NormalEvent $event */
+                $facility_logic->checkFacilityMaxTime($obj_facilities, $event->enddatetime, $event->setdatetime);
+                $facility_logic->checkFacilityLimit($obj_facilities, $event->enddatetime);
+            } elseif (is_a($event, 'GRN_Schedule_RepeatEvent')) {
+                /** @var \GRN_Schedule_RepeatEvent $event */
+                $facility_logic->checkFacilityRepeat($obj_facilities);
+
+                // Create today's CB_DateTime for facility max time check
+                $ts = new \CB_TimeStamp();
+                $ts->unix_ts = time();
+                $tsex = new \CB_TimeStampEx($ts);
+
+                $setdatetime = &$tsex->getDateTime();
+                $setdatetime->setTime($event->settime);
+
+                $enddatetime = &$tsex->getDateTime();
+                $enddatetime->setTime($event->endtime);
+
+                $facility_logic->checkFacilityMaxTime($obj_facilities, $enddatetime, $setdatetime);
+                $facility_logic->checkFacilityLimit($obj_facilities, $event->enddate);
+            } elseif (is_a($event, 'GRN_Schedule_TemporaryEvent')) {
+                /** @var \GRN_Schedule_TemporaryEvent $event */
+                if ($event->isORSearch()) {
+                    foreach ($event->setdates as $setdates) {
+                        foreach ($setdates['dates'] as $temp_date) {
+                            $facility_logic->checkFacilityMaxTime($obj_facilities, $temp_date['enddatetime'],
+                                $temp_date['setdatetime']);
+                            $facility_logic->checkFacilityLimit($obj_facilities, $temp_date['enddatetime']);
+                        }
+                    }
+
+                    // OR検索だった場合はtemporaryrelationの行を作るときに施設メンバーを作成する
+                    $event->facilities = null;
+                } else {
+                    foreach ($event->setdates as $setdates) {
+                        $facility_logic->checkFacilityMaxTime($obj_facilities, $setdates['enddatetime'],
+                            $setdates['setdatetime']);
+                        $facility_logic->checkFacilityLimit($obj_facilities, $setdates['enddatetime']);
+                    }
+                }
+            }
+        }
+
+        (new FacilityApprovalLogic())->validateEventFacilitiesForAdd($event);
+
+    }
+
+
+    /**
+     * @param \CB_User                $user
+     * @param array                   $param
+     * @param \GRN_Schedule_EventBase $event
+     *
+     * @return mixed
+     */
+    public function addEvent(\CB_User $user, array $param, $event)
+    {
+        $app = \GRN_Schedule_Application::getInstance();
+        $facility_logic = \GRN_Facility_SystemLogic::getInstance();
+
+        $event->creator = $user;
+        $systemlogic = \GRN_Schedule_SystemLogic::getInstance();
+        $color = $systemlogic->detectColorIndexFromText($event->menu);
+        if ($color != 9999 && $color != "" && $color != -1) {
+            $event->menucolor = $color;
+        }
+
+        $eid = $app->entryEvent($event);
+        if ($eid) {
+            $systemlogic = \GRN_Schedule_SystemLogic::getInstance();
+            if ($systemlogic->getAllowFileAttachment() == '1') {
+                if (is_a($event, 'GRN_Schedule_NormalEvent') || is_a($event, 'GRN_Schedule_BannerEvent')) {
+                    $attached_files = [];
+                    if (array_key_exists('files', $param)) {
+                        $files = $param['files'];
+                        foreach ($files as $file_key => $value) {
+                            $attached_files[$file_key] = cbpapi_upload_file($value);
+                        }
+                    }
+
+                    $event_base_logic = new \GRN_Schedule_EventBaseLogic();
+                    $event_table = $event_base_logic->_getEventTable();
+                    $event_row = $event_table->getRow($eid);
+                    if ( ! $event_row) {
+                        cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+                    }
+
+                    $fm = \GRN_Schedule_FileManager::getInstance();
+                    if (count($attached_files) > 0) {
+                        foreach (array_keys($attached_files) as $key) {
+                            if ($attached_files[$key]['error'] == 0) {
+                                $fm->addFile($user, $event_row, $attached_files[$key]);
+                            }
+                        }
+                    }
+                }
+            }
+            //End GTM-1136
+            /** @var \GRN_Schedule_TemporaryEvent $event */
+            if (is_array($event->facilities) && count($event->facilities) > 0) {
+                // 施設があれば、カスタマイズ項目を登録する
+                $facility_logic->registerData($eid);
+
+                if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+                    /** @var \GRN_Schedule_NormalEvent $event */
+                    $facilityApprovalLogic = new FacilityApprovalLogic();
+                    $arrayFacilityIds = $facilityApprovalLogic->objectArrayToIdArray($event->facilities);
+                    $facilityApprovalLogic->setFacilitiesApplyingInfo($event, $arrayFacilityIds);
+                }
+            } elseif (is_a($event, 'GRN_Schedule_TemporaryEvent') && $event->isORSearch()) {
+                $facility_logic->registerData($eid);
+            }
+        }
+
+        return $eid;
+    }
+
+    /**
+     * @param \CB_User                $user
+     * @param \GRN_Schedule_EventBase $event
+     */
+    public function sendNotification(\CB_User $user, $event)
+    {
+        $cbpapi_base_logic = \GRN_CBPApi_Schedule_Logic::getInstance();
+        $cbpapi_base_logic->createNotification($user, $event, null, null, GRN_SCHEDULE_NOTIFY_ENTRY);
+    }
+}

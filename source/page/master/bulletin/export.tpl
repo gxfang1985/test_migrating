@@ -1,0 +1,1 @@
+{include file="bulletin/_export.tpl"}

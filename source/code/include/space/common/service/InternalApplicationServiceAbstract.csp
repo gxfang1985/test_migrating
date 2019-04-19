@@ -1,0 +1,621 @@
+<?php
+
+namespace grn\space\common\service;
+
+use grn\space\common\data\bean\Authority;
+use grn\space\common\data\bean\SpaceMember;
+use grn\space\common\service\ServiceAbstract;
+use grn\space\common\data\bean\Comment;
+use grn\space\common\data\bean\Category;
+use grn\space\common\data\bean\LanguageStatus;
+use grn\space\common\data\collection\CommentCollection;
+use grn\space\common\data\condition\CommentSearchCondition;
+use grn\space\common\logic\CommentLogic;
+use grn\space\common\logic\CategoryLogic;
+use grn\space\common\logic\SpaceFileLogic;
+use grn\space\common\exception\GrnArgumentOutOfRangeException;
+use grn\space\common\utility\ValidateUtility;
+use grn\space\logic\TodoLogic;
+use grn\space\logic\SpaceAccessControlListLogic;
+use grn\space\logic\SpaceLogic;
+use grn\fts\Application as FtsApplication;
+use grn\fts\space\IndexService;
+
+/**
+ * アプリケーションサービス層。
+ * この層は、クライアント層からの要求を、ビジネスロジック層を利用して実現する
+ *
+ * ガルーン内部アプリケーションサービスクラス
+ * 内部アプリケーションサービスクラスで共通に利用する処理を定義した抽象クラス
+ **/
+abstract class InternalApplicationServiceAbstract extends ServiceAbstract
+{
+    const MARK_THREAD_COMMENTS_READ = true;
+    const MARK_FETCHED_COMMENTS_READ = false;
+
+    /**
+     * コンストラクタ
+     */
+    public function __construct()
+    {
+        parent::__construct();
+    }
+
+
+
+
+    //****************************************************************************************************************
+    //**********************************           category             **********************************************
+    //****************************************************************************************************************
+    /**
+     * 指定した内部アプリケーションのルートカテゴリを取得する
+     *
+     * @param     string $spaceId         target space id
+     * @param     string $applicationCode target application code(The constant has been defined in oneself.)
+     * @param     string $languageCode    dispaly language code. The standard is display at STANDARD_LANGUAGE_CODE.
+     *
+     * @throws    \grn\space\common\exception\GrnInvalidArgumentException       SpaceId is not number. or LanguageCode is invalid.
+     * @throws    GrnArgumentOutOfRangeException    Application code is specified it excluding the constant.
+     * @throws    \grn\space\common\exception\GrnDataNotFoundException          When the specified SPACE is not found.  RootCatgory is not found.
+     * @throws    \grn\space\common\exception\GrnDatabaseException              Any error in the database.
+     * @return    \grn\space\common\data\bean\Category
+     */
+    public function getApplicationRootCategory(
+        $spaceId,
+        $applicationCode,
+        $languageCode = LanguageStatus::STANDARD_LANGUAGE_CODE
+    ) {
+        ValidateUtility::isNumber($spaceId);
+        ValidateUtility::isLanguageCode($languageCode);
+
+        if (ValidateUtility::isInternalApplication($applicationCode,
+            ValidateUtility::DISABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            $categoryLogic = CategoryLogic::getInstance();
+
+            return $categoryLogic->getCategoryBySpaceIdApplicationCode($spaceId,
+                $applicationCode, $languageCode);
+        }
+        throw new GrnArgumentOutOfRangeException();
+    }
+
+
+
+    //***************************************************************************************************************
+    //**********************************           comment             **********************************************
+    //***************************************************************************************************************
+    /**
+     * Get comment.
+     *
+     * Attention: Use the method of checking the authority because it doesn't check the authority internally beforehand.
+     *
+     * @param     string $commentId       comment sequence id
+     * @param     string $operationUserId user sequence id
+     *
+     * @throws    \grn\space\common\exception\GrnInvalidArgumentException       commentId is not number. Or operationUserId is not number.
+     * @throws    \grn\space\common\exception\GrnDataNotFoundException          head comment is not found
+     * @throws    \grn\space\common\exception\GrnDatabaseException              Any error in the database.
+     * @return    \grn\space\common\data\bean\Comment
+     */
+    public function getComment($commentId, $operationUserId)
+    {
+        //input data check
+        ValidateUtility::isNumber($commentId, ValidateUtility::DISABLE_EMPTY);
+        ValidateUtility::isNumber($operationUserId,
+            ValidateUtility::DISABLE_EMPTY);
+
+        $commentLogic = CommentLogic::getInstance();
+        $resultComment = $commentLogic->getComment($commentId);
+
+        $commentCollection = new CommentCollection();
+        $commentCollection->appendBean($resultComment);
+
+        $this->_additiveInfoComments($commentCollection,
+            (Comment::PARENT_APPLICATION_TYPE_TODO
+             == $resultComment->getParentApplicationType()) ? true : false);
+
+        //read process
+        $resultCommentReadStatusCollection
+            = $commentLogic->getCommentReadStatusCollection($commentCollection,
+            $operationUserId);
+        /** @var \grn\space\common\data\bean\CommentReadStatus $commentReadStatus */
+        foreach ($resultCommentReadStatusCollection as $commentReadStatus) {
+            if ($commentReadStatus->getCommentId() == $resultComment->getId()) {
+                $resultComment->setUnRead(false);
+                break;
+            }
+        }
+
+        //read process（操作者を既読にDB更新する。これから返すコレクションの既読は変えないこと）
+        $commentLogic->replaceCreateCommentReadStatus($commentCollection,
+            $operationUserId);
+
+        return $resultComment;
+    }
+
+    /**
+     * search COMMENT by condition with access control
+     *
+     * COMMENT that exceeds THREAD and TODO cannot be retrieved.
+     *
+     * @param     string                                                  $authorityCode          The constant has been defined in Authority class
+     * @param     \grn\space\common\data\condition\CommentSearchCondition $searchCondition
+     * @param     string                                                  $operationUserId        user sequence id
+     * @param     boolean                                                 $changeAllCommentStatus change all the comments which related to the thread to be read if this is MARK_THREAD_COMMENTS_READ, otherwise change only the fetched comments to be read.
+     *
+     * @throws    \grn\space\common\exception\GrnRequiredDataIsNotException     There is no information necessary for searchCondition.
+     * @throws    \grn\space\common\exception\GrnInvalidArgumentException       authorityCode not a constant. or operationUserId is not number.
+     * @throws    \grn\space\common\exception\GrnDataNotFoundException          head comment is not found
+     * @throws    \grn\space\common\exception\GrnDatabaseException              Any error in the database.
+     * @return    \grn\space\common\data\collection\CommentCollection
+     */
+    public function searchCommentBySearchConditionWithAccessControl(
+        $authorityCode,
+        CommentSearchCondition $searchCondition,
+        $operationUserId,
+        $changeAllCommentStatus
+    ) {
+        //input data check
+        ValidateUtility::isIn($authorityCode
+            , [
+                Authority::AUTHORITY_CODE_READ_SUMMARY
+                ,
+                Authority::AUTHORITY_CODE_READ_DETAIL
+                ,
+                Authority::AUTHORITY_CODE_WRITE
+                ,
+                Authority::AUTHORITY_CODE_SYSTEM_PRIVILEGE
+                ,
+                Authority::AUTHORITY_CODE_OPERATION_PRIVILEGE
+            ]
+            , ValidateUtility::DISABLE_EMPTY);
+        ValidateUtility::isNumber($operationUserId);
+        $searchCondition->isValidData(CommentSearchCondition::VALID_TYPE_SELECT);
+
+
+        if (CommentSearchCondition::SEARCH_SCOPE_TYPE_TODO
+            == $searchCondition->getSearchScopeType()
+        ) {
+            $spaceLogic = SpaceLogic::getInstance();
+            $space
+                = $spaceLogic->getSpaceByTodoId($searchCondition->getSearchScopeValue(),
+                LanguageStatus::STANDARD_LANGUAGE_CODE);
+        } else {
+            $spaceLogic = SpaceLogic::getInstance();
+            $space
+                = $spaceLogic->getSpaceByThreadId($searchCondition->getSearchScopeValue(),
+                LanguageStatus::STANDARD_LANGUAGE_CODE);
+        }
+
+        $spaceAclLogic = SpaceAccessControlListLogic::getInstance();
+        $hasSpaceAccessControl
+            = $spaceAclLogic->hasSpaceAccessControl($authorityCode,
+            $space->getId(), $operationUserId);
+
+        if ($hasSpaceAccessControl === false) {
+            if (($authorityCode == Authority::AUTHORITY_CODE_READ_DETAIL)
+                || ($authorityCode
+                    == Authority::AUTHORITY_CODE_SYSTEM_PRIVILEGE)
+            ) {
+                $hasSpaceAccessControl
+                    = $this->_isSpaceAdministrator($operationUserId);
+            }
+        }
+
+        if ($hasSpaceAccessControl) {
+            //head comment row number get?
+            $commentLogic = CommentLogic::getInstance();
+            if (ValidateUtility::isNotNull($searchCondition->getHeadCommentId())
+                || ValidateUtility::isNotNull($searchCondition->getHeadCommentNo())
+            ) {
+                $headRowNumber = $commentLogic->getRowNumber($searchCondition);
+                $headRowOffset = $headRowNumber - 1;
+                $searchCondition->setOffset($headRowOffset);
+            }
+
+            $resultCommentCollection
+                = $commentLogic->searchComment($searchCondition);
+            $this->_additiveInfoComments($resultCommentCollection,
+                (CommentSearchCondition::SEARCH_SCOPE_TYPE_THREAD_AND_TODO
+                 == $searchCondition->getSearchScopeType()) ? true : false);
+        } else {
+            $resultCommentCollection = new CommentCollection();
+        }
+
+
+        //read process
+        if (count($resultCommentCollection) > 0) {
+            $resultCommentReadStatusCollection
+                = $commentLogic->getCommentReadStatusCollection($resultCommentCollection,
+                $operationUserId);
+            /** @var \grn\space\common\data\bean\CommentReadStatus $commentReadStatus */
+            foreach ($resultCommentReadStatusCollection as $commentReadStatus) {
+                /** @var \grn\space\common\data\bean\Comment $comment */
+                foreach ($resultCommentCollection as $comment) {
+                    if ($commentReadStatus->getCommentId()
+                        == $comment->getId()
+                    ) {
+                        $comment->setUnRead(false);
+                        continue 2;
+                    }
+                }
+            }
+
+            //read process（操作者を既読にDB更新する）
+            if ($changeAllCommentStatus == self::MARK_THREAD_COMMENTS_READ
+                && ($searchCondition->getSearchScopeType()
+                    == CommentSearchCondition::SEARCH_SCOPE_TYPE_THREAD
+                    || $searchCondition->getSearchScopeType()
+                       == CommentSearchCondition::SEARCH_SCOPE_TYPE_THREAD_AND_TODO)
+            ) {
+                $commentLogic->markAllCommentReadByUserIdAndThreadId($operationUserId,
+                    $searchCondition->getSearchScopeValue());
+            } else {
+                $commentLogic->replaceCreateCommentReadStatus($resultCommentCollection,
+                    $operationUserId);
+            }
+        }
+
+
+        return $resultCommentCollection;
+    }
+
+    /**
+     * Searches for the thread comment.
+     *
+     * Attention: Use the method of checking the authority because it doesn't check the authority internally beforehand.
+     *
+     * @param     \grn\space\common\data\condition\CommentSearchCondition $searchCondition
+     * @param     string                                                  $operationUserId user sequence id
+     *
+     * @throws    \grn\space\common\exception\GrnRequiredDataIsNotException     There is no information necessary for searchCondition.
+     * @throws    \grn\space\common\exception\GrnInvalidArgumentException       operationUserId is not number.
+     * @throws    \grn\space\common\exception\GrnDataNotFoundException          head comment is not found
+     * @throws    \grn\space\common\exception\GrnDatabaseException              Any error in the database.
+     * @return    \grn\space\common\data\collection\CommentCollection
+     */
+    public function searchCommentBySearchCondition(
+        CommentSearchCondition $searchCondition,
+        $operationUserId
+    ) {
+        //input data check
+        ValidateUtility::isNumber($operationUserId);
+        $searchCondition->isValidData(CommentSearchCondition::VALID_TYPE_SELECT);
+
+        //head comment row number get?
+        $commentLogic = CommentLogic::getInstance();
+        if (ValidateUtility::isNotNull($searchCondition->getHeadCommentId())
+            || ValidateUtility::isNotNull($searchCondition->getHeadCommentNo())
+        ) {
+            $headRowNumber = $commentLogic->getRowNumber($searchCondition);
+            $headRowOffset = $headRowNumber - 1;
+            $searchCondition->setOffset($headRowOffset);
+        }
+
+        $resultCommentCollection
+            = $commentLogic->searchComment($searchCondition);
+        $this->_additiveInfoComments($resultCommentCollection,
+            (CommentSearchCondition::SEARCH_SCOPE_TYPE_THREAD_AND_TODO
+             == $searchCondition->getSearchScopeType()) ? true : false);
+
+
+        //read process
+        if (count($resultCommentCollection) > 0) {
+            $resultCommentReadStatusCollection
+                = $commentLogic->getCommentReadStatusCollection($resultCommentCollection,
+                $operationUserId);
+            /** @var \grn\space\common\data\bean\CommentReadStatus $commentReadStatus */
+            foreach ($resultCommentReadStatusCollection as $commentReadStatus) {
+                /** @var \grn\space\common\data\bean\Comment $comment */
+                foreach ($resultCommentCollection as $comment) {
+                    if ($commentReadStatus->getCommentId()
+                        == $comment->getId()
+                    ) {
+                        $comment->setUnRead(false);
+                        continue 2;
+                    }
+                }
+            }
+
+            //read process（操作者を既読にDB更新する。これから返すコレクションの既読は変えないこと）
+            $commentLogic->replaceCreateCommentReadStatus($resultCommentCollection,
+                $operationUserId);
+        }
+
+
+        return $resultCommentCollection;
+    }
+
+    /**
+     * Additive information is added to CommentCollection.
+     *
+     * Attention: Use the method of checking the authority because it doesn't check the authority internally beforehand.
+     *
+     * @param     \grn\space\common\data\collection\CommentCollection $commentCollection
+     * @param     boolean                                             $isSetTodoInfo TRUE: set todo info
+     *
+     * @throws    \grn\space\common\exception\GrnDatabaseException              Any error in the database.
+     */
+    private function _additiveInfoComments(
+        CommentCollection $commentCollection,
+        $isSetTodoInfo
+    ) {
+        //Array with SpaceFileCollection of each commentId
+        if (count($commentCollection) > 0) {
+            $fileLogic = SpaceFileLogic::getInstance();
+            $fileCollectionArray
+                = $fileLogic->getSpaceFileCollectionsArray($commentCollection);
+
+            //set fileCollection
+            foreach ($fileCollectionArray as $commentId => $fileCollection) {
+                /** @var \grn\space\common\data\bean\Comment $comment */
+                foreach ($commentCollection as $comment) {
+                    if ($comment->getId() == $commentId) {
+                        $comment->setSpaceFileCollection($fileCollection);
+                        continue 2;
+                    }
+                }
+            }
+        }
+
+        //set todo object
+        if ($isSetTodoInfo) {
+            $todoCommentCollection = new CommentCollection();
+
+            foreach ($commentCollection as $comment) {
+                if (Comment::PARENT_APPLICATION_TYPE_TODO
+                    == $comment->getParentApplicationType()
+                ) {
+                    $todoCommentCollection->appendBean($comment);
+                }
+            }
+
+            if (count($todoCommentCollection) > 0) {
+                $todoLogic = TodoLogic::getInstance();
+                $todoCollection
+                    = $todoLogic->searchTodoByCommentCollection($todoCommentCollection);
+
+                /** @var \grn\space\data\bean\Todo $todo */
+                foreach ($todoCollection as $todo) {
+                    foreach ($todoCommentCollection as $comment) {
+                        if ($todo->getId()
+                            == $comment->getParentApplicationId()
+                        ) {
+                            $comment->setParentApplicationObject($todo);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Create a comment.
+     *
+     * Attention: Use the method of checking the authority because it doesn't check the authority internally beforehand.
+     *
+     * @param     \grn\space\common\data\bean\Comment $comment
+     * @param     string                              $operationUserId user sequence id
+     *
+     * @throws    \grn\space\common\exception\GrnRequiredDataIsNotException     There is no information necessary for comment.
+     * @throws    \grn\space\common\exception\GrnDataNotFoundException          When the specified ParentComment is not found.
+     * @throws    \grn\space\common\exception\GrnInvalidArgumentException       operationUserId is not number.
+     * @throws    \grn\space\common\exception\GrnDatabaseException              Any error in the database.
+     * @return    \grn\space\common\data\bean\Comment   (Added comment object.)
+     */
+    protected function createComment(Comment $comment, $operationUserId)
+    {
+        //コメント登録
+        //Completion Information(情報の補完)
+        $comment->setModifierId($comment->getCreatorId());
+        $comment->setModifierName($comment->getModifierName());
+
+        $commentLogic = CommentLogic::getInstance();
+        $resultComment = $commentLogic->createComment($comment);
+
+        //read process（登録者は既読扱いにしたいため　返すオブジェクトも既読フラグを立てる）
+        $commentCollection = new CommentCollection();
+        $commentCollection->appendBean($resultComment);
+        $commentLogic->replaceCreateCommentReadStatus($commentCollection,
+            $operationUserId);
+        $resultComment->setUnRead(false);
+
+
+        return $resultComment;
+    }
+
+
+    /**
+     * Delete the comment.
+     *
+     * Attention: Use the method of checking the authority because it doesn't check the authority internally beforehand.
+     *
+     * @param     string                                  $commentId comment id
+     * @param     \grn\space\common\data\bean\SpaceMember $operationUser
+     *
+     * @throws    \grn\space\common\exception\GrnInvalidArgumentException       commentId is not number. or operationUserId is not number
+     * @throws    \grn\space\common\exception\GrnDataNotFoundException          There is no commnent.
+     * @throws    \grn\space\common\exception\GrnDatabaseException              Any error in the database.
+     * @return    \grn\space\common\data\bean\Comment   (deleted comment object.)
+     */
+    protected function deleteComment($commentId, SpaceMember $operationUser)
+    {
+        //削除対象コメントを取得
+        $commentLogic = CommentLogic::getInstance();
+        $comment = $commentLogic->getComment($commentId);
+
+        //Completion Information(情報の補完)
+        $comment->setModifier($operationUser);
+
+        //read process
+        $commentLogic->deleteCommentReadStatusByCommentId($comment->getId());
+
+        //論理削除なので、コメントと他アプリの関連付けの削除はせずそのまま残しとく
+        //削除する必要がある場合はこのメソッドをサブクラスでオーバーライドして独自に記述する必要がある
+
+        //logical delete comment
+        $resultComment = $commentLogic->logicalDeleteComment($comment);
+
+        return $resultComment;
+    }
+
+
+
+
+
+    //***************************************************************************************************************
+    //**********************************           space file             *******************************************
+    //***************************************************************************************************************
+    /**
+     * Get the space-file
+     *
+     * Attention: Use the method of checking the authority because it doesn't check the authority internally beforehand.
+     *
+     * @param     string $fileId          file sequence id
+     * @param     string $operationUserId user sequence id
+     *
+     * @throws    \grn\space\common\exception\GrnInvalidArgumentException       fileId is not number. or operationUserId is not number
+     * @throws    \grn\space\common\exception\GrnDataNotFoundException          There is no space-file.
+     * @throws    \grn\space\common\exception\GrnDatabaseException              Any error in the database.
+     * @return    \grn\space\common\data\bean\SpaceFile
+     */
+    public function getSpaceFile($fileId, $operationUserId)
+    {
+        //input check
+        ValidateUtility::isNumber($fileId, ValidateUtility::DISABLE_EMPTY);
+        ValidateUtility::isNumber($operationUserId,
+            ValidateUtility::DISABLE_EMPTY);
+
+        //スペースファイルを取得
+        $fileLogic = SpaceFileLogic::getInstance();
+        $resultSpaceFile = $fileLogic->getSpaceFile($fileId);
+
+        return $resultSpaceFile;
+    }
+
+    /**
+     * Modify the space-file
+     *
+     * Attention: Use the method of checking the authority because it doesn't check the authority internally beforehand.
+     *
+     * @param     string $title        title
+     * @param     string $description  description
+     * @param     int    $version      version(There is a case of empty.)
+     * @param     int    $targetFileId upload file sequence id
+     *
+     * @throws    \grn\space\common\exception\GrnInvalidArgumentException   version is not number. Or targetFileId is not number.
+     * @throws    \grn\space\common\exception\GrnDataNotFoundException      There is no space-file.
+     * @throws    \grn\space\common\exception\GrnDatabaseException          Any error in the database.
+     * @return    \grn\space\common\data\bean\SpaceFile
+     */
+    public function modifySpaceFile(
+        $title,
+        $description,
+        $version,
+        $targetFileId
+    ) {
+        //input check
+        ValidateUtility::isNumber($version);
+        ValidateUtility::isNumber($targetFileId,
+            ValidateUtility::DISABLE_EMPTY);
+
+        //modify the space-file
+        $fileLogic = SpaceFileLogic::getInstance();
+        $resultSpaceFile = $fileLogic->modifySpaceFile($title, $description,
+            $version, $targetFileId);
+
+        return $resultSpaceFile;
+    }
+
+    /**
+     * Upload the space-file
+     *
+     * Attention: Use the method of checking the authority because it doesn't check the authority internally beforehand.
+     *
+     * @param     \GRN_File|\GRN_ServerFile|array|string $uploadedFile \GRN_File, or \GRN_ServerFile, or an element of $_FILES, or a path string of a file.
+     * @param     \CB_User                               $operationUser
+     * @param     string                                 $comment      uploaded comment
+     * @param     int                                    $targetFileId upload file sequence id
+     * @param     string                                 $spaceId
+     * @param     string                                 $threadId
+     * @param     string                                 $todoId
+     *
+     * @throws    \grn\space\common\exception\GrnInvalidArgumentException   targetFileId is not number.
+     * @throws    \grn\space\common\exception\GrnDataNotFoundException      There is no space-file.
+     * @throws    \grn\space\common\exception\GrnDatabaseException          Any error in the database.
+     */
+    public function uploadSpaceFile(
+        $uploadedFile,
+        \CB_User $operationUser,
+        $comment,
+        $targetFileId,
+        $spaceId,
+        $threadId,
+        $todoId
+    ) {
+        //input check
+        ValidateUtility::isNumber($targetFileId,
+            ValidateUtility::DISABLE_EMPTY);
+
+        //upload the space-file
+        $fileLogic = SpaceFileLogic::getInstance();
+
+        $spaceFile = $fileLogic->uploadSpaceFile($uploadedFile, $operationUser,
+            $comment, $targetFileId);
+
+        //Full Text Search
+        if (FtsApplication::isAvailable()) {
+            $searchService = new IndexService();
+            $searchService->updateFileIndex($spaceId, $threadId, $todoId,
+                $spaceFile);
+        }
+    }
+
+    /**
+     * Restore space file
+     *
+     * @param     \CB_User    $operationUser
+     * @param     int         $version      version
+     * @param     string      $comment      uploaded comment
+     * @param     int         $targetFileId upload file sequence id
+     * @param     string      $spaceId
+     * @param     string      $threadId
+     * @param     string|null $todoId
+     *
+     * @throws    \grn\space\common\exception\GrnInvalidArgumentException   targetFileId is not number.
+     * @throws    \grn\space\common\exception\GrnDataNotFoundException      There is no space-file.
+     * @throws    \grn\space\common\exception\GrnDatabaseException          Any error in the database.
+     * @return    \grn\space\common\data\bean\SpaceFile
+     */
+    public function restoreSpaceFile(
+        \CB_User $operationUser,
+        $version,
+        $comment,
+        $targetFileId,
+        $spaceId,
+        $threadId,
+        $todoId
+    ) {
+        //input check
+        ValidateUtility::isNumber($version, ValidateUtility::DISABLE_EMPTY);
+        ValidateUtility::isNumber($targetFileId,
+            ValidateUtility::DISABLE_EMPTY);
+
+        $spaceFile = $this->getSpaceFile($targetFileId,
+            $operationUser->getOID());
+        $grnSpaceFile = $spaceFile->getGrnSpaceFileObject();
+
+        $grnSpaceFile->restore($operationUser, $version, $comment);
+
+        //Full Text Search
+        if (FtsApplication::isAvailable()) {
+            $searchService = new IndexService();
+            $searchService->updateFileIndex($spaceId, $threadId, $todoId,
+                $spaceFile);
+        }
+
+        return $spaceFile;
+    }
+}
+

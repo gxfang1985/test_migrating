@@ -1,0 +1,240 @@
+<?php
+
+cb_require_role('CommandLine');
+
+define('GRN_CLI_DELETE_MAIL_COMMIT_NUM', 1000);
+
+require_once('grn/cli.csp');
+
+$summary = "";
+$deleted_record_num = 0;
+
+$opts = cb_cli_start(
+// Mandatory command-line options
+    [new CB_CLI_BEFORE_OPTION()],
+    // Optional command-line options
+    [
+        new CB_CLI_EXEC_OPTION(),
+        new CB_CLI_LOGIN_NAME_OPTION(),
+        new CB_CLI_MAX_DURATION_OPTION()
+    ]
+);
+require_once('grn/application.csp');
+require_once('mail/application.csp');
+$app_locator = GRN_ApplicationLocator::instance();
+$dbconn = $app_locator->getConnection(GRN_MAIL_APP_ID);
+
+if (array_key_exists(CB_CLI_BEFORE_OPTION, $opts)) {
+    $before = cb_date_convert2timestamp($opts[CB_CLI_BEFORE_OPTION]);
+    if (array_key_exists(CB_CLI_EXEC_OPTION, $opts) === false) {
+        if (array_key_exists(CB_CLI_LOGIN_NAME_OPTION, $opts)) {
+            $login_name = $opts[CB_CLI_LOGIN_NAME_OPTION];
+            //check user in database
+            $query
+                = "SELECT _id FROM tab_cb_user WHERE col_foreign_key= '@S' AND col_deleted IS NULL";
+            $sql_string = cb_queryf($dbconn, $query, $login_name);
+            $ret = $dbconn->query($sql_string);
+            $row = $dbconn->fetch_row($ret);
+            if ($row === false) {
+                //GRN2-3187
+                cb_throw_error(E_COMMON_AUTHENTICATION_FAILED);
+                //GRN2-3187
+            }
+            $dbconn->free_result($ret);
+
+            require_once('mail/table.csp');
+            $user_id = intval($row[0]);
+            $table_name = grn_mail_get_personal_tablename($user_id,
+                'tab_grn_mail_message');
+            // count only
+            $query
+                = sprintf("SELECT COUNT(_id) FROM %s WHERE col_ctime < '@S' and col_user='@S' and col_sent <> 1",
+                $table_name);
+            $query = cb_queryf($dbconn, $query, $before, $user_id);
+            $ret = $dbconn->query($query);
+            $row = $dbconn->fetch_row($ret);
+            $count = 0;
+            $count = $row[0];
+            $dbconn->free_result($ret);
+        } else {
+            $count = 0;
+            //GRN2-3186
+            require_once('mail/table.csp');
+            $query
+                = "SELECT _id FROM tab_cb_user WHERE col_deleted IS NOT NULL";
+            $ret = $dbconn->query($query);
+            $temp = [];
+            while (($row = $dbconn->fetch_row($ret)) !== false) {
+                $table_name = grn_mail_get_personal_tablename($row[0],
+                    'tab_grn_mail_message');
+                $temp[$table_name][] = $row[0];
+            }
+            for ($i = 0; $i < 50; $i++) {
+                $user_ids = [];
+                $table_name = "tab_grn_mail_message___p" . $i;
+                if (array_key_exists($table_name, $temp)) {
+                    $query
+                        = sprintf("SELECT COUNT(_id) FROM %s WHERE col_ctime < '@S' AND col_user NOT IN (@A) AND col_sent <> 1",
+                        $table_name);
+                    $query = cb_queryf($dbconn, $query, $before,
+                        $temp[$table_name]);
+                } else {
+                    $query
+                        = sprintf("SELECT COUNT(_id) FROM %s WHERE col_ctime < '@S' AND col_sent <> 1",
+                        $table_name);
+                    $query = cb_queryf($dbconn, $query, $before);
+                }
+                //GRN2-3186
+                $ret = $dbconn->query($query);
+                $row = $dbconn->fetch_row($ret);
+                if ($row !== false) {
+                    $count = $count + $row[0];
+                }
+                $dbconn->free_result($ret);
+            }
+        }
+        $summary = "Hit $count record";
+        $summary .= ($count > 1) ? "s." : ".";
+    } else {
+        // execute
+        $max_duration = array_key_exists(CB_CLI_MAX_DURATION_OPTION, $opts)
+            ? intval($opts[CB_CLI_MAX_DURATION_OPTION]) * 60 : null;
+        global $_cb_cli_starting_timestamp;
+        $start_ts = cb_date_convert2timestamp($_cb_cli_starting_timestamp);
+        if (array_key_exists(CB_CLI_LOGIN_NAME_OPTION, $opts)) {
+            $login_name = $opts[CB_CLI_LOGIN_NAME_OPTION];
+            //check user in database
+            $query
+                = "SELECT _id FROM tab_cb_user WHERE col_foreign_key= '@S' AND col_deleted IS NULL;";
+            $sql_string = cb_queryf($dbconn, $query, $login_name);
+            $ret = $dbconn->query($sql_string);
+            $row = $dbconn->fetch_row($ret);
+            if ($row === false) {
+                //GRN2-3187
+                cb_throw_error(E_COMMON_AUTHENTICATION_FAILED);
+                //GRN2-3187
+            }
+            $dbconn->free_result($ret);
+
+            require_once('mail/table.csp');
+            $user_id = intval($row[0]);
+            $table_name = grn_mail_get_personal_tablename($user_id,
+                'tab_grn_mail_message');
+            $mail_ids = getMailIDByUserID($table_name, $before, $user_id);
+            require_once('mail/utility.csp');
+            $count = 0;
+            $deleted_record_num = 0;
+            foreach ($mail_ids as $mail_id) {
+                if (is_null($max_duration) !== true
+                    && (time() - $start_ts) > $max_duration
+                ) {
+                    cb_cli_log("Stopped processing by passing the max_duration.");
+                    break;
+                }
+                $utility = GRN_Mail_Utility::getInstance();
+                $mail_logic =& $utility->getMailLogic();
+                $arr_mail_id = [$mail_id];
+                $mail_logic->deleteMailDatas($arr_mail_id, true, true, true,
+                    $user_id);
+                cb_cli_log(sprintf("Deleted mail_id=%s.", $mail_id));
+                $count = $count + 1;
+                if ($count === GRN_CLI_DELETE_MAIL_COMMIT_NUM) {
+                    $tm = CB_TransactionManager::getInstance();
+                    $tm->commit();
+                    cb_cli_log("Committed.");
+                    $count = 0;
+                }
+                $deleted_record_num++;
+            }
+            $tm = CB_TransactionManager::getInstance();
+            $tm->commit();
+            cb_cli_log("Committed.");
+            $summary = "Deleted $deleted_record_num record";
+            $summary .= ($deleted_record_num > 1) ? "s of $login_name."
+                : " of $login_name.";
+        } else {
+            $count = 0;
+            $deleted_record_num = 0;
+            require_once('mail/utility.csp');
+            for ($i = 0; $i < 50; $i++) {
+                $user_ids = [];
+                $table_name = "tab_grn_mail_message___p" . $i;
+                $query
+                    = sprintf("SELECT DISTINCT(col_user) FROM %s mail INNER JOIN tab_cb_user u ON mail.col_user=u._id WHERE u.col_deleted IS NULL;",
+                    $table_name);
+                $ret = $dbconn->query($query);
+                while (($row = $dbconn->fetch_row($ret)) !== false) {
+                    $mail_ids = GetMailIDByUserID($table_name, $before,
+                        $row[0]);
+                    foreach ($mail_ids as $mail_id) {
+                        if (is_null($max_duration) !== true
+                            && (time() - $start_ts) > $max_duration
+                        ) {
+                            cb_cli_log("Stopped processing by passing the max_duration.");
+                            $flag_duration = "false";
+                            break 3;
+                        }
+                        $utility = GRN_Mail_Utility::getInstance();
+                        $mail_logic =& $utility->getMailLogic();
+                        $arr_mail_id = [$mail_id];
+                        $mail_logic->deleteMailDatas($arr_mail_id, true, true,
+                            true, $row[0]);
+                        $count = $count + 1;
+                        cb_cli_log(sprintf("Deleted mail_id=%s.", $mail_id));
+                        if ($count === GRN_CLI_DELETE_MAIL_COMMIT_NUM) {
+                            $tm = CB_TransactionManager::getInstance();
+                            $tm->commit();
+                            cb_cli_log("Committed.");
+                            $count = 0;
+                        }
+                        $deleted_record_num++;
+                    }
+                }
+            }
+            $tm = CB_TransactionManager::getInstance();
+            $tm->commit();
+            cb_cli_log("Committed.");
+            $summary = "Deleted $deleted_record_num record";
+            $summary .= ($deleted_record_num > 1) ? "s of all user."
+                : " of all users.";
+        }
+    }
+} else {
+    if (array_key_exists(CB_CLI_EXEC_OPTION, $opts)) {
+        cb_cli_log('Can not be processing because missing the before parameter.');
+        cb_cli_log('Please enter the before parameter.');
+        cb_safe_exit(1);
+    }
+}
+cb_cli_end($summary);
+
+/**
+ * @param $table_name
+ * @param $before
+ * @param $user_id
+ *
+ * @return array
+ */
+function getMailIDByUserID($table_name, $before, $user_id)
+{
+    require_once('grn/application.csp');
+    $app_locator = GRN_ApplicationLocator::instance();
+    $dbconn = $app_locator->getConnection(GRN_MAIL_APP_ID);
+
+    //GRN2-3185
+    $sql_string
+        = sprintf("SELECT _id FROM %s WHERE col_ctime < '@S' and col_user='@S' and col_sent <> 1 ORDER BY col_dtime, _id DESC",
+        $table_name);
+    $sql_string = cb_queryf($dbconn, $sql_string, $before, $user_id);
+    $sql_string = $dbconn->select_format($sql_string, 0, -1,
+        CB_DATABASE_NO_LOCK);
+    //GRN2-3185
+
+    $ret = $dbconn->query($sql_string);
+    $mail_ids = [];
+    while ($row = $dbconn->fetch_assoc($ret)) {
+        $mail_ids[] = $row['_id'];
+    }
+
+    return $mail_ids;
+}

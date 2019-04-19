@@ -1,0 +1,188 @@
+<?php
+declare(strict_types=1);
+
+namespace grn\api\v1\schedule;
+
+use grn\api\http\HttpStatus;
+use grn\api\http\response\Records;
+use grn\api\ResponseEntity;
+use grn\api\RestApi;
+use grn\api\validator\ApiValidator;
+use grn\api\validator\DatetimeRFC3339Checker;
+use grn\api\validator\StringLengthChecker;
+use grn\api\validator\IntegerRangeChecker;
+use grn\api\validator\OrderByChecker;
+use grn\api\validator\schedule\GetEventsCorrelationChecker;
+use grn\schedule\api\adapter\events\GetEventsAdapter;
+
+require_once('schedule/resources.csp');
+require_once('schedule/search_logic.csp');
+
+class GetEventsApi extends RestApi
+{
+    /** Query parameters */
+    const PARAM_RANGE_START = 'rangeStart';
+    const PARAM_RANGE_END = 'rangeEnd';
+    const PARAM_TARGET_TYPE = 'targetType';
+    const PARAM_TARGET = 'target';
+    const PARAM_KEYWORD = 'keyword';
+    const PARAM_EXCLUDE_FROM_SEARCH = 'excludeFromSearch';
+
+    const ORDER_FIELDS = ['createdAt', 'updatedAt', 'start'];
+    const DEFAULT_SETDATE = '1970-01-01T00:00:00Z';
+    const DEFAULT_ENDDATE = '2037-12-31T23:59:59Z';
+
+    /**
+     * @param array $params
+     *
+     * @return ResponseEntity
+     */
+    public function execute(array $params): ResponseEntity
+    {
+        $validator = $this->createValidator();
+        $validator->validate($this->getInput());
+
+        $body = $this->getResponse();
+        $http_status = new HttpStatus(HttpStatus::OK);
+        $response_entity = new ResponseEntity(new Records($body, 'events'),
+            $http_status);
+
+        return $response_entity;
+    }
+
+    /**
+     * @return ApiValidator
+     */
+    private function createValidator(): ApiValidator
+    {
+        $validator = new ApiValidator();
+        $validator->addParamValidator(self::PARAM_LIMIT, new IntegerRangeChecker(1, 1000));
+        $validator->addParamValidator(self::PARAM_OFFSET, new IntegerRangeChecker(0, null));
+        $validator->addParamValidator(self::PARAM_ORDER_BY, new OrderByChecker(self::ORDER_FIELDS));
+        $validator->addParamValidator(self::PARAM_FIELDS, new StringLengthChecker(1, null));
+
+        $validator->addParamValidator(self::PARAM_RANGE_START, new DatetimeRFC3339Checker(null, true));
+        $validator->addParamValidator(self::PARAM_RANGE_END, new DatetimeRFC3339Checker(null, true));
+        $validator->addParamValidator(self::PARAM_KEYWORD, new StringLengthChecker(1, 100));
+        $validator->addParamValidator(self::PARAM_EXCLUDE_FROM_SEARCH, new StringLengthChecker(1, null));
+
+        $validator->addApplicationValidator(new GetEventsCorrelationChecker());
+
+        return $validator;
+    }
+
+    /**
+     * @return array
+     */
+    private function getResponse(): array
+    {
+        $login = cb_get_login_user();
+        $search_options = $this->convertToSearchOptions(
+            $this->getParam(self::PARAM_TARGET),
+            $this->getParam(self::PARAM_TARGET_TYPE),
+            explode(',', $this->getParam(self::PARAM_EXCLUDE_FROM_SEARCH, ''))
+        );
+
+        $setdate = \CB_ISO8601Util::toUTCDateTime(
+            $this->getParam(self::PARAM_RANGE_START, self::DEFAULT_SETDATE)
+        );
+        $start_ts = cb_datetime_to_timestamp($setdate, 'UTC');
+
+        $enddate = \CB_ISO8601Util::toUTCDateTime(
+            $this->getParam(self::PARAM_RANGE_END, self::DEFAULT_ENDDATE)
+        );
+        $end_ts = cb_datetime_to_timestamp($enddate, 'UTC');
+
+        $offset = $this->getParamOffset();
+        $search_text = $this->getParam(self::PARAM_KEYWORD);
+        $limit = $this->getParamLimit();
+        $order_by = $this->getParamOrderBy('updatedAt', 'asc');
+
+        $adapter = new GetEventsAdapter();
+
+        return $adapter->getResponse($login, $search_options, $search_text,
+            $offset, $limit, $start_ts, $end_ts,
+            $order_by);
+    }
+
+
+    /**
+     * Returns array in the same format as the argument $options of GRN_Schedule_SearchLogic->search().
+     *
+     * @param string|null $target
+     * @param string|null $target_type
+     * @param array       $exclude_from_search
+     *
+     * @return array
+     */
+    private function convertToSearchOptions(
+        $target,
+        $target_type,
+        array $exclude_from_search
+    ): array {
+        $search_options = [];
+        $search_options['expand_repeat_and_temporary']
+            = true;
+        $search_options[\GRN_Schedule_SearchLogic::OPTION_ALLOW_EMPTY_KEYWORD]
+            = true;
+
+        $search_options['member_ids'] = $this->convertToMemberIds($target,
+            $target_type);
+
+        $exclude_items = $this->convertToExcludeItems($exclude_from_search);
+
+        return array_merge($search_options, $exclude_items);
+    }
+
+    /**
+     * @param array $exclude_from_search
+     *
+     * @return array
+     */
+    private function convertToExcludeItems(array $exclude_from_search): array
+    {
+        // key: Possible values for request parameter "exclude_from_search".
+        // value: The key used in GRN_Schedule_SearchLogic->search().
+        $param_array_key_map = [
+            'subject'  => 'title',
+            'company'  => 'companyinfo',
+            'notes'    => 'memo',
+            'comments' => 'follow',
+        ];
+
+        $result = [];
+        foreach ($param_array_key_map as $param => $array_key) {
+            if (in_array($param, $exclude_from_search) === false) {
+                $result[$array_key] = true;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param string|null $target
+     * @param string|null $target_type
+     *
+     * @return array
+     */
+    private function convertToMemberIds($target, $target_type): array
+    {
+        if ($target === null && $target_type === null) {
+            $target_type = 'user';
+            $target = cb_get_login_user()->getOID();
+        }
+
+        // key: Possible values for request parameter "targetType".
+        // value: The key used in GRN_Schedule_SearchLogic->search().
+        $key_map = [
+            'user'         => '',
+            'organization' => 'g',
+            'facility'     => 'f',
+        ];
+
+        return [
+            $key_map[$target_type] . $target => $target
+        ];
+    }
+}

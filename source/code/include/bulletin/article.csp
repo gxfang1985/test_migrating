@@ -1,0 +1,1922 @@
+<?php
+
+use grn\bulletin\bean\GrnBulletinOperator;
+use grn\bulletin\NotificationSchedulingEvent;
+use grn\fts\Application as FtsApplication;
+use grn\fts\bulletin\IndexService;
+use grn\grn\Validate;
+
+/**
+ * @author  Tanaka, Yoshiaki        2004/11
+ * @package grn.bulletin
+ */
+
+require_once('bulletin/table.csp');
+
+
+/**
+ * 記事オブジェクトを生成
+ *
+ * @package grn.bulletin
+ */
+class GRN_Bulletin_ArticleFactory
+{
+    /**
+     * @access private
+     */
+    var $_tab_article = null;
+    /**
+     * @access private
+     */
+    var $_cache = [];
+
+
+    private static $_instance = null;
+
+    /**
+     * @return GRN_Bulletin_ArticleFactory
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    function __construct()
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('bulletin');
+        $this->_tab_article = $tm->getTableInfo('GRN_Bulletin_ArticleEntity');
+    }
+
+    /**
+     * @param GRN_Bulletin_Article $article
+     */
+    function _cache($article)
+    {
+        assert('is_a( $article, "GRN_Bulletin_Article" )');
+
+        $this->_cache[$article->getOID()] = $article;
+    }
+
+    /**
+     * @param string $id
+     *
+     * @return GRN_Bulletin_Article or FALSE
+     */
+    function _get($id)
+    {
+        $ret = false;
+        if (array_key_exists($id, $this->_cache)) {
+            $ret = $this->_cache[$id];
+        }
+
+        return $ret;
+    }
+
+    function _delete($id)
+    {
+        if (array_key_exists($id, $this->_cache)) {
+            unset($this->_cache[$id]);
+        }
+    }
+
+    /**
+     * テープルオブジェクトからAPIオブジェクトを生成する
+     *
+     * @param GRN_Bulletin_ArticleEntity $row
+     *
+     * @return GRN_Bulletin_Article
+     */
+    function row2object($row)
+    {
+        if ( ! $row) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        if ( ! ($object = $this->_get($row->getOID()))) {
+            $object = new GRN_Bulletin_Article($row);
+            $this->_cache($object);
+        }
+
+        return $object;
+    }
+
+    /**
+     * @param int $oid
+     *
+     * @return GRN_Bulletin_Article
+     */
+    function get($oid)
+    {
+        if ( ! ($object = $this->_get($oid))) {
+            $ret = $this->row2object($this->_tab_article->getRow($oid));
+
+            return $ret;
+        }
+
+        return $object;
+    }
+}
+
+/**
+ * 記事オブジェクト
+ *
+ * @package grn.bulletin
+ */
+class GRN_Bulletin_Article
+{
+    /**
+     * @access private
+     * @var GRN_Bulletin_ArticleEntity
+     */
+    var $_article = null;
+
+    /**
+     * @access private
+     */
+    var $_triggers = null;
+
+    /**
+     * @access private
+     * @return GRN_Bulletin_ArticleEntity
+     */
+    function _getRow()
+    {
+        return $this->_article;
+    }
+
+
+    /**
+     * コンストラクタ
+     *
+     * @param $row
+     */
+    function __construct($row)
+    {
+        $this->_article = clone $row;
+    }
+
+    /**
+     * invoke hooks on create, update or delete event
+     *
+     * @access public
+     *
+     * @param string $action action
+     */
+    function runHook($action)
+    {
+        if (is_null($this->_triggers)) {
+            $loader = new CB_PluginLoader('grn.bulletin.article');
+            $this->_triggers = $loader->loadHooks();
+        }
+
+        foreach ($this->_triggers as $hook) {
+            call_user_func($hook, $this->_getRow(), $action);
+        }
+    }
+
+    /**
+     * アクセスが許可されるか調べる
+     *
+     * @param CB_User $user     アクセスユーザー
+     * @param integer $acc_mode アクセスモード
+     * @param bool    $throw_error
+     *
+     * @return bool  許可される場合にTRUE、それ以外でFALSE
+     */
+    function access($user, $acc_mode, $throw_error = false)
+    {
+        assert('$user');
+
+        require_once('bulletin/access.csp');
+        $acc = GRN_Bulletin_AccessManager::getInstance();
+
+        // システム管理者ならば何でもあり
+        if ($acc->isSuperAdmin($user)) {
+            return true;
+        }
+
+        $category = $this->get('category');
+        /* @var GRN_Bulletin_Category $category */
+
+        if ( ! $this->isPublished()) {
+            // 公開前の掲示は作成者、管理者がアクセス可能
+            if ($this->isCreator($user) || $acc->isAdmin($user, $category)) {
+                // フォローの書き込みは許可されない
+                if (intval($acc_mode) & GRN_BULLETIN_ACCESS_F) {
+                    if ($throw_error) {
+                        require_once('bulletin/error_code.csp');
+                        cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_FOLLOW);
+                    }
+
+                    return false;
+                }
+
+                return true;
+            }
+
+            if ($throw_error) {
+                require_once('bulletin/error_code.csp');
+
+                if ($acc_mode == GRN_BULLETIN_ACCESS_R) {
+                    cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_READ);
+                }
+                if (intval($acc_mode) & GRN_BULLETIN_ACCESS_W) {
+                    cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_WRITE);
+                }
+
+                cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_FOLLOW);
+            }
+
+            return false;
+        }
+
+        if ($this->isExpired()) {
+            // 期限の切れた掲示は管理者でもフォロー書き込みはできない
+            if ($acc->isAdmin($user, $category)) {
+                // フォローの書き込みは許可されない
+                if (intval($acc_mode) & GRN_BULLETIN_ACCESS_F) {
+                    if ($throw_error) {
+                        require_once('bulletin/error_code.csp');
+                        cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_FOLLOW);
+                    }
+
+                    return false;
+                }
+            } else {
+                // ユーザーは閲覧以外許可されない 
+                if ($acc_mode != GRN_BULLETIN_ACCESS_R) {
+                    if ($throw_error) {
+                        require_once('bulletin/error_code.csp');
+
+                        if (intval($acc_mode) & GRN_BULLETIN_ACCESS_W) {
+                            cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_WRITE);
+                        }
+
+                        cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_FOLLOW);
+                    }
+
+                    return false;
+                }
+            }
+        }
+
+        if ( ! $category) {
+            if ($throw_error) {
+                require_once('bulletin/error_code.csp');
+
+                if ($acc_mode == GRN_BULLETIN_ACCESS_R) {
+                    cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_READ);
+                }
+                if (intval($acc_mode) & GRN_BULLETIN_ACCESS_W) {
+                    cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_WRITE);
+                }
+
+                cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_FOLLOW);
+            }
+
+            return false;
+        }
+
+        // カテゴリのアクセス権をチェック
+        //return $category->access( $user, $acc_mode, $throw_error );
+        if ( ! $category->access($user, $acc_mode, false)) {
+            if ($throw_error) {
+                require_once('bulletin/error_code.csp');
+                if ($acc_mode == GRN_BULLETIN_ACCESS_R) {
+                    require_once('grn/notification.csp');
+                    $dbconn = grn_notification_get_connection($user->getOID());
+
+                    $user_id = $user->getOID();
+                    $mapping_name = grn_get_personal_tablename($user_id,
+                        'tab_grn_notification_notify');
+                    $format
+                        = "delete from ${mapping_name} where ((col_user='@S') and (col_module_id='@S') and (col_unique_id='@S'))";
+                    $query = cb_queryf($dbconn, $format, $user_id,
+                        'grn.bulletin', $this->getOID());
+                    $dbconn->query($query);
+                    $dbconn->commit();
+
+                    cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_READ);
+                }
+                if (intval($acc_mode) & GRN_BULLETIN_ACCESS_W) {
+                    cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_WRITE);
+                }
+
+                cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_FOLLOW);
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * ユーザーの記事に対する権限情報を取得する
+     *
+     * @param CB_User $user ユーザー
+     *
+     * @return array  array( $authority_name => [0,1], ... )
+     */
+    function getAuthorities($user)
+    {
+        assert('$user');
+
+        require_once('bulletin/access.csp');
+        $acc = GRN_Bulletin_AccessManager::getInstance();
+
+        if ($acc->isSuperAdmin($user)) {
+            return ['read' => 1, 'follow' => 1, 'write' => 1];
+        }
+
+        $category = $this->get('category');
+
+        if ( ! $this->isPublished()) {
+            if ($this->isCreator($user) || $acc->isAdmin($user, $category)) {
+                return ['read' => 1, 'follow' => 0, 'write' => 1];
+            }
+
+            return ['read' => 0, 'follow' => 0, 'write' => 0];
+        }
+
+        if ($this->isExpired()) {
+            if ($acc->isAdmin($user, $category)) {
+                return ['read' => 1, 'follow' => 0, 'write' => 1];
+            }
+
+            return ['read' => 1, 'follow' => 0, 'write' => 0];
+        }
+
+        if ( ! $category) {
+            return ['read' => 0, 'follow' => 0, 'write' => 0];
+        }
+
+        return $acc->getAuthorities($user, $category);
+    }
+
+    /**
+     * 削除可能か調べる
+     *
+     * @param CB_User $user
+     * @param bool    $throw_error 拒否される場合にエラーとする場合はTRUE
+     *
+     * @return bool
+     */
+    function isDeletable($user, $throw_error = false)
+    {
+        assert('$user');
+
+        // 検索用に追加された掲示は削除できない
+        if ($this->getOID() == GRN_BULLETIN_NULL_OBJECT_ID) {
+            if ($throw_error) {
+                require_once('bulletin/error_code.csp');
+                cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_DELETE);
+            }
+
+            return false;
+        }
+
+        require_once('bulletin/access.csp');
+        $acc = GRN_Bulletin_AccessManager::getInstance();
+
+        // システム管理者はOK
+        if ($acc->isSuperAdmin($user)) {
+            return true;
+        }
+
+        $category = $this->get('category');
+
+        // カテゴリの管理者はOK
+        if ( ! is_null($category) && $acc->isAdmin($user, $category)) {
+            return true;
+        }
+
+        // 管理者以外では書き込み権限を持つ作成者に限定される
+
+        if ($this->isCreator($user)) {
+            if ($this->access($user, GRN_BULLETIN_ACCESS_W, false)) {
+                return true;
+            }
+        }
+
+        if ($this->isMaintainer($user, $throw_error)) {
+            return true;
+        }
+
+        if ($throw_error) {
+            require_once('bulletin/error_code.csp');
+            cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_DELETE);
+        }
+
+        return false;
+    }
+
+
+    /**
+     * 記事を削除する、同時に添付ファイルも削除される
+     *
+     * @param CB_User $user 操作ユーザー
+     *
+     * @return bool
+     */
+    function delete($user)
+    {
+        $this->isDeletable($user, true);
+
+        if (FtsApplication::isAvailable()) {
+            $searchService = new IndexService();
+            $searchService->deleteIndexByArticleId($this->_article->getOID());
+        }
+
+        require_once('bulletin/file.csp');
+        $fm = GRN_Bulletin_FileManager::getInstance();
+
+        $fm->deleteAllAttachedFiles($user, $this);
+
+        $this->_article->delete();
+
+        //scheduling service, delete records.
+        $scheduling_event = new NotificationSchedulingEvent();
+        $scheduling_event->unRegisterEvent($this->_article->getOID());
+
+        $this->_article = null;
+
+        return true;
+    }
+
+    /**
+     * 掲示の移動権限を調べる
+     *
+     * @param CB_User $user
+     * @param bool    $throw_error
+     *
+     * @return bool
+     */
+    function isMovable($user, $throw_error = false)
+    {
+        // 検索用オブジェクトは移動できない
+        if ( ! $user || $this->getOID() == GRN_BULLETIN_NULL_OBJECT_ID) {
+            if ($throw_error) {
+                require_once('bulletin/error_code.csp');
+                cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_MOVE);
+            }
+
+            return false;
+        }
+
+        require_once('bulletin/access.csp');
+        $acc = GRN_Bulletin_AccessManager::getInstance();
+
+        // システム管理者はOK
+        if ($acc->isSuperAdmin($user)) {
+            return true;
+        }
+
+        $category = $this->get('category');
+
+        // カテゴリの管理者はOK
+        if ( ! is_null($category) && $acc->isAdmin($user, $category)) {
+            return true;
+        }
+
+        if ($throw_error) {
+            require_once('bulletin/error_code.csp');
+            cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_MOVE);
+        }
+
+        return false;
+    }
+
+
+    /**
+     * 有効なオブジェクトかどうかチェックする
+     *
+     * @return bool
+     */
+    function isValid()
+    {
+        $row = $this->_getRow();
+
+        return ! is_null($row);
+    }
+
+    /**
+     * オブジェクトIDを取得する
+     *
+     * @return string
+     */
+    function getOID()
+    {
+        $row = $this->_getRow();
+
+        return $row->getOID();
+    }
+
+    /**
+     * リレーションオブジェクトのIDを取得する
+     *
+     * @param string $prop_name
+     *
+     * @return string
+     */
+    function getId($prop_name)
+    {
+        $row = $this->_getRow();
+
+        return $row->getId($prop_name);
+    }
+
+    /**
+     * 記事のタイトルを取得する
+     *
+     * @return string
+     */
+    function getTitle()
+    {
+        $row = $this->_getRow();
+
+        return $row->get('subject');
+    }
+
+    /**
+     * 記事の作成者かどうか調べる
+     *
+     * @param CB_User $user
+     *
+     * @return bool
+     */
+    function isCreator($user)
+    {
+        return $user && $user->getOID() == $this->getId('creator');
+    }
+
+    /**
+     * プロパティを取得する
+     *
+     * @param string $property_name プロパティ名
+     *
+     * @return GRN_Bulletin_Category|mixed
+     */
+    function &get($property_name)
+    {
+        $row = $this->_getRow();
+
+        if ($property_name == 'category') {
+            require_once('bulletin/category.csp');
+            $factory = GRN_Bulletin_CategoryFactory::getInstance();
+            $ret = $factory->get($row->getId('category'));
+
+            return $ret;
+        }
+        $ret = $row->get($property_name);
+
+        return $ret;
+    }
+
+    /**
+     * 掲示期間を変更可能か調べる
+     *
+     * @param CB_User $user
+     * @param bool    $throw_error 拒否される場合にエラーとする場合はTRUE
+     *
+     * @return bool
+     */
+    function isModifiableTerm($user, $throw_error = false)
+    {
+        if ( ! $user || $this->getOID() == GRN_BULLETIN_NULL_OBJECT_ID) {
+            if ($throw_error) {
+                require_once('bulletin/error_code.csp');
+                cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_MODIFY_TERM);
+            }
+
+            return false;
+        }
+
+        /*
+        require_once( 'bulletin/access.csp' );
+        $acc = GRN_Bulletin_AccessManager::getInstance();
+
+        // システム管理者はOK
+        if( $acc->isSuperAdmin( $user ) )
+            return TRUE;
+
+        $category =& $this->get( 'category' );
+
+        // カテゴリの管理者はOK
+        if( $acc->isAdmin( $user, $category ) )
+            return TRUE;
+        */
+
+        // 書き込み権限を持つ作成者に限定
+
+        if ($this->isCreator($user)) {
+            if ($this->access($user, GRN_BULLETIN_ACCESS_W, false)) {
+                if ( ! $this->isPublished()) {
+                    // 掲示開始待ちの場合はカテゴリのアクセス権をチェック
+                    $category = $this->get('category');
+                    /* @var GRN_Bulletin_Category $category */
+
+                    if ( ! $category
+                         || ! $category->access($user, GRN_BULLETIN_ACCESS_W,
+                            false)
+                    ) {
+                        if ($throw_error) {
+                            require_once('bulletin/error_code.csp');
+                            cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_MODIFY_TERM);
+                        }
+
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+        }
+
+        if ($throw_error) {
+            require_once('bulletin/error_code.csp');
+            cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_MODIFY_TERM);
+        }
+
+        return false;
+    }
+
+    function isModifiable($user, $throw_error = false)
+    {
+        if ( ! $user || $this->getOID() == GRN_BULLETIN_NULL_OBJECT_ID) {
+            if ($throw_error) {
+                require_once('bulletin/error_code.csp');
+                cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_MODIFY_TERM);
+            }
+
+            return false;
+        }
+
+        require_once('bulletin/access.csp');
+        $acc = GRN_Bulletin_AccessManager::getInstance();
+
+        // システム管理者はOK
+        if ($acc->isSuperAdmin($user)) {
+            return true;
+        }
+
+        if ($category = $this->get('category')) {
+            // カテゴリの管理者はOK
+            if ($acc->isAdmin($user, $category)) {
+                return true;
+            }
+        }
+
+        // 書き込み権限を持つ作成者に限定
+        if ($this->isCreator($user)) {
+            if ($this->access($user, GRN_BULLETIN_ACCESS_W, false)) {
+                if ( ! $this->isPublished()) {
+                    // 掲示開始待ちの場合はカテゴリのアクセス権をチェック
+                    $category = $this->get('category');
+                    /* @var GRN_Bulletin_Category $category */
+
+                    if ( ! $category
+                         || ! $category->access($user, GRN_BULLETIN_ACCESS_W,
+                            false)
+                    ) {
+                        if ($throw_error) {
+                            require_once('bulletin/error_code.csp');
+                            cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_MODIFY_TERM);
+                        }
+
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+        }
+
+        if ($this->isMaintainer($user, $throw_error)) {
+            return true;
+        }
+
+        if ($throw_error) {
+            require_once('bulletin/error_code.csp');
+            cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_MODIFY);
+        }
+
+        return false;
+    }
+
+    /**
+     * @param CB_User $user
+     * @param bool    $throw_error
+     *
+     * @return bool
+     */
+    function isMaintainer($user, $throw_error = false)
+    {
+        if ($this->isCreator($user)) {
+            return true;
+        }
+
+        $maintainer = new GrnBulletinOperator();
+        $maintainer->setArticle($this->getOID());
+        $maintainer->setUser($user->getOID());
+        require_once('bulletin/BulletinFacade.csp');
+        $dao = new BulletinFacade();
+        $inDataObj = [];
+        $result = $dao->isBulletinOperator($inDataObj, $maintainer);
+        if ( ! $result) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_BULLETIN_ACCESS_DENY_MODIFY);
+            } else {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * プロパティを設定する
+     *
+     * @param CB_User $user       ユーザー
+     * @param array   $properties プロパティ名をキーとする配列
+     *
+     * @return bool
+     */
+    function setProperties($user, $properties)
+    {
+        $this->isModifiable($user, true);
+
+        $row = $this->_getRow();
+
+        $row->prepareLogging();
+
+        $prop = [
+            'subject'               => 1,
+            'data'                  => 1,
+            'html'                  => 1,
+            'can_follow'            => 1,
+            'start_timestamp'       => 1,
+            'end_timestamp'         => 1,
+            'start_is_datetime'     => 1,
+            'end_is_datetime'       => 1,
+            'reserve_int1'          => 1,
+            'manually_enter_sender' => 1,
+        ];
+        foreach (array_keys($prop) as $name) {
+            if (array_key_exists($name, $properties)) {
+                $row->set($name, $properties[$name]);
+            }
+        }
+        if (array_key_exists('end_timestamp', $properties)
+            && $properties['end_timestamp'] == null
+        ) {
+            unset($row->_prop_cache['start_timestamp']);
+            unset($row->_prop_cache['end_timestamp']);
+        }
+        if (array_key_exists('start_timestamp', $properties)
+            && $properties['start_timestamp'] == null
+        ) {
+            unset($row->_prop_cache['start_timestamp']);
+        }
+        $group = null;
+        if (isset($properties['creator_group'])) {
+            if (isset($properties['user_deleted'])
+                && $properties['user_deleted'] == 1
+            ) {
+                global $G_container_base;
+                $uum = $G_container_base->getInstance('uum');
+                /* @var GRN_Uum $uum */
+                $group = $uum->getGroup($properties['creator_group']);
+            } else {
+                require_once('application.csp');
+                require_once('grn/error_code.csp');
+                $app = new GRN_Bulletin();
+                $groups = [];
+                if (isset($properties['creator_id'])) {
+                    $app->getUserGroups($properties['creator_id'], $groups);
+                } else {
+                    $app->getUserGroups($user->getOID(), $groups);
+                }
+                if ( ! array_key_exists($properties['creator_group'],
+                    $groups)
+                ) {
+                    cb_throw_error(E_GRN_GROUP_NOT_FOUND);
+                }
+                $group = $groups[$properties['creator_group']];
+            }
+        }
+        $row->set('creator_group', $group);
+        if ( ! $this->isExpired()) {
+            // 通知状態を更新
+            $ts = new CB_TimeStamp();
+            $ts->unix_ts = time();
+
+            if ( ! $this->isPublished() && $row->get('start_timestamp')) {
+                $ts = $row->get('start_timestamp');
+            }
+            $this->_setDirty($ts);
+            $this->_updateNotificationInfo($user, null, $ts);
+
+            // 自分の既読情報を更新する
+            $this->read($user, $ts, false);
+        }
+
+        // update maintainer and add log information of maintainer
+        $this->setArticleOperator($row, $properties, $this->get('creator'),
+            $this->get('category'), false);
+
+        if (array_key_exists('notifyFlag', $properties)) {
+            $add_log_information = [];
+            $add_log_information['notify_check'] = cb_at($properties,
+                'notifyFlag') == 1 ? 'ON' : 'OFF';
+            $row->addLogInformation($add_log_information);
+        }
+
+        $row->onUpdate($user);
+
+        $this->runHook('update');
+
+        if (FtsApplication::isAvailable()) {
+            $searchService = new IndexService();
+            $searchService->updateArticleIndex(new GRN_Bulletin_Article($row));
+        }
+
+        return true;
+    }
+
+    /**
+     * @access private
+     *
+     * @param CB_User $user
+     * @param mixed   $user_name
+     * @param mixed   $ts
+     */
+    function _updateNotificationInfo($user, $user_name = null, $ts = null)
+    {
+        if ( ! $ts) {
+            $ts = new CB_TimeStamp();
+            $ts->unix_ts = time();
+        }
+
+        $row = $this->_getRow();
+        $row->set('ntime', $ts);
+
+        if ($user) {
+            $row->set('notifier', $user);
+            $row->set('notifier_name', $user->get('display_name'));
+        } else {
+            $row->set('notifier', null);
+            $row->set('notifier_name', $user_name);
+        }
+    }
+
+    /**
+     * @access private
+     *
+     * @param mixed $ts
+     */
+    function _setDirty($ts = null)
+    {
+        if ($this->_getDirty()) {
+            if ( ! $ts) {
+                $ts = new CB_TimeStamp();
+                $ts->unix_ts = time();
+            }
+
+            $row = $this->_getRow();
+            $row->set('dirty_timestamp', $ts);
+        }
+    }
+
+    /**
+     * @access private
+     * @return CB_TimeStamp
+     */
+    function _getDirty()
+    {
+        $row = $this->_getRow();
+
+        return $row->get('dirty_timestamp');
+    }
+
+
+    /**
+     * @param CB_User                    $user
+     * @param GRN_Bulletin_ArticleEntity $row
+     * @param CB_TimeStamp               $start 掲示開始時間
+     * @param CB_TimeStamp               $end   掲示終了時間
+     *
+     * @access private
+     * @return bool
+     */
+    function _setTerm($user, $row, $start, $end)
+    {
+        $prev_start = $row->get('start_timestamp');
+
+        $row->set('start_timestamp', $start);
+        $row->set('end_timestamp', $end);
+
+        $update_notification = false;
+
+        if ( ! $this->isPublished()) {
+            if ($start) {
+                // 掲示待ちの場合は公開時に通知するためデータ更新時刻を掲示開始日に設定
+
+                $this->_setDirty($start);
+                $this->_updateNotificationInfo($user, null, $start);
+
+                // 自分の既読情報を更新する
+                $this->read($user, $start, false);
+
+                $update_notification = true;
+            } else {
+                // 掲示開始日の指定なしに掲示待ちはありえない
+
+                assert('FALSE');
+            }
+        } else {
+            if ($prev_start) {
+                // 掲示待ち→公開の場合
+
+                $ts = new CB_TimeStamp();
+                $ts->unix_ts = time();
+
+                $this->_setDirty($ts);
+                $this->_updateNotificationInfo($user, null, $ts);
+
+                // 自分の既読情報を更新する
+                $this->read($user, $ts, false);
+
+                $update_notification = true;
+            }
+        }
+
+        return $update_notification;
+    }
+
+    /**
+     * 掲示期間を設定する
+     *
+     * @param CB_User      $user  操作ユーザー
+     * @param CB_TimeStamp $start 掲示開始日
+     * @param CB_TimeStamp $end   掲示終了日
+     *
+     * @return bool  成功の場合にTRUE、それ以外の場合にFALSE
+     */
+    function setTerm($user, $start, $end)
+    {
+        $this->isModifiableTerm($user, true);
+
+        $row = $this->_getRow();
+
+        $row->prepareLogging();
+
+        $this->_setTerm($user, $row, $start, $end);
+
+        $row->onUpdate($user);
+
+        return true;
+    }
+
+    /**
+     * 掲示終了日を設定する
+     *
+     * @param CB_User      $user 操作ユーザー
+     * @param CB_TimeStamp $end  掲示終了日
+     *
+     * @return bool  成功の場合にTRUE、それ以外の場合にFALSE
+     */
+    function setTermEnd($user, $end)
+    {
+        $this->isModifiableTerm($user, true);
+
+        $row = $this->_getRow();
+        $row->prepareLogging();
+        $row->set('end_timestamp', $end);
+        $row->onUpdate($user);
+
+        return true;
+    }
+
+    /**
+     * 記事が公開されているか調べる
+     *
+     * @param CB_TimeStamp $ts 基準時（これ以降公開されているか調べる、nullの場合は現在時刻）
+     *
+     * @return bool  公開されていればTRUE（期限が過ぎている場合を含む）
+     */
+    function isPublished($ts = null)
+    {
+        if ( ! ($start = $this->get('start_timestamp'))) {
+            return true;
+        }
+
+        return $start->unix_ts <= ($ts ? $ts->unix_ts : time());
+    }
+
+    /**
+     * 掲示期間を過ぎているか調べる
+     *
+     * @param CB_TimeStamp $ts 基準時（これ以降期限切れか調べる、nullの場合は現在時刻）
+     *
+     * @return bool  期間を過ぎている場合にTRUE
+     */
+    function isExpired($ts = null)
+    {
+        if ( ! ($end = $this->get('end_timestamp'))) {
+            return false;
+        }
+
+        return $end->unix_ts <= ($ts ? $ts->unix_ts : time());
+    }
+
+
+    // 添付ファイル
+
+    /**
+     * 記事本文に添付されたファイル数を取得する
+     *
+     * @return integer
+     */
+    function getNumFiles()
+    {
+        require_once('bulletin/file.csp');
+        $fm = GRN_Bulletin_FileManager::getInstance();
+
+        return $fm->getNumFiles($this);
+    }
+
+    /**
+     * ファイルを添付する（コピー）
+     *
+     * @param CB_User $user 操作ユーザー
+     * @param mixed   $file ファイル
+     *
+     * @return mixed  成功の場合にGRN_Fileオブジェクト、それ以外の場合にFALSE
+     */
+    function addFile($user, & $file)
+    {
+        require_once('bulletin/file.csp');
+        $fm = GRN_Bulletin_FileManager::getInstance();
+        $ret = $fm->addFile($user, $this, $file);
+
+        return $ret;
+    }
+
+    /**
+     * ファイルを添付する（ファイルオブジェクトは非コピー）
+     *
+     * @param CB_User $user 操作ユーザー
+     * @param mixed   $file ファイル
+     *
+     * @return mixed  成功の場合にGRN_Fileオブジェクト、それ以外の場合にFALSE
+     */
+    function attachFile($user, & $file)
+    {
+        require_once('bulletin/file.csp');
+        $fm = GRN_Bulletin_FileManager::getInstance();
+        $ret = $fm->attachFile($user, $this, $file);
+
+        return $ret;
+    }
+
+    /**
+     * 指定した添付ファイルを取得する
+     *
+     * @param string $id 添付ファイルID
+     *
+     * @return object GRN_File、見つからない場合はFALSE
+     */
+    function getFile($id)
+    {
+        require_once('bulletin/file.csp');
+        $fm = GRN_Bulletin_FileManager::getInstance();
+        $ret = $fm->getFile($this, $id);
+
+        return $ret;
+    }
+
+    /**
+     * 本文に添付された全てのファイルを取得する
+     *
+     * @return array  添付ファイルの配列
+     *                array( 'ファイルID' => ファイルオブジェクト, ... // 本文の添付
+     */
+    function getFiles()
+    {
+        require_once('bulletin/file.csp');
+        $fm = GRN_Bulletin_FileManager::getInstance();
+
+        return $fm->getFiles($this);
+    }
+
+    /**
+     * 本文、フォローに添付された全てのファイルを取得する
+     *
+     * @return array  添付ファイルの配列
+     *                array( 'ファイルID' => ファイルオブジェクト, ... // 本文の添付
+     *                       'follow' => array(
+     *                                   'フォローID' => array(
+     *                                                   'ファイルID' => ファイルオブジェクト, ... )
+     *                                        ),
+     *                     )
+     */
+    function getAllFiles()
+    {
+        require_once('bulletin/file.csp');
+        $fm = GRN_Bulletin_FileManager::getInstance();
+
+        return $fm->getAllAttachedFiles($this);
+    }
+
+    /**
+     * 指定した添付ファイルを削除する
+     *
+     * @param CB_User $user
+     * @param string  $id 添付ファイルID
+     *
+     * @return bool  成功の場合にTRUE、それ以外の場合にFALSE
+     */
+    function deleteFile($user, $id)
+    {
+        require_once('bulletin/file.csp');
+        $fm = GRN_Bulletin_FileManager::getInstance();
+
+        return $fm->deleteFile($user, $this, $id);
+    }
+
+
+    // 既読処理
+
+    /**
+     * 既読処理
+     *
+     * @param CB_User $user           閲覧ユーザー
+     * @param mixed   $ts             既読時間（nullの場合は現在時刻）
+     * @param bool    $enable_confirm 通知確認を行う場合はTRUE
+     * @param bool    $write_log
+     *
+     * @return bool
+     */
+    function read(
+        $user,
+        $ts = null,
+        $enable_confirm = true,
+        $write_log = true,
+        $comfirmType = false
+    ) {
+        require_once('bulletin/notification.csp');
+        $nm = GRN_Bulletin_NotificationManager::getInstance();
+
+        return $nm->read($user, $this, $ts, $enable_confirm, $write_log,
+            $comfirmType);
+    }
+
+    /**
+     * 既読状態を調べる
+     *
+     * @param CB_User $user 閲覧ユーザー
+     *
+     * @return integer  既読の場合に「1」、更新され未読の場合は「0」、未読の場合は「-1」
+     */
+    function getReadStatus($user)
+    {
+        require_once('bulletin/notification.csp');
+        $nm = GRN_Bulletin_NotificationManager::getInstance();
+
+        return $nm->getReadStatus($user, $this);
+    }
+
+    /**
+     * 既読かどうか調べる
+     *
+     * @param CB_User $user 閲覧ユーザー
+     *
+     * @return bool  既読の場合にTRUE、未読の場合にFALSE
+     */
+    function isRead($user)
+    {
+        require_once('bulletin/notification.csp');
+        $nm = GRN_Bulletin_NotificationManager::getInstance();
+
+        return $nm->isRead($user, $this);
+    }
+
+    /**
+     * 既読時間を取得する
+     *
+     * @param CB_User $user ユーザー
+     *
+     * @return CB_TimeStamp
+     */
+    function getReadTimeStamp($user)
+    {
+        require_once('bulletin/notification.csp');
+        $nm = GRN_Bulletin_NotificationManager::getInstance();
+        $ret = $nm->getReadTimeStamp($user, $this);
+
+        return $ret;
+    }
+
+    // フォロー
+
+    /**
+     * 記事にフォローを書き込む
+     *
+     * @param CB_User $user               書き込みユーザー
+     * @param array   $properties         フォローのプロパティー
+     * @param array   $files              フォローの添付ファイル
+     *                                    配列の中身はアップロードファイルの配列もしくはファイルオブジェクト
+     *
+     * @return object GRN_Bulletin_Follow
+     */
+    function writeFollow($user, $properties, $files)
+    {
+        // 書き込み前に通知状態を更新
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+        $this->read($user, $ts, true, false);
+
+        // 書き込み
+
+        require_once('bulletin/follow.csp');
+        $fm = GRN_Bulletin_FollowManager::getInstance();
+
+        $follow = $fm->createFollow($user, $this, $properties, $files);
+
+        // データ更新時刻をセット
+        $this->_setDirty($follow->get('ctime'));
+
+        // 通知時刻をセット
+        $this->_updateNotificationInfo($user, null, $follow->get('ctime'));
+
+        // 既読タイムスタンプのみ更新
+        $this->read($user, $follow->get('ctime'), false, false);
+
+        return $follow;
+    }
+
+
+    /**
+     * フォローを取得する
+     *
+     * @param string $id フォローID
+     *
+     * @return GRN_Bulletin_Follow
+     */
+    function getFollow($id)
+    {
+        require_once('bulletin/follow.csp');
+        $fm = GRN_Bulletin_FollowManager::getInstance();
+        $ret = $fm->getArticleFollow($this, $id);
+
+        return $ret;
+    }
+
+    /**
+     * 最新フォローを取得する
+     *
+     * @param integer $offset 最新からオフセット
+     *
+     * @return object GRN_Bulletin_Follow
+     */
+    function getLastFollow($offset = 0)
+    {
+        require_once('bulletin/follow.csp');
+        $fm = GRN_Bulletin_FollowManager::getInstance();
+        $ret = $fm->getLastArticleFollow($this, $offset);
+
+        return $ret;
+    }
+
+    /**
+     * フォロー一覧を取得する
+     *
+     * @return array  フォローの一覧
+     *                array( 'フォローID' => GRN_Bulletin_Follow, ... )
+     */
+    function getFollows()
+    {
+        require_once('bulletin/follow.csp');
+        $fm = GRN_Bulletin_FollowManager::getInstance();
+
+        return $fm->getArticleFollows($this);
+    }
+
+    /**
+     * フォロー数を取得する
+     *
+     * @return integer
+     */
+    function getNumFollows()
+    {
+        require_once('bulletin/follow.csp');
+        $fm = GRN_Bulletin_FollowManager::getInstance();
+
+        return $fm->getNumArticleFollows($this);
+    }
+
+
+    // 購読設定
+
+    /**
+     * 記事を購読する、通知設定は考慮されないので強制通知であってもこの操作は成功する
+     *
+     * @param CB_User $user  購読設定するユーザー
+     * @param bool    $onoff 購読する場合にTRUE、購読解除する場合にFALSE
+     *
+     * @return bool  成功の場合にTRUE、それ以外の場合にFALSE
+     */
+    function subscribe($user, $onoff)
+    {
+        require_once('bulletin/notification.csp');
+        $nm = GRN_Bulletin_NotificationManager::getInstance();
+
+        return $nm->subscribe($user, $this, $onoff);
+    }
+
+    /**
+     * ユーザーの購読状態を取得する、通知設定は考慮されない
+     *
+     * @param CB_User $user 対象ユーザー
+     *
+     * @return bool  指定ユーザーが購読している場合にはTRUE、そうでない場合はFALSE
+     */
+    function isSubscribed($user)
+    {
+        require_once('bulletin/notification.csp');
+        $nm = GRN_Bulletin_NotificationManager::getInstance();
+
+        return $nm->isSubscribed($user, $this);
+    }
+
+    /**
+     * 通知対象か調べる、通知設定、購読設定の両方が考慮される
+     *
+     * @param CB_User $user 対象ユーザー
+     *
+     * @return bool  通知されていればTRUE、それ以外でFALSE
+     */
+    function isNotified($user)
+    {
+        require_once('bulletin/notification.csp');
+        $nm = GRN_Bulletin_NotificationManager::getInstance();
+
+        return $nm->isNotified($user, $this);
+    }
+
+    /**
+     * カテゴリを移動する、管理者以外では許可されずFALSEを返す
+     *
+     * @param CB_User               $user     ユーザー
+     * @param GRN_Bulletin_Category $category カテゴリ
+     *
+     * @return bool  移動の成功した場合はTRUE、それ以外の場合はFALSE
+     */
+    function setCategory($user, $category)
+    {
+        if ( ! $category || ! $this->isMovable($user)) {
+            return false;
+        }
+
+        require_once('bulletin/access.csp');
+        $acc = GRN_Bulletin_AccessManager::getInstance();
+
+        // 管理者以外に移動は許可しない
+        if ( ! $acc->isSuperAdmin($user)) {
+            // システム管理者でなければ、現在、移動先の双方のカテゴリで管理者でなければならない
+
+            if ( ! $acc->isAdmin($user, $category)) {
+                return false;
+            }
+
+            if ( ! ($current = $this->get('category'))) {
+                return false;
+            }
+
+            if ( ! $acc->isAdmin($user, $current)) {
+                return false;
+            }
+        }
+
+        $row = $this->_getRow();
+
+        $row->prepareLogging();
+        $row->set('category', $category->_getRow());
+
+        // 移動先で通知するためタイムスタンプを更新
+
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+
+        // 公開されている掲示のみ更新時刻をアップデート
+        if ($this->isPublished() && ! $this->isExpired()) {
+            // データ更新時刻をセット
+            $this->_setDirty($ts);
+            // 通知時刻をセット
+            $this->_updateNotificationInfo($user, null, $ts);
+        }
+
+        $row->onMove($user);
+
+        $this->runHook('move');
+
+        if (FtsApplication::isAvailable()) {
+            $searchService = new IndexService();
+            $searchService->updateArticleIndexWithMove(new GRN_Bulletin_Article($row));
+        }
+
+        return true;
+    }
+
+    /**
+     * @param GRN_Bulletin_ArticleEntity $row
+     * @param array                      $properties
+     * @param CB_User                    $creator
+     * @param GRN_Bulletin_Category      $category
+     * @param bool                       $is_new
+     */
+    function setArticleOperator(
+        $row,
+        $properties,
+        $creator,
+        $category,
+        $is_new = true
+    ) {
+        require_once('bulletin/BulletinFacade.csp');
+        $dao = new BulletinFacade();
+        $original_maintainer_list = [];
+        if ( ! $is_new) {
+            $original_maintainer_list = $dao->getOperatorListByArticleId([],
+                $this->getOID(), false);
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+
+        $insert_maintainer_id_list = cb_at($properties, 'maintainer_id_list',
+            []);
+        $insert_maintainer_list = [];
+        $creator_id = $creator instanceof CB_User
+            ? $creator->getOID() : 0;
+
+        $insert_maintainers_info
+            = $uum->getUsersById($insert_maintainer_id_list);
+        foreach ($insert_maintainer_id_list as $insert_maintainer_id) {
+            if ( ! array_key_exists($insert_maintainer_id,
+                    $insert_maintainers_info)
+                 || ($creator_id === $insert_maintainer_id)
+            ) {
+                continue;
+            }
+
+            $m_user = $insert_maintainers_info[$insert_maintainer_id];
+
+            $maintainer = new GrnBulletinOperator();
+            $maintainer->setUser($insert_maintainer_id);
+            $maintainer->setUserName($m_user->get('display_name'));
+            $maintainer->setArticle($this->getOID());
+            $insert_maintainer_list[] = $maintainer;
+
+            if ( ! array_key_exists($insert_maintainer_id,
+                $original_maintainer_list)
+            ) {
+                $access_status
+                    = $category->checkMaintainerUsersAccess([$insert_maintainer_id]);
+                if (count($access_status) === 0) {
+                    cb_throw_error(E_GRN_BULLETIN_MAINTAINER_NO_CATEGORY_PERMISSION);
+                }
+            }
+        }
+
+        if ( ! $is_new) {
+            $dao->deleteAllOperatorByArticleId([], $this->getOID());
+        }
+
+        $insert_maintainer_num = 0;
+        $add_log_information = [];
+        if ($creator_id > 0) {
+            $insert_maintainer_num++;
+            $add_log_information['maintainer_name_' . $insert_maintainer_num]
+                = $creator->get('display_name');
+        }
+        foreach ($insert_maintainer_list as $insert_maintainer) {
+            $dao->insertBulletinOperator([], $insert_maintainer);
+            $insert_maintainer_num++;
+            $add_log_information['maintainer_name_' . $insert_maintainer_num]
+                = $insert_maintainer->getUserName();
+        }
+
+        $row->addLogInformation($add_log_information);
+    }
+
+    /**
+     * @param CB_User $sender_user
+     * @param string  $sender_name
+     *
+     * @return CB_User|array('id'=>xx, 'name'=>xx)
+     */
+    public function getSenderForNotification($sender_user, $sender_name = null)
+    {
+        require_once('bulletin/notification.csp');
+        $manually_enter_sender = $this->get('manually_enter_sender');
+        if (Validate::isNotNull($manually_enter_sender)) {
+            return [
+                GRN_Bulletin_NotificationListener::KEY_SENDER_ID   => GRN_Bulletin_NotificationListener::MANUALLY_ENTER_SENDER_ID,
+                GRN_Bulletin_NotificationListener::KEY_SENDER_NAME => $manually_enter_sender
+            ];
+        } elseif ( ! $sender_user instanceof CB_User) {
+            return [
+                GRN_Bulletin_NotificationListener::KEY_SENDER_ID   => GRN_Bulletin_NotificationListener::DELETED_SENDER_ID,
+                GRN_Bulletin_NotificationListener::KEY_SENDER_NAME => $sender_name
+            ];
+        } else {
+            return $sender_user;
+        }
+    }
+
+    /**
+     * @param array $acknowledgement_user_ids
+     */
+    public function setAcknowledgement($acknowledgement_user_ids)
+    {
+        require_once('bulletin/BulletinFacade.csp');
+        $dao = new BulletinFacade();
+
+        $dao->insertAcknowledgement($this->getOID(), $acknowledgement_user_ids);
+    }
+}
+
+/**
+ * 記事管理クラス
+ *
+ * @package grn.bulletin
+ */
+class GRN_Bulletin_ArticleManager
+{
+
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Bulletin_ArticleManager
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * @access private
+     */
+    var $_tab_article = null;
+
+
+    function __construct()
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('bulletin');
+        $this->_tab_article = $tm->getTableInfo('GRN_Bulletin_ArticleEntity');
+    }
+
+    /**
+     * 記事を送信する
+     *
+     * @param CB_User               $user        送信ユーザー
+     * @param GRN_Bulletin_Category $category    送信カテゴリ
+     * @param array                 $properties  記事プロパティー
+     * @param array                 $files       添付ファイル
+     *                                           配列の中身はアップロードファイルの配列もしくはファイルオブジェクト
+     *
+     * @return GRN_Bulletin_Article $article
+     */
+    function send($user, $category, $properties, $files)
+    {
+        if ( ! $category) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $category->access($user, GRN_BULLETIN_ACCESS_W, true);
+
+        $row = $this->_tab_article->newRow();
+        /* @var GRN_Bulletin_ArticleEntity $row */
+
+        $row->prepareLogging();
+
+        $props = [
+            'subject'               => 1,
+            'data'                  => 1,
+            'html'                  => 1,
+            'can_follow'            => 1,
+            'reserve_int1'          => 1,
+            'start_timestamp'       => 1,
+            'end_timestamp'         => 1,
+            'start_is_datetime'     => 1,
+            'end_is_datetime'       => 1,
+            'manually_enter_sender' => 1,
+        ];
+
+        foreach (array_keys($properties) as $key) {
+            if (array_key_exists($key, $props)) {
+                $row->set($key, $properties[$key]);
+            }
+        }
+        if (array_key_exists('end_timestamp', $properties)
+            && $properties['end_timestamp'] == null
+        ) {
+            unset($row->_prop_cache['start_timestamp']);
+            unset($row->_prop_cache['end_timestamp']);
+        }
+        if (array_key_exists('start_timestamp', $properties)
+            && $properties['start_timestamp'] == null
+        ) {
+            unset($row->_prop_cache['start_timestamp']);
+        }
+        $group = null;
+        if (isset($properties['creator_group'])) {
+            require_once('application.csp');
+            require_once('grn/error_code.csp');
+            $app = new GRN_Bulletin();
+            $groups = [];
+            $app->getUserGroups($user->getOID(), $groups);
+            if ( ! array_key_exists($properties['creator_group'], $groups)) {
+                cb_throw_error(E_GRN_GROUP_NOT_FOUND);
+            }
+            $group = $groups[$properties['creator_group']];
+        }
+        $row->set('creator_group', $group);
+        $row->set('category', $category->_getRow());
+        $row->set('last_follow_id', 0);
+
+        $factory = GRN_Bulletin_ArticleFactory::getInstance();
+        $article = $factory->row2object($row);
+
+        if ($files) {
+            foreach (array_keys($files) as $fn) {
+                if (is_array($files[$fn])
+                    && $files[$fn]['error'] != UPLOAD_ERR_OK
+                ) {
+                    continue;
+                }
+
+                $article->addFile($user, $files[$fn]);
+
+            }
+        }
+
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+        if ( ! $article->isPublished()) {
+            // 掲示待ちの場合はデータ更新時刻を公開日に設定する
+            // 記事の作成時刻にしてしまうと通知が飛ばない
+            $ts = $row->get('start_timestamp');
+
+        }
+        $article->_setDirty($ts);
+        $article->_updateNotificationInfo($user, null, $ts);
+
+        // add acknowledgement
+        if (cb_at($properties, 'reserve_int1', null) == 1
+            && count($properties['acknowledgement_user_ids']) > 0
+        ) {
+            $article->setAcknowledgement($properties['acknowledgement_user_ids']);
+        }
+
+        $article->read($user, $ts, false);
+
+        // add maintainers and log information of maintainers
+        $article->setArticleOperator($row, $properties, $user, $category);
+
+        $row->onCreate($user);
+
+        $article->runHook('create');
+
+        if (FtsApplication::isAvailable()) {
+            $searchService = new IndexService();
+            $searchService->createArticleIndex($article);
+        }
+
+        return $article;
+    }
+
+    /**
+     * 記事を取得する
+     *
+     * @param  CB_User $user        閲覧ユーザー
+     * @param  string  $aid         記事ID
+     * @param  int     $acc_mode    アクセスモード
+     * @param  bool    $throw_error エラー発生フラグ
+     * @param  int     $lock_mode   DBロックモード
+     *
+     * @return GRN_Bulletin_Article or FALSE
+     */
+    function getArticle(
+        $user,
+        $aid,
+        $acc_mode = GRN_BULLETIN_ACCESS_R,
+        $throw_error = true,
+        $lock_mode = CB_DATABASE_DEFAULT_LOCK
+    ) {
+        $db = $this->_tab_article->getDBConnection();
+        $aid = $db->escape($aid);
+
+        $this->_tab_article->setLock($lock_mode);
+        $row = $this->_tab_article->getRow($aid);
+        if ( ! ($row)) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $factory = GRN_Bulletin_ArticleFactory::getInstance();
+
+        $article = $factory->row2object($row);
+
+        if ( ! $article->access($user, $acc_mode, $throw_error)) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        return $article;
+    }
+
+    /**
+     * @param string $aid Article ID
+     *
+     * @return bool|GRN_Bulletin_Article
+     */
+    function getArticleWithoutAccessCheck($aid)
+    {
+        $db = $this->_tab_article->getDBConnection();
+        $aid = $db->escape($aid);
+
+        $this->_tab_article->setLock(CB_DATABASE_DEFAULT_LOCK);
+        $row = $this->_tab_article->getRow($aid);
+        if ( ! ($row)) {
+            return false;
+        }
+
+        $factory = GRN_Bulletin_ArticleFactory::getInstance();
+        $article = $factory->row2object($row);
+
+        return $article;
+    }
+
+    /**
+     * カテゴリ内の記事を取得する
+     *
+     * @param GRN_Bulletin_Category $category カテゴリ
+     * @param integer               $id       記事ID
+     *
+     * @return object GRN_Bulletin_Article
+     */
+    function getCategoryArticle($category, $id)
+    {
+        if ( ! $category) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        $row = $this->_tab_article->getRow($id);
+        /* @var GRN_Bulletin_ArticleEntity $row */
+
+        if ( ! $row) {
+            $ret = null;
+
+            return $ret;
+        }
+        if ($category->getOID() != $row->getId('category')) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        $factory = GRN_Bulletin_ArticleFactory::getInstance();
+
+        $ret = $factory->row2object($row);
+
+        return $ret;
+    }
+
+    /**
+     * @param CB_User               $user
+     * @param GRN_Bulletin_Category $category
+     * @param int                   $limit
+     *
+     * @return bool
+     */
+    function deleteCategoryArticles($user, $category, $limit = -1)
+    {
+        if ( ! $category) {
+            return false;
+        }
+
+        require_once('bulletin/article_condition.csp');
+
+        $rowset = new CB_RowSet($this->_tab_article);
+
+        $conditions = [];
+        $conditions[] = $rowset->queryf("_id != '@S'",
+            GRN_BULLETIN_NULL_OBJECT_ID);
+        $conditions[] = grn_bulletin_make_category_condition(null,
+            $category->getOID());
+
+        $rowset->addCondition(implode(' AND ', $conditions));
+        $rowset->addOrderColumn('col_ntime', true);
+        $rowset->addOrderColumn(null, true);
+
+        $count = null;
+        if ($limit > 0) {
+            $rowset->limit(0, $limit + 1);
+            $count = 0;
+        }
+
+        $factory = GRN_Bulletin_ArticleFactory::getInstance();
+
+        while ( ! is_null(($row = $rowset->iterate()))) {
+            if ( ! is_null($count)) {
+                if (++$count > $limit) {
+                    break;
+                }
+            }
+            $factory->_delete($row->getOID());
+            $article = new GRN_Bulletin_Article($row);
+            $article->delete($user);
+            unset($article);
+        }
+        $rowset->destroy();
+
+        return true;
+    }
+
+    /**
+     * カテゴリ内の記事数を取得する
+     *
+     * @param GRN_Bulletin_Category $category  カテゴリ
+     * @param bool                  $published 公開されているものに限る場合はTRUE
+     * @param bool                  $expired   期限切れを含める場合はTRUE
+     *
+     * @return integer
+     */
+    function getNumArticles($category, $published = true, $expired = true)
+    {
+        if ( ! $category) {
+            return 0;
+        }
+
+        require_once('bulletin/article_condition.csp');
+
+        $rowset = new CB_RowSet($this->_tab_article);
+
+        $conditions = [];
+        $conditions[] = $rowset->queryf("_id != '@S'",
+            GRN_BULLETIN_NULL_OBJECT_ID);
+
+        if ($category) {
+            $conditions[] = grn_bulletin_make_category_condition(null,
+                $category->getOID());
+        }
+
+        if ($published) {
+            if ($expired) {
+                $conditions[] = grn_bulletin_make_published_condition(null,
+                    null, false);
+            } else {
+                $conditions[] = grn_bulletin_make_published_condition(null,
+                    null, true);
+            }
+        } else {
+            if ( ! $expired) {
+                $conditions[] = grn_bulletin_make_not_expired_condition(null);
+            }
+        }
+
+        if (count($conditions) > 0) {
+            $rowset->addCondition(implode(' AND ', $conditions));
+        }
+
+
+        $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+        $result = $rowset->iterate();
+        $rowset->destroy();
+
+        return $result['count'];
+    }
+}

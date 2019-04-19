@@ -1,0 +1,3 @@
+{capture assign='cancel_button'}{grn_button_cancel page='system/application/external_access_detail'}{/capture}
+{include file='system/application/_ip_address_csv_columns.tpl'}
+{include file='grn/std_import2.tpl' config_id='system' app_id='application' prev_page='system/application/ip_address_import1' post_page='system/application/command_ip_address_import2' column_explanation=$smarty.capture.explanation limit_number_ip='TRUE'}

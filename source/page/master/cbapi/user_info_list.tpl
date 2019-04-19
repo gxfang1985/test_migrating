@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="{$encoding}"?>
+<methodResponse>
+  <params>
+    <param>
+      <value>
+        <struct>
+          <member>
+            <name>apiver</name>
+            <value><double>{$api_ver}</double></value>
+          </member>
+{if $users}
+          <member>
+            <name>user_list</name>
+            <value>
+              <array>
+                <data>
+{foreach from=$users key=uid item=user}
+                  <value>
+                    <struct>
+                      <member>
+                        <name>userid</name>
+                        <value><string>{$uid}</string></value>
+                      </member>
+                      <member>
+                        <name>username</name>
+                        <value><string>{$user.name|escape}</string></value>
+                      </member>
+                      <member>
+                        <name>username_kana</name>
+                        <value><string>{$user.kana|escape}</string></value>
+                      </member>
+                      <member>
+                        <name>loginid</name>
+                        <value><string>{$user.login|escape}</string></value>
+                      </member>
+                      <member>
+                        <name>groupid</name>
+                        <value><string>{$user.gid|escape}</string></value>
+                      </member>
+                      <member>
+                        <name>groupname</name>
+                        <value><string>{$user.group_name|escape}</string></value>
+                      </member>
+                      <member>
+                        <name>state</name>
+                        <value><int>{$user.state}</int></value>
+                      </member>
+                      <member>
+                        <name>order</name>
+                        <value><int>{$user.order}</int></value>
+                      </member>
+                    </struct>
+                  </value>
+{/foreach}
+                </data>
+              </array>
+            </value>
+          </member>
+{/if}
+        </struct>
+      </value>
+    </param>
+  </params>
+</methodResponse>

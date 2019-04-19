@@ -1,0 +1,173 @@
+<?php
+
+use grn\fts\Application as FtsApplication;
+use grn\fts\cabinet\IndexService;
+
+/*
+* Created on 2007-03-23
+*
+* ファイル管理更新機能
+* 
+* ■受信データ仕様 
+* 名前       | 必須 |   値    | 個数 | 備考
+* ----------------------------|------------------------------------------------------------------------
+* fid        |  ○  | 数値    |  1   | ファイルID
+* newfile    |  ○  | ファイル|  1   | ファイル ( ファイルサイズはシステム管理設定により変動)
+* comment    |  ×  | 文字列  |  1   | 更新コメント
+* registrant |  ×  | 文字列  |  1   | 更新者 のログインアカウント
+*            |      |         |      | →coopLogin.cspにて、LoginAsを行う
+* app        |  ○  | 固定値  |  1   | "cabinet"
+*            |      |         |      | →coopLogin.cspにて、各アプリケーションオブジェクトの生成時使用*
+* ■機能
+* ・ファイル管理上のファイルを更新する (ファイルの実体 と更新コメント )
+* ・[受信データ]を受取り、指定されたファイルIDのファイルを更新する
+* ・以下のシステム設定値については、以下判定を行うものとする
+*   ファイルのサイズ制限            →サイズを超える場合は、エラー (GRN_CMMN_00201)  
+*   ロック機能、ロックをかける期間  →ロック機能有効＆＆ロック状態 であれば 更新しない && エラー (GRN_CMMN_00202 )  
+*                                     ★注意★ 更新者自身がロックしている場合も、エラー(GRN_CMMN_0202) とする
+*   フォルダに対するアクセス権      →フォルダに対する書込権限がない場合はエラー (GRN_CBNT_17009 ) 
+*  cabinet/command_upload（アップロード)
+*  cabinet/lock (ロック処理)
+*/
+
+global $G_INPUT;
+global $_FILE;
+
+// coopLogin.cspのファイル存在
+if ( ! is_file('coopLogin.csp')) {
+    global $G_state_set;
+    $G_state_set->set('copyright_should_be_written', false);
+    $G_state_set->set('html_should_be_closed', false);
+
+    include_once("error_code.csp");
+
+    header("X-Cybozu-Error:" . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Header Data><CR><LF>");
+    print("1," . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Footer Data><CR><LF>");
+    print("ERROR<CR><LF>");
+    cb_safe_exit();
+}
+
+//ログイン認証
+require('coopLogin.csp');
+unset($uum);
+
+
+// 受信データチェック////////////////////
+$error_msg = null;
+
+if ( ! array_key_exists('fid', $G_INPUT) || ! is_numeric($G_INPUT['fid'])) {
+    $error_msg = 'fid';
+} elseif ( ! array_key_exists('newfile', $_FILES)) {
+    $error_msg = 'newfile';
+}
+
+if ($error_msg) {
+    include_once("error_code.csp");
+    api_response_data(null, E_API_CABINET_PARAM_WRONG . "[" . $error_msg . "]");
+    cb_safe_exit();
+}
+unset($error_msg);
+
+// 任意パラムの空セット
+if ( ! array_key_exists('comment', $G_INPUT)) {
+    $G_INPUT['comment'] = "";
+}
+
+/////////////////////////////////////////
+
+
+// 2007.04.23 アクセス権メッセージが不正な箇所が存在する 不具合管理(238)
+// ファイル取得
+/** @var $G_application GRN_Cabinet */
+if ( ! ($file =& $G_application->getFile($G_login, $G_INPUT['fid'],
+    GRN_CABINET_ACCESS_R))
+) {
+    cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+}
+if ( ! ($file =& $G_application->getFile($G_login, $G_INPUT['fid'],
+    GRN_CABINET_ACCESS_W))
+) {
+    cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+}
+
+//start 2008/01/15 G2.5対応 
+//不具合№286対応 ファイル情報取得で、ファイルID 1 指定時のエラー不正
+if ( ! $folder =& $G_application->getFileFolder($file)) {
+    cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+}
+//ゴミ箱ファイルを省く
+if ($file->isInTrash())       // Huy added
+{
+    cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+}
+//end 2008/01/15 G2.5対応
+
+// Uploadファイルのチェック
+if ($_FILES['newfile']['error'] != UPLOAD_ERR_OK) {
+    cb_throw_error(E_GRN_FILE_UPLOAD);
+}
+
+// システム設定のファイルロックが有効ならばファイルロックする
+require_once('grn/ui.csp');
+$uim = GRN_UIConfigManager::getInstance();
+$uisysconf =& $uim->getSystemConfig();
+
+if ($uisysconf->getFileLockable()) {
+    $lock =& $file->getLockObject();
+
+    // 非ロックの場合
+    if ($lock->isLocked() == 0) {
+        // ファイルをロック
+        $lock->acquireLock();
+
+        // ロック済み(他ユーザ、自身含む)
+    } else {
+        require_once('grn/error_code.csp');
+        cb_throw_error(E_GRN_FILE_LOCKED);
+    }
+}
+
+$file->update($G_login, $_FILES['newfile'], $G_INPUT['comment']);
+if (FtsApplication::isAvailable()) {
+    $searchService = new IndexService();
+    $searchService->updateFileIndex($file);
+}
+
+//Write log: update file
+require_once('cabinet/inspection.csp');
+$inspection = GRN_Cabinet_Inspection::getInstance();
+//start 2008/01/15 G2.5対応
+$inspection->writeLogFile('update', $file, $folder->getOID());
+//end 2008/01/15 G2.5対応
+
+//$title = $file->getTitle();
+//if(strlen($title) === 0 ){
+//    $title = $_FILES['newfile']['name'];
+//}
+//
+//if( ($ver = $file->getMaxVersion() ) == GRN_CABINET_UNLIMITED_VERSION ){
+//    $ver = GRN_CABINET_STR_UNLIMITED_VERSION;
+//}
+//
+//$max_version = '(max_version:'.$ver.')';
+//
+//$folder =& $G_application->getFileFolder($file);
+//
+//$param = array('info'=>array($_FILES['newfile']['name'],
+//                             $title,
+//                             $max_version),
+//               'ids' =>array('hid'=>$folder->getOID(),
+//                             'fid'=>$file->getOID()));
+//
+//$inspection->record('update_file', $param);
+
+// ロックの解除
+$lock =& $file->getLockObject();
+$lock->releaseLock();
+
+//ファイルIDを戻す
+api_response_data($file->getOID());
+
+

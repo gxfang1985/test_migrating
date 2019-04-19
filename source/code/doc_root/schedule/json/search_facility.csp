@@ -1,0 +1,211 @@
+<?php
+
+use grn\grn\JSONResponse;
+
+if (strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST') != 0) {
+    cb_safe_exit();
+} // for javascript hijacking
+
+global $G_state_set;
+$G_state_set->set('copyright_should_be_written', false);
+$G_state_set->set('html_should_be_closed', false);
+
+global $G_container_base;
+$uum = $G_container_base->getInstance('uum');
+$login = $uum->getLoginUser();
+$dynamic_roles = $uum->listGrantedRoles();
+
+require_once('schedule/facility_system_logic.csp');
+$fsl = GRN_Facility_SystemLogic::getInstance();
+
+require_once('schedule/access_logic.csp');
+$acc = GRN_Schedule_Access_Logic::getInstance();
+
+//--- add VCBSCH0010 ---s
+// V-CUBEシステムが利用可能かを取得する。
+require_once('schedule/netmeeting_system_logic.csp');
+$netmeeting_system_logic = GRN_Netmeeting_SystemLogic::getInstance();
+$netmeeting_system_available
+    = $netmeeting_system_logic->getNetmeetingAvailable();
+//--- add VCBSCH0010 ---e
+
+$search_text = cb_at($G_INPUT, 'search_text');
+$page_name = cb_at($G_INPUT, 'page_name');
+$is_ancestors_path_string = cb_at($G_INPUT, 'is_ancestors_path_string')
+                            === "true";
+$facilities_info = $fsl->searchFacilitiesInfo($search_text);
+
+if ($page_name == 'schedule/portlet/set_personal_day/system'
+    || $page_name == 'schedule/portlet/set_personal_week/system'
+    || $page_name == 'schedule/portlet/set_personal_month/system'
+) // ポートレットの設定画面からのアクセスの場合は、アクセス権評価をしない
+{
+    $evaluated = $facilities_info;
+} else {
+    require_once('schedule/facility_privilege.csp');
+    $facility_privilege = GRN_Facility_Privilege_Logic::getInstance();
+    $priv_facilities
+        = $facility_privilege->getFacilitiesWithAuthority($login);
+
+    $access_list = [];
+    $lax_evaluate = false;
+    if (array_search($page_name, ['schedule/add', 'schedule/repeat_add'])
+        !== false
+    ) {
+        $access_list[] = 'add';
+    } elseif (array_search($page_name,
+            ['schedule/modify', 'schedule/repeat_modify']) !== false
+    ) {
+        $access_list = ['read', 'add', 'modify'];
+        $lax_evaluate = true;
+    } else {
+        $access_list[] = 'read';
+    }
+
+
+    require_once('schedule/facility_tree.csp');
+    $util = GRN_OrgTreeUtil::getInstance();
+    if ($page_name == 'schedule/repeat_add'
+        || $page_name == 'schedule/repeat_modify'
+    ) {
+        // 繰り返し予定の登録、変更画面では、施設を含む予定の繰り返し予定が許可されていない場合、
+        // 運用管理権限がある施設のみ表示する
+        // GTM-1676
+        $checkRepeatAndApproval
+            = $fsl->getSettingsOfFacilities(array_keys($facilities_info),
+            ['approval', 'regulary']);
+        foreach (array_keys($facilities_info) as $faid) {
+            if ( ! $checkRepeatAndApproval[$faid]['regulary']
+                 && ! array_key_exists($faid, $priv_facilities)
+            ) {
+                unset($facilities_info[$faid]);
+                //--- add VCBSCH0010 ---s
+            } // V-CUBEシステムが利用可能で施設がV-CUBE連携対象の場合、対象施設を表示しない。
+            elseif (($netmeeting_system_available == 1)
+                    && ($facilities_info[$faid]['col_netmeeting_available']
+                        == 1)
+            ) {
+                unset($facilities_info[$faid]);
+                //--- add VCBSCH0010 ---e
+            } // GTM-1676
+            elseif ($checkRepeatAndApproval[$faid]['approval']) {
+                unset($facilities_info[$faid]);
+            }
+            //end GTM-1676
+        }
+    }
+    //--- add VCBSCH0010 ---s
+    // 予定の調整の場合
+    elseif ($page_name == 'schedule/adjust_search') {
+        foreach (array_keys($facilities_info) as $faid) {
+            // V-CUBEシステムが利用可能で施設がV-CUBE連携対象の場合、対象施設を表示しない。
+            if (($netmeeting_system_available == 1)
+                && ($facilities_info[$faid]['col_netmeeting_available'] == 1)
+            ) {
+                unset($facilities_info[$faid]);
+            }
+        }
+    }
+    //--- add VCBSCH0010 ---e
+
+    // アクセス権の評価
+    $evaluated = $acc->evaluateAccessesById($login, $facilities_info,
+        $access_list, $dynamic_roles, 'facility', false, $lax_evaluate);
+    // GTM-1676
+    $checkRepeatAndApproval
+        = $fsl->getSettingsOfFacilities(array_keys($facilities_info),
+        ['approval', 'regulary']);
+    foreach (array_keys($evaluated) as $eid) {
+        $evaluated[$eid]['checkrepeat']
+            = ($checkRepeatAndApproval[$eid]['regulary']
+               || array_key_exists($eid, $priv_facilities)) ? 1 : 0;
+        // GTM-1676
+        $evaluated[$eid]['approval_facility']
+            = $checkRepeatAndApproval[$eid]['approval'];
+        // end GTM-1676
+    }
+}
+
+$facility_id_list = [];
+foreach ($evaluated as $f) {
+    $facility_id_list[] = $f['_id'];
+}
+
+$fg_map = $fsl->getFacilityGroupRelation($facility_id_list);
+
+$groups = [];
+foreach ($fg_map as $f) {
+    if ( ! is_null($f)) {
+        $groups[$f] = $f;
+    }
+}
+
+$ancestors = $fsl->getAncestors($groups);
+$all_facilities = [];
+foreach ($ancestors as $ancestor) {
+    foreach ($ancestor as $i) {
+        $all_facilities[$i] = $i;
+    }
+}
+$all_facilities_info = $fsl->getFacilityGroupsInfo($all_facilities);
+
+foreach ($evaluated as $key => $f) {
+    $group_id = $fg_map[$f['_id']];
+    $evaluated[$key]['ancestors'] = [];
+    if (is_null($group_id)) {
+        continue;
+    }
+    foreach (array_reverse($ancestors[$group_id]) as $i) {
+        $evaluated[$key]['ancestors'][] = $all_facilities_info[$i];
+    }
+}
+
+/**
+ * This function creates data for json_encode.
+ * The json is almost same as a json which is created by schedule/json/facility.tpl.
+ * The different point is that schedule/json/facility.tpl creates invalid JSON data.
+ *
+ * @param array   $facility_list
+ * @param boolean $is_ancestors_path_string
+ *
+ * @return array
+ */
+$func_create_json_data = function ($facility_list, $is_ancestors_path_string) {
+    $list = [];
+    foreach ($facility_list as $facility) {
+        $data = [
+            'id'       => (string)$facility['_id'],
+            'name'     => (string)$facility['col_name'],
+            'code'     => (string)$facility['col_foreign_key'],
+            'repeat'   => (string)cb_at($facility, 'checkrepeat', ''),
+            'approval' => (string)cb_at($facility, 'approval_facility', ''),
+        ];
+
+        if ($is_ancestors_path_string) {
+            $ancestors = [];
+            foreach ($facility['ancestors'] as $ancestor) {
+                $ancestors[] = (string)$ancestor['col_name'];
+            }
+            $data['ancestors'] = join($ancestors, " > ");
+        } else {
+            $data['ancestors'] = [];
+            foreach ($facility['ancestors'] as $ancestor) {
+                $data['ancestors'][] = [
+                    'id'   => (string)$ancestor['_id'],
+                    'name' => (string)$ancestor['col_name'],
+                    'code' => (string)$ancestor['col_foreign_key']
+                ];
+            }
+        }
+        $list[] = $data;
+    }
+
+    return $list;
+};
+
+$json = JSONResponse::create();
+$json->response(
+    $func_create_json_data($evaluated, $is_ancestors_path_string), true,
+    JSONResponse::JSON_HEADER,
+    JSONResponse::ENCODE_OPTION & ~JSON_FORCE_OBJECT
+);

@@ -1,0 +1,196 @@
+<?php
+
+// GET/POSTされたパラメータを取得する
+if (array_key_exists('charset', $G_INPUT)) {
+    $charset = $G_INPUT['charset'];
+}
+if (0 == strlen($charset)) {
+    global $G_config_common;
+    $charset = $G_config_common->get('I18N', 'default_external_encoding');
+}
+$title = false;
+if (array_key_exists('item_name', $G_INPUT)) {
+    $title = $G_INPUT['item_name'];
+}
+$filename = null;
+if (array_key_exists('filename', $G_INPUT)) {
+    $filename = $G_INPUT['filename'];
+}
+if (0 == strlen($filename)) {
+    $filename = 'address.csv';
+}
+
+// アドレス帳を取得する
+require_once('address/application.csp');
+$app_locator = GRN_ApplicationLocator::instance();
+/** @var GRN_Address_Application $app */
+$app =& $app_locator->getInstance(GRN_ADDRESS_APPLICATION_ID);
+if ( ! is_object($app) || ! is_a($app, 'GRN_Address_Application')) {
+    cb_throw_error(E_GRN_APPLICATION_NOT_AVAILABLE);
+}
+$book_manager =& $app->getBookManager();
+
+// ログインユーザーを取得する
+global $G_container_base;
+$uum =& $G_container_base->getInstance('uum');
+$login =& $uum->getLoginUser();
+if ( ! is_object($login) || ! is_a($login, 'CB_User')) {
+    cb_throw_error(E_GRN_USER_NOT_FOUND);
+}
+$login_id = $login->getOID();
+
+// 使用権限を取得する
+require_once('address/access.csp');
+$access_manager = GRN_Address_AccessManager::getInstance();
+if ( ! ($row =& $access_manager->getAbstractData(GRN_ADDRESS_AVAILABLE))) {
+    assert('FALSE');
+}
+
+// ダイナミックロールを取得する
+$dynamic_roles = $uum->listGrantedRoles();
+
+// 個人アドレス帳の使用権限を評価する
+$authorities = ['private_address'];
+$security_model = $access_manager->getSecurityModel($row);
+$access = $access_manager->evaluateAccess($row, $login, $dynamic_roles,
+    $authorities, $security_model);
+if ( ! $access_manager->isAllowedAccess($access, $authorities,
+    $security_model)
+) {
+    cb_throw_error(E_GRN_ADDRESS_ACCESS_DENY_PRIVATE_ADDRESS);
+}
+
+// 個人アドレスブックを取得する
+if ( ! ($book =& $book_manager->getPrivateAddressBookByUserid($login_id))) {
+    if ( ! ($book =& $book_manager->addPrivateAddressBook('cyde', $login_id,
+        []))
+    ) {
+        cb_throw_error(E_GRN_ADDRESS_PRIVATE_ADDRESS_BOOK_NOT_FOUND);
+    }
+}
+
+// 組み込み項目情報一覧を取得する
+require_once('address/view_util.csp');
+$view_util = GRN_Address_ViewUtil::getInstance();
+$builtin_items = $view_util->listBuiltinItems($book, false);
+
+// 名と姓と名（よみ）と姓（よみ）を除外する
+$builtin_item = $builtin_items['personal_name'];
+if ( ! $builtin_item['use']) {
+    unset($builtin_items['family_name']);
+    unset($builtin_items['given_name']);
+}
+$builtin_item = $builtin_items['personal_sort_key'];
+if ( ! $builtin_item['use']) {
+    unset($builtin_items['family_sort_key']);
+    unset($builtin_items['given_sort_key']);
+}
+// 所要時間と片道運賃を除外する
+$builtin_item = $builtin_items['route'];
+if (isset($builtin_items['route_detail'])) {
+    $builtin_items['route']['display_name']
+        = $builtin_items['route_detail']['display_name'];
+}
+unset($builtin_items['route_detail']);
+if ( ! $builtin_item['use']) {
+    unset($builtin_items['route_time']);
+    unset($builtin_items['route_fare']);
+}
+
+// 個人名、個人名（よみ）、地図、画像を除外する
+unset($builtin_items['personal_name']);
+unset($builtin_items['personal_sort_key']);
+unset($builtin_items['map']);
+unset($builtin_items['image']);
+
+// 使用しない項目を除外する
+foreach (array_keys($builtin_items) as $item_id) {
+    $builtin_item = $builtin_items[$item_id];
+    if ( ! $builtin_item['use']
+         || GRN_ADDRESS_ITEM_FILE == $builtin_item['type']
+    ) {
+        unset($builtin_items[$item_id]);
+    }
+}
+
+// カスタマイズ項目情報一覧を取得する
+$extended_items = $view_util->listExtendedItems($book);
+
+// 項目タイプがファイル、使用しない項目を除外する
+foreach (array_keys($extended_items) as $item_id) {
+    $extended_item = $extended_items[$item_id];
+    if ( ! $extended_item['use']
+         || GRN_ADDRESS_ITEM_FILE == $extended_item['type']
+    ) {
+        unset($extended_items[$item_id]);
+    }
+}
+
+cb_prepare_download($filename, 'application/csv', false);
+require_once('fw/csv.csp');
+$csv = new CB_CSVWriter($charset);
+
+// 項目名を書き出す
+if ($title) {
+    $line = [];
+    foreach ($builtin_items as $builtin_item) {
+        $line[] = $builtin_item['display_name'];
+    }
+    foreach ($extended_items as $extended_item) {
+        $line[] = $extended_item['display_name'];
+    }
+    $csv->writeLine($line);
+}
+
+// アドレス一覧を書き出す
+$limit = 10;
+$offset = 0;
+
+while (true) {
+    $datas = $book->listDatas_nocache($offset, $limit);
+    if (count($datas) === 0) {
+        break;
+    }
+
+    foreach (array_keys($datas) as $data_id) {
+        $data =& $datas[$data_id];
+        $data_for_view = $data->getProperties();
+
+        $line = [];
+        foreach ($builtin_items as $builtin_item) {
+            $id = $builtin_item['id'];
+
+            if (array_key_exists($id, $data_for_view)) {
+                $line[] = $data_for_view[$id];
+            } else {
+                $line[] = null;
+            }
+        }
+        foreach ($extended_items as $extended_item) {
+            $id = $extended_item['oid'];
+
+            if (array_key_exists($id, $data_for_view)) {
+                $line[] = $data_for_view[$id];
+            } else {
+                $line[] = null;
+            }
+        }
+        $csv->writeLine($line);
+    }
+
+    $offset = $offset + $limit;
+}
+
+$csv->close();
+
+// 監査する
+require_once('address/inspection.csp');
+$inspection = GRN_Address_Inspection::getInstance();
+if ($inspection->isEnabled()) {
+    $section = GRN_ADDRESS_INSPECTION_EXPORT;
+    $message = GRN_ADDRESS_INSPECTION_PRIVATE_ADDRESS_BOOK;
+
+    $inspection->record($section, $message);
+}
+
+

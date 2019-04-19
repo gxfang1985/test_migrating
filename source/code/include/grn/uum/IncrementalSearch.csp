@@ -1,0 +1,259 @@
+<?php
+declare(strict_types=1);
+
+namespace grn\grn\uum;
+
+require_once('grn/uum_util_search.csp');
+require_once('grn/application.csp');
+
+use grn\grn\MemberLogic;
+use GRN_UumUtil_Search;
+
+class IncrementalSearch
+{
+    CONST DEFAULT_ITEM_PER_PAGE = 20;
+
+    /** @var   string $keyword Keyword to search */
+    private $keyword;
+
+    /** @var int $limit The maximum number of items will be returned */
+    private $limit = self::DEFAULT_ITEM_PER_PAGE;
+
+    /** @var array Search type. Default search user, org, role */
+    private $searchType
+        = [
+            MemberLogic::TYPE_USER,
+            MemberLogic::TYPE_ORGANIZATION,
+            MemberLogic::TYPE_STATIC_ROLE
+        ];
+
+    /**
+     * @var accessPlugin
+     */
+    private $accessPlugin = null;
+
+    public function setKeyword(string $keyword)
+    {
+        $this->keyword = $keyword;
+    }
+
+    public function getKeyword(): string
+    {
+        return $this->keyword;
+    }
+
+    public function setLimit(int $limit)
+    {
+        $this->limit = $limit;
+    }
+
+    public function getLimit(): int
+    {
+        return $this->limit;
+    }
+
+    public function setAccessPlugin(AccessPlugin $access_plugin = null)
+    {
+        $this->accessPlugin = $access_plugin;
+    }
+
+    /**
+     * @return AccessPlugin|NULL
+     */
+    public function getAccessPlugin()
+    {
+        return $this->accessPlugin;
+    }
+
+    public function setSearchType(array $searchType)
+    {
+        $this->searchType = $searchType;
+    }
+
+    public function getSearchType(): array
+    {
+        return $this->searchType;
+    }
+
+    /**
+     * @var array $plugin_data Params in the following format [name => data, [params] => data].
+     *            "params" can be specified by the application. e.g. [app_id => data, space_id => 1, foo => 2]
+     */
+    public function createAccessPlugin(array $plugin_data = [])
+    {
+        if (is_array($plugin_data) && isset($plugin_data['name']) && isset($plugin_data['params'])) {
+            if ( ! isset($plugin_data['params']['target']) || ! is_array($plugin_data['params']['target'])) {
+                $plugin_data['params']['target'] = [MemberLogic::TYPE_USER];
+            } elseif ( ! in_array(MemberLogic::TYPE_USER, $plugin_data['params']['target'])) {
+                $plugin_data['params']['target'][] = MemberLogic::TYPE_USER;
+            }
+
+            $loader = new \CB_PluginLoader('grn.common.user.select');
+            $access_plugin = new AccessPlugin($loader->loadDriver($plugin_data['name']), $plugin_data['params']);
+            $this->setAccessPlugin($access_plugin);
+        }
+    }
+
+    /**
+     * Search member by keyword
+     *
+     * @return array Member list
+     */
+    public function search(): array
+    {
+        $data = [];
+        if ( ! is_string($this->keyword) || mb_strlen($this->keyword) < 1) {
+            return $data;
+        }
+
+        // Search User
+        $this->searchAndMergeResult($data, MemberLogic::TYPE_USER);
+
+        // Search ORG
+        $this->searchAndMergeResult($data, MemberLogic::TYPE_ORGANIZATION);
+
+        // Search ROLE
+        $this->searchAndMergeResult($data, MemberLogic::TYPE_STATIC_ROLE);
+
+        return array_values($data);
+    }
+
+    /**
+     * Search and merge result
+     *
+     * @param array  $result data after merged
+     * @param string $type   Type of member
+     *
+     */
+    protected function searchAndMergeResult(&$result, string $type)
+    {
+        if (in_array($type, $this->searchType)
+            && count($result) < $this->limit
+        ) {
+            $limit = $this->limit - count($result);
+            $data = [];
+            switch ($type) {
+                case MemberLogic::TYPE_USER:
+                    $data = $this->searchUsers($limit);
+                    break;
+                case MemberLogic::TYPE_ORGANIZATION:
+                    $data = $this->searchGroups($limit);
+                    break;
+                case MemberLogic::TYPE_STATIC_ROLE:
+                    $data = $this->searchRoles($limit);
+                    break;
+            }
+
+            $result = array_merge($result, $data);
+
+            if (count($result) > $this->limit) {
+                $result = array_slice($result, 0, $this->limit, true);
+            }
+        }
+    }
+
+    /**
+     * Search Users by keyword
+     *
+     * @param int $limit
+     *
+     * @return array
+     */
+    protected function searchUsers(int $limit): array
+    {
+        $uum_util = GRN_UumUtil_Search::getInstance();
+        $users = $uum_util->searchUsersInfoExtend($this->keyword, $limit,
+            $this->getAccessPlugin());
+
+        return $users;
+    }
+
+    /**
+     * Search Groups (Organization)
+     *
+     * @param int $limit
+     *
+     * @return array group list
+     */
+    protected function searchGroups(int $limit): array
+    {
+        $uum_util = GRN_UumUtil_Search::getInstance();
+        $org_list = $uum_util->searchOrganization($this->keyword, $limit,
+            $this->getAccessPlugin());
+        $data = [];
+        foreach ($org_list as $org) {
+            $data[$org['_id']] = $this->formatMember($org,
+                MemberLogic::TYPE_ORGANIZATION);
+        }
+
+        return $data;
+    }
+
+    /**
+     * Search Role
+     *
+     * @param int $limit
+     *
+     * @return array role list
+     */
+    protected function searchRoles(int $limit): array
+    {
+        require_once('grn/system_logic.csp');
+        $system = \GRN_System::getInstance();
+        if ( ! $system->getPermissionToSelectRole()) {
+            return [];
+        }
+        $uum_util = GRN_UumUtil_Search::getInstance();
+        $roles = $uum_util->searchStaticRole($this->keyword, 0, $limit, 'OR',
+            $this->getAccessPlugin());
+        $result = [];
+        foreach ($roles as $role) {
+            if ($role['rid'] == MemberLogic::ADMIN_ROLE_ID) {
+                continue;
+            }
+            $role['_id'] = $role['rid'];
+            $role['col_foreign_key'] = $role['foreign_key'];
+            $role['col_display_name'] = $role['foreign_key'];
+            $result[$role['rid']] = $this->formatMember($role,
+                MemberLogic::TYPE_STATIC_ROLE);
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param array  $member
+     * @param string $type
+     *
+     * @return array
+     */
+    private function formatMember(array $member, string $type): array
+    {
+        if ( ! $member) {
+            return [];
+        }
+        $result = [];
+        $result[MemberLogic::MEMBER_TYPE] = $type;
+        $result[MemberLogic::FOREIGN_KEY] = $member['col_foreign_key'];
+        $result[MemberLogic::IS_NOT_USING_APP] = isset($member["col_using_app"])
+            ? false : true;
+        $result[MemberLogic::DISPLAY_NAME] = $member['col_display_name'];
+        $result[MemberLogic::MEMBER_ID] = $member['_id'];
+        switch ($type) {
+            case MemberLogic::TYPE_USER:
+                $result[MemberLogic::IS_INVALID_USER]
+                    = isset($member["col_valid"])
+                    ? true : false;
+                $result[MemberLogic::IS_LOGIN_USER] = $user_info['logged_in'] ??
+                                                      false;
+                $result[MemberLogic::MEMBER_URL]
+                    = $member[MemberLogic::MEMBER_URL];
+                $result[MemberLogic::IMAGE]
+                    = $member[MemberLogic::IMAGE];
+                break;
+        }
+
+        return $result;
+    }
+
+}

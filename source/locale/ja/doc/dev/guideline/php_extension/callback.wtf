@@ -1,0 +1,296 @@
+[[PHPでの構文|section:php_syntax]]
+[[src]]
+<?php
+
+    {{// 関数コールバック}}
+    call_user_func("show", "hata", "yamamoto");                              {{//「hata, yamamoto」}}
+    call_user_func_array("show", array("hata", "yamamoto"));                 {{//「hata, yamamoto」}}
+
+    function show($arg1, $arg2)
+    {
+        print("$arg1, $arg2");
+    }
+
+    {{// クラスメソッドのコールバック}}
+    $obj = new framework;
+    call_user_func(array(&$obj, "show"), "hata", "yamamoto");                {{//「hata, yamamoto」}}
+    call_user_func_array(array(&$obj, "show"), array("hata", "yamamoto"));   {{//「hata, yamamoto」}}
+
+    class framework
+    {
+        function show($arg1, $arg2)
+        {
+            print("$arg1, $arg2");
+        }
+    }
+
+?>
+[[/src]]
+
+[[拡張モジュールの記述方法|section:ext_syntax]]
+[[src]]
+''コール側の記述列(hoge.csp)''
+
+<?php
+
+    hoge_callback_function("callback_function");      {{//「callback_function called」}}
+
+    function callback_function()
+    {
+        echo "callback_function called";
+    }
+?>
+[[/src]]
+[[src]]
+''モジュール側の記述例(hoge.c)''
+
+PHP_FUNCTION(hoge_callback_function)
+{
+    ...
+    zval* functionName;
+
+    {{// 文字列として取得してもいいが、call_user_functionのインターフェイスと合わせてzvalで取得する}}
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "z", &functionName) == FAILURE) {
+        return;
+    }
+    call_user_function(CG(function_table), NULL, functionName, return_value, 0, NULL, TSRMLS_C);
+}
+[[/src]]
+
+[[コールバック API|section:api]]
+[[html]]
+<table class=cb_data_list border="1">
+  <tr>
+    <th width=20%>マクロ</th>
+    <th width=40%>引数</th>
+    <th width=40%>概要</th>
+  </tr>
+  <tr>
+    <td>call_user_function</td>
+    <td>
+<table>
+<tr><td>HashTable *</td><td>関数テーブルへのポインタ<br>(CGマクロを利用してコンパイラグローバルテーブルからfunction_tableを取得する。)</td></tr>
+<tr><td>zval **</td><td>オブジェクトのポインタ<br>(クラスのメソッドをコールする際に設定する。グローバル関数の場合はNULLを設定する。)</td></tr>
+<tr><td>zval *</td><td>コールバック関数名</td></tr>
+<tr><td>zval *</td><td>コールバック関数の返り値</td></tr>
+<tr><td>int</td><td>パラメータ数</td></tr>
+<tr><td>zval **[]</td><td>パラメータ</td></tr>
+<tr><td></td><td><b>TSRMLS_CC</b><br>スレッドセーフにリソースを取得するために必要です。実体はPHP_FUNCTIONで自動的にわたされます。もしPHP_FUNCTION外で使用する場合は「TSRMLS_FETCH()」マクロを自分で呼び出して取得も可能です。</td></tr>
+</table>
+    </td>
+    <td>ユーザー指定の関数をコールするために使用する。</td>
+  </tr>
+</table>
+[[/html]]
+
+[[より詳しく知りたい方へ|section:tips]]
+
+[[src]]
+''(zend_API.c)''
+
+int call_user_function(HashTable *function_table, zval \**object_pp, zval *function_name, zval *retval_ptr, int param_count, zval *params[] TSRMLS_DC)
+{
+	zval \**\*params_array = (zval \**\*) emalloc(sizeof(zval \**)*param_count);
+	int i;
+	int ex_retval;
+	zval *local_retval_ptr;
+
+	for (i=0; i < param_count; i++) {
+		params_array[i] = &params[i];
+	}
+	ex_retval = call_user_function_ex(function_table, object_pp, function_name, &local_retval_ptr, param_count, params_array, 1, NULL TSRMLS_CC);
+	if (local_retval_ptr) {
+		COPY_PZVAL_TO_ZVAL(*retval_ptr, local_retval_ptr);
+	} else {
+		INIT_ZVAL(*retval_ptr);
+	}
+	efree(params_array);
+	return ex_retval;
+}
+
+int call_user_function_ex(HashTable *function_table, zval \**object_pp, zval *function_name, zval \**retval_ptr_ptr, int param_count, zval \**params[], int no_separation, HashTable *symbol_table TSRMLS_DC)
+{
+	int i;
+	zval \**original_return_value;
+	HashTable *calling_symbol_table;
+	zend_function_state *original_function_state_ptr;
+	zend_op_array *original_op_array;
+	zend_op \**original_opline_ptr;
+	int orig_free_op1, orig_free_op2;
+	int (*orig_unary_op)(zval *result, zval *op1);
+	int (*orig_binary_op)(zval *result, zval *op1, zval *op2 TSRMLS_DC);
+	zval function_name_copy;
+
+	zend_execute_data execute_data;
+
+	/* Initialize execute_data */
+	EX(fbc) = NULL;
+	EX(object).ptr = NULL;
+	EX(ce) = NULL;
+	EX(Ts) = NULL;
+	EX(op_array) = NULL;
+	EX(opline) = NULL;
+
+	*retval_ptr_ptr = NULL;
+
+	if (function_name->type==IS_ARRAY) { /* assume array($obj, $name) couple */
+		zval \**tmp_object_ptr, \**tmp_real_function_name;
+
+		if (zend_hash_index_find(function_name->value.ht, 0, (void \**) &tmp_object_ptr)==FAILURE) {
+			return FAILURE;
+		}
+		if (zend_hash_index_find(function_name->value.ht, 1, (void \**) &tmp_real_function_name)==FAILURE) {
+			return FAILURE;
+		}
+		function_name = *tmp_real_function_name;
+		SEPARATE_ZVAL_IF_NOT_REF(tmp_object_ptr);
+		object_pp = tmp_object_ptr;
+		(*object_pp)->is_ref = 1;
+	}
+
+	if (object_pp && !*object_pp) {
+		object_pp = NULL;
+	}
+	if (object_pp) {
+		if (Z_TYPE_PP(object_pp) == IS_OBJECT) {
+			function_table = &(*object_pp)->value.obj.ce->function_table;
+			EX(object).ptr = *object_pp;
+		} else if (Z_TYPE_PP(object_pp) == IS_STRING) {
+			zend_class_entry *ce;
+			char *lc_class;
+			int found;
+
+			lc_class = estrndup(Z_STRVAL_PP(object_pp), Z_STRLEN_PP(object_pp));
+			zend_str_tolower(lc_class, Z_STRLEN_PP(object_pp));
+			found = zend_hash_find(EG(class_table), lc_class, Z_STRLEN_PP(object_pp) + 1, (void \**) &ce);
+			efree(lc_class);
+			if (found == FAILURE)
+				return FAILURE;
+
+			function_table = &ce->function_table;
+			EX(ce) = ce;
+			object_pp = NULL;
+		} else
+			return FAILURE;
+	}
+
+	if (function_name->type!=IS_STRING) {
+		return FAILURE;
+	}
+
+	function_name_copy = *function_name;
+	zval_copy_ctor(&function_name_copy);
+	zend_str_tolower(function_name_copy.value.str.val, function_name_copy.value.str.len);
+
+	original_function_state_ptr = EG(function_state_ptr);
+	if (zend_hash_find(function_table, function_name_copy.value.str.val, function_name_copy.value.str.len+1, (void \**) &EX(function_state).function)==FAILURE) {
+		zval_dtor(&function_name_copy);
+		return FAILURE;
+	}
+	zval_dtor(&function_name_copy);
+
+	for (i=0; i<param_count; i++) {
+		zval *param;
+
+		if (EX(function_state).function->common.arg_types
+			&& i<EX(function_state).function->common.arg_types[0]
+			&& EX(function_state).function->common.arg_types[i+1]==BYREF_FORCE
+			&& !PZVAL_IS_REF(*params[i])) {
+			if ((*params[i])->refcount>1) {
+				zval *new_zval;
+
+				if (no_separation) {
+					return FAILURE;
+				}
+				ALLOC_ZVAL(new_zval);
+				*new_zval = \**params[i];
+				zval_copy_ctor(new_zval);
+				new_zval->refcount = 1;
+				(*params[i])->refcount--;
+				*params[i] = new_zval;
+			}
+			(*params[i])->refcount++;
+			(*params[i])->is_ref = 1;
+			param = *params[i];
+		} else if (*params[i] != &EG(uninitialized_zval)) {
+			(*params[i])->refcount++;
+			param = *params[i];
+		} else {
+			ALLOC_ZVAL(param);
+			*param = \**(params[i]);
+			INIT_PZVAL(param);
+		}
+		zend_ptr_stack_push(&EG(argument_stack), param);
+	}
+
+	zend_ptr_stack_n_push(&EG(argument_stack), 2, (void *) (long) param_count, NULL);
+
+	EG(function_state_ptr) = &EX(function_state);
+
+	EX(prev_execute_data) = EG(current_execute_data);
+	EG(current_execute_data) = &execute_data;
+
+	if (EX(function_state).function->type == ZEND_USER_FUNCTION) {
+		calling_symbol_table = EG(active_symbol_table);
+		if (symbol_table) {
+			EG(active_symbol_table) = symbol_table;
+		} else {
+			ALLOC_HASHTABLE(EG(active_symbol_table));
+			zend_hash_init(EG(active_symbol_table), 0, NULL, ZVAL_PTR_DTOR, 0);
+		}
+		if (object_pp) {
+			zval *dummy, \**this_ptr;
+				
+			ALLOC_ZVAL(dummy);
+			INIT_ZVAL(*dummy);	
+			zend_hash_update(EG(active_symbol_table), "this", sizeof("this"), &dummy, sizeof(zval *), (void \**) &this_ptr);
+			zend_assign_to_variable_reference(NULL, this_ptr, object_pp, NULL TSRMLS_CC);
+		}
+		original_return_value = EG(return_value_ptr_ptr);
+		original_op_array = EG(active_op_array);
+		EG(return_value_ptr_ptr) = retval_ptr_ptr;
+		EG(active_op_array) = (zend_op_array *) EX(function_state).function;
+		original_opline_ptr = EG(opline_ptr);
+		orig_free_op1 = EG(free_op1);
+		orig_free_op2 = EG(free_op2);
+		orig_unary_op = EG(unary_op);
+		orig_binary_op = EG(binary_op);
+		zend_execute(EG(active_op_array) TSRMLS_CC);
+		if (!symbol_table) {
+			zend_hash_destroy(EG(active_symbol_table));
+			FREE_HASHTABLE(EG(active_symbol_table));
+		}
+		EG(active_symbol_table) = calling_symbol_table;
+		EG(active_op_array) = original_op_array;
+		EG(return_value_ptr_ptr)=original_return_value;
+		EG(opline_ptr) = original_opline_ptr;
+		EG(free_op1) = orig_free_op1;
+		EG(free_op2) = orig_free_op2;
+		EG(unary_op) = orig_unary_op;
+		EG(binary_op) = orig_binary_op;
+	} else {
+		zend_op temp_op;
+		ALLOC_INIT_ZVAL(*retval_ptr_ptr);
+		temp_op.extended_value = param_count;
+		temp_op.result.u.var = 0;
+		temp_op.lineno = 0;
+
+		EX(opline) = &temp_op;
+		EX(Ts) = (temp_variable *) do_alloca(sizeof(temp_variable)*1);
+		EX(Ts)[EX(opline)->result.u.var].var.ptr = *retval_ptr_ptr;
+
+		if (!zend_execute_internal) {
+			((zend_internal_function *) EX(function_state).function)->handler(EX(opline)->extended_value, EX(Ts)[EX(opline)->result.u.var].var.ptr, EX(object).ptr, 1 TSRMLS_CC);
+		} else {
+			zend_execute_internal(&execute_data, 1 TSRMLS_CC);
+		}
+		INIT_PZVAL(*retval_ptr_ptr);
+		free_alloca(EX(Ts));
+	}
+	zend_ptr_stack_clear_multiple(TSRMLS_C);
+	EG(function_state_ptr) = original_function_state_ptr;
+	EG(current_execute_data) = EX(prev_execute_data);
+
+	return SUCCESS;
+}
+[[/src]]

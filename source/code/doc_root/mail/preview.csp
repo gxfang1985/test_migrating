@@ -1,0 +1,282 @@
+<?php
+global $G_INPUT;
+global $G_container_base;
+$uum = $G_container_base->getInstance('uum');
+$user = $uum->getLoginUser();
+$user_id = $user->getOID();
+if ( ! is_object($user)) {
+    cb_throw_error(E_COMMON_AUTHENTICATION_FAILED);
+}
+
+// Smarty をインスタンス化
+require_once("grn/smarty.csp");
+$t = new GRN_Smarty;
+
+$t->assign('app_name', $G_mail_name);
+
+require_once('mail/utility.csp');
+$utility = GRN_Mail_Utility::getInstance();
+$system_config = $utility->getSystemConfig();
+$personal_config = $utility->getPersonalConfig($user);
+$folder_logic = $utility->getFolderLogic();
+$mail_logic = $utility->getMailLogic();
+
+// 総メールサイズをチェック
+$system_config->getSizeUserLimitSetting($size_settings, $user_id);
+$mail_size = $personal_config->getMailSize(null);
+if ((0 <= $size_settings['user_limit_' . $user_id])
+    && ($mail_size >= $size_settings['user_limit_' . $user_id] * 1024 * 1024)
+) {
+    cb_throw_error(E_GRN_MAIL_LIMIT, null,
+        ['limit' => $size_settings['user_limit_' . $user_id] . 'MB']);
+}
+
+// 送信前確認を行う
+$personal_config->getGeneralSetting($personal_general_settings);
+$b_preview = $personal_general_settings['preview'];
+
+$account_id = @ $G_INPUT['baid'];
+$category_id = @ $G_INPUT['bcid'];
+$draft_id = @ $G_INPUT['draft_id'];
+$mail_id = @ $G_INPUT['mid'];
+$temp_mail_id = @ $G_INPUT['tmpid'];
+$sign_position = @ $G_INPUT['sign_position'];
+
+$temp_mail_data = $mail_logic->getTemporaryMailData($temp_mail_id, true);
+$temp_account_id = $temp_mail_data['temp_account_id'];
+
+
+$account_data = $personal_config->getAccountData($temp_account_id, false, true);
+$account_info = $account_data['account_info'];
+$from_name = $account_info->getFrom($user);
+$from_name = $utility->static_addNameQuotation($from_name, 'add');
+if (strlen($from_name) > 0) {
+    $from_name .= ' ';
+}
+
+$from_name .= $utility->static_addEmailBracket($account_info->email, 'add');
+
+$page_title = grn_get_current_page_display_name(['app_name' => $G_mail_name]);
+
+//------------------
+
+require_once('grn/ui.csp');
+$uim = GRN_UIConfigManager::getInstance();
+$system_ui_config = $uim->getSystemConfig();
+$user_ui_config = $uim->getUserConfig($user);
+unset($uim);
+
+// インライン表示設定
+$inline = $user_ui_config->getInlineSetting();
+
+// 開封確認設定
+$send_set = $system_config->canUserUseConfirm()
+            && $personal_config->useConfirmMail();
+
+//------------------
+
+$from = $temp_mail_data['from'];
+$to = $temp_mail_data['to'];
+$cc = $temp_mail_data['cc'];
+$bcc = $temp_mail_data['bcc'];
+
+// メール情報
+$mail_for_view = [
+    'aid'             => $temp_account_id,
+    //user_acount_ID
+    'mid'             => $temp_mail_id,
+    'from'            => $from_name,
+    'ctime'           => $temp_mail_data['send_ts'],
+    //送信日時
+    'to'              => $to,
+    'cc'              => $cc,
+    'bcc'             => $bcc,
+    'subject'         => $temp_mail_data['subject'],
+    'html_data'       => strlen($temp_mail_data['html_data']) > 0,
+    'sent'            => $temp_mail_data['sent'],
+    'source_id'       => $temp_mail_data['source_id'],
+    'no_source'       => ! $temp_mail_data['source_flag'],
+    'open'            => 3,
+    'status'          => 1,
+    'give_open_check' => $temp_mail_data['confirmation_request'] && $send_set,
+    // 開封確認メールの要求する/しない
+];
+
+require_once('grn/word_util.csp');
+$fold_words = new GRN_FoldWords;
+$fold_words->setLineWidth(GRN_MAIL_LINE_WIDTH);
+$fold_words->setExtendNum(0);
+$fold_words->setShortenNum(0);
+$data_plain_text = "";
+if ($mail_for_view['html_data']) {
+    $data = $temp_mail_data['html_data'];
+    $data_plain_text = $fold_words->fold($temp_mail_data['data']);
+} else {
+    $data = $temp_mail_data['data'];
+}
+if ( ! is_string($data)) {
+    $data = '';
+}
+
+$sign_data = $temp_mail_data['sign_data'];
+$sign_data = $fold_words->fold($sign_data);
+$action = cb_at($G_INPUT, 'action', '');
+if (strtolower($sign_position) == "top" && 0 < strlen($action)
+    && $action != "reuse"
+) {
+    if (is_string($sign_data) && 0 < strlen($sign_data)) {
+        if (strlen($data) > 0) {
+            if ($mail_for_view['html_data']) {
+                $ret = [];
+                GRN_Mail_Utility::insertSignData($data, $sign_data, [
+                    'action'          => $action,
+                    'position'        => $sign_position,
+                    'data_plain_text' => $data_plain_text,
+                    'original_mid'    => $mail_id
+                ], $ret, $utility);
+                $data = $ret['data'];
+                $data_plain_text = $ret['data_plain_text'];
+            } else {
+                $send_logic = $utility->getSendLogic();
+                $mail_data = $mail_logic->getMailData($mail_id, true);
+                //reply, reply all
+                if ($action == "reply" || $action == "reply-all") {
+                    $original_data = GRN_Mail_Utility::makeReplyInfo($mail_data,
+                        false);
+                }
+
+                //forward
+                if ($action == "forward") {
+                    $original_data
+                        = GRN_Mail_Utility::makeForwardInfo($mail_data, false);
+
+                }
+                $data = preg_replace("'(?:\r\n|\r|\n)'s", "\r\n", $data);
+                $temp_datas = explode(trim($original_data), $data);
+                if (count($temp_datas) > 1) {
+                    $temp_datas[0] = preg_replace("'(\r\n)$'s", "",
+                            $temp_datas[0])
+                                     . "\r\n"
+                                     . preg_replace("'^\r\n|\r\n$'s", "",
+                            $sign_data)
+                                     . "\r\n";
+                    $data = implode(trim($original_data), $temp_datas);
+                } else {
+                    $data = preg_replace("'(\r\n)$'s", "", $data)
+                            . "\r\n"
+                            . preg_replace("'^\r\n|\r\n$'s", "", $sign_data);
+                }
+                $data = $fold_words->fold($data);
+            }
+        } else {
+            if ($mail_for_view["html_data"]) {
+                $sign_data = htmlspecialchars($sign_data);
+            }
+            $data .= $sign_data;
+        }
+    }
+} else {
+    if ($mail_for_view['html_data']) {
+        $sign_data = preg_replace("'(?:\r\n|\r|\n)'s", "<br /></div><div>",
+            htmlspecialchars($sign_data));
+        $sign_data = "<div>" . $sign_data . "</div>";
+    } elseif (strlen($data) > 0) {
+        $sign_data = "\r\n" . $sign_data;
+    }
+    $data .= $sign_data;
+}
+$mail_for_view['data'] = $data;
+$mail_for_view['data_plain_text'] = $data_plain_text;
+
+// 添付ファイル
+if (array_key_exists('files', $temp_mail_data)) {
+    $mail_for_view['attach_files'] = $temp_mail_data['files'];
+}
+
+$mail_for_view['attach_file_type'] = $temp_mail_data['source_flag'] ? 1 : 2;
+
+//------------------
+
+$page_index = 'mail/index';
+$page_root = 'mail/root';
+$page_inbox = 'mail/inbox';
+$page_outbox = 'mail/outbox';
+$page_draftbox = 'mail/draftbox';
+$page_garbagebox = 'mail/garbagebox';
+$page_category_list = 'mail/category_list';
+
+$folder_data = $folder_logic->getFolderData($category_id, false, true);
+$folder_code = is_array($folder_data) ? $folder_data['code'] : '';
+
+switch ($folder_code) {
+    case GRN_MAIL_FOLDER_CODE_ROOT:
+        $folder_type = '0';
+        $page_folder = grn_get_page_display_name($page_root);
+        break;
+    case GRN_MAIL_FOLDER_CODE_INBOX:
+        $folder_type = '1';
+        $page_folder = grn_get_page_display_name($page_inbox);
+        break;
+    case GRN_MAIL_FOLDER_CODE_SENTBOX:
+        $folder_type = '2';
+        $page_folder = grn_get_page_display_name($page_outbox);
+        break;
+    case GRN_MAIL_FOLDER_CODE_UNSENT:
+        $folder_type = '3';
+        $page_folder = grn_get_page_display_name($page_draftbox);
+        break;
+    case GRN_MAIL_FOLDER_CODE_TRASH:
+        $folder_type = '4';
+        $page_folder = grn_get_page_display_name($page_garbagebox);
+        break;
+    default:
+        $folder_type = '5';
+        $page_folder = grn_get_page_display_name($page_category_list);
+        break;
+}
+
+$site_position = [];
+$site_position[] = $utility->getIndexSitePosition($user, $account_id);
+
+$site_position[] = [
+    'page' => $page_index,
+    'name' => $page_folder,
+    'aid'  => $account_id,
+    'cid'  => $category_id
+];
+
+$site_position[] = [
+    'page' => '',
+    'name' => $page_title
+];
+
+//------------------
+
+// set_data
+$t->assign('mail', $mail_for_view);
+
+$t->assign('sign_position', $sign_position);
+
+$t->assign('send_set', $send_set); //開封確認メール on:1 off:0
+
+$t->assign('inline', $inline);
+
+$t->assign('baid', $account_id);
+$t->assign('bcid', $category_id);
+$t->assign('mid', $mail_id);
+$t->assign('draft_id', $draft_id);
+$t->assign('preview', $b_preview);
+
+$t->assign('action', $action);
+
+// page title
+$t->assign('page_title', $page_title);
+
+// site position
+$t->assign('site_position', $site_position);
+
+// Smarty実行
+$doc_name = cb_get_pagename();
+$t->display("{$doc_name}.tpl");
+
+

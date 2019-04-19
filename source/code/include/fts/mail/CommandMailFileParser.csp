@@ -1,0 +1,196 @@
+<?php
+
+namespace grn\fts\mail;
+
+use grn\fts\IndexerLoggerInterface;
+use grn\mail\dao\GrnMailFileInfoDAO;
+use grn\mail\dao\GrnMailReceivedFileRelationDAO;
+use grn\mail\dao\GrnMailSourceFileBodyDAO;
+use grn\mail\dao\MailMessageDAO;
+
+require_once('mail/table.csp');
+require_once('fw/mail_message.csp');
+
+// 子プロセスとして実行される
+
+class CommandMailFileParser
+{
+    /** @var string */
+    private $mailId;
+    /** @var string */
+    private $target;
+    /** @var IndexerLoggerInterface */
+    private $logger;
+
+    public function __construct($input, IndexerLoggerInterface $logger)
+    {
+        $this->logger = $logger;
+        $this->parseInput($input);
+    }
+
+    public function run()
+    {
+        $dao = $this->getReceivedFileRelationDao();
+        $this->parseMailById($this->mailId, $this->target, $dao);
+    }
+
+    /**
+     * @param string                                       $mailId
+     * @param string                                       $suffix
+     * @param \grn\mail\dao\GrnMailReceivedFileRelationDAO $dao
+     */
+    private function parseMailById(
+        $mailId,
+        $suffix,
+        GrnMailReceivedFileRelationDAO $dao
+    ) {
+        $message = $this->getMessage($mailId, $suffix);
+        if ( ! is_null($message)) {
+
+            $decode_tnef_flag = $this->getMailMessageDao()
+                                     ->getDecodeTnefFlag($mailId, $suffix);
+            $file_parts = $message->getAttachedParts($decode_tnef_flag);
+
+            $fileIds = $this->getFileIds($mailId,
+                $suffix); // メールに含まれるfileinfoの一覧を取得
+            foreach ($file_parts as $part_no => $part) {
+                if ($part->getIsBody()) {
+                    continue;
+                }
+
+                $info = $this->getFileInfo($mailId, $part_no, $suffix);
+                if ( ! empty($info)) {
+                    $fm = $this->getFileManager();
+                    $content = ($part->getContent())
+                        ?: ''; // ファイル取得に失敗したら、空文字扱いとする
+                    $blob_id = $fm->addToPut($part->getFilename(), $content);
+
+                    $dao->setBlobIdRelation($blob_id, $info['fileId'],
+                        $info['userId']);
+                    unset($fileIds[array_search($info['fileId'],
+                            $fileIds)]); // receivedfilerelationに登録できたものは除外
+                }
+            }
+            foreach ($fileIds as $fileId) { // fileinfoにあるけど、パースした結果ファイルにならなかったfileはdelete扱いにする
+                $this->logger->log("fileinfo._id = {$fileId}:Cannot parse. Insert deleted value.");
+                $info = $this->getFileInfoById($fileId, $suffix);
+                $dao->insertDelete($info['fileId'], $info['userId']);
+            }
+        } else {
+            $this->logger->log("mailId = {$mailId}:Cannot get source message.");
+            $dao->insertDeletedByMailId($mailId,
+                "tab_grn_mail_fileinfo___p{$suffix}");
+        }
+    }
+
+    /**
+     * @param string $mailId
+     * @param string $suffix
+     *
+     * @return \CB_MailMessage|null
+     */
+    private function getMessage($mailId, $suffix)
+    {
+        $dao = $this->getGrnMailSourceFileBodyDao();
+        $blobId = $dao->getSourceFileBlobId($mailId, $suffix);
+        $fm = $this->getFileManager();
+        $url = $fm->getURL($blobId);
+
+        if (is_null($url)) {
+            return null;
+        }
+
+        return \CB_MailParser::static_parse($url);
+    }
+
+    /**
+     * @param string $fileId
+     * @param string $suffix
+     *
+     * @return array
+     */
+    private function getFileInfoById($fileId, $suffix)
+    {
+        $dao = $this->getGrnMailFileInfoDao();
+
+        return $dao->getFileInfoById($fileId, $suffix);
+    }
+
+    /**
+     * @param string $mailId
+     * @param string $part_no
+     * @param string $suffix
+     *
+     * @return array
+     */
+    private function getFileInfo($mailId, $part_no, $suffix)
+    {
+        $dao = $this->getGrnMailFileInfoDao();
+
+        return $dao->getFileInfo($mailId, $part_no, $suffix);
+    }
+
+    /**
+     * @param string $mailId
+     * @param string $suffix
+     *
+     * @return array
+     */
+    private function getFileIds($mailId, $suffix)
+    {
+        $dao = $this->getGrnMailFileInfoDao();
+
+        return $dao->getFileIdsByMailId($mailId,
+            "tab_grn_mail_fileinfo___p{$suffix}");
+    }
+
+    /**
+     * @return \grn\mail\dao\GrnMailFileInfoDAO
+     */
+    private function getGrnMailFileInfoDao()
+    {
+        return new GrnMailFileInfoDAO();
+    }
+
+    /**
+     * @return \grn\mail\dao\GrnMailSourceFileBodyDAO
+     */
+    private function getGrnMailSourceFileBodyDao()
+    {
+        return new GrnMailSourceFileBodyDAO();
+    }
+
+    /**
+     * @return \grn\mail\dao\GrnMailReceivedFileRelationDAO
+     */
+    private function getReceivedFileRelationDao()
+    {
+        return new GrnMailReceivedFileRelationDAO();
+    }
+
+    /**
+     * @return \grn\mail\dao\MailMessageDAO
+     */
+    private function getMailMessageDao()
+    {
+        return new MailMessageDAO();
+    }
+
+    private function parseInput($input)
+    {
+        if (isset($input['mailId'])) {
+            $this->mailId = $input['mailId'];
+        }
+        if (isset($input['target'])) {
+            $this->target = $input['target'];
+        }
+    }
+
+    /**
+     * @return \CB_BlobFileManager|\CB_ServerFileManager
+     */
+    protected function getFileManager()
+    {
+        return cb_lwc_file_manager();
+    }
+}

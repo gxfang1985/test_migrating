@@ -1,0 +1,429 @@
+<?php
+declare(strict_types=1);
+
+namespace grn\schedule\api;
+
+use grn\grn\GrnException;
+use grn\schedule\api\model\Event;
+use grn\schedule\api\model\Member;
+use grn\schedule\AttendanceStatusLogic;
+use grn\schedule\collection\EventFacilityApprovals;
+use grn\schedule\collection\FacilityApprovalSettings;
+use grn\schedule\FacilityApprovalLogic;
+use grn\schedule\ScheduleFacilityApprovalSetting;
+
+require_once('schedule/resources.csp');
+
+class EventModelArranger
+{
+    /**
+     * @var \GRN_Schedule_EventBase[]
+     */
+    private $events;
+
+    /**
+     * @var array
+     *   $files[$event_id][] = [
+     *      'id' => File id
+     *      'name' => File name
+     *      'mime' => Content type
+     *      'size' => File size
+     *   ];
+     */
+    private $files;
+
+    /** @var bool */
+    private $expandRepeatTemporary;
+
+    /**
+     * @var EventFacilityApprovals[] Key is a event id
+     */
+    private $facilityApprovalsOfEvents;
+
+    /**
+     * @var FacilityApprovalSettings
+     */
+    private $facilityApprovalSettings;
+
+    /**
+     * @var string[]
+     *  $facilityUsingPurposes[$event_id] = The purpose of the use of the facilities in the event
+     */
+    private $facilityUsingPurposes;
+
+    /**
+     * @var array
+     *   $files[$event_id][$user_id] = [
+     *      'comment' => Comment
+     *      'status' => Status
+     *   ];
+     */
+    private $attendeesResponse;
+
+    /**
+     * @var array
+     */
+    private $facilityItemData;
+
+    /**
+     * @param \GRN_Schedule_EventBase[] $events
+     * @param array                     $files
+     * @param bool                      $expand_repeat_temporary
+     */
+    public function __construct(
+        array $events,
+        array $files,
+        bool $expand_repeat_temporary
+    ) {
+        $this->events = $events;
+        $this->files = $files;
+        $this->expandRepeatTemporary = $expand_repeat_temporary;
+
+        $this->facilityApprovalsOfEvents
+            = $this->getFacilityApprovalsOfEvents();
+        $this->facilityApprovalSettings = $this->getFacilityApprovalSettings();
+        $this->facilityUsingPurposes = $this->getFacilityUsingPurposes();
+        $this->facilityItemData = $this->getFacilityItemData();
+
+        $event_ids = array_map(function (
+            \GRN_Schedule_EventBase $event
+        ) {
+            return $event->id;
+        }, $this->events);
+        $this->attendeesResponse = Member::getAttendeesResponseList($event_ids);
+    }
+
+    public function getFacilityItemData(): array
+    {
+        require_once('schedule/facility_system_logic.csp');
+        $facility_logic = \GRN_Facility_SystemLogic::getInstance();
+
+        return $facility_logic->getListData($this->events);
+    }
+
+    /**
+     * @return EventFacilityApprovals[]
+     */
+    private function getFacilityApprovalsOfEvents(): array
+    {
+        $logic = new FacilityApprovalLogic();
+
+        $event_ids = array_map(function ($event) {
+            return $event->id;
+        }, $this->events);
+
+        return $logic->getListEventFacilityApprovalsByEventIds($event_ids);
+    }
+
+    /**
+     * @return FacilityApprovalSettings
+     */
+    private function getFacilityApprovalSettings(): FacilityApprovalSettings
+    {
+        $facilities = [];
+        foreach ($this->events as $event) {
+            $facilities = array_merge($facilities, $event->getAllFacilityIds());
+        }
+
+        foreach ($this->facilityApprovalsOfEvents as $facility_approvals) {
+            $facilities = array_merge($facilities,
+                $facility_approvals->getFacilityIds());
+        }
+
+        $logic = new ScheduleFacilityApprovalSetting();
+
+        return $logic->getSettingsObject(array_unique($facilities));
+    }
+
+    /**
+     * @return string[]
+     */
+    private function getFacilityUsingPurposes(): array
+    {
+        $logic = new FacilityApprovalLogic();
+
+        $event_ids = array_map(function ($event) {
+            return $event->id;
+        }, $this->events);
+
+        return $logic->getFacilityUsingPurposesByEventIds($event_ids);
+    }
+
+    /**
+     * @param EventBuilder            $event_builder
+     * @param \GRN_Schedule_EventBase $event
+     */
+    private function setAttendeesInfo(
+        EventBuilder $event_builder,
+        \GRN_Schedule_EventBase $event
+    ) {
+        $attendance_status_logic = new AttendanceStatusLogic();
+        $use_attendance_check
+            = $attendance_status_logic->isEnableAttendanceCheck()
+              && $event->isAttendanceCheckEvent();
+        if ($attendance_status_logic->isEnableAttendanceCheck()) {
+            $event_builder->buildUseAttendanceCheck($use_attendance_check);
+        }
+        $event_builder->buildAttendees($event->users ?? [],
+            $event->groups ?? [], $this->attendeesResponse);
+    }
+
+    /**
+     * @param EventBuilder            $event_builder
+     * @param \GRN_Schedule_EventBase $event
+     */
+    private function setWatchersInfo(
+        EventBuilder $event_builder,
+        \GRN_Schedule_EventBase $event
+    ) {
+        if (is_array($event->notify_address)
+            && count($event->notify_address) > 0
+        ) {
+            $event_builder->buildWatchers($event->notify_address);
+        }
+    }
+
+    /**
+     * @param EventBuilder            $event_builder
+     * @param \GRN_Schedule_EventBase $event
+     */
+    private function setFacilityApprovalInfo(
+        EventBuilder $event_builder,
+        \GRN_Schedule_EventBase $event
+    ) {
+        if ( ! $event->isFacilityUsageRequestSupported()) {
+            return;
+        }
+
+        $event_builder->buildFacilityUsageRequests(
+            $event->getAllFacilityIds(),
+            $this->facilityApprovalsOfEvents[$event->id],
+            $this->facilityApprovalSettings
+        );
+
+        $event_builder->buildFacilityUsingPurpose(
+            $this->facilityUsingPurposes[$event->id] ?? '',
+            $event->getAllFacilityIds(),
+            $this->facilityApprovalSettings
+        );
+    }
+
+    /**
+     * @param EventBuilder            $event_builder
+     * @param \GRN_Schedule_EventBase $event
+     */
+    private function setFacilitiesInfo(
+        EventBuilder $event_builder,
+        \GRN_Schedule_EventBase $event
+    ) {
+        $facility_ids = $this->getFacilityIds($event);
+
+        $event_builder->buildFacilities($facility_ids);
+
+        $extended_items = [];
+        if (( ! empty($facility_ids))
+            || (is_a($event, 'GRN_Schedule_TemporaryEvent')
+                && $event->isORSearch())
+        ) {
+            $extended_items = $this->facilityItemData[$event->id];
+        }
+
+        $event_builder->buildFacilityReservation($extended_items);
+
+        $this->setFacilityApprovalInfo($event_builder, $event);
+    }
+
+    /**
+     * @param EventBuilder            $event_builder
+     * @param \GRN_Schedule_EventBase $event
+     */
+    private function setTemporaryScheduleDateAndFacilityInfo(
+        EventBuilder $event_builder,
+        \GRN_Schedule_EventBase $event
+    ) {
+        if ( ! is_a($event, 'GRN_Schedule_TemporaryEvent')) {
+            return;
+        }
+
+        $event_builder->buildTemporaryEventCandidates($event);
+    }
+
+    /**
+     * @param EventBuilder            $event_builder
+     * @param \GRN_Schedule_EventBase $event
+     *
+     * @throws GrnException
+     */
+    private function setStartEndInfo(
+        EventBuilder $event_builder,
+        \GRN_Schedule_EventBase $event
+    ) {
+        $event_builder->buildIsStartOnlyAndIsAllDayByEventType($event->getEventType(),
+            $this->expandRepeatTemporary);
+
+        $is_noraml = $event instanceof \GRN_Schedule_NormalEvent;
+        $is_repeat_or_temporary = $event instanceof \GRN_Schedule_RepeatEvent
+                                  || $event instanceof
+                                     \GRN_Schedule_TemporaryEvent;
+
+        $end_timezone = $is_repeat_or_temporary ? $event->timezone
+            : $event->end_timezone;
+        $event_builder->buildOriginalTimezone($event->timezone, $end_timezone);
+
+        if ($is_repeat_or_temporary && ! $this->expandRepeatTemporary) {
+            return;
+        }
+
+        $login_timezone = \CB_I18N::getInstance()->getCurrentTimezone();
+
+        // Get datetime in original(event's) time zone.
+        $start_original = $event->getStart();
+        $end_original = $event->getEnd();
+
+        $src_end_timezone = ($is_noraml && $event->isAllDay())
+                            || $is_repeat_or_temporary ? $event->timezone
+            : $event->end_timezone;
+
+        // Convert the time zone of the event to that of the login user.
+        $start = \CB_I18N::translateDatetimeTimezone($start_original,
+            $event->timezone, $login_timezone);
+        $end = \CB_I18N::translateDatetimeTimezone($end_original,
+            $src_end_timezone, $login_timezone);
+
+        $event_builder->buildStartEnd($start->getDate(), $start->getTime(),
+            $login_timezone, $end->getDate(),
+            $end->getTime(), $login_timezone);
+    }
+
+    /**
+     * @param \GRN_Schedule_EventBase $event
+     *
+     * @return string[]
+     */
+    private function getFacilityIds(\GRN_Schedule_EventBase $event): array
+    {
+        if ($event instanceof \GRN_Schedule_TemporaryEvent) {
+            if ($this->expandRepeatTemporary) {
+                return $event->getCandidateFacilityIds();
+            } else {
+                return $event->getAllFacilityIds();
+            }
+        } else {
+            return $event->facilities ?? [];
+        }
+    }
+
+    private function getAllowFileAttachment(): bool
+    {
+        static $allow_file_attachment = null;
+        if (is_null($allow_file_attachment)) {
+            require_once('schedule/system_logic.csp');
+            $system_logic = \GRN_Schedule_SystemLogic::getInstance();
+            $allow_file_attachment = $system_logic->getAllowFileAttachment()
+                                     == '1';
+        }
+
+        return $allow_file_attachment;
+    }
+
+
+    /**
+     * @param EventBuilder            $event_builder
+     * @param \GRN_Schedule_EventBase $event
+     */
+    private function setRepeatInfo(
+        EventBuilder $event_builder,
+        \GRN_Schedule_EventBase $event
+    ) {
+        if ( ! ($event instanceof \GRN_Schedule_RepeatEvent)) {
+            return;
+        }
+        $is_start_only = ! $event->endtime;
+        $is_all_day = ! $event->endtime && ! $event->settime;
+        if ($is_all_day) {
+            $event->endtime = \CB_Time::valueOf(0, 0, 0);
+            $event->settime = \CB_Time::valueOf(0, 0, 0);
+        } elseif ($is_start_only) {
+            $event->endtime = \CB_Time::valueOf(0, 0, 0);
+        }
+
+        $start_datetime = $event->getRepeatInfoStart();
+        $end_datetime = $event->getRepeatInfoEnd();
+
+        $start_time = $start_datetime->getTime();
+        $end_time = $end_datetime->getTime();
+
+        if ($is_all_day) {
+            $start_time = null;
+            $end_time = null;
+        } elseif ($is_start_only) {
+            $end_time = null;
+        }
+
+        $event_builder->buildRepeatInfo($event->repeat_type,
+            $start_datetime->getDate(), $end_datetime->getDate(),
+            $start_time, $end_time, $event->timezone, $event->day, $event->wday,
+            null,
+            $event->except);
+    }
+
+    /**
+     * @param EventBuilder            $event_builder
+     * @param \GRN_Schedule_EventBase $event
+     */
+    private function setRepeatID(
+        EventBuilder $event_builder,
+        \GRN_Schedule_EventBase $event
+    ) {
+        if ($event instanceof \GRN_Schedule_RepeatEvent
+            && $this->expandRepeatTemporary
+        ) {
+            $event_builder->buildRepeatId($event);
+        }
+    }
+
+    /**
+     * Makes Event model objects from GRN_Schedule_EventBase objects
+     *
+     * @return Event[]
+     */
+    public function arrange(): array
+    {
+        $arranged_results = [];
+
+        $event_builder
+            = new EventBuilder(new RenderMemberProvider($this->events, [],
+            $this->facilityApprovalsOfEvents));
+
+        foreach ($this->events as $event) {
+            $visibility_type = $event->getVisibilityType();
+            $event_type = Event::getEventTypeFromObject($event);
+            $event_builder->initEvent($event, $event_type, $visibility_type);
+
+            $company_data = $event->getCompanyData();
+            $event_builder->buildCompany($company_data ?? []);
+
+            $this->setAttendeesInfo($event_builder, $event);
+            $this->setFacilitiesInfo($event_builder, $event);
+            $this->setWatchersInfo($event_builder, $event);
+            $this->setTemporaryScheduleDateAndFacilityInfo($event_builder,
+                $event);
+            $this->setStartEndInfo($event_builder, $event);
+            $this->setRepeatInfo($event_builder, $event);
+            $this->setRepeatId($event_builder, $event);
+
+            if ($this->getAllowFileAttachment()) {
+                $event_builder->buildAttachments($this->files[$event->id],
+                    true);
+            }
+
+            if (($event instanceof \GRN_Schedule_TemporaryEvent) === false) {
+                $event_builder->buildCustomItem($event->additional_items);
+            }
+
+            $arranged_results[] = $event_builder->getEvent();
+        }
+
+        return $arranged_results;
+    }
+}

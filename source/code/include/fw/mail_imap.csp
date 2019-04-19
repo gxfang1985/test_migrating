@@ -1,0 +1,1554 @@
+<?php
+/**
+ * A store implementation that accesses the server by using the IMAP protocol(RFC2030).
+ * <p>
+ *   It supports authentication methods, AUTO, USER, LOGIN, PLAIN, CRAM-MD5 and DIGEST-MD5.
+ * </p>
+ *
+ * @author  Mizuno, Kuniaki     2004/07
+ * @auther  Miyabe, Tatsuhiko   2004/09
+ * @version 1.0
+ * @package fw.mail
+ */
+
+require_once('fw/i18n.csp');
+require_once('fw/mail_store.csp');
+require_once('fw/mail_imap_protocol.csp');
+require_once('fw/mail_message.csp');
+
+/**
+ * The IMAP default port number.
+ */
+define('CB_MAIL_PORT_IMAP', '143');
+
+/**
+ * A IMAP implementation of the store.
+ *
+ * @package fw.mail
+ */
+class CB_MailIMAPStore extends CB_MailStore
+{
+    /**
+     * The protocol handler.
+     *
+     * @var object CB_MailSMTPProtocol
+     * @access private
+     */
+    var $_p;
+
+    /**
+     * If true, this sender has connected the server.
+     *
+     * @var boolean
+     * @access private
+     */
+    var $_connected = false;
+
+    /**
+     * Mapping from name to folder.
+     *
+     * @var array has CB_MailIMAPFolder
+     * @access private
+     */
+    var $_nameToFolder = [];
+
+    /**
+     * @access private
+     */
+    var $_reconnect_config = false;
+
+    /**
+     * Constructor
+     */
+    function __construct()
+    {
+        parent::__construct();
+        $this->_p = new CB_MailIMAPProtocol();
+    }
+
+    /**
+     * Set protocol logger.
+     *
+     * @param object CB_Logger $logger
+     */
+    function setLogger($logger)
+    {
+        parent::setLogger($logger);
+        $this->_p->setLogger($logger);
+    }
+
+    /**
+     * Set error listener object.
+     *
+     * @param object CB_MailErrorListener $listener
+     */
+    function setErrorListener($listener)
+    {
+        parent::setErrorListener($listener);
+        $this->_p->setErrorListener($listener);
+    }
+
+    /**
+     * Implementation of {@link CB_Transactional} method.
+     */
+    public function commit()
+    {
+        if ( ! $this->_connected) {
+            return true;
+        }
+        foreach ($this->_nameToFolder as $folder) {
+            if (PEAR::isError($err = $folder->_commit())) {
+                if ( ! is_null($this->_logger)) {
+                    $this->_logger->warning('Failed commit. reason = disconnect server');
+                }
+                $this->disconnect();
+                $this->connect($this->_reconnect_config);
+                if ( ! $folder->_commit()) {
+                    if ( ! is_null($this->_logger)) {
+                        $this->_logger->error('Failed recommit.');
+                    }
+
+                    return false;
+                }
+            }
+            $folder->_invalidate();
+        }
+        $this->_nameToFolder = [];
+
+        $this->disconnect();
+
+        return true;
+    }
+
+    /**
+     * Implementation of {@link CB_Transactional} method.
+     */
+    public function abort()
+    {
+        if ( ! $this->_connected) {
+            return true;
+        }
+
+        foreach ($this->_nameToFolder as $folder) {
+            $folder->_invalidate();
+        }
+        $this->_nameToFolder = [];
+
+        $this->disconnect();
+
+        return true;
+    }
+
+    /**
+     * Implementation of {@link CB_MailService} method.
+     *
+     * @param array $info_array
+     *
+     * @return boolean    TRUE if the connect succeeds; otherwise FALSE.
+     */
+    function connect($info_array)
+    {
+        assert('!is_null( $info_array)');
+        if ($this->_connected) {
+            $msg = cb_msg('fw.mail', 'Already connected to the server.');
+            if ( ! is_null($this->_listener)) {
+                $this->_listener->error(-1, $msg);
+            }
+            if ( ! is_null($this->_logger)) {
+                $this->_logger->warning($msg);
+            }
+
+            return false;
+        }
+
+        $ret = $this->_setDefaultConnInfo($info_array);
+        if (PEAR::isError(
+            $result = $this->_p->connect($ret['hostname'], $ret['port'], $ret['domain'], $ret['uid'], $ret['password'],
+                $ret['auth'], $ret['timeout'], true, $ret['imap4_ssl'], $ret['socks_info']))
+        ) {
+            return false;
+        }
+        $this->_reconnect_config = $info_array;
+        $this->_connected = true;
+
+        return true;
+    }
+
+    /**
+     * @access private
+     */
+    function _setDefaultConnInfo($info_array)
+    {
+        $ret = [];
+
+        $ret['hostname'] = 'localhost';
+        $ret['port'] = CB_MAIL_PORT_IMAP;
+        $ret['imap4_ssl'] = false;
+        $ret['domain'] = 'localhost';
+        $ret['timeout'] = CB_MAIL_DEFAULT_TIMEOUT;
+        $ret['auth'] = 'AUTO';
+        $ret['uid'] = '';
+        $ret['password'] = '';
+
+        foreach (array_keys($ret) as $key) {
+            if (isset($info_array[$key]) && isset($ret[$key])) {
+                $ret[$key] = $info_array[$key];
+            }
+        }
+
+        $ret['socks_info'] = cb_get_socks_info();
+        $ret['auth'] = strtoupper($ret['auth']);
+
+        return $ret;
+    }
+
+    /**
+     * Implementation of {@link CB_MailService} method.
+     */
+    function isConnected()
+    {
+        return ($this->_connected);
+    }
+
+    /**
+     * Implementation of {@link CB_MailService} method.
+     */
+    function disconnect()
+    {
+        $this->_connected = false;
+        if (PEAR::isError($result = $this->_p->disconnect())) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Checks whether the service is available or not
+     *
+     * @param  array $info_array
+     *   'hostname' => server hostname,
+     *   'port'     => TCP port number,
+     *   'timeout'  => timeout duration in seconds,
+     *   'auth'     => implementation specific authentication mechanism.
+     *
+     * @return boolean
+     */
+    function isAvailable($info_array)
+    {
+        if ( ! is_array($info_array)) {
+            return false;
+        }
+
+        if ( ! isset($info_array['auth'])) {
+            $info_array['auth'] = 'LOGIN';
+        }
+
+        $ret = $this->_setDefaultConnInfo($info_array);
+        if (PEAR::isError(
+            $result = $this->_p->connect($ret['hostname'], $ret['port'], $ret['domain'], $ret['uid'], $ret['password'],
+                $ret['auth'], $ret['timeout'], false, $ret['imap4_ssl'], $ret['socks_info']))
+        ) {
+            // Don't call disconnect(). If connected server isn't IMAP,
+            // library hangs up probably.
+            return false;
+        }
+
+        if (PEAR::isError($result = $this->_p->checkSupportedAuthMethod($ret['auth']))) {
+            return false;
+        }
+
+        $this->disconnect();
+
+        return true;
+    }
+
+    /**
+     * Implementation of {@link CB_MailStore} method.
+     *
+     * @return CB_MailIMAPFolder or FALSE
+     */
+    function getDefaultFolder()
+    {
+        $folder = false;
+        if ( ! $this->_checkConnection()) {
+            return $folder;
+        }
+
+        $folder = $this->getFolder('INBOX');
+
+        return $folder;
+    }
+
+    /**
+     * Implementation of {@link CB_MailStore} method.
+     *
+     * @return CB_MailIMAPFolder or FALSE
+     */
+    function getFolder($name)
+    {
+        assert('!is_null( $name )');
+
+        $folder = false;
+        if ( ! $this->_checkConnection()) {
+            return $folder;
+        }
+
+        $name = strtoupper($name);
+        if ( ! isset($this->_nameToFolder[$name])) {
+            $this->_nameToFolder[$name] = new CB_MailIMAPFolder($this, $name);
+        }
+
+        return $this->_nameToFolder[$name];
+    }
+
+    /**
+     * Implementation of {@link CB_MailStore} method.
+     */
+    function getFolders()
+    {
+        $fail = false;
+        if ( ! $this->_checkConnection()) {
+            return $fail;
+        }
+
+        if (PEAR::isError($result = $this->_p->cmdLIST('', '*'))) {
+            return $fail;
+        }
+
+        $folders = [];
+        if (isset($result['PARSED'])) {
+            foreach ($result['PARSED'] as $mbox) {
+                //If the folder has the \NoSelect atribute we don't put in the list
+                // it solves a bug in wu-imap that crash the IMAP server if we select that mailbox
+                $internal = mb_internal_encoding();
+                if (isset($mbox['EXT']['LIST']['NAME_ATTRIBUTES'])) {
+                    if ( ! in_array('\NoSelect', $mbox['EXT']['LIST']['NAME_ATTRIBUTES'])) {
+                        // IMAP sends strings in 'Modified UTF7', must convert encoding. 
+                        // See "RFC 2060 5.1.3.  Mailbox International Naming Convention".
+                        $name = $mbox['EXT']['LIST']['MAILBOX_NAME'];
+                        $folders[$name] = $this->getFolder($name);
+                    }
+                }
+            }
+        }
+
+        return $folders;
+    }
+
+    /**
+     * Checks whether the connection is available.
+     *
+     * @return boolean
+     * @access private
+     */
+    function _checkConnection()
+    {
+        if ( ! $this->_connected) {
+            $msg = cb_msg('fw.mail', 'Has not connected to the server yet.');
+            if ( ! is_null($this->_listener)) {
+                $this->_listener->error(-1, $msg);
+            }
+            if ( ! is_null($this->_logger)) {
+                $this->_logger->warning($msg);
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+}
+
+class CB_MailIMAPFolder extends CB_MailFolder
+{
+    var $_valid = true;
+
+    /**
+     * Name of the folder.
+     *
+     * @var string
+     * @access private
+     */
+    var $_name;
+
+    /**
+     * The protocol handler.
+     *
+     * @var object CB_MailIMAPProtocol
+     * @access private
+     */
+    var $_p;
+
+    var $_messagesToDelete = [];
+    var $_deleteAll = false;
+    var $_maildropList = [];
+    var $_maildropAllListed = false;
+    var $_mailheaderList = [];
+    var $_mailheaderAllListed = false;
+    var $_UID_Msgnum = [];
+    var $_Msgnum_UID = [];
+    var $_seens = null;
+    var $_unseens = null;
+    var $_newseens = [];
+    var $_newunseens = [];
+    var $_initialized = false;
+
+    var $_error_code = 'FW00041';
+
+    /**
+     *
+     * @param object $store CB_MailIMAPStore
+     * @param object $name  name of the folder.
+     */
+    function __construct($store, $name)
+    {
+        assert('is_a( $store, "CB_MailIMAPStore" )');
+        assert('!is_null( $name )');
+
+        parent::__construct($store);
+        $this->_p = $store->_p;
+        $this->_name = $name;
+    }
+
+    function setThrowError($error_code)
+    {
+        $this->_error_code = $error_code;
+    }
+
+    function throwError($message = '')
+    {
+        if ( ! is_null($this->_error_code)) {
+            cb_throw_error($this->_error_code,
+                ['info' => $message],
+                ['info' => $message],
+                ['info' => $message],
+                ['info' => $message]);
+        }
+    }
+
+    /**
+     * Implementation of {@link CB_MailFolder} method.
+     */
+    function getStore()
+    {
+        return $this->_store;
+    }
+
+    /**
+     * Implementation of {@link CB_MailFolder} method.
+     */
+    function getMessageCount()
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ( ! $this->_fetchMailDropAll()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        return count($this->_maildropList) - count($this->_messagesToDelete);
+    }
+
+    /**
+     * @param int $msgnum
+     *
+     * @return mixed {@link CB_MailMessage}, or FALSE.
+     */
+    function getMessage($msgnum)
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+            $message = false;
+
+            return $message;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+            $message = false;
+
+            return $message;
+        }
+
+        if ($this->_deleteAll === true) {
+            $message = null;
+
+            return $message;
+        }
+
+        if (array_key_exists($msgnum, $this->_messagesToDelete)) {
+            $message = null;
+
+            return $message;
+        }
+
+        if ( ! $this->_fetchMailDrop($msgnum)) {
+            $this->throwError();
+            $message = false;
+
+            return $message;
+        }
+
+        if ( ! array_key_exists($msgnum, $this->_maildropList)) {
+            $message = null;
+
+            return $message;
+        }
+
+        return $this->_maildropList[$msgnum];
+    }
+
+    /**
+     * Implementation of {@link CB_MailFolder} method.
+     */
+    function getAllMessages()
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ($this->_deleteAll == true) {
+            return [];
+        }
+
+        if ( ! $this->_fetchMailDropAll()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        $ret = [];
+        foreach (array_keys($this->_maildropList) as $msgnum) {
+            if (array_key_exists($msgnum, $this->_messagesToDelete)) {
+                continue;
+            }
+            $ret[$msgnum] = $this->_maildropList[$msgnum];
+        }
+
+        return $ret;
+    }
+
+    /**
+     * Return message size in byte.
+     *
+     * @param int $msgnum
+     *
+     * @return int
+     */
+    function getMessageSize($msgnum)
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ($this->_deleteAll === true) {
+            return null;
+        }
+
+        if (array_key_exists($msgnum, $this->_messagesToDelete)) {
+            return null;
+        }
+
+        if ( ! $this->_fetchMailDrop($msgnum)) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if (array_key_exists($msgnum, $this->_maildropList)) {
+            $message = $this->_maildropList[$msgnum];
+
+            return $message->_size;
+        } else {
+            return null;
+        }
+    }
+
+    /**
+     * Implementation of {@link CB_MailFolder} method.
+     */
+    function getTotalSize()
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ( ! $this->_fetchMailDropAll()) {
+            $message = false;
+
+            return $message;
+        }
+
+        $size = 0;
+        foreach (array_keys($this->_maildropList) as $msgnum) {
+            if (array_key_exists($msgnum, $this->_messagesToDelete)) {
+                continue;
+            } else {
+                $message = $this->_maildropList[$msgnum];
+                $size += $message->_size;
+            }
+        }
+
+        return $size;
+    }
+
+    /**
+     * @param  int   $msgnum
+     * @param  mixed $header_names
+     *
+     * @return array
+     */
+    function getMessageHeaders($msgnum, $header_names = null)
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ($this->_deleteAll === true) {
+            return null;
+        }
+
+        if (array_key_exists($msgnum, $this->_messagesToDelete)) {
+            return null;
+        }
+
+        if ( ! $this->_fetchMailHeader($msgnum)) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ( ! array_key_exists($msgnum, $this->_mailheaderList)) {
+            return null;
+        }
+
+        $message = $this->_mailheaderList[$msgnum];
+        if (is_null($header_names)) {
+            return $message->getAllHeaders();
+        } else {
+            $headers = [];
+            foreach ($header_names as $name) {
+                $headers = $headers + $message->getHeaders($name);
+            }
+
+            return $headers;
+        }
+    }
+
+    /**
+     * Implementation of {@link CB_MailFolder} method.
+     */
+    function getAllMessageHeaders($header_names = null)
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ($this->_deleteAll == true) {
+            return [];
+        }
+
+        if ( ! $this->_fetchMailHeaderAll()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        $ret = [];
+        foreach (array_keys($this->_mailheaderList) as $msgnum) {
+            if (array_key_exists($msgnum, $this->_messagesToDelete)) {
+                continue;
+            }
+            $message = $this->_mailheaderList[$msgnum];
+            if (is_null($header_names)) {
+                $ret[$msgnum] = $message->getAllHeaders();
+            } else {
+                $headers = [];
+                foreach ($header_names as $name) {
+                    $headers = $headers + $message->getHeaders($name);
+                }
+                $ret[$msgnum] = $headers;
+            }
+        }
+
+        return $ret;
+    }
+
+    /**
+     * @param int $msgnum
+     */
+    function deleteMessage($msgnum)
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ($this->_deleteAll === true) {
+            return true;
+        }
+
+        if (array_key_exists($msgnum, $this->_messagesToDelete)) {
+            return true;
+        }
+
+        if ( ! $this->_fetchMailDrop($msgnum)) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if (array_key_exists($msgnum, $this->_maildropList)) {
+            $this->_messagesToDelete[$msgnum] = $msgnum;
+
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * Implementation of {@link CB_MailFolder} method.
+     */
+    function deleteAllMessages()
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        $this->_deleteAll = true;
+        $this->_maildropList = [];
+        $this->_maildropAllListed = true;
+        $this->_mailheaderList = [];
+        $this->_mailheaderAllListed = true;
+        $this->_UID_Msgnum = [];
+        $this->_Msgnum_UID = [];
+        $this->_seens = [];
+        $this->_newseens = [];
+        $this->_unseens = [];
+        $this->_newunseens = [];
+
+        return true;
+    }
+
+    /**
+     * Implementation of {@link CB_MailFolder} method.
+     */
+    function getUnseenMessageNumbers()
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ($this->_deleteAll === true) {
+            return [];
+        }
+
+        if ( ! $this->_fetchUnseens()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        $this->_unseens = array_diff($this->_unseens, $this->_messagesToDelete);
+
+        return array_keys($this->_unseens);
+    }
+
+    /**
+     * Implementation of {@link CB_MailFolder} method.
+     */
+    function getNextUnseenMessage()
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail',
+                'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ($this->_deleteAll === true) {
+            return null;
+        }
+
+        if ( ! $this->_fetchUnseens()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        $result = null;
+        foreach (array_keys($this->_unseens) as $msgnum) {
+            if ( ! array_key_exists($msgnum, $this->_messagesToDelete)) {
+                $message = $this->getMessage($msgnum);
+                if ( ! $message) {
+                    return false;
+                }
+                $this->_newseens[$msgnum] = $msgnum;
+
+                $result = [
+                    'msgnum'  => $msgnum,
+                    'message' => $message
+                ];
+            }
+            unset($this->_unseens[$msgnum]);
+            unset($this->_newunseens[$msgnum]);
+
+            if ( ! is_null($result)) {
+                break;
+            }
+
+        }
+
+        return $result;
+    }
+
+    /**
+     * Implementation of {@link CB_MailFolder} method.
+     */
+    function deleteSeenMessages()
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ($this->_deleteAll === true) {
+            return null;
+        }
+
+        if ( ! $this->_fetchSeens()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        $seens = $this->_seens + $this->_newseens;
+        $this->_seens = [];
+        $this->_newseens = [];
+        $this->_messagesToDelete = $this->_messagesToDelete + $seens;
+    }
+
+    /**
+     * Set specified messages to unseen status.
+     *
+     * @param  array $msgnums
+     *
+     * @return boolean Success/Failure
+     */
+    function setUnseen($msgnums)
+    {
+        if ( ! is_array($msgnums)) {
+            return false;
+        }
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ($this->_deleteAll === true) {
+            return null;
+        }
+
+        if ( ! $this->_fetchSeens()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ( ! $this->_fetchUnseens()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        foreach ($msgnums as $msgnum) {
+            if (array_key_exists($msgnum, $this->_seens)) {
+                unset($this->_seens[$msgnum]);
+            } elseif (array_key_exists($msgnum, $this->_newseens)) {
+                unset($this->_newseens[$msgnum]);
+            } else {
+                continue;
+            }
+
+            $this->_unseens[$msgnum] = $msgnum;
+            $this->_newunseens[$msgnum] = $msgnum;
+        }
+
+        return true;
+    }
+
+    function isUIDCapable()
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        return true;
+    }
+
+    function getMessageNumber($uid)
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ($this->_deleteAll === true) {
+            return null;
+        }
+
+        if ( ! $this->_fetchMsgnum($uid)) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if (array_key_exists($uid, $this->_UID_Msgnum)) {
+            $msgnum = $this->_UID_Msgnum[$uid];
+            if ( ! array_key_exists($msgnum, $this->_messagesToDelete)) {
+                return $msgnum;
+            } else {
+                return null;
+            }
+        } else {
+            return null;
+        }
+    }
+
+    function getMessageUID($msgnum)
+    {
+        if ( ! $this->_checkValidity()) {
+            $this->throwError(cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.'));
+
+            return false;
+        }
+        if ( ! $this->_initialize()) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if ($this->_deleteAll === true) {
+            return null;
+        }
+
+        if ( ! $this->_fetchUID($msgnum)) {
+            $this->throwError();
+
+            return false;
+        }
+
+        if (array_key_exists($msgnum, $this->_Msgnum_UID)) {
+            $uid = $this->_Msgnum_UID[$msgnum];
+            if ( ! array_key_exists($msgnum, $this->_messagesToDelete)) {
+                return $uid;
+            } else {
+                return null;
+            }
+        } else {
+            return null;
+        }
+    }
+
+    /**
+     * Deletes all messages that has been marked as deleted.
+     * Also marks read messages as read on the server side.
+     *
+     * @return true or PEAR_Error
+     * @access private
+     */
+    function _commit()
+    {
+        if ( ! $this->_initialize()) {
+            return false;
+        }
+
+        if ($this->_deleteAll === true) {
+            if (PEAR::isError($err = $this->_p->cmdSTORE('1:*', '+FLAGS.SILENT', '\\Deleted'))) {
+                return false;
+            }
+            if (PEAR::isError($err = $this->_p->cmdEXPUNGE())) {
+                return false;
+            }
+
+            return true;
+        } else {
+            if ( ! empty($this->_newunseens)) {
+                $set = implode(',', $this->_newunseens);
+                if (PEAR::isError($err = $this->_p->cmdSTORE($set, '-FLAGS.SILENT', '\\Seen'))) {
+                    if ( ! is_null($this->_logger)) {
+                        $uid = $this->_store->_reconnect_config['uid'];
+                        $msg
+                            = "[receive] Failed (account:$uid, protocol:imap4, command:STORE, flag:-FLAGS.SILENT[\Seen])";
+                        $this->_logger->warningEx($msg);
+                    }
+
+                    return false;
+                }
+            }
+            if ( ! empty($this->_newseens)) {
+                $set = implode(',', $this->_newseens);
+                if (PEAR::isError($err = $this->_p->cmdSTORE($set, '+FLAGS.SILENT', '\\Seen'))) {
+                    if ( ! is_null($this->_logger)) {
+                        $uid = $this->_store->_reconnect_config['uid'];
+                        $msg
+                            = "[receive] Failed (account:$uid, protocol:imap4, command:STORE, flag:+FLAGS.SILENT[\Seen])";
+                        $this->_logger->warningEx($msg);
+                    }
+
+                    return false;
+                }
+            }
+            if ( ! empty($this->_messagesToDelete)) {
+                $set = implode(",", array_keys($this->_messagesToDelete));
+                if (PEAR::isError($err = $this->_p->cmdSTORE($set, '+FLAGS.SILENT', '\\Deleted'))) {
+                    if ( ! is_null($this->_logger)) {
+                        $uid = $this->_store->_reconnect_config['uid'];
+                        $msg
+                            = "[receive] Failed (account:$uid, protocol:imap4, command:STORE, flag:+FLAGS.SILENT[\Deleted])";
+                        $this->_logger->warningEx($msg);
+                    }
+
+                    return false;
+                }
+                if (PEAR::isError($err = $this->_p->cmdEXPUNGE())) {
+                    if ( ! is_null($this->_logger)) {
+                        $uid = $this->_store->_reconnect_config['uid'];
+                        $msg = "[receive] Failed (account:$uid, protocol:imap4, command:EXPUNGE)";
+                        $this->_logger->warningEx($msg);
+                    }
+
+                    return false;
+                }
+            }
+
+            return true;
+        }
+    }
+
+    function _initialize()
+    {
+        if ($this->_initialized === false) {
+            if ( ! $this->_selectMailbox(true)) {
+                return false;
+            }
+            $this->_initialized = true;
+        }
+
+        return true;
+    }
+
+    /**
+     * Sends SELECT or EXAMINE command to select mailbox.
+     *
+     * @param boolean $write true to writeable.
+     *
+     * @return true or PEAR_Error
+     * @access private
+     */
+    function _selectMailbox($write = false)
+    {
+        if ($this->_name === $this->_p->getCurrentMailbox() && $write === $this->_p->isWriteable()) {
+            return true;
+        }
+
+        if ($write === true) {
+            if (PEAR::isError($err = $this->_p->cmdSELECT($this->_name))) {
+                return false;
+            }
+        } else {
+            if (PEAR::isError($err = $this->_p->cmdEXAMINE($this->_name))) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    function _fetchMailDrop($msgnum)
+    {
+        if (array_key_exists($msgnum, $this->_maildropList)) {
+            return true;
+        }
+
+        $result = $this->_p->cmdFETCH($msgnum, 'RFC822.SIZE');
+        if (PEAR::isError($result)
+            || ! isset($result['PARSED'])
+            || ! is_array($result['PARSED'])
+        ) {
+            return false;
+        }
+
+        $message_number = null;
+        $message_size = null;
+        foreach ($result['PARSED'] as $message) {
+            if (isset($message['NRO']) && isset($message['EXT']['RFC822.SIZE'])) {
+                $message_number = $message['NRO'];
+                $message_size = $message['EXT']['RFC822.SIZE'];
+                break;
+            }
+        }
+        if (is_null($message_number)
+            || is_null($message_size)
+        ) {
+            return false;
+        }
+        $this->_maildropList[$message_number] = new CB_MailIMAPMessage($this, $message_number, $message_size);
+
+        return true;
+    }
+
+    function _fetchMailDropAll()
+    {
+        if ($this->_maildropAllListed) {
+            return true;
+        }
+
+        if (PEAR::isError($result = $this->_p->cmdFETCH('1:*', 'RFC822.SIZE'))) {
+            return false;
+        }
+        foreach (array_keys($result['PARSED']) as $key) {
+            $msgnum = $result['PARSED'][$key]['NRO'];
+            $size = $result['PARSED'][$key]['EXT']['RFC822.SIZE'];
+            $this->_maildropList[$msgnum] = new CB_MailIMAPMessage($this, $msgnum, $size);
+        }
+        $this->_maildropAllListed = true;
+
+        return true;
+    }
+
+    function _fetchMailHeader($msgnum)
+    {
+        if (array_key_exists($msgnum, $this->_mailheaderList)) {
+            return true;
+        }
+
+        if (PEAR::isError($result = $this->_p->cmdFETCH($msgnum, 'BODY.PEEK[HEADER]'))) {
+            return false;
+        }
+        if (isset($result['PARSED'][0])) {
+            $msgnum = $result['PARSED'][0]['NRO'];
+            $header = $result['PARSED'][0]['EXT']['BODY[HEADER]']['CONTENT'];
+            $message = new CB_MailIMAPMessage($this, 0, 0);
+            $message->_parseHeaders($headers);
+            $this->_mailheaderList[$msgnum] = $message;
+        }
+
+        return true;
+    }
+
+    function _fetchMailHeaderAll()
+    {
+        if ($this->_mailheaderAllListed) {
+            return true;
+        }
+
+        if (PEAR::isError($result = $this->_p->cmdFETCH('1:*', 'BODY.PEEK[HEADER]'))) {
+            return false;
+        }
+        foreach (array_keys($result['PARSED']) as $key) {
+            $msgnum = $result['PARSED'][$key]['NRO'];
+            $header = $result['PARSED'][$key]['EXT']['BODY[HEADER]']['CONTENT'];
+            $message = new CB_MailIMAPMessage($this, 0, 0);
+            $message->_parseHeaders($headers);
+            $this->_mailheaderList[$msgnum] = $message;
+        }
+        $this->_mailheaderAllListed = true;
+
+        return true;
+    }
+
+    function _fetchSeens()
+    {
+        if ( ! is_null($this->_seens)) {
+            return true;
+        }
+
+        if (PEAR::isError($result = $this->_p->cmdSEARCH('SEEN'))) {
+            return false;
+        }
+
+        $this->_seens = [];
+        if (is_array($result['PARSED']['SEARCH']['SEARCH_LIST'])) {
+            foreach ($result['PARSED']['SEARCH']['SEARCH_LIST'] as $msgnum) {
+                $this->_seens[$msgnum] = $msgnum;
+            }
+        }
+
+        return true;
+    }
+
+    function _fetchUnseens()
+    {
+        if ( ! is_null($this->_unseens)) {
+            return true;
+        }
+
+        if (PEAR::isError($result = $this->_p->cmdSEARCH('UNSEEN'))) {
+            return false;
+        }
+        $this->_unseens = [];
+        if (is_array($result['PARSED']['SEARCH']['SEARCH_LIST'])) {
+            foreach ($result['PARSED']['SEARCH']['SEARCH_LIST'] as $msgnum) {
+                $this->_unseens[$msgnum] = $msgnum;
+            }
+        }
+
+        return true;
+    }
+
+    function _fetchUID($msgnum)
+    {
+        if (array_key_exists($msgnum, $this->_Msgnum_UID)) {
+            return true;
+        }
+
+        if (PEAR::isError($result = $this->_p->cmdFETCH($msgnum, 'UID'))) {
+            return false;
+        }
+        if (isset($result['PARSED'][0])) {
+            $msgnum = $result['PARSED'][0]['NRO'];
+            $uid = $result['PARSED'][0]['EXT']['UID'];
+            $this->_Msgnum_UID[$msgnum] = $uid;
+        }
+
+        return true;
+    }
+
+    function _fetchMsgnum($uid)
+    {
+        if (array_key_exists($uid, $this->_UID_Msgnum)) {
+            return true;
+        }
+
+        if (PEAR::isError($result = $this->_p->cmdSEARCH("UID $uid"))) {
+            return false;
+        }
+        if (isset($result['PARSED']['SEARCH']['SEARCH_LIST'][0])) {
+            $this->_UID_Msgnum[$uid] = $result['PARSED']['SEARCH']['SEARCH_LIST'][0];
+        }
+
+        return true;
+    }
+
+    /**
+     * Marks the folder as invalidated.
+     *
+     * @access private
+     */
+    function _invalidate()
+    {
+        $this->_valid = false;
+    }
+
+    /**
+     * Checks whether the folder is valid.
+     *
+     * @access private
+     * @return If the folder is valid, returns true. Otherwise false.
+     */
+    function _checkValidity()
+    {
+        if ( ! $this->_valid) {
+            $msg = cb_msg('fw.mail', 'This folder is invalid. Please get the folder from the store again.');
+            if ( ! is_null($this->_listener)) {
+                $this->_listener->error(-1, $msg);
+            }
+            if ( ! is_null($this->_logger)) {
+                $this->_logger->warning($msg);
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+}
+
+/**
+ * A Implementation of mail message whitch fetches content from the IMAP server.
+ *
+ * @package fw.mail
+ */
+class CB_MailIMAPMessage extends CB_MailLazyMessage
+{
+    /**
+     * Creator mail store.
+     *
+     * @var object CB_MailIMAPStore
+     * @access private
+     */
+    var $_store;
+
+    /**
+     * The parent folder.
+     *
+     * @var object CB_MailIMAPFolder
+     * @access private
+     */
+    var $_folder;
+
+    /**
+     * The protocol handler.
+     *
+     * @var object CB_MailIMAPProtocol
+     * @access private
+     */
+    var $_p;
+
+    /**
+     * Message number.
+     *
+     * @var integer
+     * @access private
+     */
+    var $_msgnum;
+
+    /**
+     * Message size.
+     *
+     * @var integer
+     * @access private
+     */
+    var $_size;
+
+    var $_error_code = 'FW00041';
+
+    /**
+     * The constractor.
+     *
+     * @param object  $filder CB_MailIMAPFolder parent folder.
+     * @param integer $msgnum message number.
+     * @param integer $size   message size
+     *
+     * @access protected
+     */
+    function __construct($folder, $msgnum, $size)
+    {
+        assert('is_a( $folder, "CB_MailIMAPFolder" )');
+        assert('!is_null( $msgnum )');
+        assert('!is_null( $size )');
+
+        parent::__construct();
+        $this->_folder = $folder;
+        $this->_store = $folder->_store;
+        $this->_p = $this->_store->_p;
+        $this->_msgnum = $msgnum;
+        $this->_size = $size;
+    }
+
+    function setThrowError($error_code)
+    {
+        $this->_error_code = $error_code;
+    }
+
+    function throwError($message = '')
+    {
+        if ( ! is_null($this->_error_code)) {
+            cb_throw_error($this->_error_code,
+                ['info' => $message],
+                ['info' => $message],
+                ['info' => $message],
+                ['info' => $message]);
+        }
+    }
+
+    /**
+     * Message size gotten from the server.
+     *
+     * @return integer
+     */
+    function getSize()
+    {
+        return $this->_size;
+    }
+
+    /**
+     * If _name_to_headers has not been set
+     * which fetches header from the server.
+     *
+     * @access private
+     */
+    function _fetchHeaders()
+    {
+        if (isset($this->_name_to_headers)) {
+            return true;
+        }
+
+        if (PEAR::isError($result = $this->_p->cmdFETCH($this->_msgnum, 'BODY.PEEK[HEADER]'))) {
+            $this->throwError();
+
+            return $result;
+        }
+        $row_headers = $result['PARSED'][0]['EXT']['BODY[HEADER]']['CONTENT'];
+        $this->_parseHeaders($row_headers);
+
+        return true;
+    }
+
+    /**
+     * If _source_data has not been set
+     * whitch fetches body.
+     *
+     * @access private
+     */
+    function _fetchSource()
+    {
+        if (isset($this->_source_data)) {
+            return true;
+        }
+
+        if (PEAR::isError($result = $this->_p->cmdFETCH($this->_msgnum, 'BODY.PEEK[]'))) {
+            $this->throwError();
+
+            return $result;
+        }
+        $this->_source_data =& $result['PARSED'][0]['EXT']['BODY[]']['CONTENT'];
+        $message = CB_MailParser::static_parse($this->_source_data, 'var');
+        $this->_name_to_headers =& $message->_name_to_headers;
+        $this->_setBody($message->_body);
+
+        return true;
+    }
+
+    /**
+     * Parses RFC822 message headers.
+     *
+     * @param string $row_headers
+     *
+     * @access private
+     */
+    function _parseHeaders($row_headers)
+    {
+        assert('!is_null( $row_headers )');
+
+        $row_headers = rtrim($row_headers);
+        $row_headers = preg_replace("/\r\n([ \t])/", "$1", $row_headers); // Unfold headers
+        $row_headers = explode("\r\n", $row_headers);
+        $headers = [];
+        foreach ($row_headers as $line) {
+            $pos = strpos($line, ':');
+            $name = substr($line, 0, $pos);
+            $value = ltrim(substr($line, $pos + 1));
+            $header = new CB_MailHeader($name, $value);
+            $name = strtolower($name);
+            if (isset($headers[$name])) {
+                $headers[$name][] = $header;
+            } else {
+                $headers[$name] = [$header];
+            }
+        }
+        $this->_name_to_headers =& $headers;
+    }
+
+
+    function getAllRawHeaders()
+    {
+        $this->_fetchHeaders();
+
+        $_header = [];
+        foreach ($this->_name_to_headers as $key => $data) {
+            $_header[$key] = $this->_decodeHeader($data[0]);
+        }
+
+        return $_header;
+    }
+}
+
+

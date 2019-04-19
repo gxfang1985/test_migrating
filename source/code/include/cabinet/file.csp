@@ -1,0 +1,604 @@
+<?php
+
+use grn\fts\Application as FtsApplication;
+use grn\fts\cabinet\IndexService;
+
+require_once('grn/file.csp');
+require_once('cabinet/table.csp');
+require_once('cabinet/file_util.csp');    // Huy added
+
+class GRN_Cabinet_FileBody extends GRN_FileBody
+{
+    var $_app_id = 'cabinet';
+
+    var $col_file
+        = [
+            'type' => 'weak_relation',
+            'to'   => 'GRN_Cabinet_File',
+            'lazy' => true
+        ];
+
+    function __construct(& $row)
+    {
+        parent::__construct($row);
+    }
+}
+
+class GRN_Cabinet_FileLog extends GRN_FileLog
+{
+    var $_app_id = 'cabinet';
+
+    var $col_file
+        = [
+            'type' => 'relation',
+            'to'   => 'GRN_Cabinet_File',
+            'lazy' => true
+        ];
+    var $col_body = ['type' => 'weak_relation', 'to' => 'GRN_Cabinet_FileBody'];
+
+    function __construct(& $row)
+    {
+        parent::__construct($row);
+    }
+}
+
+class GRN_Cabinet_FileLock extends GRN_FileLock
+{
+    var $_app_id = 'cabinet';
+
+    var $col_file
+        = [
+            'type'   => 'relation',
+            'to'     => 'GRN_Cabinet_File',
+            'unique' => true
+        ];
+
+    function __construct(& $row)
+    {
+        parent::__construct($row);
+    }
+}
+
+class GRN_Cabinet_File extends GRN_File
+{
+    var $_app_id = 'cabinet';
+    var $_body_table_name = 'GRN_Cabinet_FileBody';
+    var $_log_table_name = 'GRN_Cabinet_FileLog';
+    var $_lock_table_name = 'GRN_Cabinet_FileLock';
+
+    // Huy added
+    // The time file is deleted (NULL is not in Trash)
+    var $col_dtime = ['type' => 'timestamp'];
+
+    /**
+     * @access private
+     */
+    var $_triggers = null;
+
+    function __construct(& $row)
+    {
+        parent::__construct($row, 'grn.cabinet');
+    }
+
+    /**
+     * invoke hooks on create, update or delete event
+     *
+     * @access public
+     *
+     * @param string $action action
+     */
+    function runHook($action)
+    {
+        if (is_null($this->_triggers)) {
+            $loader = new CB_PluginLoader('grn.cabinet.file');
+            $this->_triggers = $loader->loadHooks();
+        }
+
+        foreach ($this->_triggers as $hook) {
+            call_user_func($hook, $this, $action);
+        }
+    }
+
+    // Huy added
+    function isInTrash()
+    {
+        $inTrash = false;
+        if ($this->get('dtime')) {
+            $inTrash = true;
+        }
+
+        return $inTrash;
+    }
+
+    function moveToTrash()
+    {
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+        $this->set('dtime', $ts);
+
+        $this->runHook('delete');
+    }
+
+    function restoreFileFromTrash()
+    {
+        $this->set('dtime', null);
+
+        $this->runHook('create');
+    }
+
+    function isExpired()
+    {
+        $isExpired = false;
+
+        require_once('cabinet/config.csp');
+        $sysconf = GRN_Cabinet_SystemConfig::getInstance();
+        $trash_period = $sysconf->getTrashPeriod();
+
+        assert("$trash_period > 0");
+
+        $ts = new CB_TimeStampEx();
+        $ts->unix_ts = time();
+        $today =& $ts->getDateTime();
+
+        $ts_dtime = $this->get('dtime');
+        $ts_dtimeEx = new CB_TimeStampEx($ts_dtime);
+        $dtime = $ts_dtimeEx->getDateTime($ts_dtimeEx);
+
+        $dtime->hour = 0;
+        $dtime->minute = 0;
+        $dtime->second = 0;
+        $dtime->moveDays(1);
+
+        $tspan = $today->getInterval($dtime);
+
+        if ($tspan->toDays() >= $trash_period) {
+            $isExpired = true;
+        }
+
+        return $isExpired;
+    }
+
+    function getFileBodySize()
+    {
+        $file_body = new CB_RowSet(cb_class2table($this->_body_table_name));
+        $fid = $this->getOId();
+        $file_body->addCondition('col_file = ' . $fid);
+        $size = 0;
+        while ( ! is_null($body = $file_body->iterate())) {
+            $size += $body->get('size');
+        }
+
+        return $size;
+    }
+    // end Huy added
+
+    // override
+    function setTitle($title)
+    {
+        parent::setTitle($title);
+        $this->runHook('update');
+    }
+
+    /**
+     * @param mixed  $user    {@link CB_User}, or NULL.
+     * @param mixed  $file    {@link GRN_ServerFile}, or an element of
+     *                          $_FILES, or a path string of a file.
+     * @param string $comment comment on this operation.
+     *
+     * @return bool             TRUE if success, FALSE otherwise.
+     */
+    function update($user, $file, $comment)
+    {
+        parent::update($user, $file, $comment);
+        $this->runHook('update');
+    }
+
+    /**
+     * @param mixed  $user    {@link CB_User}, or NULL.
+     * @param int    $restore_version
+     * @param string $comment comment on this operation.
+     *
+     * @return bool             TRUE if success, FALSE otherwise.
+     */
+    function restore($user, $restore_version, $comment)
+    {
+        parent::restore($user, $restore_version, $comment);
+        $this->runHook('update');
+    }
+}
+
+class GRN_Cabinet_FileManager_Core extends GRN_FileManager
+{
+    function __construct()
+    {
+        $this->_file_table = cb_class2table('GRN_Cabinet_File');
+        $this->_body_table = cb_class2table('GRN_Cabinet_FileBody');
+    }
+}
+
+class GRN_Cabinet_FileManager
+{
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Cabinet_FileManager
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * @access private
+     */
+    var $_tab_file = null;
+
+    /**
+     * constructor
+     */
+    function __construct()
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('cabinet');
+        $this->table_manager = $tm;
+        $this->_tab_file = $tm->getTableInfo('GRN_Cabinet_FileRelation');
+    }
+
+
+    /**
+     * @access private
+     * @return CB_TableInfo|null
+     */
+    function _getTable()
+    {
+        return $this->_tab_file;
+    }
+
+
+    function createFile($user, $folder, & $file, $comment)
+    {
+        if ( ! $folder) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        if ( ! $folder->access($user, GRN_CABINET_ACCESS_RW)) {
+            cb_throw_error(E_GRN_CABINET_ACCESS_DENY_WRITE);
+        }
+
+        if (is_array($file)) {
+            if ($file['error'] != UPLOAD_ERR_OK) {
+                cb_throw_error();
+            }
+        }
+
+        require_once('grn/file.csp');
+        $basemgr = new GRN_Cabinet_FileManager_Core();
+        $object = $basemgr->createFile($user, $file, $comment);
+
+        assert('$object');
+
+        $row = $this->_tab_file->newRow();
+        $row->set('folder', $folder->_getRow());
+        $row->set('file', $object);
+        $row->updateNow();
+
+        require_once('cabinet/notification.csp');
+        $nm = GRN_Cabinet_NotificationManager::getInstance();
+        $nm->read($user, $object, $object->get('ctime'), false);
+
+        $object->runHook('create');
+
+        return $object;
+    }
+
+    function &getFolderFile(& $folder, $id)
+    {
+        $this->_tab_file->getDBConnection();
+
+        $rowset = new CB_RowSet($this->_tab_file);
+        $condition = $rowset->queryf("col_file = '@S' AND col_folder = '@S'",
+            $id, $folder->getOID());
+        $rowset->addCondition($condition);
+
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        if (is_null($row)) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $ret = $row->get('file');
+
+        return $ret;
+    }
+
+    function &getFile(
+        & $user,
+        $id,
+        $acc_mode = GRN_CABINET_ACCESS_R,
+        $throw_error = true
+    ) {
+        $this->_tab_file->getDBConnection();
+
+        $rowset = new CB_RowSet($this->_tab_file);
+        $condition = $rowset->queryf("col_file = '@S'", $id);
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        if (is_null($row)) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $file_row = $row->get('file');
+
+        require_once('cabinet/folder.csp');
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+
+        $folder = $factory->row2object($row->get('folder'));
+
+        if ($folder) {
+            //$folder->access( $user, $acc_mode, $throw_error );
+            if ( ! $folder->access($user, $acc_mode, false)
+                 || $folder->checkDeletedFlag()
+            ) //GTM-528
+            {
+                if ($throw_error) {
+                    if ($acc_mode == GRN_CABINET_ACCESS_R) {
+                        require_once('grn/notification.csp');
+                        $dbconn
+                            = grn_notification_get_connection($user->getOID());
+
+                        $user_id = $user->getOID();
+                        $mapping_name = grn_get_personal_tablename($user_id,
+                            'tab_grn_notification_notify');
+                        $format
+                            = "delete from ${mapping_name} where ((col_user='@S') and (col_module_id='@S') and (col_unique_id='@S'))";
+                        $query = cb_queryf($dbconn, $format, $user_id,
+                            'grn.cabinet', $id);
+                        $dbconn->query($query);
+                        $dbconn->commit();
+                        cb_throw_error(E_GRN_CABINET_ACCESS_DENY_READ);
+                    }
+
+                    cb_throw_error(E_GRN_CABINET_ACCESS_DENY_WRITE);
+                }
+
+            }
+        }
+
+        return $file_row;
+    }
+
+    function &_getFileSafe(& $user, $id, &$auth)
+    {
+        if ( ! $user || ! $id) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $this->_tab_file->getDBConnection();
+
+        $rowset = new CB_RowSet($this->_tab_file);
+        $condition = $rowset->queryf("col_file = '@S'", $id);
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        if (is_null($row)) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $file_row = $row->get('file');
+
+        require_once('cabinet/folder.csp');
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+
+        $folder = $factory->row2object($row->get('folder'));
+
+        $auth = $folder->getAuthorities($user);
+
+        if ( ! $auth['read']) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        return $file_row;
+    }
+
+    /**
+     * @param GRN_Cabinet_Folder $folder
+     * @param int                $list_mode
+     *
+     * @return GRN_Cabinet_File[]|bool
+     */
+    function getFolderFiles(
+        $folder,
+        $list_mode = GRN_CABINET_FILELIST_MODE_NOT_IN_TRASH
+    )    // Huy added "$list_mode"
+    {
+        if ( ! $folder) {
+            return false;
+        }
+
+        $db = cb_get_app_db("cabinet");
+        $rowset
+            = new CB_RowSet($this->table_manager->getTableInfo('GRN_Cabinet_File'));
+        $rowset->addJoin($this->_tab_file,
+            "tab_grn_cabinet_filerelation.col_file = tab_grn_cabinet_file._id");
+        $rowset->addCondition($db->format('col_folder = "@S"',
+            [$folder->getOID()]));
+        $files = [];
+
+        // 引数にフォルダが指定されているのでアクセスは許可されているとみなして
+        // アクセス権のチェックは行わない
+        while ( ! is_null(($file_row = $rowset->iterate()))) {
+            // Huy added
+            switch ($list_mode) {
+                case GRN_CABINET_FILELIST_MODE_ALL:
+                    $files[$file_row->getOID()] = $file_row;
+                    break;
+                case GRN_CABINET_FILELIST_MODE_NOT_IN_TRASH:
+                    if ($file_row->isInTrash() == false) {
+                        $files[$file_row->getOID()] = $file_row;
+                    }
+                    break;
+                case GRN_CABINET_FILELIST_MODE_IN_TRASH:
+                    if ($file_row->isInTrash()) {
+                        $files[$file_row->getOID()] = $file_row;
+                    }
+                    break;
+            }
+            unset ($file_row);
+        }
+
+        return $files;
+    }
+
+
+    function getNumFolderFiles(& $folder)
+    {
+        if ( ! $folder) {
+            return 0;
+        }
+
+        $rowset = new CB_RowSet($this->_tab_file);
+        $rowset->addCondition('col_folder = ' . $folder->getOID());
+        $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+        $result = $rowset->iterate();
+        $rowset->destroy();
+
+        return $result['count'];
+    }
+
+    /**
+     * ファイルの保存されてるフォルダを取得する
+     * ファイルオブジェクトを引数にとり、フォルダのアクセス権チェックは行わない
+     *
+     * @param GRN_File $file ファイル
+     *
+     * @return GRN_Cabinet_Folder
+     */
+    function getFolder(& $file)
+    {
+        if ( ! $file) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        assert('is_a($file,"grn_file")');
+
+        $rowset = new CB_RowSet($this->_tab_file);
+        $rowset->addCondition('col_file = ' . $file->getOID());
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        if ( ! $row) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        require_once('cabinet/folder.csp');
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+
+        $ret = $factory->row2object($row->get('folder'));
+
+        return $ret;
+    }
+
+    /**
+     * @param $user
+     * @param $file
+     * @param $folder
+     *
+     * @return bool
+     */
+    function moveFile(& $user, & $file, & $folder)
+    {
+        if ( ! $folder || ! $file) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $rowset = new CB_RowSet($this->_tab_file);
+        $rowset->addCondition('col_file = ' . $file->getOID());
+        $relation = $rowset->iterate();
+        $rowset->destroy();
+
+        if ( ! $relation) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        if (($current =& $relation->get('folder'))) {
+            require_once('cabinet/folder.csp');
+            $factory = GRN_Cabinet_FolderFactory::getInstance();
+            $current_folder = $factory->row2object($current);
+            $current_folder->canMoveFileTo($user, $file, $folder, true);
+        }
+
+        $relation->set('folder', $folder->_getRow());
+        $relation->updateNow();
+
+        // 移動先で通知するためタイムスタンプを更新
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+        $file->set('mtime', $ts);
+
+        if ($user) {
+            $file->set('modifier', $user);
+            $file->set('modifier_name', $user->get('display_name'));
+        } else {
+            $file->set('modifier', null);
+            $file->set('modifier_name', null);
+        }
+
+        $file->runHook('update');
+
+        if (FtsApplication::isAvailable()) {
+            $searchService = new IndexService();
+            $searchService->updateFileIndex($file);
+        }
+
+        $ret = true;
+
+        return $ret;
+    }
+
+    /**
+     * @param string $fileId
+     *
+     * @return GRN_Cabinet_File
+     */
+    public function getFileById($fileId)
+    {
+        $tableName = 'grn_cabinet_file';
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tableManager = $app_locator->getTableManager('cabinet');
+        $tableInfo = $tableManager->getTableInfo($tableName);
+        $file = $tableInfo->getRow($fileId);
+
+        return $file;
+    }
+}
+

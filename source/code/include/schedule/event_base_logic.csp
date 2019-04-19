@@ -1,0 +1,5007 @@
+<?php
+/**
+ * スケジューラーのイベントを管理するメインのロジック
+ *
+ * @author      A.Shima     2004/10/25
+ * @package     grn.schedule
+ */
+
+require_once('schedule/resources.csp');
+require_once('fw/date.csp');
+require_once('schedule/error_code.csp');
+require_once('grn/application.csp');
+require_once('schedule/utility.csp');
+
+use grn\grn\GrnException;
+use grn\grn\MemberLogic;
+use grn\schedule\bean\AttendanceStatus;
+use grn\schedule\FacilityApprovalLogic;
+use grn\schedule\ScheduleMemberLogic;
+
+/**
+ * 予定の基本的なロジッククラス
+ *
+ * @package     grn.schedule
+ * @abstract
+ */
+class GRN_Schedule_EventBaseLogic
+{
+    public $facilityConflictHandler;
+
+    /**
+     * @author vuminh@Cybozu 2010/02/24
+     * Create a new structure cache to store data
+     */
+    private $_cache = null;
+
+    /**
+     * Store a ($key, $value) to cache, return true if success
+     */
+    function save_to_cache($key, $value)
+    {
+        $this->_cache[$key] = $value;
+
+        return true;
+    }
+
+    /**
+     * Get a value by a $key, return null if error)
+     */
+    function get_from_cache($key)
+    {
+        if (array_key_exists($key, $this->_cache) === true) {
+            return $this->_cache[$key];
+        }
+
+        return null;
+    }
+
+    /**
+     * Remove cache by a $key whenever we have change to the database
+     */
+    function remove_cache_at($key)
+    {
+        unset($this->_cache[$key]);
+    }
+
+    /**
+     * Should call this function to reset cache data whenever we commit change to the database
+     */
+    function reset_cache()
+    {
+        unset($this->_cache);
+        $this->_cache = [];
+    }
+
+    function __construct()
+    {
+        $this->_cache = [];
+    }
+
+    /**
+     * @access private
+     */
+    private $_tablemanager = null;
+
+    /**
+     * @access private
+     * @return CB_TableManager
+     */
+    function _getTableManager()
+    {
+        if (is_null($this->_tablemanager)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->_tablemanager = $app_locator->getTableManager('schedule');
+        }
+
+        return $this->_tablemanager;
+    }
+
+    /**
+     * @access private
+     */
+    private $_eventtable = null;
+
+    /**
+     * @access private
+     */
+    function _getEventTable()
+    {
+        if (is_null($this->_eventtable)) {
+            require_once('schedule/table.csp');
+            $tm = $this->_getTableManager();
+            $this->_eventtable = $tm->getTableInfo(GRN_SCHEDULEEVENT);
+        }
+
+        return $this->_eventtable;
+    }
+
+    /**
+     * @access private
+     */
+    private $_datetimetable = null;
+
+    /**
+     * @access private
+     */
+    function _getDateTimeTable()
+    {
+        if (is_null($this->_datetimetable)) {
+            require_once('schedule/table.csp');
+            $tm = $this->_getTableManager();
+            $this->_datetimetable = $tm->getTableInfo(GRN_EVENTDATETIME);
+        }
+
+        return $this->_datetimetable;
+    }
+
+    /**
+     * @access private
+     */
+    private $_datetable = null;
+
+    /**
+     * @access private
+     */
+    function _getDateTable()
+    {
+        if (is_null($this->_datetable)) {
+            require_once('schedule/table.csp');
+            $tm = $this->_getTableManager();
+            $this->_datetable = $tm->getTableInfo(GRN_EVENTDATE);
+        }
+
+        return $this->_datetable;
+    }
+
+    /**
+     * @access private
+     */
+    private $_membertable = null;
+
+    /**
+     * @access private
+     */
+    function _getMemberTable()
+    {
+        if (is_null($this->_membertable)) {
+            require_once('schedule/table.csp');
+            $tm = $this->_getTableManager();
+            $this->_membertable = $tm->getTableInfo(GRN_EVENTMEMBER);
+        }
+
+        return $this->_membertable;
+    }
+
+    /**
+     * @access private
+     */
+    private $_followtable = null;
+
+    /**
+     * @return CB_TableInfo
+     */
+    function _getFollowTable()
+    {
+        if (is_null($this->_followtable)) {
+            require_once('schedule/table.csp');
+            $tm = $this->_getTableManager();
+            $this->_followtable = $tm->getTableInfo(GRN_EVENTFOLLOW);
+        }
+
+        return $this->_followtable;
+    }
+
+    /**
+     * @access private
+     */
+    private $_addresstable = null;
+
+    /**
+     * @access private
+     */
+    function _getAddressTable()
+    {
+        if (is_null($this->_addresstable)) {
+            require_once('schedule/table.csp');
+            $tm = $this->_getTableManager();
+            $this->_addresstable = $tm->getTableInfo(GRN_SCHEDULE_ADDRESSDATA);
+        }
+
+        return $this->_addresstable;
+    }
+
+    /**
+     * @access private
+     */
+    private $_notifyaddresstable = null;
+
+    /**
+     * @access private
+     */
+    function _getNotifyAddressTable()
+    {
+        if (is_null($this->_notifyaddresstable)) {
+            require_once('schedule/table.csp');
+            $tm = $this->_getTableManager();
+            $this->_notifyaddresstable
+                = $tm->getTableInfo(GRN_SCHEDULE_NOTIFYADDRESS);
+        }
+
+        return $this->_notifyaddresstable;
+    }
+
+    /**
+     * @access protected
+     */
+    protected $_ts = null;
+
+    /**
+     * @access private
+     */
+    private $_shared_list = null;
+    /**
+     * @access private
+     */
+    private $_hidden_list = null;
+    /**
+     * @access private
+     */
+    private $_private_list = null;
+
+    /**
+     * @access private
+     */
+    private $_db = null;
+
+    /**
+     * @access private
+     */
+    function _getDBConnection()
+    {
+        // 初期化されいなければ初期化
+        if (is_null($this->_db)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->_db = $app_locator->getConnection('schedule');
+        }
+
+        return $this->_db;
+    }
+
+
+    /**
+     * 予定の登録
+     *
+     * @param   object GRN_Schedule_EventBase $event  イベント
+     *
+     * @return  mixed       成功した場合はイベントID、それ以外はFALSE。
+     */
+    function entryEvent($event)
+    {
+        // 内容
+        $eventrow = $this->_entryEventData($event);
+        if ($eventrow == false) {
+            return false;
+        }
+
+        // 時間
+        if ( ! $this->_entryEventDate($eventrow, $event)) {
+            $eventrow->delete();
+
+            return false;
+        }
+
+        // メンバー
+        if ( ! $this->_setEventMember($eventrow, $event)) {
+            $eventrow->delete();
+
+            return false;
+        }
+
+        // 通知先
+        if ( ! $this->_setNotifyAddress($eventrow, $event)) {
+            $eventrow->delete();
+
+            return false;
+        }
+
+        // イベントのIDを与える
+        $event->id = $eventrow->getOID();
+
+        // ログ
+        $eventrow->onAction('create');
+
+        return $eventrow->getOID();
+    }
+
+    /**
+     * 予定の内容の登録関数
+     *
+     * @access private
+     */
+    function _entryEventData($event)
+    {
+        $id = $this->_getNextEventID();
+
+        // Create event
+        $eventtable = $this->_getEventTable();
+        $eventrow = $eventtable->newRow($id);
+        if ( ! $this->_setEventData($eventrow, $event)) {
+            $___ret = false;
+
+            return $___ret;
+        }
+
+        // 登録者情報
+        if ( ! is_null($event->creator) && is_a($event->creator, 'CB_User')) {
+            $eventrow->set('creator', $event->creator);
+            $eventrow->set('creator_foreign_key',
+                $event->creator->get('foreign_key'));
+            $eventrow->set('creator_name',
+                $event->creator->get('display_name'));
+            $eventrow->set('modifier', $event->creator);
+            $eventrow->set('modifier_foreign_key',
+                $event->creator->get('foreign_key'));
+            $eventrow->set('modifier_name',
+                $event->creator->get('display_name'));
+        } elseif (is_string($event->creator)) {
+            $eventrow->set('creator_name', $event->creator);
+            $eventrow->set('modifier_name', $event->creator);
+        }
+        $ts = new CB_TimeStampEx();
+        $eventrow->set('ctime', $ts);
+        $eventrow->set('mtime', $ts);
+
+        return $eventrow;
+    }
+
+    private function _getNextEventID()
+    {
+        require_once('resources.csp');
+        $db = $this->_getDBConnection();
+
+        // Get next sequence number
+        $query = 'SELECT _id + 1 FROM ' . GRN_SCHEDULE_EVENTSEQUENCE
+                 . ' FOR UPDATE;';
+        $result = $db->query($query);
+        $row = $db->fetch_assoc($result);
+        $id = $row['_id + 1'];
+        $db->free_result($result);
+
+        // Update event sequence number
+        $query = 'UPDATE ' . GRN_SCHEDULE_EVENTSEQUENCE . ' SET _id=' . $id
+                 . ';';
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on UPDATE: ' . $query]);
+        }
+
+        return $id;
+    }
+
+    /**
+     * 日付の登録関数
+     *
+     * @access private
+     *
+     */
+    function _entryEventDate($eventrow, $event)
+    {
+        $event_type = $event->getEventType();
+        $daterow = null;
+
+        // データタイプにより日付の保存場所を変更する
+        if (($event_type & GRN_SCHEDULE_EVENT_TYPE_ALLDAY) > 0) {
+            $datetable = $this->_getDateTable();
+            $daterow = $datetable->newRow();
+        } else {
+            $datetimetable = $this->_getDateTimeTable();
+            $daterow = $datetimetable->newRow();
+        }
+
+        return $this->_setEventDate($daterow, $eventrow, $event);
+    }
+
+    /**
+     * 施設がぶつかっているかどうかのチェック
+     *
+     * @param  int         $event_id
+     * @param  CB_DateTime $setdatetime ログインユーザーのタイムゾーンにおける開始日時
+     * @param  CB_DateTime $enddatetime ログインユーザーのタイムゾーンにおける終了日時
+     * @param  array<GRN_Facility_Facility>  $facilities
+     *
+     * @return  string      成功した場合は0それ以外は、衝突している施設のID
+     */
+    protected function _checkConfilictFacilites(
+        $event_id,
+        $setdatetime,
+        $enddatetime,
+        & $facilities
+    ) {
+        // 日付の生成
+        foreach (array_keys($facilities) as $key) {
+            if ($this->_checkConflictMemberEvent($facilities[$key],
+                $setdatetime, $enddatetime, $event_id)
+            ) {
+                return $facilities[$key]->getOID();
+            }
+        }
+
+        return '0';
+    }
+
+    //GTM-143
+    protected function _getIdsConfilictFacilites(
+        $event_id,
+        $setdatetime,
+        $enddatetime,
+        & $facilities
+    ) {
+        // 日付の生成
+        $conflict_fac = [];
+        foreach (array_keys($facilities) as $key) {
+            if ($this->_checkConflictMemberEvent($facilities[$key],
+                $setdatetime, $enddatetime, $event_id)
+            ) {
+                $conflict_fac [] = $facilities[$key]->getOID();
+            }
+        }
+
+        return $conflict_fac;
+    }
+    //GTM-143
+    //end
+    function _lockFacilites($facilities)
+    {
+        $tm = $this->_getTableManager();
+        $table = $tm->getTableInfo(GRN_FACILITY_FACILITY_FOR_LOCK);
+        $fids = [];
+        foreach (array_keys($facilities) as $key) {
+            $f_id = $facilities[$key]->getOID();
+            $fids[] = cb_queryf($table->getDBConnection(), "'@S'", $f_id);
+        }
+        foreach ($fids as $fid) {
+            $table_name = 'tab_' . $table->getTableName();
+            $query
+                = "SELECT _id FROM $table_name WHERE col_facility = $fid";
+            $db = $table->getDBConnection();
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError(['query' => 'query failed: ' . $query]);
+            }
+            $row = $db->fetch_assoc($result);
+            unset($result);
+            if ($row === false) {
+                $query = sprintf('INSERT INTO %s (%s) VALUES(%s)', $table_name,
+                    'col_facility', $fid);
+                $result = $db->query($query);
+                if ($result === false) {
+                    $db->throwError(['query' => 'query failed: ' . $query]);
+                }
+                unset($result);
+            }
+            unset($db);
+        }
+        if (count($fids) > 0) {
+            $rowset = new CB_RowSet($table);
+            $condition = 'col_facility IN (' . implode(',', $fids) . ')';
+            $rowset->addCondition($condition);
+            $rowset->setLock(CB_DATABASE_EXCLUSIVE_LOCK);
+            $row = $rowset->iterate();
+            $rowset->destroy();
+            unset($rowset);
+            if ($row == false) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 日付の設定（派生先で実装すること！）
+     *
+     * @access private
+     */
+    function _setEventDate($row, $eventrow, $event)
+    {
+        $row->delete();
+
+        return false;
+    }
+
+
+    /**
+     * イベントの中身の設定
+     *
+     * @access private
+     */
+    function _setEventData($eventrow, $event)
+    {
+        //GTM-103  v2
+        //GRN2-8022 add (drag and drop event have ;#)
+        if (preg_match('/(.*)(;#)(\d+)$/', $event->menu, $matches)
+            && $event->menucolor <= 0
+        ) {
+            $menuName = $matches[1];//menu-name
+            $menuColor = $matches[3];//menu-color
+        } else {
+            $menuName = $event->menu;//menu-name
+            $menuColor = $event->menucolor;//menu-color
+        }
+        $eventrow->set(GRN_SCHEDULE_EVENTMENU, $menuName);
+        $eventrow->set(GRN_SCHEDULE_RESERVE_INT2, $menuColor);
+        //end GTM-103 v2
+        $eventrow->set(GRN_SCHEDULE_DETAIL, $event->detail);
+        $eventrow->set(GRN_SCHEDULE_MEMO, $event->memo);
+        $eventrow->set(GRN_SCHEDULE_EVENT_TYPE, $event->getEventType());
+        $eventrow->set(GRN_SCHEDULE_PRIVATE, $event->private);
+
+        /*
+GRN2-1931
+        $eventrow->set( GRN_SCHEDULE_CHECKABSENCE, $event->checkabsence );
+*/
+        $eventrow->set(GRN_SCHEDULE_DUMMYTITLE, $menuName . $event->detail);
+
+        // GTM-1622
+        if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+            $eventrow->set(GRN_SCHEDULE_ATTENDANCE_CHECK,
+                $event->attendanceCheck);
+            $eventrow->setRefreshAttendanceStatusFlag($event->refreshAttendanceStatus);
+        }
+
+        if ( ! is_null($event->additional_items)) {
+            $eventrow->set(GRN_SCHEDULE_ADDITIONAL_ITEMS,
+                $event->additional_items);
+        }
+
+        $eventrow->registerNow();
+
+        // アドレス帳連携
+        if ( ! $this->_setEventAddressData($eventrow, $event)) {
+            $eventrow->delete();
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     *
+     * @access private
+     */
+    function _getAddressDataRow($event_id)
+    {
+        $addresstable = $this->_getAddressTable();
+        $rowset = new CB_RowSet($addresstable);
+
+        $rowset->addCondition($rowset->queryf("col_event = '@S'", $event_id));
+
+        $row = $rowset->iterate();
+
+        return $row;
+    }
+
+    /**
+     * アドレス帳のデータの登録
+     *
+     * @access private
+     */
+    function _setEventAddressData($eventrow, $event)
+    {
+        $addressrow = $this->_getAddressDataRow($eventrow->getOID());
+        // 空の場合は何もしない
+        if (is_null($event->company_name) && is_null($event->zip_code)
+            && is_null($event->physical_address)
+            && is_null($event->map)
+            && is_null($event->route)
+            && is_null($event->route_time)
+            && is_null($event->route_fare)
+            && is_null($event->company_telephone_number)
+            && is_null($event->facsimile_number)
+            && is_null($event->company_url)
+        ) {
+            if ($addressrow) {
+                $addressrow->delete();
+            }
+
+            return true;
+        }
+
+        if ( ! $addressrow) {
+            $addresstable = $this->_getAddressTable();
+            $addressrow = $addresstable->newRow();
+        }
+
+
+        $addressrow->set(GRN_SCHEDULE_EVENT, $eventrow);
+        $addressrow->set('company_name', $event->company_name);
+        $addressrow->set('zip_code', $event->zip_code);
+        $addressrow->set('physical_address', $event->physical_address);
+        $addressrow->set('map', $event->map);
+        $addressrow->set('route', $event->route);
+        $addressrow->set('route_time', $event->route_time);
+        $addressrow->set('route_fare', $event->route_fare);
+        $addressrow->set('company_telephone_number',
+            $event->company_telephone_number);
+        $addressrow->set('facsimile_number', $event->facsimile_number);
+        $addressrow->set('company_url', $event->company_url);
+
+        return true;
+    }
+
+    /**
+     * 共有情報の登録
+     *
+     * @access private
+     */
+    function _setEventMember($eventrow, $event)
+    {
+
+        $event_type = $event->getEventType();
+        $event_type_simple = 2;
+        if ($event_type >= 1 && $event_type <= 31) {
+            $event_type_simple = 1;
+        }
+
+        $number = 0;
+        if (is_array($event->users)) {
+            $number += count($event->users);
+        }
+        if (is_array($event->groups)) {
+            $number += count($event->groups);
+        }
+        if (is_array($event->facilities)) {
+            $number += count($event->facilities);
+        }
+
+        $list_index = 0;
+        // ユーザーの登録
+        $membertable = $this->_getMemberTable();
+
+        if (is_array($event->users)) {
+            foreach (array_keys($event->users) as $index) {
+                $member = $event->users[$index];
+                if ( ! $member) {
+                    continue;
+                }
+
+                $row = $membertable->newRow();
+                $row->set(GRN_SCHEDULE_EVENT, $eventrow);
+                $row->set(GRN_SCHEDULE_EVENT_TYPE, $event_type);
+                $row->set(GRN_SCHEDULE_USER, $member);
+                $row->set(GRN_SCHEDULE_MEMBER_LIST, $list_index++);
+                $row->set(GRN_SCHEDULE_EVENT_TYPE_SIMPLE, $event_type_simple);
+                if ($number == 1) {
+                    $row->set(GRN_SCHEDULE_SINGLE, 1);
+                }
+//                $row->registerNow();
+            }
+        }
+
+        // 組織の登録
+        if (is_array($event->groups)) {
+            foreach (array_keys($event->groups) as $index) {
+                $member = $event->groups[$index];
+                if ( ! $member) {
+                    continue;
+                }
+                $row = $membertable->newRow();
+                $row->set(GRN_SCHEDULE_EVENT, $eventrow);
+                $row->set(GRN_SCHEDULE_EVENT_TYPE, $event_type);
+                $row->set(GRN_SCHEDULE_GROUP, $member);
+                $row->set(GRN_SCHEDULE_MEMBER_LIST, $list_index++);
+                $row->set(GRN_SCHEDULE_EVENT_TYPE_SIMPLE, $event_type_simple);
+                if ($number == 1) {
+                    $row->set(GRN_SCHEDULE_SINGLE, 1);
+                }
+            }
+        }
+
+        // 施設の登録
+        if (is_array($event->facilities)) {
+            foreach (array_keys($event->facilities) as $index) {
+                $member = $event->facilities[$index];
+                if ( ! $member) {
+                    continue;
+                }
+                $row = $membertable->newRow();
+                $row->set(GRN_SCHEDULE_EVENT, $eventrow);
+                $row->set(GRN_SCHEDULE_EVENT_TYPE, $event_type);
+                $row->set(GRN_SCHEDULE_FACILITY, $member);
+                $row->set(GRN_SCHEDULE_MEMBER_LIST, $list_index++);
+                $row->set(GRN_SCHEDULE_EVENT_TYPE_SIMPLE, $event_type_simple);
+                if ($number == 1) {
+                    $row->set(GRN_SCHEDULE_SINGLE, 1);
+                }
+            }
+        }
+
+        // Remove cached data
+        $cache_key = 'event_member' . $event->id;
+        $this->remove_cache_at($cache_key);
+
+        return true;
+    }
+
+    /**
+     * 共有情報の登録
+     *
+     * @access private
+     */
+    function _setNotifyAddress($eventrow, $event)
+    {
+        // いなければ何もしない
+        if ( ! is_array($event->notify_address)
+             || count($event->notify_address) == 0
+        ) {
+            return true;
+        }
+
+        $notifyaddresstable = $this->_getNotifyAddressTable();
+        // Note: $event->notify_address ordered by "order" field
+        $notify_address_order = 0;
+        foreach ($event->notify_address as $order => $object) {
+            $notify_address_order++;
+            if (is_a($object, 'CB_User')) {
+                $row = $notifyaddresstable->newRow();
+                $row->set(GRN_SCHEDULE_EVENT, $eventrow);
+                $row->set(GRN_SCHEDULE_USER, $object);
+                $row->set(GRN_SCHEDULE_DEFAULT_PUBLIC_ORDER,
+                    $notify_address_order);
+            } elseif (is_a($object, 'CB_Group')) {
+                $row = $notifyaddresstable->newRow();
+                $row->set(GRN_SCHEDULE_EVENT, $eventrow);
+                $row->set(GRN_SCHEDULE_GROUP, $object);
+                $row->set(GRN_SCHEDULE_DEFAULT_PUBLIC_ORDER,
+                    $notify_address_order);
+            } elseif (is_a($object, 'CB_Role')) {
+                $row = $notifyaddresstable->newRow();
+                $row->set(GRN_SCHEDULE_EVENT, $eventrow);
+                $row->set(GRN_SCHEDULE_ROLE, $object);
+                $row->set(GRN_SCHEDULE_DEFAULT_PUBLIC_ORDER,
+                    $notify_address_order);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 予定の変更処理
+     *
+     * @param \GRN_Schedule_EventBase $event イベント
+     *
+     * @return  mixed  成功した場合はイベントID、それ以外はFALSE。
+     */
+    function modifyEvent($event)
+    {
+        $eventtable = $this->_getEventTable();
+        $eventrow = $eventtable->getRow($event->id);
+        if ( ! $eventrow) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        // 時間
+        if ( ! $this->_modifyEventDate($eventrow, $event)) {
+            return false;
+        }
+
+        // 内容の変更
+        if ( ! $this->_modifyEventData($eventrow, $event)) {
+            return false;
+        }
+
+
+        // 参加者の変更
+        if ( ! $this->_modifyEventMember($eventrow, $event)) {
+            return false;
+        }
+
+        // 通知先の変更
+        if ( ! $this->_modifyNotifyAddress($eventrow, $event)) {
+            return false;
+        }
+
+        // GTM-1676 modify using purpose
+        $this->_modifyEventApprovalFacility($event);
+        // end GTM-1676
+
+        // ログ
+        $eventrow->onAction('update');
+
+        return $eventrow->getOID();
+    }
+
+    /**
+     * 予定の内容の変更
+     *
+     * @access private
+     */
+    function _modifyEventData($eventrow, $event)
+    {
+        $this->_setEventData($eventrow, $event);
+        // 登録者情報
+        if ( ! is_null($event->modifier) && is_a($event->modifier, 'CB_User')) {
+            $eventrow->set('modifier', $event->modifier);
+            $eventrow->set('modifier_foreign_key',
+                $event->modifier->get('foreign_key'));
+            $eventrow->set('modifier_name',
+                $event->modifier->get('display_name'));
+        } elseif (is_string($event->modifier)) {
+            $eventrow->set('modifier_name', $event->modifier);
+        }
+
+        $ts = new CB_TimeStampEx();
+        $eventrow->set('mtime', $ts);
+
+        return true;
+
+    }
+
+    /**
+     * 予定の日付の変更
+     *
+     * @access private
+     */
+    function _modifyEventDate($eventrow, $event)
+    {
+        $oldType = intval($eventrow->get(GRN_SCHEDULE_EVENT_TYPE));
+        $event_type = $event->getEventType();
+        $daterow = null;
+        // イベントのタイプに変更がある場合
+        if (($event_type < GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+             && $oldType >= GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+            || ($event_type >= GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+                && $oldType < GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+        ) {
+            // 古い日付の削除
+            if ($oldType >= GRN_SCHEDULE_EVENT_TYPE_ALLDAY) {
+                $datetable = $this->_getDateTable();
+                $rowset = new CB_RowSet($datetable);
+                $rowset->addCondition($rowset->queryf("col_event = '@S'",
+                    $event->id));
+                $row = $rowset->iterate();
+                $row->delete();
+            } else {
+                $datetimetable = $this->_getDateTimeTable();
+                $rowset = new CB_RowSet($datetimetable);
+                $rowset->addCondition($rowset->queryf("col_event = '@S'",
+                    $event->id));
+                $row = $rowset->iterate();
+                $row->delete();
+            }
+            // 新たに日付の登録
+            if ( ! $this->_entryEventDate($eventrow, $event)) {
+                return false;
+            }
+        } else {
+            $row = null;
+            if (($oldType & GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+                == GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+            ) {
+                $datetable = $this->_getDateTable();
+                $rowset = new CB_RowSet($datetable);
+                $rowset->addCondition($rowset->queryf("col_event = '@S'",
+                    $event->id));
+                $row = $rowset->iterate();
+            } else {
+                $datetimetable = $this->_getDateTimeTable();
+                $rowset = new CB_RowSet($datetimetable);
+                $rowset->addCondition($rowset->queryf("col_event = '@S'",
+                    $event->id));
+                $row = $rowset->iterate();
+            }
+
+            // 日付の設定
+            if ( ! $this->_setEventDate($row, $eventrow, $event, true)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 予定の参加者の変更
+     *
+     * @access private
+     */
+    function _modifyEventMember($eventrow, $event)
+    {
+        // いったんメンバーの削除
+        $this->_removeAllMember($event->id);
+
+        // メンバー
+        return $this->_setEventMember($eventrow, $event);
+
+    }
+
+    // GTM-1676
+    function _modifyEventApprovalFacility($event)
+    {
+        $facilityApprovalLogic = new FacilityApprovalLogic();
+        if ($event->usingPurpose == null) {
+            return;
+        }
+        $facilityApprovalLogic->setFacilityUsingPurpose($event->id,
+            $event->usingPurpose);
+    }
+    // end GTM-1676
+
+    /**
+     * 参加者をすべて削除
+     *
+     * @access private
+     *
+     * @param   string $eid イベントID
+     */
+    function _removeAllMember($eid)
+    {
+        $membertable = $this->_getMemberTable();
+        $memberrowset = new CB_RowSet($membertable);
+        $memberrowset->addCondition($memberrowset->queryf("col_event = '@S'",
+            $eid));
+        $memberrowset->deleteAllMatched();
+    }
+
+    /**
+     * 通知先の変更
+     *
+     * @access private
+     */
+    function _modifyNotifyAddress($eventrow, $event)
+    {
+        $notifyaddresstable = $this->_getNotifyAddressTable();
+        $notifyrowset = new CB_RowSet($notifyaddresstable);
+        $notifyrowset->addCondition($notifyrowset->queryf("col_event = '@S'",
+            $event->id));
+        $notifyrowset->deleteAllMatched();
+
+        // 通知先の設定
+        return $this->_setNotifyAddress($eventrow, $event);
+    }
+
+    /**
+     * 生のイベントを取得する
+     *
+     * @param   string $event_id イベントID
+     *
+     * @return  object GRN_Schedule_Event       イベントオブジェクト
+     */
+    function getEventRow($event_id)
+    {
+        $eventtable = $this->_getEventTable();
+        $row = $eventtable->getRow($event_id);
+
+        return $row;
+    }
+
+
+    /**
+     * イベントの削除
+     *
+     * @param   CB_User $user                   削除した人
+     * @param   string  $eid                    イベントID
+     * @param   CB_Date $date                   削除する日付。nullの場合はすべてのイベントが削除
+     * @param   array   $extension_log_messages 削除するときに追加するログメッセージ
+     *
+     * @return  boolean     成功した場合はTRUE、それ以外はFALSE
+     */
+    function deleteEvent(
+        $user,
+        $eid,
+        $date = null,
+        array $extension_log_messages = null
+    ) {
+        $eventtable = $this->_getEventTable();
+        $event = $eventtable->getRow($eid);
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        // 日付がある場合は、日付のチェック
+        if (is_a($date, 'CB_Date')) {
+            $event_type = intval($event->get(GRN_SCHEDULE_EVENT_TYPE));
+            if (($event_type & GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+                == GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+            ) {
+                $datetable = $this->_getDateTable();
+                $rowset = new CB_RowSet($datetable);
+                $rowset->addCondition($rowset->queryf("col_event = '@S'",
+                    $event->getOID()));
+                $row = $rowset->iterate();
+                $setdate = $row->get(GRN_SCHEDULE_SETDATE);
+                $setdate = new CB_DateEx($setdate);
+                $enddate = $row->get(GRN_SCHEDULE_ENDDATE);
+                $enddate = new CB_DateEx($enddate);
+
+                // 日付が合っていない場合
+                if (($setdate->compare($date) > 0)
+                    || ($enddate->compare($date) < 0)
+                ) {
+                    cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+                }
+            } elseif (($event_type & GRN_SCHEDULE_EVENT_TYPE_START)
+                      == GRN_SCHEDULE_EVENT_TYPE_START
+            ) {
+                $datetimetable = $this->_getDateTimeTable();
+                $rowset = new CB_RowSet($datetimetable);
+                $rowset->addCondition($rowset->queryf("col_event = '@S'",
+                    $event->getOID()));
+
+                $row = $rowset->iterate();
+                $setdatetime = $row->get(GRN_SCHEDULE_SETDATETIME);
+
+                $datetime = new CB_DateTime();
+                $datetime->year = intval($date->year);
+                $datetime->month = intval($date->month);
+                $datetime->day = intval($date->day);
+                $datetime->hour = 0;
+                $datetime->minute = 0;
+                $datetime->second = 0;
+                $datetime = new CB_DateTimeEx($datetime);
+                $timestamp1 = new CB_TimeStampEx($this->_ts);
+                $timestamp2 = new CB_TimeStampEx($this->_ts);
+                $timestamp1->setDateTime($datetime);
+                $datetime->add(new CB_DateTimeSpan(86400));
+                $timestamp2->setDateTime($datetime);
+
+                if (($timestamp1->compare($setdatetime) > 0)
+                    || ($timestamp2->compare($setdatetime) <= 0)
+                ) {
+                    cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+                }
+            } else {
+                $datetimetable = $this->_getDateTimeTable();
+                $rowset = new CB_RowSet($datetimetable);
+                $rowset->addCondition($rowset->queryf("col_event = '@S'",
+                    $event->getOID()));
+
+                $row = $rowset->iterate();
+                $setdatetime = $row->get(GRN_SCHEDULE_SETDATETIME);
+                $enddatetime = $row->get(GRN_SCHEDULE_ENDDATETIME);
+
+                // ここにタイムゾーンを入れる
+
+                $datetime = new CB_DateTime();
+                $datetime->year = intval($date->year);
+                $datetime->month = intval($date->month);
+                $datetime->day = intval($date->day);
+                $datetime->hour = 0;
+                $datetime->minute = 0;
+                $datetime->second = 0;
+                $datetime = new CB_DateTimeEx($datetime);
+                $timestamp1 = new CB_TimeStampEx($this->_ts);
+                $timestamp2 = new CB_TimeStampEx($this->_ts);
+                $timestamp1->setDateTime($datetime);
+                $datetime->add(new CB_DateTimeSpan(86400));
+                $timestamp2->setDateTime($datetime);
+
+
+                // 日付が合っていない場合
+                if ($enddatetime->unix_ts != $setdatetime->unix_ts) {
+                    if (($timestamp1->compare($enddatetime) >= 0)
+                        || ($timestamp2->compare($setdatetime) <= 0)
+                    ) {
+                        cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+                    }
+                } elseif ($enddatetime->unix_ts == $setdatetime->unix_ts) {
+                    if (($timestamp1->compare($setdatetime) > 0)
+                        || ($timestamp2->compare($setdatetime) <= 0)
+                    ) {
+                        cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+                    }
+                }
+            }
+        }
+
+        //報告書との関連を消す
+        $reportScheduleRelationDao
+            = new \grn\report\dao\ReportScheduleRelationDAO();
+        $reportScheduleRelationDao->deleteReportRelationByScheduleId($eid);
+
+        // ログ
+        if (is_array($extension_log_messages)
+            && count($extension_log_messages)
+        ) {
+            $event->setExtensionLogMessage($extension_log_messages);
+        }
+        $event->onAction('delete');
+
+        //GTM-1136
+        require_once('schedule/file.csp');
+        $fm = GRN_Schedule_FileManager::getInstance();
+        $fm->deleteFiles($eid);
+        //End GTM-1136
+
+        $event->delete();
+
+        return true;
+    }
+
+    /**
+     * イベントの取得
+     *
+     * @param   string  $eid       イベントID
+     * @param   CB_Date $date      イベントの日付
+     * @param   int     $lock_mode DBのロックモード
+     * @param   int     $get_mode
+     *
+     * @return  mixed       成功した場合はイベント、それ以外はFALSE
+     */
+    function getEvent(
+        $eid,
+        $date = null,
+        $lock_mode = CB_DATABASE_SHARED_LOCK,
+        $get_mode = GRN_SCHEDULE_GET_MEMBER_OBJECT
+    ) {
+        {
+            $___ret = false;
+
+            return $___ret;
+        }
+    }
+
+    /**
+     * イベントの中身の取得
+     *
+     * @access private
+     */
+    function _getEventData($eventrow, $event)
+    {
+        $event->id = $eventrow->getOID();
+        $event->menu = $eventrow->get(GRN_SCHEDULE_EVENTMENU);
+        $event->menucolor = $eventrow->get(GRN_SCHEDULE_RESERVE_INT2);
+        $event->detail = $eventrow->get(GRN_SCHEDULE_DETAIL);
+        $event->memo = $eventrow->get(GRN_SCHEDULE_MEMO);
+        $event->private = intval($eventrow->get(GRN_SCHEDULE_PRIVATE));
+        $event->creator = $eventrow->get('creator');
+        $event->attendanceCheck
+            = $eventrow->get(GRN_SCHEDULE_ATTENDANCE_CHECK);
+        $event->additional_items
+            = $eventrow->get(GRN_SCHEDULE_ADDITIONAL_ITEMS);
+
+        if (is_null($event->creator)) {
+            $event->creator = $eventrow->get('creator_name');
+            $event->creatorDeleted
+                = true; // GRB-16905 It is set when creator is deleted
+        }
+        $event->ctime = $eventrow->get('ctime');
+        $event->modifier = $eventrow->get('modifier');
+        if (is_null($event->modifier)) {
+            $event->modifier = $eventrow->get('modifier_name');
+        }
+        $event->mtime = $eventrow->get('mtime');
+
+        // アドレスデータの取得
+        $this->_getEventAddressData($eventrow, $event);
+    }
+
+    /**
+     * アドレスデータの中身の取得
+     *
+     * @access private
+     */
+    function _getEventAddressData($eventrow, $event)
+    {
+        $row = $this->_getAddressDataRow($eventrow->getOID());;
+        if ( ! $row) {
+            return;
+        }
+
+        $event->company_name = $row->get('company_name');
+        $event->zip_code = $row->get('zip_code');
+        $event->physical_address = $row->get('physical_address');
+        $event->map = $row->get('map');
+        $event->route = $row->get('route');
+        $event->route_time = $row->get('route_time');
+        $event->route_fare = $row->get('route_fare');
+        $event->company_telephone_number
+            = $row->get('company_telephone_number');
+        $event->facsimile_number = $row->get('facsimile_number');
+        $event->company_url = $row->get('company_url');
+    }
+
+    /**
+     * イベントの日付の取得
+     *
+     * @access private
+     */
+    function _getEventDate($eventrow, $event, $date)
+    {
+        return false;
+    }
+
+    /**
+     * イベントの参加者の取得
+     *
+     * @access private
+     */
+    function _getEventMember(
+        $event,
+        $lock_mode = CB_DATABASE_SHARED_LOCK,
+        $get_mode = GRN_SCHEDULE_GET_MEMBER_OBJECT
+    ) {
+        if ( ! $this->_getEventMemberIDs($event, $lock_mode)) {
+            return false;
+        }
+
+        // IDで取得する場合は、ここで終わり
+        if (($get_mode & GRN_SCHEDULE_GET_MEMBER_ID)
+            === GRN_SCHEDULE_GET_MEMBER_ID
+        ) {
+            return true;
+        }
+
+        // IDからオブジェクトの変換
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $db = $this->_getDBConnection();
+        if (is_array($event->users)) {
+            $orders = [];
+            $conditions = [];
+            foreach (array_keys($event->users) as $user_id) {
+                $conditions[] = cb_queryf($db, "'@S'", $user_id);
+                $orders[$user_id] = $user_id;
+            }
+            if (count($conditions) > 0) {
+                $condition = '_id IN ( ' . implode(',', $conditions) . ' )';
+                $users = $uum->getUsers(0, -1, null, $condition);
+                if (count($users) > 0) {
+                    foreach (array_keys($orders) as $user_id) {
+                        if ( ! array_key_exists($user_id, $users)) {
+                            continue;
+                        }
+                        $event->users[$user_id] = $users[$user_id];
+                    }
+                }
+            }
+        }
+        if (is_array($event->groups)) {
+            foreach (array_keys($event->groups) as $group_id) {
+                $group = $uum->getGroup($group_id);
+                if ($group !== false) {
+                    $event->groups[$group_id] = $group;
+                }
+            }
+        }
+        if (is_array($event->facilities)) {
+            require_once('schedule/facility_system_logic.csp');
+            $facility_logic = GRN_Facility_SystemLogic::getInstance();
+            foreach (array_keys($event->facilities) as $facility_id) {
+                $facility = $facility_logic->getFacility($facility_id);
+                if ($facility !== false) {
+                    $event->facilities[$facility_id] = $facility;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * イベントの参加者IDの取得
+     *
+     * @access private
+     */
+    function _getEventMemberIDs($event, $lock_mode = CB_DATABASE_SHARED_LOCK)
+    {
+        $cache_key = 'event_member' . $event->id;
+        $member = $this->get_from_cache($cache_key);
+        if ( ! is_null($member)) {
+            $event->users = $member['users'];
+            $event->groups = $member['groups'];
+            $event->facilities = $member['facilities'];
+
+            if (is_null($event->users) && is_null($event->groups)
+                && is_null($event->facilities)
+            ) {
+                return false;
+            }
+
+            return true;
+        }
+
+        $db = $this->_getDBConnection();
+        $query = cb_queryf($db,
+            "SELECT col_user, col_group, col_facility, col_single, u.col_deleted FROM tab_grn_schedule_eventmember AS m LEFT JOIN tab_cb_user AS u ON m.col_user = u._id WHERE (col_event ='@S') ORDER BY col_member_list, m._id",
+            $event->id);
+        $query = $db->select_format($query, 0, -1, $lock_mode);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $event->users = [];
+        $event->groups = [];
+        $event->facilities = [];
+
+        $index = 0;
+        while ($row = $db->fetch_assoc($result)) {
+            // ユーザー削除フラグがたっていたらメンバーから外す
+            if ( ! is_null($row['col_deleted'])) {
+                continue;
+            }
+
+            $index++;
+            if ($row['col_user']) {
+                $event->users[$row['col_user']] = $row['col_user'];
+                continue;
+            }
+
+            if ($row['col_group']) {
+                $event->groups[$row['col_group']] = $row['col_group'];
+                continue;
+            }
+
+            if ($row['col_facility']) {
+                $event->facilities[$row['col_facility']] = $row['col_facility'];
+            }
+        }
+
+        // 結果の開放
+        $db->free_result($result);
+
+        if (count($event->users) == 0) {
+            $event->users = null;
+        }
+        if (count($event->groups) == 0) {
+            $event->groups = null;
+        }
+        if (count($event->facilities) == 0) {
+            $event->facilities = null;
+        }
+
+        if (is_null($event->users) && is_null($event->groups)
+            && is_null($event->facilities)
+        ) {
+            return false;
+        }
+
+        // Save calculated results into cache for reuse
+        $member['users'] = $event->users;
+        $member['groups'] = $event->groups;
+        $member['facilities'] = $event->facilities;
+        $this->save_to_cache($cache_key, $member);
+
+        return true;
+    }
+
+    /**
+     * イベントの通知先の取得
+     *
+     * @access private
+     */
+    function _getEventNotifyAddress(
+        $event,
+        $lock_mode = CB_DATABASE_SHARED_LOCK,
+        $get_mode = GRN_SCHEDULE_GET_MEMBER_OBJECT
+    ) {
+        if ( ! $this->_getEventNotifyAddressIDs($event, $lock_mode)) {
+            return false;
+        }
+
+        // IDで取得する場合は、ここで終わり
+        if (($get_mode & GRN_SCHEDULE_GET_MEMBER_ID)
+            === GRN_SCHEDULE_GET_MEMBER_ID
+        ) {
+            return true;
+        }
+
+        // IDからオブジェクトの変換
+        $event->notify_address = ScheduleMemberLogic::getInstance()
+                                                    ->getObjectMembersByTypeIdArray($event->notify_address);
+
+        return true;
+    }
+
+    /**
+     * イベントの通知先の取得
+     *
+     * @access private
+     */
+    function _getEventNotifyAddressIDs(
+        $event,
+        $lock_mode = CB_DATABASE_SHARED_LOCK
+    ) {
+        $db = $this->_getDBConnection();
+        // ユーザー削除フラグをチェック
+        $query = cb_queryf($db,
+            "SELECT n.col_user, n.col_group, n.col_role, u.col_foreign_key FROM tab_grn_schedule_notifyaddress AS n "
+            . "LEFT JOIN tab_cb_user AS u ON n.col_user = u._id WHERE (n.col_event = '@S') AND u.col_deleted IS NULL ORDER BY n.col_order, n._id",
+            $event->id);
+        $query = $db->select_format($query, 0, -1, $lock_mode);
+
+        $result = $db->query($query);
+
+        $event->notify_address = [];
+        while ($row = $db->fetch_assoc($result)) {
+            if ($row['col_user']) {
+                $id = $row['col_user'];
+                $type
+                    = MemberLogic::TYPE_USER;
+                $event->notify_address[MemberLogic::PREFIX_USER . $id] = [
+                    MemberLogic::MEMBER_TYPE => $type,
+                    MemberLogic::MEMBER_ID   => $id
+                ];
+            } elseif ($row['col_group']) {
+                $id = $row['col_group'];
+                $type
+                    = MemberLogic::TYPE_ORGANIZATION;
+                $event->notify_address[MemberLogic::PREFIX_ORGANIZATION . $id]
+                    = [
+                    MemberLogic::MEMBER_TYPE => $type,
+                    MemberLogic::MEMBER_ID   => $id
+                ];
+            } elseif ($row['col_role']) {
+                $id = $row['col_role'];
+                $type
+                    = MemberLogic::TYPE_STATIC_ROLE;
+                $event->notify_address[MemberLogic::PREFIX_STATIC_ROLE . $id]
+                    = [
+                    MemberLogic::MEMBER_TYPE => $type,
+                    MemberLogic::MEMBER_ID   => $id
+                ];
+            }
+        }
+
+        if (count($event->notify_address) == 0) {
+            $event->notify_address = null;
+        }
+
+        return true;
+    }
+
+    /**
+     * @param GRN_Facility_Facility $ids_facility
+     * @param CB_DateTime           $setdate_time
+     * @param CB_DateTime           $setdate_time
+     *
+     * @return event
+     */
+    //GTM-143
+    public function _loadEventConflictFacilities(
+        $ids_facility,
+        $setdate_time,
+        $enddate_time,
+        $eventId = null,
+        $excepts = null,
+        $edit_flag = false
+    ) {
+        $db = $this->_getDBConnection();
+        $escaped_id_list = [];
+        foreach ($ids_facility as $id) {
+            $escaped_id_list[] = $db->escape($id);
+        }
+        $str_facility = "col_facility IN ('" . implode("', '", $escaped_id_list)
+                        . "')";
+
+        $ts1 = new CB_TimeStampEx($this->_ts);
+        $ts1->setDateTime($setdate_time);
+
+        $ts2 = new CB_TimeStampEx($this->_ts);
+        $ts2->setDateTime($enddate_time);
+        $ts2->add(new CB_DateTimeSpan(86400));
+        $query = "SELECT"
+                 . " d.col_event AS event, d.col_setdatetime, d.col_enddatetime, m.col_facility, d.col_end_timezone "
+                 . " FROM"
+                 . " tab_grn_schedule_eventmember AS m,"
+                 . " tab_grn_schedule_eventdatetime AS d"
+                 . " WHERE"
+                 . " m.col_event = d.col_event";
+
+        if ($eventId != null) {
+            $query .= " AND d.col_event != '" . $eventId . "'";
+        }
+        $query .= " AND m." . $str_facility
+                  . " AND m.col_event_type_simple = 1"
+                  . " AND"
+                  . " ("
+                  . cb_queryf($db,
+                " ( d.col_setdatetime >= '@S' AND d.col_setdatetime < '@S' )",
+                $ts1->unix_ts, $ts2->unix_ts)
+                  . " OR"
+                  . cb_queryf($db,
+                " ( d.col_setdatetime <> d.col_enddatetime AND d.col_enddatetime > '@S' AND d.col_enddatetime <= '@S' )",
+                $ts1->unix_ts, $ts2->unix_ts)
+                  . " OR"
+                  . cb_queryf($db,
+                " ( d.col_setdatetime < '@S' AND d.col_enddatetime > '@S' )",
+                $ts1->unix_ts, $ts2->unix_ts)
+                  . " )
+            ORDER BY d.col_setdatetime ASC";
+        $result = $db->query($query);
+        $events = [];
+        $faci = [];
+        $timestamp = new CB_TimeStampEx();
+        require_once('schedule/facility_system_logic.csp');
+        $facility_logic = GRN_Facility_SystemLogic::getInstance();
+        foreach ($ids_facility as $id) {
+            $facility = $facility_logic->getFacility($id);
+            $faci[$id] = $facility->get('name');
+        }
+        if (is_array($faci) && count($faci) > 0) {
+            while ($row = $db->fetch_assoc($result)) {
+                $event = [];
+                $event['id'] = $row['event'];
+                $timestamp->unix_ts = intval($row['col_setdatetime']);
+                $event['setdatetime'] = cb_date_format("ShortDateFormat",
+                    $timestamp->getDate());
+                $date_compare = $timestamp->getDate();
+                $timestamp->unix_ts = intval($row['col_enddatetime']);
+                $event['_id'] = $row['event'];
+                $event['enddatetime'] = cb_date_format("ShortDateFormat",
+                    $timestamp->getDate());
+                $event['col_setdatetime'] = $row['col_setdatetime'];
+                $event['col_enddatetime'] = $row['col_enddatetime'];
+                $event['col_facility']
+                    = htmlspecialchars($faci[$row['col_facility']]);
+                if ($edit_flag == true && isset($excepts)
+                    && count($excepts) > 0
+                ) {
+                    foreach ($excepts as $key => $exdate) {
+                        if ($date_compare->compare($exdate) != 0) {
+                            $events[] = $event;
+                            break;
+                        }
+                    }
+                } else {
+                    $events[] = $event;
+                }
+
+            }
+        }
+
+        return $events;
+    }
+
+    public function _checkConflictMemberEvent(
+        $member,
+        $setdatetime,
+        $enddatetime,
+        $eid
+    ) {
+        if (is_null($setdatetime)) {
+            return false;
+        }
+        $str_member = '';
+        if (is_a($member, 'CB_User')) {
+            $str_member = 'col_user';
+        } elseif (is_a($member, 'CB_Group')) {
+            $str_member = 'col_group';
+        } elseif (is_a($member, 'GRN_Facility_Facility')) {
+            $str_member = 'col_facility';
+        } else {
+            cb_throw_error();
+        }
+
+        $datetimetable = $this->_getDateTimeTable();
+        $membertable = $this->_getMemberTable();
+
+        // 取得する日付の計算
+        $ts1 = new CB_TimeStampEx($this->_ts);
+        $ts1->setDateTime($setdatetime);
+
+        if ( ! $enddatetime) {
+            $enddatetime = $setdatetime;
+        }
+        // 終了日時
+        $ts2 = new CB_TimeStampEx($this->_ts);
+        $ts2->setDateTime($enddatetime);
+
+        if ($str_member == 'col_facility') {
+            $rowset = new CB_MultiRowSet($membertable, 'm');
+            // クエリーの作成
+            $format
+                = $rowset->queryf("(( d.col_setdatetime >= '@S' AND d.col_setdatetime < '@S' ) OR ( d.col_setdatetime <> d.col_enddatetime AND d.col_enddatetime > '@S' AND d.col_enddatetime <= '@S' ) OR ( d.col_setdatetime < '@S' AND d.col_enddatetime > '@S' ) )",
+                $ts1->unix_ts, $ts2->unix_ts, $ts1->unix_ts, $ts2->unix_ts,
+                $ts1->unix_ts, $ts2->unix_ts);
+
+            $rowset->addJoin($datetimetable, "d.col_event = m.col_event",
+                CB_DATABASE_LEFT_JOIN, 'd');
+            $rowset->addCondition("m.col_event_type_simple = '1' AND m."
+                                  . $str_member . " = "
+                                  . $rowset->queryf("'@S'", $member->getOID())
+                                  . " AND m.col_event <> "
+                                  . $rowset->queryf("'@S'", $eid)
+                                  . " AND m.col_event_type <> "
+                                  . GRN_SCHEDULE_EVENT_TYPE_TEMPORARY);
+            $rowset->addCondition($format);
+            $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+            $rowset->limit(0, 1);
+            $rowset->setLock(CB_DATABASE_EXCLUSIVE_LOCK);
+            $row = $rowset->iterate();
+            $rowset->destroy();
+            if ($row['count'] > 0) {
+                return true;
+            }
+
+            //Event is a temporary schedule
+            require_once('schedule/table.csp');
+            $tm = $this->_getTableManager();
+            $temporaryrelationtable
+                = $tm->getTableInfo(GRN_SCHEDULE_TEMPORARYEVENTRELATION);
+
+            $rowset = new CB_MultiRowSet($membertable, 'm');
+            $rowset->addJoin($temporaryrelationtable, "r.col_member = m._id",
+                CB_DATABASE_INNER_JOIN, 'r');
+            $rowset->addJoin($datetimetable, "r.col_date = d._id",
+                CB_DATABASE_LEFT_JOIN, 'd');
+            $rowset->addCondition("m.col_event_type_simple = '1' AND m."
+                                  . $str_member . " = "
+                                  . $rowset->queryf("'@S'", $member->getOID())
+                                  . " AND m.col_event <> "
+                                  . $rowset->queryf("'@S'", $eid));
+            $rowset->addCondition($format);
+            $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+            $rowset->limit(0, 1);
+            $rowset->setLock(CB_DATABASE_EXCLUSIVE_LOCK);
+            $row = $rowset->iterate();
+            $rowset->destroy();
+            if ($row['count'] > 0) {
+                return true;
+            }
+
+            //Event is a temporary with Use All Facility Option
+            $rowset = new CB_MultiRowSet($membertable, 'm');
+            $rowset->addJoin($datetimetable, "d.col_event = m.col_event",
+                CB_DATABASE_LEFT_JOIN, 'd');
+            $rowset->addCondition("m.col_event_type_simple = '1' AND m."
+                                  . $str_member . " = "
+                                  . $rowset->queryf("'@S'", $member->getOID())
+                                  . " AND m.col_event <> "
+                                  . $rowset->queryf("'@S'", $eid)
+                                  . " AND m.col_event_type = "
+                                  . GRN_SCHEDULE_EVENT_TYPE_TEMPORARY);
+            $rowset->addCondition("NOT EXISTS (SELECT r._id FROM "
+                                  . CB_DATABASE_TABLE_PREFIX
+                                  . $temporaryrelationtable->getTableName()
+                                  . " AS r WHERE r.col_event = m.col_event)");
+            $rowset->addCondition($format);
+            $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+            $rowset->limit(0, 1);
+            $rowset->setLock(CB_DATABASE_EXCLUSIVE_LOCK);
+            $row = $rowset->iterate();
+            $rowset->destroy();
+            if ($row['count'] > 0) {
+                return true;
+            }
+        } else {
+            $rowset = new CB_MultiRowSet($membertable, 'm');
+            // クエリーの作成
+            $format
+                = $rowset->queryf("(( d.col_setdatetime >= '@S' AND d.col_setdatetime < '@S' ) OR ( d.col_setdatetime <> d.col_enddatetime AND d.col_enddatetime > '@S' AND d.col_enddatetime <= '@S' ) OR ( d.col_setdatetime < '@S' AND d.col_enddatetime > '@S' ) )",
+                $ts1->unix_ts, $ts2->unix_ts, $ts1->unix_ts, $ts2->unix_ts,
+                $ts1->unix_ts, $ts2->unix_ts);
+
+            // 削除フラグたってたらオブジェクト取れないし対処すると普段のパフォーマンスが怖いのでこれは対処しない
+            $rowset->addJoin($datetimetable,
+                "m.col_event_type_simple = '1' AND m." . $str_member . " = "
+                . $rowset->queryf("'@S'", $member->getOID())
+                . " AND d.col_event = m.col_event AND m.col_event <> "
+                . $rowset->queryf("'@S'", $eid), CB_DATABASE_LEFT_JOIN, 'd');
+
+            $rowset->addCondition($format);
+            $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+            $rowset->limit(0, 1);
+            $rowset->setLock(CB_DATABASE_EXCLUSIVE_LOCK);
+
+            // 予定があるかどうか
+            $row = $rowset->iterate();
+            $rowset->destroy();
+            if ($row['count'] > 0) {
+                return true;
+            }
+
+        }
+
+        return false;
+    }
+
+    /**
+     * 指定された参加者がほかの予定と時刻がぶつかっているかをチェックする
+     *
+     * @param       CB_User     $user          ログインユーザー
+     * @param       array       $members       チェックするメンバー
+     * @param       CB_DateTime $setdatetime   開始日時
+     * @param       CB_DateTime $enddatetime   開始日時
+     * @param       string      $event_id      イベントID
+     * @param       boolean     $hiddenprivate 非公開を隠すかどうか
+     *
+     * @return      array   チェックした結果。
+     */
+    function conflictMembersEvent(
+        $user,
+        $members,
+        $setdatetime,
+        $enddatetime,
+        $event_id,
+        $hiddenprivate
+    ) {
+        // チェックするメンバーがいない
+        if ( ! is_array($members) || count($members) == 0) {
+            return false;
+        }
+
+        if (is_null($setdatetime) || ! is_a($setdatetime, 'CB_DateTime')) {
+            return false;
+        }
+
+        // 取得する日付の計算
+        $ts1 = new CB_TimeStampEx($this->_ts);
+        $ts1->setDateTime($setdatetime);
+
+        if ( ! $enddatetime) {
+            $enddatetime = $setdatetime;
+        }
+
+        // 終了日時
+        $ts2 = new CB_TimeStampEx($this->_ts);
+        $ts2->setDateTime($enddatetime);
+
+        // 同じ場合は1秒ずらす
+        if (cb_date_compare($setdatetime, $enddatetime) === 0) {
+            $ts2->unix_ts += 1;
+        }
+
+        $db = $this->_getDBConnection();
+
+        $retval = [];
+        // 組織に対する衝突のチェック
+        if (count($members['groups']) > 0) {
+            $strgroups = "";
+            foreach ($members['groups'] as $group) {
+                $strgroups .= cb_queryf($db, "'@S',", $group);
+            }
+            $strgroups = substr($strgroups, 0, strlen($strgroups) - 1);
+
+            $retval += $this->_conflictMembersEvent($user, 'col_group',
+                $strgroups, $ts1, $ts2, $event_id,true,
+                $hiddenprivate);
+        }
+
+        if (count($members['users']) > 0) {
+            $strusers = "";
+            foreach ($members['users'] as $tuser) {
+                $strusers .= cb_queryf($db, "'@S',", $tuser);
+            }
+            $strusers = substr($strusers, 0, strlen($strusers) - 1);
+
+            $retval += $this->_conflictMembersEvent($user, 'col_user',
+                $strusers, $ts1, $ts2, $event_id,false,
+                $hiddenprivate);
+        }
+
+        return $retval;
+    }
+
+    /**
+     * Check the event members conflict
+     *
+     * @access private
+     *
+     * @param       CB_User      $user          login user
+     * @param       string       $column        'col_user' or 'col_group'
+     * @param       string       $query_members all member id compose string
+     * @param       CB_TimeStamp $ts1           setdatetime
+     * @param       CB_TimeStamp $ts2           enddatetime
+     * @param       int          $event_id      event id
+     * @param       boolean      $b_group
+     * @param       boolean      $hiddenprivate
+     *
+     * @return      array   チェックした結果。
+     */
+    private function _conflictMembersEvent(
+        $user,
+        $column,
+        $query_members,
+        $ts1,
+        $ts2,
+        $event_id,
+        $b_group = false,
+        $hiddenprivate = false
+    ) {
+        $db = $this->_getDBConnection();
+
+        require_once('schedule/system_logic.csp');
+        $systemLogic = \GRN_Schedule_SystemLogic::getInstance();
+        $b_attendance_check = false;
+        if ($systemLogic->getAllowAttendanceCheck() == '1') {
+            $b_attendance_check = true;
+        }
+
+        $sqlAttendanceJoin = "";
+        $sqlAttendanceJoinCondition = "";
+        if ($b_attendance_check && ! $b_group) {
+            $sqlAttendanceJoin
+                = " LEFT JOIN tab_grn_schedule_event_attendance_status AS ats ON m.col_user = ats.col_user AND m.col_event = ats.col_event";
+            $sqlAttendanceJoinCondition
+                = "AND (ats.col_status IS NULL OR ats.col_status <> 0) ";
+        }
+
+        $query = cb_queryf(
+            $db,
+            "SELECT m.col_event AS eid, e.col_private, m." . $column
+            . " FROM tab_grn_schedule_eventdatetime AS d FORCE INDEX(idx_setdatetime_enddatetime)"
+            . " STRAIGHT_JOIN tab_grn_schedule_eventmember AS m"
+            . " ON d.col_event = m.col_event AND m.col_event_type_simple = '1' AND m.col_event <> '@S' AND m."
+            . $column
+            . " IN (" . $query_members . ")"
+            . " LEFT JOIN tab_cb_user AS u ON m.col_user = u._id AND u.col_deleted IS NULL"
+            . " LEFT JOIN tab_grn_schedule_event AS e ON m.col_event = e._id"
+            . $sqlAttendanceJoin
+            . " WHERE ((d.col_setdatetime < '@S' AND d.col_enddatetime > '@S') OR (d.col_setdatetime = '@S' AND d.col_enddatetime = '@S')) "
+            . $sqlAttendanceJoinCondition
+            , $event_id, $ts2->unix_ts, $ts1->unix_ts, $ts1->unix_ts, $ts1->unix_ts
+        );
+
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $retval = [];
+        if ($hiddenprivate) {
+            $user_id = $user->getOID();
+            $private_ids = [];
+            $open_ids = [];
+        }
+
+        while ($row = $db->fetch_assoc($result)) {
+            if ($row[$column] <= 0) {
+                continue;
+            }
+
+            if ( ! $hiddenprivate) {
+                if ($b_group) {
+                    $retval['g' . $row[$column]] = true;
+                } else {
+                    $retval[$row[$column]] = true;
+                }
+            } else {
+                // 非公開以外
+                if ($row['col_private'] === '0') {
+                    if ($b_group) {
+                        $retval['g' . $row[$column]] = true;
+                    } else {
+                        $retval[$row[$column]] = true;
+                    }
+                    continue;
+                }
+
+                // 自分の非公開
+                if ( ! $b_group && $row['col_user'] == $user_id) {
+                    $retval[$row['col_user']] = true;
+                    $open_ids[$row['eid']] = $row['eid'];
+                    if (array_key_exists($row['eid'], $private_ids)
+                        && count($private_ids[$row['eid']]) > 0
+                    ) {
+                        foreach ($private_ids[$row['eid']] as $id) {
+                            $retval[$id] = true;
+                        }
+                        unset($private_ids[$row['eid']]);
+                    }
+                    continue;
+                }
+
+                // 自分が参加している非公開予定
+                if (array_key_exists($row['eid'], $open_ids)) {
+                    $retval[$row['col_user']] = true;
+                    continue;
+                }
+
+                // 公開先に指定されているかチェックが必要なイベント
+                if ( ! array_key_exists($row['eid'], $private_ids)) {
+                    $private_ids[$row['eid']] = [];
+                }
+
+                if ($b_group) {
+                    $private_ids[$row['eid']][] = 'g' . $row[$column];
+                } else {
+                    $private_ids[$row['eid']][] = $row[$column];
+                }
+            }
+        }
+
+        // 結果の開放
+        $db->free_result($result);
+
+        if ($hiddenprivate && count($private_ids) > 0) {
+            //公開先のチェック
+            $notify_address_event_info = ScheduleMemberLogic::getInstance()
+                                                            ->getEventInfoFromNotifyAddress($user,
+                                                                array_keys($private_ids));
+            foreach ($notify_address_event_info as $event_info) {
+                foreach ($private_ids[$event_info['event']] as $value) {
+                    $retval[$value] = true;
+                }
+            }
+
+            //check the event id in $private_ids and login user is 'absent' event member
+            if ($b_attendance_check && ! $b_group) {
+                $query = cb_queryf($db,
+                    "SELECT col_event FROM tab_grn_schedule_event_attendance_status WHERE col_user = '@S' AND ( col_event IN (",
+                    $user_id);
+                foreach (array_keys($private_ids) as $private_id) {
+                    $query .= cb_queryf($db, "'@S',", $private_id);
+                }
+                $query = substr($query, 0, strlen($query) - 1);
+
+                $query .= ") ) GROUP BY col_event";
+
+                $query = $db->select_format($query, 0, -1,
+                    CB_DATABASE_NO_LOCK);
+                $result = $db->query($query);
+                if ($result === false) {
+                    $db->throwError([
+                        'query' => 'failed query on SELECT: ' . $query
+                    ]);
+                }
+
+                while ($row = $db->fetch_assoc($result)) {
+                    foreach ($private_ids[$row['col_event']] as $value) {
+                        $retval[$value] = true;
+                    }
+                }
+
+                // 結果の開放
+                $db->free_result($result);
+            }
+        }
+
+        // 欠席のチェック
+        if ($b_attendance_check && ! $b_group) {
+            $query = cb_queryf($db,
+                "SELECT col_status,col_user FROM tab_grn_schedule_event_attendance_status WHERE col_event = '@S' ",
+                $event_id);
+            $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError([
+                    'query' => 'failed query on SELECT: ' . $query
+                ]);
+            }
+
+            while ($row = $db->fetch_assoc($result)) {
+                if ($row['col_status'] === '0') {
+                    $retval[$row['col_user']] = false;
+                }
+            }
+
+            // 結果の開放
+            $db->free_result($result);
+        }
+
+        return $retval;
+    }
+
+
+    /**
+     * イベントの参加者だけを取得する
+     *
+     * @param       string $eid イベントID
+     *
+     * @return      array       成功した場合は参加者の連想配列、それ以外はFALSE
+     */
+    function getEventMembers($eid)
+    {
+        $db = $this->_getDBConnection();
+
+        $query = cb_queryf($db,
+            "SELECT col_user, col_group, col_facility, u.col_deleted FROM tab_grn_schedule_eventmember LEFT JOIN tab_cb_user AS u ON tab_grn_schedule_eventmember.col_user = u._id WHERE col_event = '@S' ORDER BY col_member_list",
+            $eid);
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $members = ['groups' => [], 'users' => [], 'facilities' => []];
+        $index = 0;
+        while ($row = $db->fetch_assoc($result)) {
+            // ユーザー削除フラグが立っていたら無視
+            if ( ! is_null($row['col_deleted'])) {
+                continue;
+            }
+
+            if ($row['col_user']) {
+                ++$index;
+                $members['users'][$row['col_user']] = $row['col_user'];
+            } elseif ($row['col_group']) {
+                ++$index;
+                $members['groups'][$row['col_group']] = $row['col_group'];
+            } elseif ($row['col_facility']) {
+                ++$index;
+                $members['facilities'][$row['col_facility']]
+                    = $row['col_facility'];
+            }
+
+        }
+        // 結果の開放
+        $db->free_result($result);
+
+        if ($index == 0) {
+            return false;
+        }
+
+        return $members;
+    }
+
+    /**
+     * 予定に対するフォローの登録
+     *
+     * @param       string  $eid  イベントID
+     * @param       CB_User $user 登録ユーザー
+     * @param       string  $msg  フォローの内容
+     *
+     * @return      boolean     成功した場合はTRUE、それ以外はFALSE
+     */
+    function writeScheduleFollow($eid, $user, $msg)
+    {
+        $eventtable = $this->_getEventTable();
+        $eventrow = $eventtable->getRow($eid);
+        if ( ! $eventrow) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        $followtable = $this->_getFollowTable();
+        $row = $followtable->newRow();
+        $row->set(GRN_SCHEDULE_EVENT, $eventrow);
+        $row->set(GRN_SCHEDULE_FOLLOW, $msg);
+
+        $row->onCreate($user);
+
+        return true;
+    }
+
+    /**
+     * 予定のフォローの削除
+     *
+     * @param       string $eid イベントID
+     * @param       string $fid フォローのID
+     *
+     * @return      boolean     成功した場合はTRUE、それ以外はFALSE
+     */
+    function deleteScheduleFollow($eid, $fid)
+    {
+        $eventtable = $this->_getEventTable();
+        $eventrow = $eventtable->getRow($eid);
+        if ( ! $eventrow) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        $followtable = $this->_getFollowTable();
+        $followrow = $followtable->getRow($fid);
+        if ( ! $followrow) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENTFOLLOW);
+        }
+        $followrow->delete();
+
+        return true;
+    }
+
+    /**
+     * 予定のフォローの取得
+     *
+     * @param       string $eid イベントID
+     * @param       string $fid フォローのID
+     *
+     * @return      mixed       成功した場合はフォロー、それ以外はFALSE
+     */
+    function getScheduleFollowData($eid, $fid)
+    {
+        $eventtable = $this->_getEventTable();
+        $eventrow = $eventtable->getRow($eid);
+        if ( ! $eventrow) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        $followtable = $this->_getFollowTable();
+        $row = $followtable->getRow($fid);
+        if ( ! $row) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENTFOLLOW);
+        }
+
+        return $this->_getFollowData($row);;
+    }
+
+
+    /**
+     * 純粋にDBからフォローを取り出す
+     *
+     * @access private
+     */
+    function _getFollowData($row)
+    {
+        $follow = [];
+
+        $creator = $row->get('creator');
+
+        if ($creator) {
+            $follow['creator_id'] = $creator->getOID();
+            $follow['creator_name'] = $creator->get('display_name');
+        } else {
+            $follow['creator_id'] = '';
+            $follow['creator_name'] = $row->get('creator_name');
+        }
+        $follow['ctime'] = $row->get('ctime');
+        $follow['data'] = $row->get(GRN_SCHEDULE_FOLLOW);
+
+        //GTM-1190
+        $follow['event_id'] = $row->get('event')->getOID();
+
+        return $follow;
+    }
+
+
+    /**
+     * 予定のフォローの取得
+     *
+     * @param       string $eid       イベントID
+     * @param       int    $offset    ずらす位置
+     * @param       int    $limit     取得するフォロー数（0の場合はすべて）
+     * @param       string $follow_id 取得するフォローIDの先頭
+     *
+     * @return      mixed       成功した場合はフォロー、それ以外はFALSE
+     */
+    function getScheduleFollowDataList($eid, $offset, $limit, $follow_id = null)
+    {
+        $eventtable = $this->_getEventTable();
+        $eventrow = $eventtable->getRow($eid);
+        if ( ! $eventrow) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        if ($offset < 0) {
+            $offset = 0;
+        }
+
+        $db = $this->_getDBConnection();
+
+        if (empty($follow_id)) {
+            $query = cb_queryf($db,
+                "SELECT f._id, f.col_creator, f.col_creator_name, f.col_ctime, f.col_follow, u.col_deleted FROM tab_grn_schedule_eventfollow AS f LEFT JOIN tab_cb_user AS u ON f.col_creator = u._id WHERE (f.col_event = '@S') ORDER BY _id DESC",
+                $eid);
+        } else {
+            $query = cb_queryf($db,
+                "SELECT f._id, f.col_creator, f.col_creator_name, f.col_ctime, f.col_follow, u.col_deleted FROM tab_grn_schedule_eventfollow AS f LEFT JOIN tab_cb_user AS u ON f.col_creator = u._id WHERE (col_event = '@S') AND f._id <= '@S' ORDER BY f._id DESC",
+                $eid, $follow_id);
+        }
+
+        // 指定範囲内でデータの取得を行う場合
+        if ($limit > 0) {
+            $query = $db->select_format($query, $offset, $limit + 1);
+        } else {
+            $query = $db->select_format($query);
+        }
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+
+        $follows = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $follow = [];
+
+            $follow['data'] = $row['col_follow'];
+            $follow['ctime'] = new CB_TimeStamp();
+            $follow['ctime']->unix_ts = intval($row['col_ctime']);
+
+            // ユーザー削除フラグもチェック
+            if ($row['col_creator'] && is_null($row['col_deleted'])) {
+                $follow['creator_id'] = $row['col_creator'];
+                $follow['creator_name'] = '';
+            } elseif ($row['col_creator_name']) {
+                $follow['creator_id'] = '';
+                $follow['creator_name'] = $row['col_creator_name'];
+            } else {
+                $follow['creator_id'] = '';
+                $follow['creator_name'] = '';
+            }
+
+            $follows[$row['_id']] = $follow;
+        }
+        // 結果の開放
+        $db->free_result($result);
+
+        return $follows;
+    }
+
+    /**
+     * フォローの内容のコピー
+     *
+     * @param   string $old_eid コピー元のイベントID
+     * @param   string $new_eid コピー先のイベントID
+     */
+    function copyFollows($old_eid, $new_eid)
+    {
+        // 確認作業
+        $eventtable = $this->_getEventTable();
+        $old_event = $eventtable->getRow($old_eid);
+
+        if ( ! $old_event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        $new_event = $eventtable->getRow($new_eid);
+        if ( ! $new_event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        $followtable = $this->_getFollowTable();
+        $old_rowset = new CB_RowSet($followtable);
+        $old_rowset->addCondition($old_rowset->queryf("col_event = '@S'",
+            $old_event->getOID()));
+        $old_rowset->addOrderColumn('_id');
+
+        while ( ! is_null($row = $old_rowset->iterate())) {
+            $new_follow = $followtable->newRow();
+
+            $new_follow->set(GRN_SCHEDULE_EVENT, $new_event);
+            $new_follow->set(GRN_SCHEDULE_FOLLOW,
+                $row->get(GRN_SCHEDULE_FOLLOW));
+            $new_follow->set('creator', $row->get('creator'));
+            $new_follow->set('creator_name', $row->get('creator_name'));
+            $new_follow->set('ctime', $row->get('ctime'));
+            $new_follow->set('modifier', $row->get('creator'));
+            $new_follow->set('modifier_name', $row->get('creator_name'));
+            $new_follow->set('mtime', $row->get('ctime'));
+        }
+
+    }
+
+    /**
+     * フォローの位置を取得する関数
+     *
+     * @param   string  $event_id
+     * @param   string  $follow_id
+     * @param   boolean $desc 古い順にするかどうか
+     *
+     * @return  mixed       成功した場合は、位置それ以外はFALSE
+     */
+    function getFollowPosition($event_id, $follow_id, $desc = false)
+    {
+        if (empty($event_id) || empty($follow_id)) {
+            return false;
+        }
+
+        $db = $this->_getDBConnection();
+        $query = cb_queryf($db,
+            "SELECT COUNT(*) FROM tab_grn_schedule_eventfollow WHERE col_event = '@S' AND _id ",
+            $event_id);
+
+        if ($desc) {
+            $query .= "<";
+        } else {
+            $query .= ">";
+        }
+
+        $query .= cb_queryf($db, " '@S'", $follow_id);
+
+        $query = $db->select_format($query);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $row = $db->fetch_assoc($result);
+        // 結果の開放
+        $db->free_result($result);
+
+        return intval($row['COUNT(*)']);
+    }
+
+    //Phan Anh
+
+    /**
+     * get total of follows
+     *
+     * @param   string $event_id
+     *
+     * @return  int         total of follows
+     */
+    function countFollows($event_id)
+    {
+        if (empty($event_id)) {
+            return false;
+        }
+
+        $db = $this->_getDBConnection();
+        $query = cb_queryf($db,
+            "SELECT COUNT(_id) FROM tab_grn_schedule_eventfollow WHERE col_event = '@S'",
+            $event_id);
+
+        $query = $db->select_format($query);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $row = $db->fetch_assoc($result);
+
+        $db->free_result($result);
+
+        return intval($row['COUNT(_id)']);
+    }
+
+    /**
+     * 時間の入っているイベントの一覧の取得
+     *
+     * @param   mixed   $member                  ユーザー（組織/設備）
+     * @param   mixed   $setdate                 取得期間（開始日）
+     * @param   mixed   $enddate                 取得期間（終了日）
+     * @param   CB_User $login                   ログインユーザー
+     * @param   boolean $hidden                  非公開のデータを取得するかどうか
+     * @param   boolean $b_checkconflict         イベントの衝突チェックをするかどうか
+     * @param   boolean $isEnableAttendanceCheck Attendance check function setting
+     *
+     * @return  mixed       成功した場合は予定の配列、それ以外はFALSE
+     */
+    function getNormalEvents(
+        $member,
+        $setdate,
+        $enddate,
+        $login,
+        $hidden = false,
+        $b_checkconflict = true,
+        $isEnableAttendanceCheck = false
+    ) {
+        $b_facility = false;
+        $str_member = '';
+        $_bConflict = false;
+        $_attendanceCheckForUser = false;
+        if (is_a($member, 'CB_User')) {
+            $str_member = 'col_user';
+            $_bConflict = true;
+            $_attendanceCheckForUser = true;
+        } elseif (is_a($member, 'CB_Group')) {
+            $str_member = 'col_group';
+            $_bConflict = true;
+        } elseif (is_a($member, 'GRN_Facility_Facility')) {
+            $str_member = 'col_facility';
+            // 施設の完全非公開はできない
+            $hidden = false;
+            $b_facility = true;
+        } else {
+            return false;
+        }
+
+        $ts1 = null;
+        $ts2 = null;
+        // 取得する日付の計算
+        if (is_a($setdate, 'CB_Date')) {
+            $datetime = new CB_DateTime();
+            $datetime->year = intval($setdate->year);
+            $datetime->month = intval($setdate->month);
+            $datetime->day = intval($setdate->day);
+            $datetime->hour = 0;
+            $datetime->minute = 0;
+            $datetime->second = 0;
+            $ts1 = new CB_TimeStampEx($this->_ts);
+            $ts1->setDateTime($datetime);
+
+            $datetime->year = intval($enddate->year);
+            $datetime->month = intval($enddate->month);
+            $datetime->day = intval($enddate->day);
+            $ts2 = new CB_TimeStampEx($this->_ts);
+            $ts2->setDateTime($datetime);
+            $ts2->unix_ts += 86400;
+        } elseif (is_a($setdate, 'CB_DateTime')) {
+            $ts1 = new CB_TimeStampEx($this->_ts);
+            $ts1->setDateTime($setdate);
+            $ts2 = new CB_TimeStampEx($this->_ts);
+            $ts2->setDateTime($enddate);
+        } elseif (is_a($setdate, 'CB_TimeStamp')) {
+            $ts1 = $setdate;
+            $ts2 = $enddate;
+        }
+
+        $db = $this->_getDBConnection();
+
+        //GRN2-3611
+        // get date facility of temporary schedule
+        $temporary_facility_dates = [];
+        if ($str_member == 'col_facility') {
+            $query_tmp = cb_queryf($db,
+                'SELECT DISTINCT ' .
+                'm.col_event AS _id, temp_re.col_date ' .
+                'FROM ' .
+                'tab_grn_schedule_eventmember AS m, ' .
+                'tab_grn_schedule_eventdatetime AS d, ' .
+                'tab_grn_schedule_temporaryeventrelation AS temp_re ' .
+                'WHERE ' .
+                "m.col_event = temp_re.col_event " .
+                "AND " .
+                "m._id = temp_re.col_member " .
+                "AND " .
+                "d._id = temp_re.col_date " .
+                "AND " .
+                "d.col_event = m.col_event " .
+                "AND " .
+                "(" .
+                "(d.col_setdatetime < '@S' AND d.col_enddatetime > '@S' ) " .
+                "OR " .
+                "( d.col_setdatetime = '@S' AND d.col_enddatetime = '@S' )" .
+                ") " .
+                "AND " .
+                "m.col_facility='@S'",
+                $ts2->unix_ts, $ts1->unix_ts, $ts1->unix_ts, $ts1->unix_ts,
+                $member->getOID());
+
+            $ret = $db->query($query_tmp);
+            while ($row = $db->fetch_assoc($ret)) {
+                $temporary_facility_dates[$row['_id']][] = $row['col_date'];
+            }
+            $db->free_result($ret);
+        }
+        if ($_attendanceCheckForUser && $isEnableAttendanceCheck) {
+            $_attendanceCheckFields
+                = ",e." . AttendanceStatus::ATTENDANCE_CHECK_FIELD .
+                  ",ats.col_status AS "
+                  . AttendanceStatus::ATTENDANCE_CHECK_STATUS;
+            $_attendanceCheckQuery
+                = " LEFT JOIN tab_grn_schedule_event_attendance_status ats " .
+                  "ON m.col_event = ats.col_event AND m.col_user = ats.col_user, ";
+
+        } else {
+            $_attendanceCheckFields = "";
+            $_attendanceCheckQuery = ",";
+        }
+        // end get date facility of temporary schedule
+        //GRN2-3611
+        //GRN-2286 : add select col_status in grn_eventmember
+        $query = cb_queryf(
+            $db,
+            "SELECT " .
+            "m.col_status , m.col_single, " .
+            "d._id as id_datetime , d.col_enddatetime , d.col_setdatetime, " .
+            "e._id, e.col_creator_name , e.col_creator , e.col_detail , e.col_event_type , e.col_eventmenu, e.col_reserve_int2,"
+            .
+            " e.col_private, " .
+            "u.col_deleted" .
+            $_attendanceCheckFields .
+            " FROM " .
+            "tab_grn_schedule_eventmember AS m "
+            . $_attendanceCheckQuery .
+            "tab_grn_schedule_eventdatetime AS d, " .
+            "tab_grn_schedule_event AS e " .
+            "LEFT JOIN tab_cb_user AS u ON e.col_creator = u._id " .
+            "WHERE " .
+            "d.col_event = m.col_event " .
+            "AND " .
+            "m.{$str_member} = '@S' " .
+            "AND " .
+            "m.col_event_type_simple = '1' " .
+            "AND " .
+            "m.col_event = e._id " .
+            "AND " .
+            "(" .
+            "( d.col_setdatetime < '@S' AND d.col_enddatetime > '@S' ) " .
+            "OR " .
+            "( d.col_setdatetime = '@S' AND d.col_enddatetime = '@S' ) " .
+            ") " .
+            "ORDER BY " .
+            "d.col_setdatetime, d.col_enddatetime, d.col_event",
+            $member->getOID(), $ts2->unix_ts, $ts1->unix_ts, $ts1->unix_ts,
+            $ts1->unix_ts);
+
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+        $result = $db->query($query);
+
+        $events = [];
+
+        $timestamp = new CB_TimeStampEx();
+        while ($row = $db->fetch_assoc($result)) {
+            $private = $this->_isHidden($row, $login);
+
+            if ($hidden && ($private == GRN_EVENT_PRIVATE_HIDDEN)) {
+                continue;
+            }
+
+            $event = [];
+            $event['id'] = $row['_id'];
+            //GRN2-3611
+            $eid = $row['_id'];
+            // check temporary schedule using facility
+            if ($str_member == 'col_facility'
+                && count($temporary_facility_dates) > 0
+                && ($row['col_event_type'] & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY)
+                   == GRN_SCHEDULE_EVENT_TYPE_TEMPORARY
+            ) {
+                if (array_key_exists($eid, $temporary_facility_dates)) {
+                    if (array_search($row['id_datetime'],
+                            $temporary_facility_dates[$eid]) === false
+                    ) {
+                        continue;
+                    }
+                }
+            }
+            //GRN2-3611
+            $event['title']
+                = grn_schedule_get_event_title($row['col_eventmenu'],
+                $row['col_detail']);
+            $event['event_menu']
+                = htmlspecialchars($row['col_eventmenu']);
+            $event['event_menu_color'] = $row['col_reserve_int2'];
+
+            //GTM-1625
+            grn_schedule_createAttendanceStatusAttribute($row, $event);
+            //end GTM-1625
+            $event['event_detail'] = htmlspecialchars($row['col_detail']);
+
+            $timestamp->unix_ts = intval($row['col_setdatetime']);
+            $event['setdatetime'] = $timestamp->getDateTime();
+            $timestamp->unix_ts = intval($row['col_enddatetime']);
+            $event['enddatetime'] = $timestamp->getDateTime();
+            if ($row['col_single'] == 1) {
+                $event['share'] = false;
+            } else {
+                $event['share'] = $this->_isShered($event['id']);
+            }
+            $event['event_type'] = $row['col_event_type'];
+            $event_type = intval($event['event_type']);
+            if (($event_type & GRN_SCHEDULE_EVENT_TYPE_REPEAT)
+                == GRN_SCHEDULE_EVENT_TYPE_REPEAT
+            ) {
+                $event['repeat'] = true;
+            } elseif (($event_type & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY)
+                      == GRN_SCHEDULE_EVENT_TYPE_TEMPORARY
+            ) {
+                $event['temporary'] = true;
+            }
+            $event['end_time_available'] = true;
+            if ($event_type == GRN_SCHEDULE_EVENT_TYPE_REPEAT_NO_ENDTIME
+                || $event_type == GRN_SCHEDULE_EVENT_TYPE_NORMAL_NO_ENDTIME
+            ) {
+                $event['end_time_available'] = false;
+            }
+            $event['private'] = $private;
+            // ユーザーと組織は衝突のチェック
+            if ($b_checkconflict && $_bConflict) {
+                $event['conflict'] = $this->_isConflict($events,
+                    $event['setdatetime']);
+            }
+
+            // 施設の場合、タイトルを表示するための登録者情報を取得
+            if ($b_facility) {
+                $creator_id = $row['col_creator'];
+                if ($creator_id && is_null($row['col_deleted'])) {
+                    $event['creator_name'] = $this->_getUserName($creator_id);
+                } elseif (($creator_name = $row['col_creator_name'])) {
+                    $event['creator_name'] = $creator_name;
+                }
+            }
+            //GRN2-2286
+            if (is_null($row['col_status'])) {
+                $event['absent'] = 0;
+            } else {
+                $event['absent'] = 1;
+            }
+            //GRN2-2286
+            $events[] = $event;
+        }
+
+        // 結果の開放
+        $db->free_result($result);
+
+        $temp_list = [];
+        foreach (array_keys($events) as $key) {
+            $event_id = $events[$key]['id'];
+            $event_type = $events[$key]['event_type'];
+            if ($event_type != GRN_SCHEDULE_EVENT_TYPE_TEMPORARY) {
+                continue;
+            }
+
+            if (array_key_exists($event_id, $temp_list)) {
+                $event = $events[$key];
+                foreach (array_keys($temp_list[$event_id]) as $temp_key) {
+                    $temp = $temp_list[$event_id][$temp_key];
+                    // 開始日時と終了日時がまったく一緒だったら削除
+                    if ($event['setdatetime']->compare($temp['setdatetime'])
+                        === 0
+                        && $event['enddatetime']->compare($temp['enddatetime'])
+                           === 0
+                    ) {
+                        unset($events[$key]);
+                    }
+                }
+                // 重複でなかったら次の重複チェック候補に入れる
+                if (array_key_exists($key, $events)) {
+                    $temp_list[$event_id][] = $event;
+                }
+            } else {
+                $temp_list[$event_id] = [];
+                $temp_list[$event_id][] = $events[$key];
+            }
+        }
+        unset($temp_list);
+
+        return $events;
+    }
+
+    /**
+     * @access private
+     */
+    function _getUserName($user_id)
+    {
+        static $_uum = null;
+
+        if (is_null($_uum)) {
+            global $G_container_base;
+            $_uum = $G_container_base->getInstance('uum');
+        }
+
+        $user = $_uum->getUser($user_id);
+        if ($user) {
+            return $_uum->getOnlyOneNameByUserObject($user);
+        }
+
+        return '';
+    }
+
+    /**
+     * 終日予定の一覧の取得
+     *
+     * @param   mixed   $member  ユーザー（組織/設備）
+     * @param   CB_Date $setdate 取得期間（開始日）
+     * @param   CB_Date $enddate 取得期間（終了日）
+     * @param   CB_User $login   ログインユーザー
+     *
+     * @return  mixed       成功した場合は予定の配列、それ以外はFALSE
+     */
+    function getAllDayEvents(
+        $member,
+        $setdate,
+        $enddate,
+        $login,
+        $isEnableAttendanceCheck = false
+    ) {
+        $_attendanceCheckForUser = false;
+        $str_member = '';
+        if (is_a($member, 'CB_User')) {
+            $str_member = 'col_user';
+            $_attendanceCheckForUser = true;
+        } elseif (is_a($member, 'CB_Group')) {
+            $str_member = 'col_group';
+        } elseif (is_a($member, 'GRN_Facility_Facility')) {
+            return [];
+//            $str_member = 'col_facility';
+        } else {
+            return false;
+        }
+
+        if (is_a($setdate, 'CB_DateTime')) {
+            $ex = new CB_DateTimeEx($setdate);
+            $setdate = $ex->getDate();
+            $ex = new CB_DateTimeEx($enddate);
+            $enddate = $ex->getDate();
+            $time = $ex->getTime();
+            // 0時は1日前にする
+            if ($time->hour == 0 && $time->minute == 0 && $time->second == 0) {
+                $enddate->moveDays(-1);
+            }
+        }
+        $sqlAttendanceCheckJoin = "";
+        $sqlAttendanceCheckField = "";
+        if ($_attendanceCheckForUser && $isEnableAttendanceCheck) {
+            $sqlAttendanceCheckField = ",e."
+                                       . AttendanceStatus::ATTENDANCE_CHECK_FIELD
+                                       . ", ats.col_status AS "
+                                       . AttendanceStatus::ATTENDANCE_CHECK_STATUS;
+            $sqlAttendanceCheckJoin
+                = " LEFT JOIN tab_grn_schedule_event_attendance_status ats ON m.col_event = ats.col_event AND m.col_user = ats.col_user";
+
+        }
+        $db = $this->_getDBConnection();
+        // 削除フラグたってたらオブジェクト取れないし対処すると普段のパフォーマンスが怖いのでこれは対処しない
+        //GRN-2286 : add select column col_status in table grn_event_member
+        $query = cb_queryf(
+            $db,
+            "SELECT m.col_status , m.col_single , d.col_enddate , d.col_setdate , e._id , e.col_detail , e.col_event_type , e.col_eventmenu, e.col_reserve_int2  ,e.col_creator_name , e.col_creator, e.col_private"
+            . $sqlAttendanceCheckField
+            . " FROM (tab_grn_schedule_eventmember AS m LEFT JOIN tab_grn_schedule_eventdate AS d ON m.col_event_type BETWEEN '32' AND '34' AND m."
+            . $str_member
+            . " = '@S' AND d.col_event = m.col_event) LEFT JOIN tab_grn_schedule_event AS e ON m.col_event = e._id"
+            . $sqlAttendanceCheckJoin
+            . " WHERE ( d.col_setdate <= '@S' AND d.col_enddate >= '@S' ) ORDER BY d.col_setdate, d.col_enddate, d.col_event",
+            $member->getOID(), $enddate->format(), $setdate->format()
+        );
+
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $events = [];
+        while ($row = $db->fetch_assoc($result)) {
+            // 非公開の場合は取得しない
+            if (($private = $this->_isHidden($row, $login))
+                == GRN_EVENT_PRIVATE_HIDDEN
+            ) {
+                continue;
+            }
+
+            $event = [];
+
+            $eid = $row['_id'];
+            $event['id'] = $eid;
+            $event['title']
+                = grn_schedule_get_event_title($row['col_eventmenu'],
+                $row['col_detail']);
+            $event['event_menu']
+                = htmlspecialchars($row['col_eventmenu']);
+            $event['event_menu_color'] = $row['col_reserve_int2'];
+            $event['event_detail'] = htmlspecialchars($row['col_detail']);
+            $date = new CB_Date();
+            $date->parse($row['col_setdate']);
+            $event['setdate'] = $date;
+            $date = new CB_Date();
+            $date->parse($row['col_enddate']);
+            $event['enddate'] = $date;
+            if ($row['col_single'] == 1) {
+                $event['share'] = false;
+            } else {
+                $event['share'] = $this->_isShered($event['id']);
+            }
+
+            $event['event_type'] = $row['col_event_type'];
+            $event_type = intval($event['event_type']);
+            if (($event_type & GRN_SCHEDULE_EVENT_TYPE_REPEAT)
+                == GRN_SCHEDULE_EVENT_TYPE_REPEAT
+            ) {
+                $event['repeat'] = true;
+            }
+
+            $event['allday'] = true;
+            $event['private'] = $private;
+            //GRN2-2286
+            if (is_null($row['col_status'])) {
+                $event['absent'] = 0;
+            } else {
+                $event['absent'] = 1;
+            }
+            //GRN2-2286
+
+            //GTM-1625
+            grn_schedule_createAttendanceStatusAttribute($row, $event);
+            //end GTM-1625
+            $events[] = $event;
+        }
+
+        // 結果の開放
+        $db->free_result($result);
+
+        return $events;
+    }
+
+    /**
+     * バナー予定の一覧の取得
+     *
+     * @param   mixed   $member  ユーザー（組織/設備）
+     * @param   CB_Date $setdate 取得期間（開始日）
+     * @param   CB_Date $enddate 取得期間（終了日）
+     * @param   CB_User $login   ログインユーザー
+     *
+     * @return  array       成功した場合は予定の配列
+     */
+    function getBannerEvents($member, $setdate, $enddate, $login)
+    {
+        $str_member = '';
+        if (is_a($member, 'CB_User')) {
+            $str_member = 'col_user';
+        } elseif (is_a($member, 'CB_Group')) {
+            $str_member = 'col_group';
+        } elseif (is_a($member, 'GRN_Facility_Facility')) {
+            return [];
+        } else {
+            return false;
+        }
+
+        if (is_a($setdate, 'CB_DateTime')) {
+            $ex = new CB_DateTimeEx($setdate);
+            $setdate = $ex->getDate();
+            $ex = new CB_DateTimeEx($enddate);
+            $enddate = $ex->getDate();
+            $time = $ex->getTime();
+
+            // 0時は1日前にする
+            if ($time->hour == 0 && $time->minute == 0 && $time->second == 0) {
+                $enddate->moveDays(-1);
+            }
+        }
+
+        $db = $this->_getDBConnection();
+
+        // 削除フラグたってたらオブジェクト取れないし対処すると普段のパフォーマンスが怖いのでこれは対処しない
+        //GRN2-2286 : add select col_status include grn_eventmember
+        $query = cb_queryf($db,
+            "SELECT m.col_status , m.col_single , d.col_enddate , d.col_setdate , e._id , e.col_detail , e.col_event_type , e.col_eventmenu, e.col_reserve_int2 ,e.col_creator_name , e.col_creator, e.col_private, e.col_memo FROM (tab_grn_schedule_eventmember AS m LEFT JOIN tab_grn_schedule_eventdate AS d ON m.col_event_type = '64' AND m."
+            . $str_member
+            . " = '@S' AND d.col_event = m.col_event) LEFT JOIN tab_grn_schedule_event AS e ON m.col_event = e._id WHERE ( d.col_setdate <= '@S' AND d.col_enddate >= '@S' ) ORDER BY d.col_setdate, d.col_enddate, d.col_event",
+            $member->getOID(), $enddate->format(), $setdate->format());
+
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $events = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $event = [];
+
+            $eid = $row['_id'];
+
+            $event['id'] = $eid;
+            $event['title']
+                = grn_schedule_get_event_title($row['col_eventmenu'],
+                $row['col_detail']);
+            $event['event_menu']
+                = htmlspecialchars($row['col_eventmenu']);
+            $event['event_menu_color'] = $row['col_reserve_int2'];
+            $event['event_detail'] = htmlspecialchars($row['col_detail']);
+            $event['memo'] = $row['col_memo'];
+            $date = new CB_Date();
+            $date->parse($row['col_setdate']);
+            $event['setdate'] = $date;
+            $date = new CB_Date();
+            $date->parse($row['col_enddate']);
+            $event['enddate'] = $date;
+            if ($row['col_single'] == 1) {
+                $event['share'] = false;
+            } else {
+                $event['share'] = $this->_isShered($event['id']);
+            }
+            $event['event_type'] = $row['col_event_type'];
+            $event['banner'] = true;
+            //GRN2-2286
+            if (is_null($row['col_status'])) {
+                $event['absent'] = 0;
+            } else {
+                $event['absent'] = 1;
+            }
+            //GRN2-2286
+            $events[] = $event;
+        }
+
+        // 結果の開放
+        $db->free_result($result);
+
+        return $events;
+    }
+
+    /**
+     * 終日+バナー予定の一覧の取得
+     *
+     * @param   mixed   $member  ユーザー（組織/設備）
+     * @param   CB_Date $setdate 取得期間（開始日）
+     * @param   CB_Date $enddate 取得期間（終了日）
+     * @param   CB_User $login   ログインユーザー
+     *
+     * @return  mixed       成功した場合は予定の配列、それ以外はFALSE
+     */
+    function getDailyEvents(
+        $member,
+        $setdate,
+        $enddate,
+        $login,
+        $isEnableAttendanceCheck = false
+    ) {
+        $str_member = '';
+        $_attendanceCheckForUser = false;
+        if (is_a($member, 'CB_User')) {
+            $str_member = 'col_user';
+            $_attendanceCheckForUser = true;
+        } elseif (is_a($member, 'CB_Group')) {
+            $str_member = 'col_group';
+        } elseif (is_a($member, 'GRN_Facility_Facility')) {
+            return [];
+        } else {
+            return false;
+        }
+
+        if (is_a($setdate, 'CB_DateTime')) {
+            $ex = new CB_DateTimeEx($setdate);
+            $setdate = $ex->getDate();
+            $ex = new CB_DateTimeEx($enddate);
+            $enddate = $ex->getDate();
+            $time = $ex->getTime();
+            // 0時は1日前にする
+            if ($time->hour == 0 && $time->minute == 0 && $time->second == 0) {
+                $enddate->moveDays(-1);
+            }
+        }
+        $sqlAttendanceCheckField = "";
+        $sqlAttendanceCheckJoin = "";
+
+        if ($_attendanceCheckForUser && $isEnableAttendanceCheck) {
+            $sqlAttendanceCheckField = ",e."
+                                       . AttendanceStatus::ATTENDANCE_CHECK_FIELD
+                                       . ", ats.col_status AS "
+                                       . AttendanceStatus::ATTENDANCE_CHECK_STATUS;
+            $sqlAttendanceCheckJoin
+                = " LEFT JOIN tab_grn_schedule_event_attendance_status ats ON m.col_event = ats.col_event AND m.col_user = ats.col_user";
+
+        }
+        // process setdate move -1 day for search
+        $setdate_original_ex = clone $setdate;
+        $setdate_tmp = clone $setdate;
+        $setdate_tmp->moveDays(-1);
+        $setdate = $setdate_tmp;
+        // process enddate move +1 day for search
+        $enddate_original_ex = clone $enddate;
+        $enddate_tmp = clone $enddate;
+        $enddate_tmp->moveDays(+1);
+        $enddate = $enddate_tmp;
+
+        $db = $this->_getDBConnection();
+
+        // 削除フラグたってたらオブジェクト取れないし対処すると普段のパフォーマンスが怖いのでこれは対処しない
+        //GRN2-2286 add select col_status in table grn_scheduleeventmember
+        $query = cb_queryf(
+            $db,
+            "SELECT m.col_status ,m.col_single, d.col_enddate, d.col_setdate,d.col_timezone, e._id, e.col_detail, e.col_event_type, e.col_eventmenu, e.col_reserve_int2 ,e.col_creator_name, e.col_creator, e.col_private "
+            .
+            $sqlAttendanceCheckField .
+            " FROM (tab_grn_schedule_eventmember AS m LEFT JOIN tab_grn_schedule_eventdate AS d ON m.col_event_type BETWEEN '32' AND '64' AND m."
+            . $str_member . " = '@S' AND d.col_event = m.col_event)" .
+            " LEFT JOIN tab_grn_schedule_event AS e ON m.col_event = e._id " .
+            $sqlAttendanceCheckJoin .
+            " WHERE ( d.col_setdate <= '@S' AND d.col_enddate >= '@S' ) ORDER BY d.col_setdate, d.col_enddate, d.col_event",
+            $member->getOID(), $enddate->format(), $setdate->format()
+        );
+
+
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $events = [];
+        while ($row = $db->fetch_assoc($result)) {
+            // 非公開の場合は取得しない
+            if (($private = $this->_isHidden($row, $login))
+                == GRN_EVENT_PRIVATE_HIDDEN
+            ) {
+                continue;
+            }
+
+            $event = [];
+
+            $eid = $row['_id'];
+            $event['id'] = $eid;
+            $event['title']
+                = grn_schedule_get_event_title($row['col_eventmenu'],
+                $row['col_detail']);
+            $event['event_menu']
+                = htmlspecialchars($row['col_eventmenu']);
+            $event['event_menu_color'] = $row['col_reserve_int2'];
+            $event['event_detail'] = htmlspecialchars($row['col_detail']);
+            $date = new CB_Date();
+            $date->parse($row['col_setdate']);
+            // get original date for star
+            $event['star_date'] = $row['col_setdate'];
+            $event['setdate'] = $date;
+            $date = new CB_Date();
+            $date->parse($row['col_enddate']);
+            $event['enddate'] = $date;
+            $event['creator'] = $row['col_creator'];
+            // GRN2-2284
+            $event['timezone'] = $row['col_timezone'];
+            // process date to UTC
+            // setdatetime
+            $setdatetime = new CB_DateTime();
+            $setdatetime->day = $event['setdate']->day;
+            $setdatetime->month = $event['setdate']->month;
+            $setdatetime->year = $event['setdate']->year;
+            $setdatetime->hour = 0;
+            $setdatetime->minute = 0;
+            $setdatetime->second = 0;
+            $setdatetime_ts = new CB_TimeStampEx(null);
+            $setdatetime_ts->setDateTime($setdatetime, $event['timezone']);
+            $event['setdate'] = $setdatetime_ts->getDateTime();
+            // enddatetime
+            $enddatetime = new CB_DateTime();
+            $enddatetime->day = $event['enddate']->day;
+            $enddatetime->month = $event['enddate']->month;
+            $enddatetime->year = $event['enddate']->year;
+            $enddatetime->hour = 23;
+            $enddatetime->minute = 59;
+            $enddatetime->second = 0;
+            $enddatetime_ts = new CB_TimeStampEx(null);
+            $enddatetime_ts->setDateTime($enddatetime, $event['timezone']);
+            $event['enddate'] = $enddatetime_ts->getDateTime();
+
+            // check date schedule
+            $setdate_tmp = new CB_Date();
+            $setdate_tmp->day = $event['setdate']->day;
+            $setdate_tmp->month = $event['setdate']->month;
+            $setdate_tmp->year = $event['setdate']->year;
+
+            $enddate_tmp = new CB_Date();
+            $enddate_tmp->day = $event['enddate']->day;
+            $enddate_tmp->month = $event['enddate']->month;
+            $enddate_tmp->year = $event['enddate']->year;
+
+            if ($setdate_original_ex->compare($enddate_tmp) > 0
+                || $enddate_original_ex->compare($setdate_tmp) < 0
+            ) {
+                continue;
+            }
+            // GRN2-2284
+            if ($row['col_single'] == 1) {
+                $event['share'] = false;
+            } else {
+                $event['share'] = $this->_isShered($event['id']);
+            }
+
+            $event['event_type'] = $row['col_event_type'];
+            $event_type = intval($event['event_type']);
+            if (($event_type & GRN_SCHEDULE_EVENT_TYPE_REPEAT)
+                == GRN_SCHEDULE_EVENT_TYPE_REPEAT
+            ) {
+                $event['repeat'] = true;
+                $event['banner'] = false;
+            } elseif (($event_type & GRN_SCHEDULE_EVENT_TYPE_BANNER)
+                      == GRN_SCHEDULE_EVENT_TYPE_BANNER
+            ) {
+                $event['banner'] = true;
+                $event['repeat'] = false;
+            } else {
+                $event['banner'] = false;
+                $event['repeat'] = false;
+            }
+
+            $event['allday'] = true;
+            $event['private'] = $private;
+            //GRN2-2286
+            if (is_null($row['col_status'])) {
+                $event['absent'] = 0;
+            } else {
+                $event['absent'] = 1;
+            }
+            //GRN2-2286
+            //GTM-1625
+            grn_schedule_createAttendanceStatusAttribute($row, $event);
+            //end GTM-1625
+            $events[] = $event;
+        }
+
+        // 結果の開放
+        $db->free_result($result);
+
+        return $events;
+    }
+
+    /**
+     * 予定が共有かどうかをチェック
+     *
+     * @access private
+     */
+    function _isShered($eid)
+    {
+        if (is_null($this->_shared_list)) {
+            $this->_shared_list = [];
+        }
+
+        if (array_key_exists($eid, $this->_shared_list)) {
+            return true;
+        }
+
+        $db = $this->_getDBConnection();
+
+        // 先に削除フラグが立っているメンバーを知っておく
+        $query = cb_queryf(
+            $db,
+            "SELECT m._id FROM tab_grn_schedule_eventmember AS m " .
+            "LEFT JOIN tab_cb_user AS u ON m.col_user = u._id " .
+            "WHERE u.col_deleted IS NOT NULL AND col_event = '@S'", $eid
+        );
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $deleted_members = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $deleted_members[] = "'" . $db->escape($row['_id']) . "'";
+        }
+
+        $deleted_condition = '';
+        if (count($deleted_members) > 0) {
+            $deleted_members_str = implode(',', $deleted_members);
+            $deleted_condition = "AND _id NOT IN ( " . $deleted_members_str
+                                 . " )";
+        }
+
+        // メンバーが2人（つ）あるかどうかでチェック
+        $query = cb_queryf($db,
+            "SELECT COUNT(*) FROM tab_grn_schedule_eventmember WHERE col_event = '@S' "
+            .
+            $deleted_condition,
+            $eid);
+        $query = $db->select_format($query, 0, 2, CB_DATABASE_NO_LOCK);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $is_share = false;
+        while ($row = $db->fetch_assoc($result)) {
+            if (intval($row['COUNT(*)']) > 1) {
+                $is_share = true;
+            }
+        }
+
+        // 結果の開放
+        $db->free_result($result);
+
+        if ($is_share) {
+            $this->_shared_list[$eid] = $eid;
+        }
+
+        return $is_share;
+    }
+
+    /**
+     * 非公開のパターンをチェック
+     *
+     * @access private
+     */
+    function _isHidden(& $eventrow, & $login)
+    {
+        $private = intval($eventrow['col_private']);
+
+        // そもそも公開予定は関係ない
+        if ($private == 0) {
+            return GRN_EVENT_PRIVATE_NONE;
+        }
+
+        // 比較ユーザーがいない場合はすべて隠す
+        if ( ! $login) {
+            return GRN_EVENT_PRIVATE_HIDDEN;
+        }
+
+        if (is_null($this->_hidden_list)) {
+            $this->_hidden_list = [];
+            $this->_private_list = [];
+        }
+
+        $event_id = $eventrow['_id'];
+
+        if (array_key_exists($event_id, $this->_hidden_list)) {
+            return GRN_EVENT_PRIVATE_HIDDEN;
+        }
+        if (array_key_exists($event_id, $this->_private_list)) {
+            return GRN_EVENT_PRIVATE_PRIVATE;
+        }
+
+        // 自分が登録したかどうか
+        $creator_id = $eventrow['col_creator'];
+        if ($creator_id == $login->getOID()) {
+            $this->_private_list[$event_id] = $event_id;
+
+            return GRN_EVENT_PRIVATE_PRIVATE;
+        }
+
+
+        $db = $this->_getDBConnection();
+
+        // CB_Userからuidを取得しているので、削除フラグチェックは行わない。
+        $query = cb_queryf($db,
+            "SELECT COUNT(*) from tab_grn_schedule_eventmember WHERE col_event = '@S' AND col_user = '@S'",
+            $event_id, $login->getOID());
+        $query = $db->select_format($query, 0, 1, CB_DATABASE_NO_LOCK);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $private = null;
+        while ($row = $db->fetch_assoc($result)) {
+            if (intval($row['COUNT(*)']) === 0) {
+
+                $private = GRN_EVENT_PRIVATE_HIDDEN;
+            } else {
+
+                $private = GRN_EVENT_PRIVATE_PRIVATE;
+            }
+        }
+        // 結果の開放
+        $db->free_result($result);
+
+        // 公開先のチェック
+        if ($private === GRN_EVENT_PRIVATE_HIDDEN) {
+            $notify_address_event_info = ScheduleMemberLogic::getInstance()
+                                                            ->getEventInfoFromNotifyAddress($login,
+                                                                [$event_id]);
+            if (isset($notify_address_event_info[$event_id])
+                && $notify_address_event_info[$event_id]['count'] > 0
+            ) {
+                $this->_private_list[$event_id] = $event_id;
+                $private = GRN_EVENT_PRIVATE_PRIVATE;
+            } else {
+                $this->_hidden_list[$event_id] = $event_id;
+            }
+        }
+
+        return $private;
+    }
+
+    /**
+     * スケジュールがほかの予定とぶつかっているかのチェック
+     *
+     * @access private
+     */
+    function _isConflict(& $events, $datetime)
+    {
+        foreach (array_keys($events) as $key) {
+            $item = $events[$key];
+            $setdatetime = $item['setdatetime'];
+            $enddatetime = $item['enddatetime'];
+
+            // 開始時間が同じ場合は衝突
+            if ($setdatetime->compare($datetime) == 0) {
+                if ($item['conflict'] == false) {
+                    // 1回目がチェックできないので入れ替え
+                    $item['conflict'] = true;
+                }
+
+                return true;
+            } elseif ($enddatetime->compare($datetime) > 0) {
+                if ($item['conflict'] == false) {
+                    // 1回目がチェックできないので入れ替え
+                    $item['conflict'] = true;
+                }
+
+                return true;
+            }
+
+        }
+
+        return false;
+    }
+
+    function getNormalEventsForExportICS(
+        $member,
+        $setdate,
+        $enddate,
+        $login,
+        $hidden = false,
+        $b_checkconflict = true,
+        $isEnableAttendanceCheck = false
+    ) {
+        $ts1 = null;
+        $ts2 = null;
+        // 取得する日付の計算
+        if (is_a($setdate, 'CB_Date')) {
+            $datetime = new CB_DateTime();
+            $datetime->year = intval($setdate->year);
+            $datetime->month = intval($setdate->month);
+            $datetime->day = intval($setdate->day);
+            $datetime->hour = 0;
+            $datetime->minute = 0;
+            $datetime->second = 0;
+            $ts1 = new CB_TimeStampEx($this->_ts);
+            $ts1->setDateTime($datetime);
+
+            $datetime->year = intval($enddate->year);
+            $datetime->month = intval($enddate->month);
+            $datetime->day = intval($enddate->day);
+            $ts2 = new CB_TimeStampEx($this->_ts);
+            $ts2->setDateTime($datetime);
+            $ts2->unix_ts += 86400;
+        } elseif (is_a($setdate, 'CB_DateTime')) {
+            $ts1 = new CB_TimeStampEx($this->_ts);
+            $ts1->setDateTime($setdate);
+            $ts2 = new CB_TimeStampEx($this->_ts);
+            $ts2->setDateTime($enddate);
+        } elseif (is_a($setdate, 'CB_TimeStamp')) {
+            $ts1 = $setdate;
+            $ts2 = $enddate;
+        }
+
+        $db = $this->_getDBConnection();
+        $member_id = $member->getOID();
+        if (is_a($member, 'CB_User')) {
+            $str_member = 'col_user';
+            $str_member_query = cb_queryf($db, "col_user = '@S'", $member_id);
+        } elseif (is_a($member, 'CB_Group')) {
+            $str_member = 'col_group';
+            $str_member_query = cb_queryf($db, "col_group = '@S'", $member_id);
+        } elseif (is_a($member, 'GRN_Facility_Facility')) {
+            $str_member = 'col_facility';
+            $str_member_query = cb_queryf($db, "col_facility = '@S'",
+                $member_id);
+        } else {
+            return false;
+        }
+
+        $settimestamp = cb_datetime_to_timestamp($setdate);
+        $endtimestamp = cb_datetime_to_timestamp($enddate);
+        $query = "SELECT DISTINCT d.col_event "
+                 . "FROM tab_grn_schedule_eventmember AS m, tab_grn_schedule_eventdatetime AS d "
+                 . "WHERE m.col_event = d.col_event "
+                 . "AND m." . $str_member_query
+                 . "AND m.col_event_type_simple = 1 "
+                 . "AND ("
+                 . cb_queryf($db,
+                " ( d.col_setdatetime < '@S' AND d.col_enddatetime > '@S' )",
+                $endtimestamp,
+                $settimestamp)
+                 . " OR"
+                 . cb_queryf($db,
+                " ( d.col_setdatetime = '@S' AND d.col_enddatetime = '@S' )",
+                $endtimestamp,
+                $settimestamp)
+                 . " )";
+
+        $result = $db->query($query);
+        $eventIds = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $eventIds[] = $row['col_event'];
+        }
+        $db->free_result($result);
+
+        if (count($eventIds) === 0) {
+            return false;
+        }
+
+        //GRN2-3611
+        // get date facility of temporary schedule
+        $temporary_facility_dates = [];
+        if ($str_member == 'col_facility') {
+            $query_tmp
+                = 'SELECT DISTINCT e._id,temp_re.col_date
+                              FROM tab_grn_schedule_event AS e 
+                              LEFT JOIN tab_grn_schedule_eventmember AS m ON m.col_event = e._id
+                              INNER JOIN tab_grn_schedule_temporaryeventrelation AS temp_re ON  e._id=temp_re.col_event AND m._id=temp_re.col_member WHERE '
+                  . cb_queryf($db, "e._id IN (@S) AND m.col_facility='@S'",
+                    implode(',', $eventIds), $member_id);
+            $ret = $db->query($query_tmp);
+            while ($row = $db->fetch_assoc($ret)) {
+                $temporary_facility_dates[$row['_id']][] = $row['col_date'];
+            }
+            $db->free_result($ret);
+        }
+
+        //GTM-1632
+        if ($isEnableAttendanceCheck) {
+            $_attendanceCheckFields
+                = ",e." . AttendanceStatus::ATTENDANCE_CHECK_FIELD .
+                  ",ats.col_status AS "
+                  . AttendanceStatus::ATTENDANCE_CHECK_STATUS;
+            $_attendanceCheckQuery
+                = " LEFT JOIN tab_grn_schedule_event_attendance_status ats " .
+                  "ON m.col_event = ats.col_event AND m.col_user = ats.col_user ";
+        } else {
+            $_attendanceCheckFields = "";
+            $_attendanceCheckQuery = "";
+        }
+
+        $sql
+            = "SELECT d.col_enddatetime as col_enddatetime, d._id as id_datetime, "
+              . "d.col_setdatetime as col_setdatetime , e._id, e.col_creator_name , e.col_creator , e.col_detail , "
+              . "e.col_event_type , e.col_eventmenu, e.col_reserve_int2"
+              . $_attendanceCheckFields
+              . " , e.col_private, e.col_memo, u.col_deleted ";
+
+        $sql .= "FROM (tab_grn_schedule_eventmember AS m ";
+        $sql .= $_attendanceCheckQuery;
+        $sql .= "LEFT JOIN tab_grn_schedule_eventdatetime AS d ON m.col_event_type_simple = '1' AND m."
+                . $str_member
+                . " = '@S' AND d.col_event = m.col_event) ";
+        $sql .= "LEFT JOIN tab_grn_schedule_event AS e ON m.col_event = e._id ";
+        $sql .= "LEFT JOIN tab_cb_user AS u ON e.col_creator = u._id ";
+        $sql .= "WHERE ( ( d.col_setdatetime >= '@S' AND d.col_setdatetime < '@S' ) ";
+        $sql .= "OR ( d.col_setdatetime <> d.col_enddatetime AND d.col_enddatetime > '@S' AND d.col_enddatetime <= '@S' ) ";
+        $sql .= "OR ( d.col_setdatetime < '@S' AND d.col_enddatetime > '@S' ) ) ";
+        $sql .= "ORDER BY col_setdatetime, col_enddatetime, e._id";
+
+        $query = cb_queryf($db, $sql, $member->getOID(), $ts1->unix_ts,
+            $ts2->unix_ts, $ts1->unix_ts, $ts2->unix_ts,
+            $ts1->unix_ts, $ts2->unix_ts);
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $events = [];
+
+        $timestamp = new CB_TimeStampEx();
+        while ($row = $db->fetch_assoc($result)) {
+            $private = $this->_isHidden($row, $login);
+
+            if ($hidden && ($private == GRN_EVENT_PRIVATE_HIDDEN)) {
+                continue;
+            }
+
+            //GRN2-3611
+            // check temporary schedule using facility
+            if ($str_member == 'col_facility'
+                && count($temporary_facility_dates) > 0
+                && ($row['col_event_type'] & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY)
+                   == GRN_SCHEDULE_EVENT_TYPE_TEMPORARY
+                && array_key_exists($row['_id'], $temporary_facility_dates)
+                && array_key_exists('id_datetime', $row)
+                && (array_search($row['id_datetime'],
+                        $temporary_facility_dates[$row['_id']]) === false)
+            ) {
+                continue;
+            }
+            //GRN2-3611
+
+            $event = [];
+            $event['id'] = $row['_id'];
+            $event['title']
+                = grn_schedule_get_event_title($row['col_eventmenu'],
+                $row['col_detail']);
+            $event['event_menu'] = $row['col_eventmenu'];
+
+            //GTM-1632
+            grn_schedule_createAttendanceStatusAttribute($row, $event);
+
+            $event['event_menu_color'] = $row['col_reserve_int2'];
+            $event['event_detail'] = $row['col_detail'];
+            $event['memo'] = $row['col_memo'];
+
+            $timestamp->unix_ts = intval($row['col_setdatetime']);
+            $event['setdatetime'] = $timestamp->getDateTime();
+            $timestamp->unix_ts = intval($row['col_enddatetime']);
+            $event['enddatetime'] = $timestamp->getDateTime();
+            $event['event_type'] = $row['col_event_type'];
+            $event_type = intval($event['event_type']);
+            if (($event_type & GRN_SCHEDULE_EVENT_TYPE_REPEAT)
+                == GRN_SCHEDULE_EVENT_TYPE_REPEAT
+            ) {
+                $event['repeat'] = true;
+                $dtend_datetime = clone $event['setdatetime'];
+                if ($event['enddatetime']->getTime()
+                                         ->compare($event['setdatetime']->getTime())
+                    < 0
+                ) {
+                    $dtend_datetime->moveDays(1);
+                }
+                $event['dtend_datetime'] = $dtend_datetime;
+            } elseif (($event_type & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY)
+                      == GRN_SCHEDULE_EVENT_TYPE_TEMPORARY
+            ) {
+                $event['temporary'] = true;
+            }
+            $event['private'] = $private;
+
+            //check if event already exists then update end time
+            if (array_key_exists($event['id'], $events)) {
+                $events[$event['id']]['enddatetime'] = $event['enddatetime'];
+            } else {
+                $events[$event['id']] = $event;
+            }
+        }
+
+        // 結果の開放
+        $db->free_result($result);
+
+        $temp_list = [];
+        foreach (array_keys($events) as $key) {
+            $event_id = $events[$key]['id'];
+            $event_type = $events[$key]['event_type'];
+            if ($event_type != GRN_SCHEDULE_EVENT_TYPE_TEMPORARY) {
+                continue;
+            }
+
+            if (array_key_exists($event_id, $temp_list)) {
+                $event = $events[$key];
+                foreach (array_keys($temp_list[$event_id]) as $temp_key) {
+                    $temp = $temp_list[$event_id][$temp_key];
+                    // 開始日時と終了日時がまったく一緒だったら削除
+                    if ($event['setdatetime']->compare($temp['setdatetime'])
+                        === 0
+                        && $event['enddatetime']->compare($temp['enddatetime'])
+                           === 0
+                    ) {
+                        unset($events[$key]);
+                    }
+                }
+                // 重複でなかったら次の重複チェック候補に入れる
+                if (array_key_exists($key, $events)) {
+                    $temp_list[$event_id][] = $event;
+                }
+            } else {
+                $temp_list[$event_id] = [];
+                $temp_list[$event_id][] = $events[$key];
+            }
+        }
+        unset($temp_list);
+
+        return $events;
+    }
+
+    /**
+     * 終日+バナー予定の一覧の取得
+     *
+     * @param   mixed   $member  ユーザー（組織/設備）
+     * @param   CB_Date $setdate 取得期間（開始日）
+     * @param   CB_Date $enddate 取得期間（終了日）
+     * @param   CB_User $login   ログインユーザー
+     * @param   bool    $isEnableAttendanceCheck
+     *
+     * @return  mixed       成功した場合は予定の配列、それ以外はFALSE
+     */
+    function getDailyEventsForExportICS(
+        $member,
+        $setdate,
+        $enddate,
+        $login,
+        $isEnableAttendanceCheck = false
+    ) {
+        $str_member = '';
+        if (is_a($member, 'CB_User')) {
+            $str_member = 'col_user';
+        } elseif (is_a($member, 'CB_Group')) {
+            $str_member = 'col_group';
+        } elseif (is_a($member, 'GRN_Facility_Facility')) {
+            return [];
+        } else {
+            return false;
+        }
+
+        if (is_a($setdate, 'CB_DateTime')) {
+            $ex = new CB_DateTimeEx($setdate);
+            $setdate = $ex->getDate();
+            $ex = new CB_DateTimeEx($enddate);
+            $enddate = $ex->getDate();
+            $time = $ex->getTime();
+            // 0時は1日前にする
+            if ($time->hour == 0 && $time->minute == 0 && $time->second == 0) {
+                $enddate->moveDays(-1);
+            }
+        }
+
+        $db = $this->_getDBConnection();
+
+        //GTM-1632
+        if ($isEnableAttendanceCheck) {
+            $_attendanceCheckFields
+                = ",e." . AttendanceStatus::ATTENDANCE_CHECK_FIELD .
+                  ",MAX(ats.col_status) AS "
+                  . AttendanceStatus::ATTENDANCE_CHECK_STATUS;
+            $_attendanceCheckQuery
+                = " LEFT JOIN tab_grn_schedule_event_attendance_status ats " .
+                  "ON m.col_event = ats.col_event AND m.col_user = ats.col_user ";
+        } else {
+            $_attendanceCheckFields = "";
+            $_attendanceCheckQuery = "";
+        }
+
+        // 削除フラグたってたらオブジェクト取れないし対処すると普段のパフォーマンスが怖いのでこれは対処しない
+        $query = cb_queryf(
+            $db,
+            "SELECT GROUP_CONCAT(DISTINCT m.col_single) AS col_single, max(d.col_enddate) as col_enddate, min(d.col_setdate) as col_setdate, e._id,"
+            . " e.col_detail, e.col_event_type, e.col_eventmenu, e.col_reserve_int2"
+            . $_attendanceCheckFields
+            . " ,e.col_creator_name, e.col_creator, e.col_private, e.col_memo "
+            . "FROM (tab_grn_schedule_eventmember AS m "
+            . $_attendanceCheckQuery
+            . "LEFT JOIN tab_grn_schedule_eventdate AS d ON m.col_event_type BETWEEN '32' AND '64' AND m."
+            . $str_member
+            . " = '@S' AND d.col_event = m.col_event) LEFT JOIN tab_grn_schedule_event AS e ON m.col_event = e._id "
+            . "WHERE ( d.col_setdate <= '@S' AND d.col_enddate >= '@S' ) "
+            . "GROUP BY e._id ORDER BY col_setdate, col_enddate, e._id",
+            $member->getOID(), $enddate->format(), $setdate->format()
+        );
+
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $events = [];
+        while ($row = $db->fetch_assoc($result)) {
+            // 非公開の場合は取得しない
+            if (($private = $this->_isHidden($row, $login))
+                == GRN_EVENT_PRIVATE_HIDDEN
+            ) {
+                continue;
+            }
+
+            $event = [];
+            $eid = $row['_id'];
+            $event['id'] = $eid;
+            $event['title']
+                = grn_schedule_get_event_title($row['col_eventmenu'],
+                $row['col_detail']);
+            $event['event_menu'] = $row['col_eventmenu'];
+
+            //GTM-1632
+            grn_schedule_createAttendanceStatusAttribute($row, $event);
+
+            $event['event_menu_color'] = $row['col_reserve_int2'];
+            $event['event_detail'] = $row['col_detail'];
+            $event['memo'] = $row['col_memo'];
+            $date = new CB_Date();
+            $date->parse($row['col_setdate']);
+            $event['setdate'] = $date;
+            $date = new CB_Date();
+            $date->parse($row['col_enddate']);
+            $event['enddate'] = $date;
+            if ($row['col_single'] == 1) {
+                $event['share'] = false;
+            } else {
+                $event['share'] = $this->_isShered($event['id']);
+            }
+
+            $event['event_type'] = $row['col_event_type'];
+            $event_type = intval($event['event_type']);
+            if (($event_type & GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+                == GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+            ) {
+                $date_setend = new CB_Date();
+                $date_setend->parse($row['col_setdate']);
+                cb_date_move_days($date_setend, 1);
+                $event['date_setend'] = $date_setend;
+
+                $date_endend = new CB_Date();
+                $date_endend->parse($row['col_enddate']);
+                cb_date_move_days($date_endend, 1);
+                $event['date_endend'] = $date_endend;
+            }
+            if (($event_type & GRN_SCHEDULE_EVENT_TYPE_REPEAT)
+                == GRN_SCHEDULE_EVENT_TYPE_REPEAT
+            ) {
+                $event['repeat'] = true;
+                $event['banner'] = false;
+            } elseif (($event_type & GRN_SCHEDULE_EVENT_TYPE_BANNER)
+                      == GRN_SCHEDULE_EVENT_TYPE_BANNER
+            ) {
+                $event['banner'] = true;
+                $event['repeat'] = false;
+            } else {
+                $event['banner'] = false;
+                $event['repeat'] = false;
+            }
+
+            $event['allday'] = true;
+            $event['private'] = $private;
+            $events[$eid] = $event;
+        }
+
+        // 結果の開放
+        $db->free_result($result);
+
+        return $events;
+    }
+
+    /**
+     * 日付をログインユーザーのタイムゾーンから予定のタイムゾーンに変換する
+     *
+     * @param  GRN_Schedule_EventBase $event
+     * @param  CB_Date                $date
+     *
+     * @return CB_Date
+     */
+    public function translateDateToEventTimezone($event, $date)
+    {
+        assert('$event instanceof GRN_Schedule_EventBase');
+        assert('$date instanceof CB_Date');
+
+        require_once('schedule/view_util.csp');
+        $datetime = CB_DateTimeEx::createByDateAndTime($date,
+            GRN_Schedule_View_Util::getAlldayStartTime());
+        $timestamp = cb_datetime_to_timestamp($datetime);
+        $datetime = new CB_DateTimeEx(cb_timestamp_to_datetime($timestamp,
+            $event->timezone));
+        if ($datetime->hour > 0) {
+            $datetime->moveDays(1);
+        }
+
+        $translated_date = new CB_Date();
+        $translated_date->year = $datetime->year;
+        $translated_date->month = $datetime->month;
+        $translated_date->day = $datetime->day;
+
+        return $translated_date;
+    }
+
+    public static function getEventWithEventTimezoneDateTime(
+        $event,
+        $from_timezone
+    ) {
+        if ($event instanceof GRN_Schedule_BannerEvent) {
+            return $event;
+        }
+
+        $new_event = clone $event;
+        if ($new_event->setdatetime instanceof CB_DateTime) {
+            $new_event->setdatetime
+                = CB_I18N::translateDatetimeTimezone($new_event->setdatetime,
+                $from_timezone, $new_event->timezone);
+        }
+        if ($new_event->enddatetime instanceof CB_DateTime) {
+            $new_event->enddatetime
+                = CB_I18N::translateDatetimeTimezone($new_event->enddatetime,
+                $from_timezone, $new_event->end_timezone);
+        }
+
+        return $new_event;
+    }
+
+    public function getEventReadTime($eventId, $userId)
+    {
+        $db = $this->_getDBConnection();
+        $query = cb_queryf($db,
+            "SELECT col_timestamp FROM tab_grn_schedule_readstatus WHERE col_event_id = '@S' AND col_user = '@S'",
+            $eventId, $userId);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $row = $db->fetch_assoc($result);
+
+        $db->free_result($result);
+
+        return $row['col_timestamp'];
+    }
+}
+
+/**
+ * @package     grn.schedule
+ */
+abstract class GRN_Schedule_EventBase
+{
+    /**
+     * イベントID
+     */
+    public $id = null;
+    /**
+     * 予定
+     */
+    public $menu = null;
+    /**
+     * GTM-103
+     */
+    public $menucolor = null;
+    /**
+     * 予定詳細
+     */
+    public $detail = null;
+    /**
+     * メモ
+     */
+    public $memo = null;
+    /**
+     * 公開/非公開
+     */
+    public $private = null;
+    /**
+     * 登録者または、登録者名
+     *
+     * @var \CB_User
+     */
+    public $creator = null;
+    /**
+     * 登録日時
+     */
+    public $ctime = null;
+    /**
+     * 更新者または、更新者名
+     *
+     * @var \CB_User
+     */
+    public $modifier = null;
+    /**
+     * 更新日時
+     */
+    public $mtime = null;
+    /**
+     * イベントのタイムゾーン
+     */
+    public $timezone = null;
+    public $end_timezone = null;
+    /**
+     * 参加者
+     */
+    public $users = null;
+    /**
+     * 参加組織
+     */
+    public $groups = null;
+
+    /**
+     * List of facilities. Each array key is a facility id.
+     *
+     * @var array[]|GRN_Facility_Facility[]|null
+     */
+    public $facilities = null;
+
+    /**
+     * 通知先
+     */
+    public $notify_address = null;
+
+    /**
+     * 会社名
+     */
+    public $company_name = null;
+
+    /**
+     * 郵便番号
+     */
+    public $zip_code = null;
+
+    /**
+     * 会社住所
+     */
+    public $physical_address = null;
+
+    /**
+     * 地図（NET連携）
+     */
+    public $map = null;
+
+    /**
+     * 路線（NET連携）
+     */
+    public $route = null;
+
+    /**
+     * 路線（NET連携）
+     */
+    public $route_time = null;
+
+    /**
+     * 路線（NET連携）
+     */
+    public $route_fare = null;
+
+    /**
+     * 電話番号
+     */
+    public $company_telephone_number = null;
+
+    /**
+     * Fax番号
+     */
+    public $facsimile_number = null;
+
+    /**
+     * 会社URL
+     */
+    public $company_url = null;
+
+    // GTM-1622
+    /**
+     * determine that event has function attendance check or not
+     */
+    public $attendanceCheck = null;
+
+    // GTM-1676
+    /**
+     * determine that event using approval facility or not
+     */
+    public $usingPurpose = null;
+
+    // flag refresh attendance status
+    public $refreshAttendanceStatus = null;
+
+    /**
+     * この予定のほかに重なった予定がある人が入っているユーザーのリスト
+     *
+     * @access private
+     */
+    private $_conflict_users = null;
+    /**
+     * この予定のほかに重なった予定がある組織が入っている組織のリスト
+     *
+     * @access private
+     */
+    private $_conflict_groups = null;
+
+    public $additional_items = null;
+
+    /*
+GRN2-1931
+    private $checkabsence = 0;
+ */
+    function __construct()
+    {
+    }
+
+    /*
+     * 予定の種類の取得
+     * @return mixed    成功した場合はそのイベントのタイプ、それ以外はFALSE
+     */
+    function getEventType()
+    {
+        return false;
+    }
+
+    /**
+     * 指定したメンバーがほかの予定とぶつかっているか
+     *
+     * @param   mixed $member ユーザー/組織
+     *
+     * @return bool ほかの予定とぶつかっている場合はTRUE、それ以外はFALSE
+     */
+    function isConflict($member)
+    {
+        if (is_a($member, 'CB_User')) {
+            if (is_null($this->_conflict_users)) {
+                return false;
+            }
+
+            return $this->_conflict_users[$member->getOID()];
+        } elseif (is_a($member, 'CB_Group')) {
+            if (is_null($this->_conflict_groups)) {
+                return false;
+            }
+
+            return $this->_conflict_groups[$member->getOID()];
+        }
+
+        return false;
+    }
+
+    /**
+     * タイトルを求める
+     *
+     * @return  string      イベントのタイトル
+     */
+    function getTitle()
+    {
+        $menu = $this->menu;
+        if (preg_match('/(.*)(;#)(\d+)$/', trim($menu), $matches)) {
+            $menu = $matches[1];
+        }
+
+        return grn_schedule_get_event_title($menu, $this->detail);
+    }
+
+
+    /**
+     * Get only a menu name from a menu string which might contain a menu color info
+     *
+     * @return string|null
+     */
+    public function getMenuName()
+    {
+        if (preg_match('/(.*)(;#)(\d+)$/', trim($this->menu), $matches)) {
+            // Strip the color info
+            return $matches[1];
+        }
+
+        return $this->menu;
+    }
+
+    /**
+     * 共有イベントかどうか
+     *
+     * @return  boolean     共有している場合はTRUE、それ以外はFALSE
+     */
+    function isShared()
+    {
+        $member_count = count($this->users) + count($this->groups)
+                        + count($this->facilities);
+
+        return ($member_count > 1);
+    }
+
+    /**
+     * 指定された日付以降で最初にイベントがある日付を返す
+     *
+     * @param   CB_Date $date 比較する日付
+     *
+     * @return  mixed       成功した場合は日付、それ以外はFALSE
+     */
+    function getFirstDate($date)
+    {
+        {
+            $___ret = false;
+
+            return $___ret;
+        }
+    }
+
+    /**
+     * 全日予定かどうかを返す
+     *
+     * @return bool
+     */
+    public function isAllDay()
+    {
+        $event_type = $this->getEventType();
+        if ($event_type !== false
+            && ($event_type & GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * event with attendance check or not
+     *
+     * @return bool
+     */
+    public function isAttendanceCheckEvent()
+    {
+        if ( ! is_null($this->attendanceCheck)
+             && intval($this->attendanceCheck) > 0
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * event with attendance check or not
+     *
+     * @return bool
+     */
+    public function isFacilityForEvent($facilityId)
+    {
+        if ( ! is_array($this->facilities) || count($this->facilities) == 0) {
+            return false;
+        }
+
+        return array_key_exists($facilityId, $this->facilities);
+    }
+
+    public function setUsingPurpose(
+        $usingPurpose,
+        callable $onErrorHandler = null
+    ) {
+        $logic = new FacilityApprovalLogic();
+        $approvalFacilities
+            = $logic->getNamesForFacilitiesNeedApproval($this->facilities);
+        if (count($approvalFacilities) == 0) {
+            return;
+        }
+
+        $usingPurpose = cb_trim($usingPurpose);
+        if (strlen($usingPurpose) > 0) {
+            $this->usingPurpose = $usingPurpose;
+        } else {
+            if (is_null($onErrorHandler)) {
+                $facilitiesString = implode("; ", $approvalFacilities);
+                cb_throw_error(
+                    E_GRN_SCHD_APPROVAL_FACILITY_SETTING_CHANGE,
+                    ['facility' => $facilitiesString]
+                );
+            } else {
+                $onErrorHandler();
+            }
+        }
+    }
+
+    /**
+     * Returns visibility judged by notify address.
+     *
+     * @return int
+     */
+    public function getVisibilityType(): int
+    {
+        if ($this->private) {
+            if (is_array($this->notify_address)
+                && count($this->notify_address) > 0
+            ) {
+                return GRN_PRIVATE_SETTING_MANAGED;
+            } else {
+                return GRN_PRIVATE_SETTING_PRIVATE;
+            }
+        } else {
+            return GRN_PRIVATE_SETTING_PUBLIC;
+        }
+    }
+
+    /**
+     * @return array|null
+     */
+    public function getCompanyData()
+    {
+        if ( ! is_null($this->company_name)
+             || ! is_null($this->zip_code)
+             || ! is_null($this->physical_address)
+             || ! is_null($this->map)
+             || ! is_null($this->route)
+             || ! is_null($this->route_time)
+             || ! is_null($this->route_fare)
+             || ! is_null($this->company_telephone_number)
+             || ! is_null($this->facsimile_number)
+             || ! is_null($this->company_url)
+        ) {
+            return [
+                'company_name'             => $this->company_name,
+                'zip_code'                 => $this->zip_code,
+                'physical_address'         => $this->physical_address,
+                'map_image'                => $this->map,
+                'route'                    => $this->route,
+                'route_time'               => $this->route_time,
+                'route_fare'               => $this->route_fare,
+                'company_telephone_number' => $this->company_telephone_number,
+                'facsimile_number'         => $this->facsimile_number,
+                'URL'                      => $this->company_url,
+            ];
+        }
+
+        return null;
+    }
+
+    /**
+     * Returns whether the event supports the facility usage request feature or not
+     *
+     * @return bool
+     */
+    public function isFacilityUsageRequestSupported()
+    {
+        return $this instanceof GRN_Schedule_NormalEvent;
+    }
+
+    /**
+     * Returns the list of all facility ids.
+     * The list includes facilities event if the event is a temporary event.
+     *
+     * @return string[] Each array key is a facility id.
+     */
+    public function getAllFacilityIds(): array
+    {
+        $facility_ids = [];
+
+        foreach ($this->facilities ?? [] as $facility_id => $facility) {
+            $facility_ids[$facility_id] = $facility_id;
+        }
+
+        return $facility_ids;
+    }
+
+    /**
+     * Returns the start datetime of the event.
+     * The time zone of this value is the event time zone.
+     *
+     * @return CB_DateTime
+     */
+    abstract public function getStart();
+
+    /**
+     * Returns the end datetime of the event.
+     * The time zone of this value is the event time zone.
+     *
+     * If the event is a start only event, the value is the same as the result of the getStart() method.
+     *
+     * @return CB_DateTime
+     */
+    abstract public function getEnd();
+
+    /**
+     * @return GRN_Schedule_EventBase
+     */
+    public function convertTimezoneOfSetAndEndDateTime()
+    {
+        return $this;
+    }
+}
+
+/**
+ * 通常予定のクラス
+ *
+ * @package     grn.schedule
+ */
+class GRN_Schedule_NormalEvent extends GRN_Schedule_EventBase
+{
+    /**
+     * 開始日時
+     *
+     * @var CB_Date|CB_DateTimeEx|null
+     */
+    public $setdatetime = null;
+
+    /**
+     * 終了日時
+     *
+     * @var CB_DateTimeEx|null
+     */
+    public $enddatetime = null;
+
+    function __construct()
+    {
+        parent::__construct();
+    }
+
+    /**
+     *イベントタイプの取得
+     *
+     * @return      mixed       日時が設定されていればイベントタイプ、それ以外はFALSE
+     */
+    function getEventType()
+    {
+        if (is_null($this->setdatetime) && is_null($this->enddatetime)) {
+            return false;
+        } elseif (is_a($this->setdatetime, 'CB_Date')) {
+            return GRN_SCHEDULE_EVENT_TYPE_NORMAL
+                   + GRN_SCHEDULE_EVENT_TYPE_ALLDAY;
+        } elseif (is_a($this->setdatetime, 'CB_DateTime')
+                  && is_null($this->enddatetime)
+        ) {
+            return GRN_SCHEDULE_EVENT_TYPE_NORMAL
+                   + GRN_SCHEDULE_EVENT_TYPE_START;
+        } elseif (is_a($this->setdatetime, 'CB_DateTime')
+                  && is_a($this->enddatetime, 'CB_DateTime')
+        ) {
+            return GRN_SCHEDULE_EVENT_TYPE_NORMAL;
+        }
+
+        return false;
+    }
+
+    /**
+     * 指定された日付以降で最初にイベントがある日付を返す
+     *
+     * @param   CB_Date $date 比較する日付
+     *
+     * @return  mixed       成功した場合は日付、それ以外はFALSE
+     */
+    function getFirstDate($date)
+    {
+        if (is_null($this->setdatetime) && is_null($this->enddatetime)) {
+            $___ret = false;
+
+            return $___ret;
+        }
+
+        $dateex = new CB_DateEx($date);
+
+        // 開始日のみの場合
+        if (($this->getEventType() & GRN_SCHEDULE_EVENT_TYPE_START)
+            == GRN_SCHEDULE_EVENT_TYPE_START
+        ) {
+            $ret = $dateex->compare($this->setdatetime);
+            if ($ret == 0) {
+                return $dateex;
+            }
+
+            $dateex->year = $this->setdatetime->year;
+            $dateex->month = $this->setdatetime->month;
+            $dateex->day = $this->setdatetime->day;
+
+            return $dateex;
+        }
+
+        // 過去または未来の場合
+        if (($dateex->compare($this->enddatetime) > 0)
+            || ($dateex->compare($this->setdatetime) < 0)
+        ) {
+            $dateex->year = $this->setdatetime->year;
+            $dateex->month = $this->setdatetime->month;
+            $dateex->day = $this->setdatetime->day;
+
+            return $dateex;
+        }
+
+        // 当てはまらない場合は
+        return $dateex;
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function getStart()
+    {
+        if ($this->isAllDay()) {
+            require_once('schedule/view_util.csp');
+
+            // Set start time to '00:00'.
+            return \CB_DateTimeEx::createByDateAndTime($this->setdatetime,
+                \GRN_Schedule_View_Util::getAlldayStartTime());
+        } else {
+            return \CB_I18N::translateDatetimeTimezone($this->setdatetime,
+                CB_I18N::getInstance()->getCurrentTimezone(), $this->timezone);
+        }
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function getEnd()
+    {
+        if ($this->isAllDay()) {
+            require_once('schedule/view_util.csp');
+
+            // Set end time to '23:59'.
+            return \CB_DateTimeEx::createByDateAndTime($this->enddatetime,
+                \GRN_Schedule_View_Util::getAlldayEndTime());
+        } else {
+            $is_start_only = is_null($this->enddatetime);
+
+            // Use start datetime and start time zone when the event is start only.
+            $datetime = $is_start_only ? $this->setdatetime
+                : $this->enddatetime;
+            $timezone = $is_start_only ? $this->timezone : $this->end_timezone;
+
+            return \CB_I18N::translateDatetimeTimezone($datetime,
+                CB_I18N::getInstance()->getCurrentTimezone(), $timezone);
+        }
+    }
+
+    /**
+     * @return GRN_Schedule_NormalEvent
+     */
+    public function convertTimezoneOfSetAndEndDateTime()
+    {
+        $result = clone $this;
+        $from = CB_I18N::getInstance()->getCurrentTimezone();
+        $to = $result->timezone;
+        // 通常予定（終日以外）も、イベントのタイムゾーンに変更する
+        if ($result->setdatetime instanceof CB_DateTimeEx) {
+            require_once('fw/i18n.csp');
+            $result->setdatetime
+                = CB_I18N::translateDatetimeTimezone($result->setdatetime,
+                $from, $to);
+            if (isset($result->enddatetime)) {
+                $result->enddatetime
+                    = CB_I18N::translateDatetimeTimezone($result->enddatetime,
+                    $from, $to);
+            } else {
+                $result->enddatetime = $result->setdatetime;
+            }
+        }
+
+        return $result;
+    }
+}
+
+/**
+ * 繰り返し予定のクラス
+ *
+ * @package     grn.schedule
+ */
+class GRN_Schedule_RepeatEvent extends GRN_Schedule_EventBase
+{
+    /**
+     * 繰り返しのタイプ
+     */
+    public $repeat_type = null;
+    /**
+     * 条件(曜日）
+     */
+    public $wday = null;
+    /**
+     * 条件(日）
+     */
+    public $day = null;
+    /**
+     * 開始時刻
+     */
+    public $settime = null;
+    /**
+     * 終了時刻
+     */
+    public $endtime = null;
+    /**
+     * 開始日
+     */
+    public $setdate = null;
+    /**
+     * 終了日
+     */
+    public $enddate = null;
+    /**
+     * 例外日
+     */
+    public $except = null;
+
+    // 日付でデータを取得する場合に該当のイベントの日時が入る領域（必ず入っているとは限らない）
+    /** @var \CB_Date|\CB_DateTimeEx|null $setdatetime */
+    public $setdatetime = null;
+    /** @var \CB_Date|\CB_DateTimeEx|null $enddatetime */
+    public $enddatetime = null;
+
+    /**
+     * 登録直後にDBに登録した日付を入れておくリスト（登録/変更時にしか設定されない。主に通知で使用）
+     *
+     * @access private
+     */
+    public $_date_list = null;
+
+
+    function __construct()
+    {
+        parent::__construct();
+    }
+
+    /**
+     *イベントタイプの取得
+     *
+     * @return      mixed       条件が設定されていればイベントタイプ、それ以外はFALSE
+     */
+    function getEventType()
+    {
+        if (is_null($this->settime) && is_null($this->endtime)) {
+            return GRN_SCHEDULE_EVENT_TYPE_REPEAT
+                   + GRN_SCHEDULE_EVENT_TYPE_ALLDAY;
+        } elseif (is_a($this->settime, 'CB_Time') && is_null($this->endtime)) {
+            return GRN_SCHEDULE_EVENT_TYPE_REPEAT
+                   + GRN_SCHEDULE_EVENT_TYPE_START;
+        } elseif (is_a($this->settime, 'CB_Time')
+                  && is_a($this->endtime, 'CB_Time')
+        ) {
+            return GRN_SCHEDULE_EVENT_TYPE_REPEAT;
+        }
+
+        return false;
+    }
+
+    /**
+     * 指定された日付以降で最初にイベントがある日付を返す
+     *
+     * @param   CB_Date $date 比較する日付
+     *
+     * @return  mixed       成功した場合は日付、それ以外はFALSE
+     */
+    function getFirstDate($date)
+    {
+        if ( ! is_array($this->_date_list) || count($this->_date_list) === 0) {
+            $___ret = false;
+
+            return $___ret;
+        }
+
+        $dateex = new CB_DateEx($date);
+
+        // 過去または未来の場合
+        if (($dateex->compare(end($this->_date_list)) > 0)
+            || ($dateex->compare(reset($this->_date_list)) < 0)
+        ) {
+            $dateex = new CB_DateEx(reset($this->_date_list));
+
+            return $dateex;
+        }
+
+
+        foreach ($this->_date_list as $_date) {
+            if ($dateex->compare($_date) <= 0) {
+                $dateex = new CB_DateEx($_date);
+
+                return $dateex;
+            }
+        }
+
+        // 見つからない場合
+        {
+            $___ret = false;
+
+            return $___ret;
+        }
+    }
+
+    /**
+     * check the last repeat event.
+     *
+     * @return  true    if this is the last repeat event, false otherwise.
+     */
+    function isLastRepeatEvent()
+    {
+        //date of last event
+        $date_last_event = new CB_DateEx($this->enddate);
+        //calculate date of the last repeat event
+        while (true) {
+            $wday_last_event = $date_last_event->getDayOfWeek();
+            switch ($this->repeat_type) {
+                case GRN_REPEAT_TYPE_DAY:
+                    break;
+                case GRN_REPEAT_TYPE_WEEKDAY:
+                    if (($wday_last_event == 0) || ($wday_last_event == 6)) {
+                        $subtract_day = ($wday_last_event - 5 > 0)
+                            ? $wday_last_event - 5 : $wday_last_event - 5 + 7;
+                        $date_last_event->moveDays(-$subtract_day);
+                    }
+                    break;
+                case GRN_REPEAT_TYPE_WEEK:
+                    if ($wday_last_event != $this->wday) {
+                        $subtract_day = ($wday_last_event - $this->wday > 0)
+                            ? $wday_last_event - $this->wday
+                            : $wday_last_event - $this->wday + 7;
+                        $date_last_event->moveDays(-$subtract_day);
+                    }
+                    break;
+                case GRN_REPEAT_TYPE_1STWEEK:
+                case GRN_REPEAT_TYPE_2NDWEEK:
+                case GRN_REPEAT_TYPE_3RDWEEK:
+                case GRN_REPEAT_TYPE_4THWEEK:
+                    $week_number = (int)substr($this->repeat_type, 0, 1);
+                    $begin_day_week = ($week_number - 1) * 7 + 1;
+                    $end_day_week = $week_number * 7;
+                    while (true) {
+                        if (($date_last_event->getDayOfWeek() == $this->wday)
+                            && ($date_last_event->day >= $begin_day_week)
+                            && ($date_last_event->day <= $end_day_week)
+                        ) {
+                            break;
+                        }
+                        $date_last_event->moveDays(-1);
+                    }
+                    break;
+                case GRN_REPEAT_TYPE_LASTWEEK:
+                    while (true) {
+                        if (($date_last_event->getDayOfWeek() == $this->wday)
+                            && ($date_last_event->day
+                                > $date_last_event->getEndOfMonthDay() - 7)
+                        ) {
+                            break;
+                        }
+                        $date_last_event->moveDays(-1);
+                    }
+                    break;
+                case GRN_REPEAT_TYPE_MONTH:
+                    //normal day 1->31
+                    if ($this->day > 0) {
+                        if ($date_last_event->day >= $this->day) {
+                            $date_last_event->day = $this->day;
+                        } else {
+                            while (true) {
+                                $date_last_event->moveMonths(-1);
+                                if ($date_last_event->getEndOfMonthDay()
+                                    >= $this->day
+                                ) {
+                                    $date_last_event->day = $this->day;
+                                    break;
+                                }
+                            }
+                        }
+                    } //the last day of the month
+                    else {
+                        if ($date_last_event->day
+                            != $date_last_event->getEndOfMonthDay()
+                        ) {
+                            $date_last_event->moveMonths(-1);
+                            $date_last_event->day
+                                = $date_last_event->getEndOfMonthDay();
+                        }
+                    }
+                    break;
+            }
+
+            //check duplicate except date
+            if (is_array($this->except) && (count($this->except) > 0)) {
+                $duplicate_except_date = false;
+                foreach ($this->except as $except_date) {
+                    if ($date_last_event->compare($except_date) == 0) {
+                        $duplicate_except_date = true;
+                        break;
+                    }
+                }
+
+                if ( ! $duplicate_except_date) {
+                    break;
+                } else {
+                    $date_last_event->moveDays(-1);
+                }
+            } else {
+                break;
+            }
+        }
+
+        //date of current event
+        $date_current_event = new CB_Date();
+        $date_current_event->year = is_null($this->setdatetime) ? null
+            : $this->setdatetime->year;
+        $date_current_event->month = is_null($this->setdatetime) ? null
+            : $this->setdatetime->month;
+        $date_current_event->day = is_null($this->setdatetime) ? null
+            : $this->setdatetime->day;
+
+        //this is the last repeat event.
+        if ($date_last_event->compare($date_current_event) == 0) {
+            return true;
+        }
+
+        //not the last repeat event.
+        return false;
+    }
+
+    /**
+     * @return CB_DateTime|CB_DateTimeEx
+     */
+    public function getRepeatInfoStart()
+    {
+        return new \CB_DateTimeEx(\CB_DateTime::valueOf($this->setdate->year,
+            $this->setdate->month,
+            $this->setdate->day, $this->settime->hour, $this->settime->minute,
+            $this->settime->second));
+    }
+
+    /**
+     * @return CB_DateTime|CB_DateTimeEx
+     */
+    public function getRepeatInfoEnd()
+    {
+        return new \CB_DateTimeEx(\CB_DateTime::valueOf($this->enddate->year,
+            $this->enddate->month,
+            $this->enddate->day, $this->endtime->hour, $this->endtime->minute,
+            $this->endtime->second));
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function getStart()
+    {
+        if ($this->isAllDay()) {
+            require_once('schedule/view_util.csp');
+
+            // Set start time to '00:00'.
+            return \CB_DateTimeEx::createByDateAndTime($this->setdatetime,
+                \GRN_Schedule_View_Util::getAlldayStartTime());
+        } else {
+            return \CB_I18N::translateDatetimeTimezone($this->setdatetime,
+                CB_I18N::getInstance()->getCurrentTimezone(), $this->timezone);
+        }
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function getEnd()
+    {
+        if ($this->isAllDay()) {
+            require_once('schedule/view_util.csp');
+
+            // Set end time to '23:59'.
+            return \CB_DateTimeEx::createByDateAndTime($this->enddatetime,
+                \GRN_Schedule_View_Util::getAlldayEndTime());
+        } else {
+            $is_start_only = is_null($this->enddatetime);
+
+            // Use start datetime and start time zone when the event is start only.
+            $datetime = $is_start_only ? $this->setdatetime
+                : $this->enddatetime;
+
+            return \CB_I18N::translateDatetimeTimezone($datetime,
+                CB_I18N::getInstance()->getCurrentTimezone(), $this->timezone);
+        }
+    }
+
+    /**
+     * @return GRN_Schedule_RepeatEvent
+     */
+    public function convertTimezoneOfSetAndEndDateTime()
+    {
+        $result = clone $this;
+        $from = CB_I18N::getInstance()->getCurrentTimezone();
+        $to = $result->timezone;
+
+        if ($result->setdatetime instanceof CB_DatetimeEx) {
+            // 通常予定の繰り返しは、そのまま変換する
+            $result->setdatetime
+                = CB_I18N::translateDatetimeTimezone($result->setdatetime,
+                $from, $to);
+            if (isset($result->enddatetime)) {
+                $result->enddatetime
+                    = CB_I18N::translateDatetimeTimezone($result->enddatetime,
+                    $from, $to);
+            } else {
+                $result->enddatetime = $result->setdatetime;
+            }
+        } elseif ($result->setdatetime instanceof CB_Date) {
+            // 終日予定の場合、イベントとユーザーのタイムゾーンの時差を見る。
+            // その時差によって、終日予定が1日早くなっているかどうか確認する。
+            $dateTimeZoneEvent = new DateTimeZone($result->timezone);
+            $dateTimeZoneUser = new DateTimeZone(CB_I18N::getInstance()
+                                                        ->getCurrentTimezone());
+
+            $dateTimeUser = new DateTime("now", $dateTimeZoneUser);
+            $timeOffset = $dateTimeZoneEvent->getOffset($dateTimeUser);
+            if ($timeOffset <= 0) {
+                // イベントのタイムゾーンがユーザーのタイムゾーンと同じか、遅い場合。
+                // 開始日はイベントのタイムゾーンと同じなので、そのまま。終了日を同日にしておく。
+                $result->enddatetime = $result->setdatetime;
+            } else {
+                // イベントのタイムゾーンがユーザーのタイムゾーンより早い場合。
+                // イベントのタイムゾーンの開始日は1日後となるので、変更する。
+                // enddatetimeはsetdatetimeの1日後になっているため、それを利用する。
+                $result->setdatetime = $result->enddatetime;
+            }
+        }
+
+        return $result;
+    }
+}
+
+/**
+ * バナー予定のクラス
+ *
+ * @package     grn.schedule
+ */
+class GRN_Schedule_BannerEvent extends GRN_Schedule_EventBase
+{
+    /**
+     * @var CB_Date|CB_Time|CB_DateTimeEx
+     *
+     * 開始日
+     */
+    public $setdate = null;
+
+    /**
+     * @var CB_Date|CB_Time|CB_DateTimeEx
+     *
+     * 終了日
+     */
+    public $enddate = null;
+
+    function __construct()
+    {
+        parent::__construct();
+    }
+
+    /**
+     *イベントタイプの取得
+     *
+     * @return int 固定        バナーのイベントタイプ
+     */
+    function getEventType()
+    {
+        return GRN_SCHEDULE_EVENT_TYPE_BANNER;
+    }
+
+    /**
+     * 指定された日付以降で最初にイベントがある日付を返す
+     *
+     * @param   CB_Date $date 比較する日付
+     *
+     * @return  mixed       成功した場合は日付、それ以外はFALSE
+     */
+    function getFirstDate($date)
+    {
+        if (is_null($this->setdate) && is_null($this->enddate)) {
+            $___ret = false;
+
+            return $___ret;
+        }
+
+        $dateex = new CB_DateEx($date);
+
+        // 過去または未来の場合
+        if (($dateex->compare($this->enddate) > 0)
+            || ($dateex->compare($this->setdate) < 0)
+        ) {
+            $dateex->year = $this->setdate->year;
+            $dateex->month = $this->setdate->month;
+            $dateex->day = $this->setdate->day;
+
+            return $dateex;
+        }
+
+        // 当てはまらない場合は
+        return $dateex;
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function getStart()
+    {
+        require_once('schedule/view_util.csp');
+
+        // Set start time to '00:00'.
+        return \CB_DateTimeEx::createByDateAndTime($this->setdate,
+            \GRN_Schedule_View_Util::getAlldayStartTime());
+    }
+
+    /**
+     * Returns end date(datetime) of the event.
+     *
+     * @return CB_DateTimeEx
+     */
+    public function getEnd()
+    {
+        require_once('schedule/view_util.csp');
+
+        // Set end time to '23:59'.
+        return \CB_DateTimeEx::createByDateAndTime($this->enddate,
+            \GRN_Schedule_View_Util::getAlldayEndTime());
+    }
+}
+
+/**
+ * 仮予定のクラス
+ *
+ * @package     grn.schedule
+ */
+class GRN_Schedule_TemporaryEvent extends GRN_Schedule_EventBase
+{
+    /**
+     * 日付
+     *  日付だけの配列か施設と複数の日付の2つのパターンがある
+     * <pre>
+     *   ■Garoon形式またはOffice6のAND検索の場合
+     *      array( array( 'setdatetime'=>$setdatetime1, 'enddatetime'=>enddatetime1 ),
+     *             array( 'setdatetime'=>$setdatetime2, 'enddatetime'=>enddatetime2 ) );
+     *
+     *   ■Office6のOR検索の場合
+     *      array( array( 'facility'=>facility1,
+     *                    'setdates'=>array( array( 'setdatetime'=>$setdatetime1, 'enddatetime'=>enddatetime1 ),
+     *                                       array( 'setdatetime'=>$setdatetime2, 'enddatetime'=>enddatetime2 ) ) ),
+     *             array( 'facility'=>facility2,
+     *                    'setdates'=>array( array( 'setdatetime'=>$setdatetime3, 'enddatetime'=>enddatetime3 ),
+     *                                       array( 'setdatetime'=>$setdatetime4, 'enddatetime'=>enddatetime4 ) ) ), );
+     * </pre>
+     */
+    public $setdates = null;
+
+    // 日付でデータを取得する場合に該当のイベントの日時が入る領域
+    public $setdatetime = null;
+    public $enddatetime = null;
+
+    // The ID of the table 'tab_grn_schedule_eventdatetime'.
+    public $candidateId = null;
+
+    function __construct()
+    {
+        parent::__construct();
+    }
+
+    /**
+     *イベントタイプの取得
+     *
+     * @return int 固定        仮予定のイベントタイプ
+     */
+    function getEventType()
+    {
+        return GRN_SCHEDULE_EVENT_TYPE_TEMPORARY;
+    }
+
+    /**
+     * 指定された日付以降で最初にイベントがある日付を返す
+     *
+     * @param   CB_Date $date 比較する日付
+     *
+     * @return  mixed       成功した場合は日時、それ以外はFALSE
+     */
+    function getFirstDate($date)
+    {
+        if (is_null($this->setdates)) {
+            $___ret = false;
+
+            return $___ret;
+        }
+
+        $dateex = new CB_DateEx($date);
+
+        $temp_dates = reset($this->setdates);
+
+        // OR検索の場合
+        if (array_key_exists('facility', $temp_dates)) {
+            foreach ($this->setdates as $facility_data) {
+                foreach ($facility_data['dates'] as $_data) {
+                    if ($dateex->compare($_data['setdatetime']) <= 0) {
+                        $dateex = new CB_DateTimeEx($_data['setdatetime']);
+
+                        return $dateex;
+                    }
+                }
+            }
+            $temp_date = reset($temp_dates['dates']);
+            $dateex = new CB_DateTimeEx($temp_date['setdatetime']);
+        } else {
+            foreach ($this->setdates as $_data) {
+                if ($dateex->compare($_data['setdatetime']) <= 0) {
+                    $dateex = new CB_DateTimeEx($_data['setdatetime']);
+
+                    return $dateex;
+                }
+            }
+            $dateex = new CB_DateTimeEx($temp_dates['setdatetime']);
+        }
+
+        // 見つからない場合
+        return $dateex;
+    }
+
+    /**
+     * OR検索の結果かどうか
+     *
+     * @return boolean      OR検索だった場合はTRUE、それ以外はFALSE
+     */
+    function isORSearch()
+    {
+        if ( ! is_array($this->setdates) || count($this->setdates) == 0) {
+            return false;
+        }
+
+        if (array_key_exists('facility', reset($this->setdates))) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Returns the list of all facility ids.
+     * The list includes facilities event if the event is a temporary event.
+     *
+     * @return string[] Each array key is a facility id.
+     */
+    public function getAllFacilityIds(): array
+    {
+        if ( ! $this->isORSearch()) {
+            return parent::getAllFacilityIds();
+        }
+
+        $facility_ids = [];
+        foreach ($this->setdates as $data) {
+            $id = $data['facility']->getOID();
+            $facility_ids[$id] = $id;
+        }
+
+        return $facility_ids;
+    }
+
+    /**
+     * Returns the list of all facility ids related to candidate.
+     *
+     * @return string[].
+     * @throws GrnException
+     */
+    public function getCandidateFacilityIds(): array
+    {
+        if ( ! $this->candidateId) {
+            // This case is bug.
+            throw new GrnException();
+        }
+
+        if ($this->isORSearch()) {
+            foreach ($this->setdates as $setdate) {
+                if (isset($setdate['dates'][$this->candidateId])) {
+                    /** @var \GRN_Facility_Facility $facility */
+                    $facility = $setdate['facility'];
+
+                    return [$facility->getOID()];
+                }
+            }
+            // This case is bug.
+            throw new GrnException();
+        } else {
+            return parent::getAllFacilityIds();
+        }
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function getStart()
+    {
+        return \CB_I18N::translateDatetimeTimezone($this->setdatetime,
+            CB_I18N::getInstance()->getCurrentTimezone(), $this->timezone);
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function getEnd()
+    {
+        return \CB_I18N::translateDatetimeTimezone($this->enddatetime,
+            CB_I18N::getInstance()->getCurrentTimezone(), $this->timezone);
+    }
+}

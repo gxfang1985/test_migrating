@@ -1,0 +1,1042 @@
+<?php
+/**
+ *
+ * @author      KADOYA Ryo
+ * @package     grn.common
+ */
+
+require_once('fw/FwFacade.csp');
+require_once('fw/i18n.csp');
+require_once('grn/application.csp');
+require_once('grn/org_tree.csp');
+require_once('grn/nested_set_model.csp');
+
+define("GRN_GROUP_PRIVILEGE_TABLE", "GRN_Group_Privilege");
+
+/**
+ * 組織の運用管理権限
+ *
+ * @package grn.common
+ */
+class GRN_Group_Privilege extends CB_PersistentBase
+{
+    function __construct(& $row)
+    {
+        parent::__construct($row);
+    }
+
+    var $col_pv_group
+        = [
+            'type'    => 'relation',
+            'to'      => 'CB_Group',
+            'notnull' => true,
+            'lazy'    => true
+        ];       // グループ名
+
+    var $col_user = ['type' => 'relation', 'to' => 'CB_User', 'lazy' => true];
+    var $col_group = ['type' => 'relation', 'to' => 'CB_Group', 'lazy' => true];
+    var $col_static_role
+        = [
+            'type' => 'relation',
+            'to'   => 'CB_Role',
+            'lazy' => true
+        ];
+    var $col_dynamic_role
+        = [
+            'type'   => 'char',
+            'length' => '100',
+            'lazy'   => true
+        ];
+
+    var $col_transferable = ['type' => 'int', 'lazy' => true];
+
+    var $idx_pv_group_user = ['cols' => ['pv_group', 'user'], 'unique' => true];
+    var $idx_pv_group_group
+        = [
+            'cols'   => ['pv_group', 'group'],
+            'unique' => true
+        ];
+    var $idx_pv_group_static_role
+        = [
+            'cols'   => ['pv_group', 'static_role'],
+            'unique' => true
+        ];
+    var $idx_pv_group_dynamic_role
+        = [
+            'cols'   => ['pv_group', 'dynamic_role'],
+            'unique' => true
+        ];
+
+    /**
+     * @param string $col_name
+     *
+     * @return bool|CB_Row|mixed
+     */
+    public function get($col_name)
+    {
+        $result = false;
+
+        $table_info = $this->getTableInfo();
+        $col_info = $table_info->getColumnInfo($col_name);
+        if (is_null($col_info)) {
+            return $result;
+        }
+
+
+        if (($col_name == 'pv_group') || ($col_name == 'group')) {
+            $isKeyExists = array_key_exists(CB_DATABASE_COLUMN_PREFIX
+                                            . $col_name,
+                $this->__row->_rawdata);
+            $id = $isKeyExists
+                ? $this->__row->_rawdata[CB_DATABASE_COLUMN_PREFIX . $col_name]
+                : null;
+
+            if ( ! is_null($id)) {
+                $i18n = CB_I18N::getInstance();
+                $table_info = $this->getTableInfo();
+                $tableManager = $table_info->getTableManager();
+                $relationTableName = $col_info['to'];
+                $relationTableInfo
+                    = $tableManager->getTableInfo($relationTableName);
+                $relationTableLock = $relationTableInfo->_lock;
+
+                $dao = new FwFacade();
+                $dataObj = [];
+                $dataObj['lock'] = $relationTableLock;
+                $dataObj['language'] = $i18n->getCurrentLanguage();
+
+                $groupData = $dao->referGroupById($dataObj, $id);
+                $result = $relationTableInfo->getRow($groupData->getId(),
+                    $groupData->convertArray());
+            } else {
+                $result = parent::get($col_name);
+            }
+        } else {
+            $result = parent::get($col_name);
+        }
+
+        return $result;
+    }
+}
+
+class GRN_OrganizationPrivilegeLogic extends CB_ModuleBase
+{
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        global $G_state_set;
+        if ($G_state_set->get('command_line')) {
+            $this->_is_admin = true;
+        }
+        parent::__construct('grn.common.organization_privilege_logic');
+    }
+
+    /**
+     *
+     * @return GRN_OrganizationPrivilegeLogic
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_OrganizationPrivilegeLogic();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * @access private
+     */
+    var $_privilage_table = null;
+
+    var $_table_name = 'tab_grn_group_privilege';
+
+    var $_is_admin = false;
+
+    var $_is_privileged_page = false;
+
+    var $_privileged_groups = [];
+    var $_transferable_groups = [];
+    var $_privileged_descendants = [];
+
+    /**
+     * @access private
+     */
+    function _getTable()
+    {
+        if (is_null($this->_privilage_table)) {
+            global $G_container_base;
+            $tm = $G_container_base->getInstance('table_manager');
+
+            $this->_privilage_table
+                = $tm->getTableInfo(GRN_GROUP_PRIVILEGE_TABLE);
+        }
+
+        return $this->_privilage_table;
+    }
+
+    /**
+     * @access private
+     */
+    var $_db = null;
+
+    /**
+     * @access private
+     */
+    function _getDBConnection()
+    {
+        // 初期化されていなければ初期化
+        if (is_null($this->_db)) {
+            global $G_container_base;
+            $this->_db = $G_container_base->getInstance('dbconn');
+        }
+
+        return $this->_db;
+    }
+
+    /**
+     * @access private
+     */
+    function _isAlreadyEntry(& $object, & $target, $target_type)
+    {
+        // 既に登録されているかの確認
+        $rowset = new CB_RowSet($this->_getTable());
+        switch ($target_type) {
+            case 'user':
+                $rowset->addCondition($rowset->queryf("col_pv_group = '@S' AND col_user = '@S'",
+                    $object->getOID(), $target->getOID()));
+                break;
+            case 'group':
+                $rowset->addCondition($rowset->queryf("col_pv_group = '@S' AND col_group = '@S'",
+                    $object->getOID(), $target->getOID()));
+                break;
+            case 'static_role':
+                $rowset->addCondition($rowset->queryf("col_pv_group = '@S' AND col_static_role = '@S'",
+                    $object->getOID(), $target->getOID()));
+                break;
+            case 'dynamic_role':
+                $rowset->addCondition($rowset->queryf("col_pv_group = '@S' AND col_dynamic_role = '@S'",
+                    $object->getOID(), $target));
+                break;
+            default:
+                return false;
+        }
+
+        $row = &$rowset->iterate();
+        $rowset->destroy();
+
+        return ( ! is_null($row));
+    }
+
+    /**
+     * 管理の設定
+     *
+     * @param   object CB_Group                     $object
+     * @param   mixed  $target
+     * @param   string $target_type
+     * @param   int    $transferable
+     */
+    function setPrivilege(& $object, & $target, $target_type, $transferable)
+    {
+        if ( ! is_a($object, 'CB_Group')) {
+            return false;
+        }
+
+        // 既に登録されている場合
+        if ($this->_isAlreadyEntry($object, $target, $target_type)) {
+            $this->deletePrivilege($object, $target, $target_type);
+        }
+
+        $table = &$this->_getTable();
+
+        $row = &$table->newRow();
+
+        $row->set('pv_group', $object);
+
+        switch ($target_type) {
+            case 'user':
+                $row->set('user', $target);
+                break;
+            case 'group':
+                $row->set('group', $target);
+                break;
+            case 'static_role':
+                $row->set('static_role', $target);
+                break;
+            case 'dynamic_role':
+                $row->set('dynamic_role', $target);
+                break;
+            default:
+                return false;
+        }
+        $row->set('transferable', $transferable);
+
+        return true;
+    }
+
+    /**
+     * 管理の取得
+     *
+     * @param   object CB_Group   $object
+     * @param   mixed  $target
+     * @param   string $target_type
+     *
+     * @return  CB_Row
+     */
+    function getPrivilege(& $object, & $target, $target_type)
+    {
+        if ( ! is_a($object, 'CB_Group')) {
+            $___ret = false;
+
+            return $___ret;
+        }
+
+        $rowset = new CB_RowSet($this->_getTable());
+
+        $condition = $rowset->queryf("col_pv_group = '@S' AND ",
+            $object->getOID());
+        switch ($target_type) {
+            case 'user':
+                $condition .= $rowset->queryf("col_user = '@S'",
+                    $target->getOID());
+                break;
+            case 'group':
+                $condition .= $rowset->queryf("col_group = '@S'",
+                    $target->getOID());
+                break;
+            case 'static_role':
+                $condition .= $rowset->queryf("col_static_role = '@S'",
+                    $target->getOID());
+                break;
+            case 'dynamic_role':
+                $condition .= $rowset->queryf("col_dynamic_role = '@S'",
+                    $target);
+                break;
+            default:
+                {
+                    $___ret = false;
+
+                    return $___ret;
+                }
+        }
+
+        $rowset->addCondition($condition);
+
+        $row = $rowset->iterate();
+
+        return $row;
+
+    }
+
+    /**
+     * 管理の取得
+     *
+     * @param   object CB_Group   $object
+     */
+    function getPrivileges(& $object)
+    {
+        if ( ! is_a($object, 'CB_Group')) {
+            return false;
+        }
+        $rowset = new CB_RowSet($this->_getTable());
+
+        $rowset->addCondition($rowset->queryf("col_pv_group = '@S'",
+            $object->getOID()));
+        $rowset->addOrderColumn('col_user, col_group, col_static_role, col_dynamic_role, _id');
+
+        $retval = [
+            'dynamic_role'              => [],
+            'static_role'               => [],
+            'group'                     => [],
+            'user'                      => [],
+            'dynamic_role_transferable' => [],
+            'static_role_transferable'  => [],
+            'group_transferable'        => [],
+            'user_transferable'         => []
+        ];
+
+        while ( ! is_null($row = &$rowset->iterate())) {
+            if (($user = &$row->get('user'))) {
+                $retval['user'][$user->getOID()] = &$user;
+                $retval['user_transferable'][$user->getOID()]
+                    = $row->get('transferable');
+            } elseif (($group = &$row->get('group'))) {
+                $retval['group'][$group->getOID()] = &$group;
+                $retval['group_transferable'][$group->getOID()]
+                    = $row->get('transferable');
+            } elseif (($role = &$row->get('static_role'))) {
+                $retval['static_role'][$role->getOID()] = &$role;
+                $retval['static_role_transferable'][$role->getOID()]
+                    = $row->get('transferable');
+            } elseif (($dynamic_role = &$row->get('dynamic_role'))) {
+                $retval['dynamic_role'][$dynamic_role] = &$dynamic_role;
+                $retval['dynamic_role_transferable'][$dynamic_role]
+                    = $row->get('transferable');
+
+            }
+        }
+        $rowset->destroy();
+
+        return $retval;
+    }
+
+    /**
+     * 管理の件数の取得
+     *
+     * @param   object CB_Group   $object
+     */
+    function getPrivilegesCount(& $object)
+    {
+        if ( ! is_a($object, 'CB_Group')) {
+            return false;
+        }
+        $rowset = new CB_RowSet($this->_getTable());
+
+        $rowset->addCondition($rowset->queryf("col_pv_group = '@S'",
+            $object->getOID()));
+
+        // 削除フラグ付きのユーザーを除外(col_userはNULLを許す)
+        global $G_container_base;
+        $tm =& $G_container_base->getInstance('table_manager');
+        $user_table_info =& $tm->getTableInfo('cb_user');
+        $on = $this->_table_name . '.col_user = u._id';
+        $rowset->addJoin($user_table_info, $on, CB_DATABASE_LEFT_JOIN, 'u');
+        $rowset->addCondition("u.col_deleted IS NULL");
+
+        $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+
+        $row = &$rowset->iterate();
+        $rowset->destroy();
+
+        if ( ! $row) {
+            return false;
+        }
+
+        return intval($row['count']);
+    }
+
+    /**
+     * 削除
+     *
+     * @param   object CB_Group   $object
+     * @param   mixed  $target
+     * @param   string $target_type
+     */
+    function deletePrivilege(& $object, & $target, $target_type)
+    {
+        if ( ! is_a($object, 'CB_Group')) {
+            return false;
+        }
+
+        $rowset = new CB_RowSet($this->_getTable());
+
+        $condition = $rowset->queryf("col_pv_group = '@S' AND ",
+            $object->getOID());
+        switch ($target_type) {
+            case 'user':
+                $condition .= $rowset->queryf("col_user = '@S'",
+                    $target->getOID());
+                break;
+            case 'group':
+                $condition .= $rowset->queryf("col_group = '@S'",
+                    $target->getOID());
+                break;
+            case 'static_role':
+                $condition .= $rowset->queryf("col_static_role = '@S'",
+                    $target->getOID());
+                break;
+            case 'dynamic_role':
+                $condition .= $rowset->queryf("col_dynamic_role = '@S'",
+                    $target);
+                break;
+            default:
+                return false;
+        }
+
+        $rowset->addCondition($condition);
+
+        $row = &$rowset->iterate();
+        if ( ! is_null($row)) {
+            $row->delete();
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * 削除
+     *
+     * @param   object CB_Group   $object
+     */
+    function deletePrivileges(& $object)
+    {
+        if ( ! is_a($object, 'CB_Group')) {
+            return false;
+        }
+        $rowset = new CB_RowSet($this->_getTable());
+
+        $rowset->addCondition($rowset->queryf("col_pv_group = '@S'",
+            $object->getOID()));
+
+        $rowset->deleteAllMatched();
+
+        return true;
+    }
+
+    /**
+     * 権限があるか？
+     *
+     * @param   object CB_User      $user
+     */
+    function hasPrivilege(& $user)
+    {
+        if ( ! is_a($user, 'CB_User')) {
+            return false;
+        }
+
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+
+        // CB_Userからuidを取得しているため、削除フラグチェックの必要がない。
+        $user_groups = $uum->getUserGroupsInfo($user->getOID(), true);
+        $user_roles = $uum->getUserRolesInfo($user->getOID(), true);
+        $dynamic_roles = $uum->listGrantedRoles();
+
+        $db = &$this->_getDBConnection();
+        $query = cb_queryf($db, "SELECT COUNT(*) FROM " . $this->_table_name
+                                . " WHERE col_user = '@S'", $user->getOID());
+
+        if (is_array($user_groups) && count($user_groups) > 0) {
+            $groups = [];
+            foreach (array_keys($user_groups) as $key) {
+                $groups[] = cb_queryf($db, "col_group = '@S'", $key);
+            }
+
+            $query .= ' OR ' . implode(' OR ', $groups);
+        }
+
+        if (is_array($user_roles) && count($user_roles) > 0) {
+            $roles = [];
+            foreach (array_keys($user_roles) as $key) {
+                $roles[] = cb_queryf($db, "col_static_role = '@S'", $key);
+            }
+
+            $query .= ' OR ' . implode(' OR ', $roles);
+        }
+
+        if (is_array($dynamic_roles) && count($dynamic_roles) > 0) {
+            $roles = [];
+            foreach (array_keys($dynamic_roles) as $key) {
+                $roles[] = cb_queryf($db, "col_dynamic_role = '@S'", $key);
+            }
+
+            $query .= ' OR ' . implode(' OR ', $roles);
+        }
+
+        $query = $db->select_format($query);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $row = $db->fetch_assoc($result);
+        // 結果の開放
+        $db->free_result($result);
+
+        if (intval($row['COUNT(*)']) > 0) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * 指定されたグループに与えられた権限情報を返す
+     *
+     * @param   object CB_User                      $user
+     * @param   mixed  CB_Group or gid              $object
+     *
+     * @return  array
+     */
+    function getPrivilegesOnGroup(& $user, & $object, $transferable = false)
+    {
+        if ( ! is_a($user, 'CB_User')) {
+            return false;
+        }
+
+        if (empty($object)) {
+            return false;
+        }
+
+        if (is_a($object, 'CB_Group')) {
+            $oid = $object->getOID();
+        } else {
+            $oid = $object;
+        }
+
+        $nested_group = GRN_NestedGroup::getInstance();
+        $ancestors =& $nested_group->getAncestorsByID($oid, true);
+
+        $privileges =& $this->getGroupsWithAuthority($user, $transferable);
+
+        if ($ancestors === false || $privileges === false) {
+            return false;
+        }
+        //return array_intersect_key( $privilegs, $ancestors );
+        $ret = [];
+        foreach ($privileges as $key => $value) {
+            if (array_key_exists($key, $ancestors)) {
+                $ret[$key] = $value;
+            }
+        }
+
+        return $ret;
+    }
+
+    /**
+     * 指定されたグループもしくは先祖に権限があるかどうか
+     *
+     * @param   CB_User      $user
+     * @param   CB_Group|int $object
+     *
+     * @return  bool
+     */
+    function isPrivileged(& $user, & $object)
+    {
+        if ($this->_is_admin) {
+            return true;
+        }
+
+        $privileges = $this->getPrivilegesOnGroup($user, $object, false);
+
+        if (is_bool($privileges)) {
+            return $privileges;
+        }
+
+        return (count($privileges) > 0);
+    }
+
+    /**
+     * 指定されたグループもしくは先祖に委譲権限があるかどうか
+     *
+     * @param   CB_User      $user
+     * @param   CB_Group|int $object
+     *
+     * @return  bool
+     */
+    function isTransferable(& $user, & $object)
+    {
+        if ($this->_is_admin) {
+            return true;
+        }
+
+        $privileges = $this->getPrivilegesOnGroup($user, $object, true);
+
+        if (is_bool($privileges)) {
+            return $privileges;
+        }
+
+        return (count($privileges) > 0);
+    }
+
+    /**
+     * 指定されたグループの権限があるかどうか
+     *
+     * @param   CB_User      $user
+     * @param   CB_Group|int $object
+     *
+     * @return bool
+     */
+    function hasPrivilegeOfGroup(& $user, & $object)
+    {
+        if ($this->_is_admin) {
+            return true;
+        }
+
+        if ( ! is_a($user, 'CB_User')) {
+            return false;
+        }
+
+        if (empty($object)) {
+            return false;
+        }
+
+        if (is_a($object, 'CB_Group')) {
+            $oid = $object->getOID();
+        } else {
+            $oid = $object;
+        }
+
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+
+        // CB_Userからuidを取得しているため、削除フラグチェックの必要がない。
+        $user_groups = $uum->getUserGroupsInfo($user->getOID(), true);
+        $user_roles = $uum->getUserRolesInfo($user->getOID(), true);
+        $dynamic_roles = $uum->listGrantedRoles();
+
+        $db = &$this->_getDBConnection();
+        $query = cb_queryf($db, "SELECT COUNT(*) from " . $this->_table_name
+                                . " WHERE col_pv_group = '@S' AND ( col_user = '@S'",
+            (string)$oid, $user->getOID());
+
+        if (is_array($user_groups) && count($user_groups) > 0) {
+            $groups = [];
+            foreach (array_keys($user_groups) as $key) {
+                $groups[] = cb_queryf($db, "col_group = '@S'", $key);
+            }
+
+            $query .= ' OR ' . implode(' OR ', $groups);
+        }
+
+        if (is_array($user_roles) && count($user_roles) > 0) {
+            $roles = [];
+            foreach (array_keys($user_roles) as $key) {
+                $roles[] = cb_queryf($db, "col_static_role = '@S'", $key);
+            }
+
+            $query .= ' OR ' . implode(' OR ', $roles);
+        }
+
+        if (is_array($dynamic_roles) && count($dynamic_roles) > 0) {
+            $roles = [];
+            foreach (array_keys($dynamic_roles) as $key) {
+                $roles[] = cb_queryf($db, "col_dynamic_role = '@S'", $key);
+            }
+
+            $query .= ' OR ' . implode(' OR ', $roles);
+        }
+        $query .= ' )';
+
+        $query = $db->select_format($query);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $row = $db->fetch_assoc($result);
+        // 結果の解放
+        $db->free_result($result);
+
+        if (intval($row['COUNT(*)']) > 0) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * 運用管理者の持つグループの一覧を取得する
+     *
+     * @param object CB_User       $user
+     *
+     * @return array
+     */
+    function &getGroupsWithAuthority(
+        $user,
+        $transferable = false,
+        $isUseLocal = true
+    ) {
+        if ( ! is_a($user, 'CB_User')) {
+            $__ret = false;
+
+            return $__ret;
+        }
+
+        if ($transferable) {
+            $cache =& $this->_transferable_groups;
+        } else {
+            $cache =& $this->_privileged_groups;
+        }
+
+        if ($isUseLocal) {
+            $numIsUseLocal = 1;
+        } else {
+            $numIsUseLocal = 0;
+        }
+
+        if (array_key_exists($user->getOID(), $cache)) {
+            if (array_key_exists($numIsUseLocal, $cache[$user->getOID()])) {
+                // use cache
+                return $cache[$user->getOID()][$numIsUseLocal];
+            }
+
+            return $cache[$user->getOID()][$numIsUseLocal];
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+
+        // CB_Userからuidを取得しているため、削除フラグチェックの必要がない。
+        $user_groups = $uum->getUserGroupsInfo($user->getOID(), true);
+        $user_roles = $uum->getUserRolesInfo($user->getOID(), true);
+        $dynamic_roles = $uum->listGrantedRoles();
+
+        global $G_container_base;
+        $tm = $G_container_base->getInstance('table_manager');
+        $groupTableInfo = $tm->getTableInfo('CB_Group');
+        $i18n = CB_I18N::getInstance();
+
+        $dataObj = [];
+        $dataObj['lock'] = $groupTableInfo->_lock;;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+        $dataObj['isTransferable'] = $transferable;
+        if (is_array($user_groups) && count($user_groups) > 0) {
+            $dataObj['groupArray'] = array_keys($user_groups);
+        }
+        if (is_array($user_roles) && count($user_roles) > 0) {
+            $dataObj['roleArray'] = array_keys($user_roles);
+        }
+        if (is_array($dynamic_roles) && count($dynamic_roles) > 0) {
+            $dataObj['dynamicRoleArray'] = array_keys($dynamic_roles);
+        }
+
+        $dao = new FwFacade();
+        $groupObjList = ($isUseLocal)
+            ? $dao->getAuthorityGroupListByUserId($dataObj, $user->getOID())
+            : $dao->getAuthorityGroupListWithNonLocalByUserId($dataObj,
+                $user->getOID());
+
+        $results = [];
+        foreach ($groupObjList as $groupObj) {
+            $row = $groupTableInfo->getRow($groupObj->getId(),
+                $groupObj->convertArray());
+            $groupId = $row->getOID();
+
+            $results[$groupId] = $row;
+        }
+
+        $cache[$user->getOID()][$numIsUseLocal] = $results;
+
+        return $results;
+    }
+
+    /**
+     * 運用管理者の持つグループの一覧を取得する
+     * グループが親子関係にある場合は、親のみを取得する
+     *
+     * @param object CB_User       $user
+     *
+     * @return array
+     */
+    function &getRootGroupsWithAuthority($user, $isUseLocal = true)
+    {
+        $privileges = $this->getGroupsWithAuthority($user, false,
+            $isUseLocal);
+        $nested_group = GRN_NestedGroup::getInstance();
+
+        if ($privileges === false) {
+            $__ret = false;
+
+            return $__ret;
+        }
+
+        $ret = [];
+
+        foreach ($privileges as $key => $value) {
+            $ancestors = $nested_group->getAncestorsByID($key, false);
+            $parent_exists = false;
+            foreach (array_keys($privileges) as $other_key) {
+                if (array_key_exists($other_key, $ancestors)) {
+                    $parent_exists = true;
+                }
+            }
+
+            if ( ! $parent_exists) {
+                $ret[$key] = $value;
+            }
+        }
+
+        return $ret;
+    }
+
+    /**
+     * 運用管理者の持つグループの子孫一覧を取得する
+     *
+     * @param object CB_User       $user
+     *
+     * @return array
+     */
+    function &getDescendantsWithAuthority(& $user)
+    {
+        if (array_key_exists($user->getOID(), $this->_privileged_descendants)) {
+            // use cache
+            return $this->_privileged_descendants[$user->getOID()];
+        } else {
+            $privileges =& $this->getRootGroupsWithAuthority($user);
+
+            $nested_group = GRN_NestedGroup::getInstance();
+            $descendants = [];
+            foreach (array_keys($privileges) as $privilege) {
+                $descs =& $nested_group->getDescendantsByID($privilege);
+
+                foreach ($descs as $key => $value) {
+                    $descendants[$key] =& $value;
+                }
+            }
+
+            $this->_privileged_descendants[$user->getOID()] =& $descendants;
+
+            return $descendants;
+        }
+    }
+
+    /**
+     * 権限のあるユーザーかどうか
+     *
+     * @param object CB_User         $user
+     * @param mixed  CB_User or uid  $target
+     */
+    function isPrivilegedUser(& $user, & $target)
+    {
+
+        if ($this->_is_admin) {
+            return true;
+        }
+
+        if ( ! is_a($user, 'CB_User')) {
+            return false;
+        }
+
+        if (empty($target)) {
+            return false;
+        }
+
+        if (is_a($target, 'CB_User')) {
+            $uid = $target->getOID();
+        } else {
+            $uid = $target;
+        }
+
+        $descendants =& $this->getDescendantsWithAuthority($user);
+
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+        $groups = $uum->getUserGroups($uid);
+
+        if (count($groups) == 0) {
+            return false;
+        }
+
+        foreach ($groups as $key => $value) {
+            if ( ! array_key_exists($key, $descendants)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /*
+     * 管理者フラグをセット
+     */
+    function setAdmin($value = true)
+    {
+        $this->_is_admin = $value;
+    }
+
+    /*
+     * 管理者かどうか
+     */
+    function isAdmin()
+    {
+        return $this->_is_admin;
+    }
+
+    /*
+     * 特権ページフラグをセット
+     */
+    function setPrivilegedPage($value = true)
+    {
+        $this->_is_privileged_page = $value;
+    }
+
+    /*
+     * 管理者かどうか
+     */
+    function isPrivilegedPage()
+    {
+        return $this->_is_privileged_page;
+    }
+}
+
+/**
+ * 運用管理用組織ツリー
+ */
+class GRN_PrivilegedOrgTree extends GRN_OrgTree
+{
+    function __construct()
+    {
+        parent::__construct();
+    }
+
+    /**
+     * @param int $oid
+     *
+     * @return array
+     */
+    function _getChildren($oid)
+    {
+        $logic = GRN_OrganizationPrivilegeLogic::getInstance();
+
+        if ( ! $logic->isAdmin() && is_null($oid)) {
+            global $G_container_base;
+            $uum =& $G_container_base->getInstance('uum');
+            $user =& $uum->getLoginUser();
+            $groups =& $logic->getRootGroupsWithAuthority($user);
+
+            $ret = [];
+            foreach ($groups as $key => $value) {
+                $group =& $uum->getGroupInfo($key);
+                $ret[$key] = $group;
+            }
+
+            return $ret;
+        } else {
+            return parent::_getChildren($oid);
+        }
+    }
+
+    /**
+     * 選択中のノードOIDを取得する。
+     *
+     * @return  int
+     */
+    function getSelectedNode()
+    {
+        $logic = GRN_OrganizationPrivilegeLogic::getInstance();
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $user = $uum->getLoginUser();
+
+        if ($this->_uid !== $user->getOID()) {
+            $this->_selectedNode = null;
+            $this->initialize();
+        }
+
+        if ( ! is_null($this->_selectedNode) && ! $logic->isAdmin()) {
+            $group = $uum->getGroup($this->_selectedNode);
+            if ( ! $logic->isPrivileged($user, $group)) {
+                $this->_selectedNode = null;
+                $this->initialize();
+            }
+        }
+
+        if ( ! is_null($this->_selectedNode)
+             && $uum->getGroupInfo($this->_selectedNode) === false
+        ) {
+            $this->_selectedNode = null;
+            $this->initialize();
+        }
+
+        return $this->_selectedNode;
+
+    }
+
+}
+

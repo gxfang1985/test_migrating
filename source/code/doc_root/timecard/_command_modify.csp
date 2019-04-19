@@ -1,0 +1,189 @@
+<?php
+
+global $G_INPUT;
+require_once('timecard/application.csp');
+
+if ( ! isset($user) || is_null($user)) {
+    require_once('grn/error_code.csp');
+    cb_throw_error(E_GRN_USER_NOT_FOUND);
+}
+if ( ! array_key_exists('date', $G_INPUT) || strlen($G_INPUT['date']) < 1) {
+    require_once('timecard/error_code.csp');
+    cb_throw_error(E_GRN_TIMECARD_INVALID_DATE);
+}
+
+
+$date = new CB_Date();
+
+if ( ! $date->parse($G_INPUT['date'])) {
+    require_once('timecard/error_code.csp');
+    cb_throw_error(E_GRN_TIMECARD_INVALID_DATE);
+}
+
+require_once('fw/date.csp');
+$ts = new CB_TimeStampEx();
+$today = $ts->getDate();
+
+require_once('timecard/logic.csp');
+$logic = GRN_Timecard_Logic::getInstance();
+
+if (is_null(($record =& $logic->getRecord($user, $date)))) {
+    $record =& $logic->createRecord($user, $date);
+}
+$record->set('description', @ $G_INPUT['remarks']);
+
+$previous_values = $record->getRecordedValues();
+
+if ( ! isset($utility) || is_null($utility)) {
+    require_once('timecard/controller.csp');
+    $utility = new GRN_Timecard_ControllerUtil();
+}
+$config = $utility->getConfigValues();
+
+// 未来の日付では備考以外を変更しない
+// システム管理以外でユーザーに時刻の修正を許可していない場合も変更しない。
+if ($today->compare($date) >= 0
+    && ($is_system
+        || $config['enable_modify_record'])
+) {
+    require_once('timecard/functions.csp');
+
+    // 出社
+    if (($ts = grn_timecard_argtime2timestamp('start', $date)) !== false) {
+        $record->set('in', $ts);
+    } else {
+        $record->set('in', null);
+    }
+    if ( ! is_null($ts) && $ts !== false) {
+        // we add ip into timecard only when not system
+        if ( ! $is_system) {
+            $record->set('reserve_text2', GRN_Timecard::getIPAddress());
+        }
+    } else {
+        $record->set('reserve_text2', null);
+    }
+    // 退社
+    if (($ts = grn_timecard_argtime2timestamp('finish', $date)) !== false) {
+        $record->set('out', $ts);
+    } else {
+        $record->set('out', null);
+    }
+    if ( ! is_null($ts) && $ts !== false) {
+        // we add ip into timecard only when not system
+        if ( ! $is_system) {
+            $record->set('reserve_text3', GRN_Timecard::getIPAddress());
+        }
+    } else {
+        $record->set('reserve_text3', null);
+    }
+
+    // 追加されている不在記録を修正
+
+    $absences = $record->listAbsenceRecords();
+
+    foreach (array_keys($absences) as $key) {
+        $absence =& $absences[$key];
+
+        // 外出
+        if (($ts = grn_timecard_argtime2timestamp('trip' . $key, $date))
+            !== false
+        ) {
+            $absence->set('out', $ts);
+        } else {
+            $absence->set('out', null);
+        }
+        if ( ! is_null($ts) && $ts !== false) {
+            // we add ip into timecard only when not system
+            if ( ! $is_system) {
+                $absence->set('reserve_text3', GRN_Timecard::getIPAddress());
+            }
+        } else {
+            $absence->set('reserve_text3', null);
+        }
+        // 復帰
+        if (($ts = grn_timecard_argtime2timestamp('back' . $key, $date))
+            !== false
+        ) {
+            $absence->set('in', $ts);
+        } else {
+            $absence->set('in', null);
+        }
+        if ( ! is_null($ts) && $ts !== false) {
+            // we add ip into timecard only when not system
+            if ( ! $is_system) {
+                $absence->set('reserve_text2', GRN_Timecard::getIPAddress());
+            }
+        } else {
+            $absence->set('reserve_text2', null);
+        }
+
+        // 両方の時刻が未設定となれば削除
+        if (is_null($absence->get('out')) && is_null($absence->get('in'))) {
+            $absence->delete();
+            unset($absences[$key]);
+        }
+    }
+
+    // 新たに追加される不在記録
+
+    require_once('timecard/config.csp');
+    $config = GRN_Timecard_SystemConfig::getInstance();
+    $limit = $config->getAbsenceMax();
+
+    for ($i = 1; $i <= $limit; ++$i) {
+        $ots = grn_timecard_argtime2timestamp('tripN' . $i, $date);
+        $its = grn_timecard_argtime2timestamp('backN' . $i, $date);
+
+        if ($ots || $its) {
+            $absence =& $logic->createAbsenceRecord($record, null, $is_system);
+            if ($ots !== false) {
+                $absence->set('out', $ots);
+                if ( ! is_null($ots)) {
+                    if ( ! $is_system) {
+                        $absence->set('reserve_text3',
+                            GRN_Timecard::getIPAddress());
+                    }
+                }
+            }
+            if ($its !== false) {
+                $absence->set('in', $its);
+                if ( ! is_null($its)) {
+                    if ( ! $is_system) {
+                        $absence->set('reserve_text2',
+                            GRN_Timecard::getIPAddress());
+                    }
+                }
+            }
+
+            $absences[$absence->getOID()] =& $absence;
+
+            $absence->registerNow();
+        }
+    }
+
+    // 不在記録も出社・退社時刻もメモもクリアされたら削除
+    if (count($absences) < 1) {
+        if (is_null($record->get('in')) && is_null($record->get('out'))
+            && is_null($record->get('description'))
+        ) {
+            $logic->onDelete($record);
+            $record->delete();
+        } else {
+            // 時刻設定をチェック
+            $record->validate();
+            $logic->onModify($record);
+            require_once('timecard/inspection.csp');
+            $inspection = GRN_Timecard_Inspection::getInstance();
+            $inspection->record($record, $previous_values);
+        }
+    } else {
+        // 時刻設定をチェック
+        $record->validate();
+        $logic->onModify($record);
+        require_once('timecard/inspection.csp');
+        $inspection = GRN_Timecard_Inspection::getInstance();
+        $inspection->record($record, $previous_values);
+    }
+}
+
+

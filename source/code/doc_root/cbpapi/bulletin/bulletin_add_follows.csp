@@ -1,0 +1,203 @@
+<?php
+if (isset($cbpapi_service)) {
+    $request = $cbpapi_service->getRequestParameters();
+    $add_follows = $cbpapi_service->selectNodes($request, 'add_follow');
+
+    if ( ! isset($add_follows)) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'add_follow']);
+    }
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    unset($uum);
+
+    require_once('bulletin/article.csp');
+    $obj_article = GRN_Bulletin_ArticleManager::getInstance();
+
+    $topic_ids = [];
+    foreach ($add_follows as $follow_tmp) {
+        if ( ! isset($follow_tmp['attributes']['topic_id'])) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => 'topic_id']);
+        }
+        $topic_id = $follow_tmp['attributes']['topic_id'];
+
+        if ( ! is_numeric($topic_id)) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_BULLETIN_ARTICLE_NOT_FOUND);
+        }
+
+        if (array_search($topic_id, $topic_ids)) {
+            require_once('bulletin/error_code.csp');
+            $app_name = cb_msg('grn.bulletin', 'application_name');
+            cb_throw_error(E_GRN_BULLETIN_DUPLICATE_ARTICLE, null,
+                ['app_name' => $app_name]);
+        }
+        $follow = $cbpapi_service->selectSingleNode($follow_tmp, 'follow');
+        if ( ! isset($follow['attributes']['text'])) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => 'text']);
+        }
+
+        if ( ! ($article = $obj_article->getArticle($login, $topic_id,
+            GRN_BULLETIN_ACCESS_R, true, CB_DATABASE_EXCLUSIVE_LOCK))
+        ) {
+            cb_throw_error(E_GRN_BULLETIN_ARTICLE_NOT_FOUND);
+        }
+
+        //check if topic allow comment or not
+        if ( ! $article->get('can_follow')) {
+            require_once('bulletin/error_code.csp');
+            $app_name = cb_msg('grn.bulletin', 'application_name');
+            cb_throw_error(E_GRN_BULLETIN_TOPIC_DO_NOT_ALLOW_FOLLOW, null,
+                ['app_name' => $app_name]);
+        }
+
+        $properties = [];
+        $properties['data'] = $follow['attributes']['text'];
+
+        // file
+        $files = [];
+        $uploaded_files_info = grn_add_follow_get_file_info($cbpapi_service,
+            $follow, 'file');
+        if (isset($uploaded_files_info) && is_array($uploaded_files_info)) {
+            $uploaded_files_content
+                = grn_add_follow_get_file_content($cbpapi_service, $follow_tmp,
+                'file');
+
+            foreach (array_keys($uploaded_files_info) as $key) {
+                $uploaded_files_info[$key]['content']
+                    = @$uploaded_files_content[$key];
+                $uploaded_files_info[$key]
+                    = cbpapi_upload_file($uploaded_files_info[$key]);
+            }
+            $files = $uploaded_files_info;
+        }
+        if (cb_trim($properties['data']) == '') {
+            $found_files = false;
+            foreach (array_keys($files) as $name) {
+                if ($files[$name]['error'] == UPLOAD_ERR_OK) {
+                    $found_files = true;
+                    break;
+                }
+            }
+            if ( ! $found_files) {
+                require_once('bulletin/error_code.csp');
+                cb_throw_error(E_GRN_BULLETIN_EMPTY_FOLLOW);
+            }
+        }
+        // write follow
+        $ret = $article->writeFollow($login, $properties, $files);
+        assert('$ret !== FALSE');
+
+        $topic_ids[$topic_id] = $topic_id;
+    }
+
+    require_once('cbpapi/bulletin_logic.csp');
+    $cbpapi_logic = GRN_CBPApi_Bulletin_Logic::getInstance();
+    $topics_for_view = $cbpapi_logic->getTopicForViewByIds($login, $topic_ids);
+
+    // SOAP response
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty();
+    $t->assign('action', $cbpapi_service->getAction());
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('bulletin')]);
+    $t->assign('topics', $topics_for_view);
+
+    grn_cbpapi_response($t, __FILE__);
+}
+
+/**
+ * get file content
+ *
+ * @param    object $service   GRN_Util_Api_Service object
+ * @param    object $node      current node
+ * @param    string $node_name name of node you want to get
+ *
+ * @return   array      Array: [id],    file content
+ *                             [content],
+ */
+function grn_add_follow_get_file_content($service, $current_node, $node_name)
+{
+    $files = $service->selectNodes($current_node, $node_name);
+    $file_content = null;
+    if ( ! isset($files) || ! is_array($files)) {
+        return $file_content;
+    }
+    foreach (array_keys($files) as $key) {
+        $file =& $files[$key];
+        if ( ! isset($file['attributes']['id'])) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => 'id']);
+        }
+        $file_id = $file['attributes']['id'];
+        $content = $service->selectSingleNode($file, 'content');
+        if ( ! isset($content) || ! is_array($content)) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => 'content']);
+        }
+        $file_content[$file_id] = array_key_exists('text', $content)
+            ? $content['text'] : '';
+    }
+
+    return $file_content;
+}
+
+/**
+ * get follow's file information
+ *
+ * @param    object $service   GRN_Util_Api_Service object
+ * @param    object $node      current node
+ * @param    string $node_name name of node you want to get
+ *
+ * @return   array      Array: [name],    file information
+ *                             [content],
+ *                             [mime_type],
+ *                             [size]
+ */
+function grn_add_follow_get_file_info($service, $current_node, $node_name)
+{
+    $files = $service->selectNodes($current_node, $node_name);
+    $file_info = null;
+    if ( ! isset($files) || ! is_array($files)) {
+        return $file_info;
+    }
+    foreach (array_keys($files) as $key) {
+        $file =& $files[$key];
+        if ( ! isset($file['attributes']['id'])) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => 'id']);
+        }
+        if ( ! isset($file['attributes']['name'])) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => 'name']);
+        }
+        $file_id = $file['attributes']['id'];
+        $file_name = $file['attributes']['name'];
+        $file_size = null;
+        $mime_type = '';
+        if (isset($file['attributes']['size'])) {
+            $file_size = intval($file['attributes']['size']);
+        }
+        if (isset($file['attributes']['mime_type'])) {
+            $mime_type = $file['attributes']['mime_type'];
+        }
+        $file_info[$file_id] = [
+            'name'      => $file_name,
+            'mime_type' => $mime_type,
+            'size'      => $file_size,
+            'content'   => ''
+        ];
+    }
+
+    return $file_info;
+}

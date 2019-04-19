@@ -1,0 +1,633 @@
+<?php
+
+require_once('fw/module.csp');
+require_once('fw/persistent.csp');
+require_once('grn/error_code.csp');
+
+define('GRN_LICENSE_LENGTH', 45);
+define('GRN_LICENSE_KEY_LENGTH', 15);
+define('GRN_LICENSE_KEY_TOKEN_LENGTH', 5);
+define('GRN_LICENSE_SALT_LENGTH', 10);
+
+define('GRN_LICENSE_TYPE_DEMO', 0);        // デモライセンス
+define('GRN_LICENSE_TYPE_NEWUSER', 1);        // 新規ユーザーライセンス
+define('GRN_LICENSE_TYPE_UPDATEUSER', 2);        // ユーザー数変更ライセンス
+define('GRN_LICENSE_TYPE_SERVICE', 3);        // サービスライセンス
+define('GRN_LICENSE_TYPE_CYBOZUNET', 4);        // サイボウズNET連携ライセンス
+
+define('GRN_LICENSE_TYPE_DEMO_GR3',
+    50);    // License for expanding demo term ( GR3 )
+define('GRN_LICENSE_TYPE_NEWUSER_GR3',
+    51);    // License for starting Garoon ( GR3 )
+define('GRN_LICENSE_TYPE_UPDATEUSER_GR3',
+    52);    // License for adding users (GR3)
+define('GRN_LICENSE_TYPE_SERVICE_GR3', 53);    // License for service (GR3)
+
+define('GRN_LICENSE_TYPE_DEMO_GR4',
+    70);    // License for expanding demo term ( GR4 )
+define('GRN_LICENSE_TYPE_NEWUSER_GR4',
+    71);    // License for starting Garoon ( GR4 )
+define('GRN_LICENSE_TYPE_UPDATEUSER_GR4',
+    72);    // License for adding users (GR4)
+define('GRN_LICENSE_TYPE_SERVICE_GR4', 73);    // License for service (GR4)
+
+define('GRN_LICENSE_KIND_DEMO', 0);        // デモライセンス
+define('GRN_LICENSE_KIND_NORMAL', 1);        // 通常ライセンス
+
+define('GRN_LICENSE_SUCCESS', 0);        // 正常
+define('GRN_LICENSE_ERROR', 1);        // 異常
+define('GRN_LICENSE_OVER_USER', 2);        // ユーザー数超過
+define('GRN_LICENSE_EXPIRED', 3);        // 期限切れ
+
+define('GRN_LICENSE_BASESYSTEM', 'common'); // ベースシステムのライセンス種別
+define('GRN_LICENSE_SERVICE_EXPIRED_OFFSET', 30);   // サービス期限切れの猶予
+define('GRN_LICENSE_BASEID', 'grn.common.license');
+
+define('GRN_LICENSE_TYPE_UPGRADE_GR3', 49);
+
+/**
+ * ライセンスの履歴情報テーブル
+ *
+ * @package grn.common
+ */
+class GRN_LicenseHistory extends CB_PersistentBase
+{
+    var $col_customer = ['type' => 'char'];      // お客様番号
+    var $col_issue = ['type' => 'char'];           // 発行ID
+    var $col_key = ['type' => 'char'];             // ライセンスキー
+    var $col_type = ['type' => 'int'];             // タイプ
+    var $col_users = ['type' => 'int'];            // ユーザー数
+    var $col_limit = ['type' => 'date'];           // 期限日時
+    var $col_register = ['type' => 'timestamp'];   // 登録日時
+
+    var $idx_issue = ['cols' => ['issue'], 'unique' => true];
+    var $idx_register = ['cols' => ['register']];
+
+    function __construct(&$row)
+    {
+        parent::__construct($row);
+    }
+}
+
+/**
+ * ライセンスロジックのベースクラス
+ *
+ * @abstract
+ * @package grn.common
+ */
+class GRN_LicenseLogicBase extends CB_ModuleBase
+{
+    var $_lic_type;     // ライセンスタイプ ( 0, 1, 2, ... )
+    var $_lic_kind;     // ライセンス種別   ( common, sync, ... )
+
+    function __construct()
+    {
+        parent::__construct(GRN_LICENSE_BASEID);
+    }
+
+    /**
+     * 初期化処理
+     *
+     * @param int    $lic_type
+     * @param string $lic_kind
+     */
+    function init($lic_type, $lic_kind)
+    {
+        $this->_lic_type = $lic_type;
+        $this->_lic_kind = $lic_kind;
+
+        parent::__construct(GRN_LICENSE_BASEID . ".{$lic_kind}");
+    }
+
+    /**
+     * ライセンス追加処理
+     *
+     * @param $license_info
+     */
+    function addLicense($license_info)
+    {
+        $profile =& $this->getSystemProfile();
+        $lm = GRN_LicenseManager::getInstance();
+
+        // ** 既に登録されている属性もマージしてチェックサム計算 **
+        $info = $profile->getAttributes();
+        $info = $license_info + $info;
+        unset($info['checksum']);
+
+        $checksum = $lm->createChecksum($info);
+        $info['checksum'] = $checksum;
+
+        foreach ($info as $key => $value) {
+            $ret = $profile->getAttribute($key, $item);
+            if ( ! $ret) {
+                $profile->createAttribute($key, $value);
+            } else {
+                $profile->updateAttribute($key, $value);
+            }
+        }
+    }
+
+    /**
+     * ライセンス情報を取得する。
+     *
+     * @param array $license_info ライセンス情報
+     *
+     * @return array This type mismatch is caused by https://bozuman.cybozu.com/k/15435/show#record=353
+     */
+    function getPropertiesArray($license_info)
+    {
+        return false;
+    }
+
+    /**
+     * ライセンス名を取得する。
+     *
+     * @return bool
+     */
+    function getName()
+    {
+        return false;
+    }
+}
+
+/**
+ * ライセンスマネージャー
+ *
+ * @package grn.common
+ */
+class GRN_LicenseManager extends CB_ModuleBase
+{
+    /**
+     * @access private
+     */
+    var $_ids = null;
+
+    var $_cache_license = [];  // ライセンスのキャッシュ
+
+    /**
+     * @access private
+     */
+    function _constructIds()
+    {
+        $this->_ids = [];
+
+        $path = cb_basedir() . '/code/plugin/grn/common/license';
+        $dir = @opendir($path);
+        if ($dir === false) {
+            require_once('grn/error_code.csp');
+            cb_throw_error(E_GRN_LICENSE_NO_LOGIC_DIR, null,
+                ['dir' => $path]);
+        }
+        while (($file = readdir($dir)) !== false) {
+            if (preg_match('#^([0-9][0-9])(.*)\\.csp$#', $file, $regs)) {
+                // 0 -> common.
+                $this->_ids[(int)$regs[1]] = $regs[2];
+            }
+        }
+        closedir($dir);
+        ksort($this->_ids);
+    }
+
+    /**
+     * シングルトンインスタンスを取得する
+     *
+     * @return GRN_LicenseManager
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_LicenseManager();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * コンストラクタ
+     */
+    function __construct()
+    {
+        parent::__construct(GRN_LICENSE_BASEID);
+        $this->_history = cb_class2table('GRN_LicenseHistory');
+    }
+
+    /**
+     * @param int $lic_type
+     *
+     * @return \GRN_LicenseLogicBase|bool
+     */
+    function getLogic($lic_type)
+    {
+        if (is_null($this->_ids)) {
+            $this->_constructIds();
+        }
+        if ( ! array_key_exists($lic_type, $this->_ids)) {
+            $___ret = false;
+
+            return $___ret;
+        }
+
+        $id = sprintf("%02d%s", $lic_type, $this->_ids[$lic_type]);
+        $loader = $this->getPluginLoader();
+        /** @var GRN_LicenseLogicBase $driver */
+        $driver = $loader->loadDriver($id);
+        $driver->init($lic_type, $this->_ids[$lic_type]);
+
+        return $driver;
+    }
+
+    /**
+     * 最新のライセンスを取得する
+     *
+     * @param $id   string
+     *
+     * @return FALSE|array
+     *
+     * $idはライセンスに紐づく一意のID
+     * プラグインフォルダ( grn/common/license/00common.csp ) のように配置されるので
+     * commonの部分がそれに該当する
+     */
+    function getLicense($id)
+    {
+        if (array_key_exists($id, $this->_cache_license)) {
+            return $this->_cache_license[$id];
+        }
+
+        // This code will be replaced by hazama/infra's cydec-setup-garoon.
+        // ref. https://github.dev.cybozu.co.jp/hazama/infra/blob/2260bd8b42711c14fd4fcd166b721f400a6b372b/forest/sbin/latest/cydec-setup-garoon#L133-L134
+        // @codingStandardsIgnoreStart
+        if( /*FOREST*/FALSE ) {
+            $limit = new CB_Date();
+            $limit->year = 2037;
+            $limit->month = 12;
+            $limit->day = 31;
+            $info = array(
+                'limit' => $limit,
+                'service_limit' => $limit,
+                'users' => 1000000,
+                'type' => GRN_LICENSE_TYPE_NEWUSER_GR4,
+            );
+            $this->_cache_license[$id] = $info;
+            return $info;
+        }
+        // @codingStandardsIgnoreEnd
+
+        require_once('fw/profile.csp');
+        ///////////////////////////////////////////
+        // ライセンス自体はプロファイルに保存する
+        // 項目数が固定でないため
+        ///////////////////////////////////////////
+        $profile = cb_get_system_profile(GRN_LICENSE_BASEID . ".{$id}");
+        $attr = $profile->getAttributes($id);
+        if (is_array($attr) && count($attr) > 0) {
+            $checksum = $attr['checksum'];
+            unset($attr['checksum']);
+
+            if ($this->createChecksum($attr) != $checksum) {
+                cb_throw_error(E_GRN_LICENSE_FAIL_VARIDATION);
+            }
+        }
+        if (count($attr) <= 0) {
+            return false;
+        }
+        $this->_cache_license[$id] = $attr;
+
+        return $attr;
+    }
+
+    /**
+     * @access private
+     *
+     * @param CB_Row $row
+     *
+     * @return array
+     */
+    function _createLicenseParam(&$row)
+    {
+        $info = [];
+        $info['customer'] = $row->get('customer');
+        $info['issue'] = $row->get('issue');
+        $info['key'] = $row->get('key');
+        $info['type'] = $row->get('type');
+        $info['users'] = $row->get('users');
+        $info['limit'] = $row->get('limit');
+        $info['register'] = $row->get('register');
+
+        return $info;
+    }
+
+    /**
+     * OIDによって履歴テーブルからライセンス情報を取得する
+     *
+     * @param string $oid オブジェクトID
+     *
+     * @return bool|array
+     */
+    function getLicenseByOID($oid)
+    {
+        $row = $this->_history->getRow($oid);
+        if ($row) {
+            return $this->_createLicenseParam($row);
+        }
+
+        return false;
+    }
+
+    /**
+     * 履歴テーブルからライセンスのリストを取得する
+     */
+    function getLicensesFromHistory()
+    {
+        $rowset = new CB_Rowset($this->_history);
+        $rowset->addOrderColumn('col_register desc');
+        $rowset->addCondition('_id > 1'); // お試しのライセンスは排除
+
+        $info = [];
+        while ($row = $rowset->iterate()) {
+            $p = $this->_createLicenseParam($row);
+            if (0 < strlen($p['customer'])) {
+                $logic = $this->getLogic($row->get('type'));
+                $p['name'] = $logic->getName();
+                $info[$row->getOID()] = $p;
+            }
+        }
+
+        return $info;
+    }
+
+    /**
+     * ライセンス情報の追加
+     *
+     * @param array $license_info
+     *
+     * $license_info[ 'customer' ]  -> string   お客様番号
+     *              [ 'issue' ]     -> string   発行ID
+     *              [ 'key' ]       -> string   ライセンスキー
+     *              [ 'type' ]      -> int      ライセンスタイプ
+     *              [ 'kind' ]      -> int      ライセンス種類
+     *              [ 'users' ]     -> int      ユーザー数
+     *              [ 'limit' ]     -> date     期限
+     */
+    function addLicense($license_info)
+    {
+        // license validation
+        if ( ! $this->isDemoLicense($license_info['type'])) {
+            $kind = GRN_LICENSE_KIND_NORMAL;
+            if (array_key_exists('kind', $license_info)) {
+                $kind = $license_info['kind'];
+            }
+
+            if (GRN_LICENSE_KIND_NORMAL == $kind) {
+                require_once('grn/license_validator.csp');
+                $lg = new GRN_LicenseValidator;
+                if ( ! $lg->validate($license_info['key'])) {
+                    cb_throw_error(E_GRN_LICENSE_FAIL_VARIDATION);
+                }
+
+                $limit1 = $license_info['limit'];
+                $limit2 = $lg->getLimit();
+
+                if ($license_info['customer'] !== $lg->getCustomerId()
+                    || $license_info['type'] !== $lg->getType()
+                    || $license_info['users'] !== $lg->getUsers()
+                    || $limit1->format() !== $limit2->format()
+                ) {
+                    cb_throw_error(E_GRN_LICENSE_FAIL_VARIDATION);
+                }
+            }
+        }
+
+        $row = $this->searchHistoryByIssueId($license_info['issue']);
+        if ($row) {
+            cb_throw_error(E_GRN_LICENSE_COLLISION_ISSUE);
+        }
+
+        $row = $this->_history->newRow();
+
+        foreach ($license_info as $key => $value) {
+            $row->set($key, $value);
+        }
+
+        $register = new CB_Timestamp;
+        $register->unix_ts = time();
+
+        $license_info['register'] = $register;
+        $row->set('register', $register);
+
+        $logic = $this->getLogic($license_info['type']);
+        if ($logic === false) {
+            require_once('grn/error_code.csp');
+            cb_throw_error(E_GRN_LICENSE_DONT_REGISTER);
+        }
+        $logic->addLicense($license_info);
+    }
+
+    /**
+     * 発行IDによって履歴テーブルを検索する
+     *
+     * @param $issue
+     *
+     * @return CB_Row|null
+     */
+    function searchHistoryByIssueId($issue)
+    {
+        $rowset = new CB_Rowset($this->_history);
+        $condition = $rowset->queryf("col_issue='@S'", $issue);
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return $row;
+    }
+
+    /**
+     * ライセンス種別による存在確認を行う
+     *
+     * @param $type string  ライセンス種別
+     *
+     * @return bool
+     */
+    function findLicense($type)
+    {
+        if (strlen($type) <= 0) {
+            return false;
+        }
+
+        $rowset = new CB_Rowset($this->_history);
+        $condition = $rowset->queryf("col_type='@S'", $type);
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+        if ($row) {
+            return true;
+        }
+
+        return false;
+    }
+
+
+    /**
+     * 残り日時を取得する
+     *
+     * @param cb_date $limit  期限
+     * @param int     $offset オフセット
+     *
+     * @return bool
+     */
+    function getRemindDays($limit, $offset = 0)
+    {
+        if (is_a($limit, 'cb_date')) {
+            $now = getdate();
+            $e = gregoriantojd($limit->month, $limit->day, $limit->year);
+            $s = gregoriantojd($now['mon'], $now['mday'], $now['year']);
+
+            return (int)($e - $s + $offset);
+        }
+
+        return false;
+    }
+
+    /**
+     * チェックサムを生成する
+     *
+     * @param $license_info
+     *
+     * @return string
+     */
+    function createChecksum($license_info)
+    {
+        ksort($license_info);
+
+        $x = '';
+        foreach ($license_info as $value) {
+            $v = '';
+            if (is_a($value, 'cb_date') || is_a($value, 'cb_datetime')) {
+                /** @var cb_date|cb_datetime $value */
+                $v .= $value->format();
+            } elseif (is_a($value, 'cb_timestamp')) {
+                $v .= strval($value->unix_ts);
+            } else {
+                $v .= strval($value);
+            }
+            $x .= $v;
+        }
+
+        return md5($x
+                   . 'h2=:L4WjMCHAVWnsgdpI3zb;Ce:B;cbJCZTOu6YDH2txq?pmXJksLBd?G2fFCBv^`pNoL:1I:TG]Mc4Jh[3FOH{QNN818GLzJ|By');
+    }
+
+    /**
+     * ベースライセンスの状態判定
+     *
+     * @param $license_info
+     *
+     * @return int|null
+     */
+    function getStatus($license_info)
+    {
+        static $_status = null;
+        if ( ! is_null($_status)) {
+            return $_status;
+        }
+
+        $_status = GRN_LICENSE_SUCCESS;
+
+        $type = $license_info['type'];
+
+        // 試用期間中の場合
+        if ($this->isDemoLicense($type)) {
+            if ( ! $this->isValidDemoLicense($license_info['limit'],
+                $license_info['register'])
+            ) {
+                $_status = GRN_LICENSE_EXPIRED;
+            }
+        } // 正規のライセンスが登録されている場合
+        else {
+            global $G_container_base;
+            $uum = $G_container_base->getInstance('uum');
+            $count = $uum->getActiveUserCount();
+            $count--;   // - administrator
+            $users = $license_info['users'];
+
+            /**
+             * 2011.10.13 Add license check for SaaS
+             */
+            // SaaSライセンス以上のユーザーが登録されている場合
+
+            if (defined('ON_SAAS')) {
+                $saas_users = $uum->checkSaasLincense();
+                if ($count > $saas_users) {
+                    $_status = GRN_LICENSE_OVER_USER;
+                }
+            }
+
+            // ライセンス以上のユーザーが登録されている場合
+            if ($count > $users) {
+                $_status = GRN_LICENSE_OVER_USER;
+            }
+        }
+
+        return $_status;
+    }
+
+    /**
+     * Whether the status of the base license is DEMO/DEMO_GR3
+     *
+     * @param $limit
+     * @param $register
+     *
+     * @return bool
+     */
+    public function isValidDemoLicense($limit, $register)
+    {
+        $remind_days = $this->getRemindDays($limit);
+        // 試用期間過ぎた場合
+        if ($remind_days < 0) {
+            return false;
+        }
+
+        // 試用期間を不正に延ばそうとした場合（試用開始日時 > 現在日時）
+        if (time() < $register->unix_ts) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @param $type
+     *
+     * @return bool
+     */
+    public function isDemoLicense($type)
+    {
+        $demo_licenses = [
+            GRN_LICENSE_TYPE_DEMO,
+            GRN_LICENSE_TYPE_DEMO_GR3,
+            GRN_LICENSE_TYPE_DEMO_GR4
+        ];
+
+        return in_array($type, $demo_licenses);
+    }
+
+    /**
+     * @param int $moratorium
+     *
+     * @return bool
+     */
+    public function hasEffectiveLicense($moratorium = 0)
+    {
+        $license = $this->getLicense(GRN_LICENSE_BASESYSTEM);
+        if ( ! is_array($license) || 0 == count($license)) {
+            return false;
+        }
+        if ($this->isDemoLicense($license['type'])) {
+            return $this->isValidDemoLicense($license['limit'],
+                $license['register']);
+        } else {
+            return $this->getRemindDays($license['service_limit'], $moratorium)
+                   >= 0;
+        }
+    }
+}

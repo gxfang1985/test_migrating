@@ -1,0 +1,2663 @@
+<?php
+/**
+ *
+ * @author      A.Shima
+ * @package     grn.schedule
+ */
+
+require_once('schedule/resources.csp');
+require_once('fw/mail_core.csp');
+require_once('grn/application.csp');
+
+use grn\schedule\bean\AttendanceStatus;
+use \grn\schedule\AttendanceStatusLogic;
+use grn\schedule\FacilityApprovalLogic;
+use grn\schedule\bean\FacilityApproval;
+use grn\schedule\ScheduleFacilityApprovalSetting;
+use grn\grn\access\service\AppAccess;
+
+class GRN_Schedule_MailErrorListener extends CB_MailErrorListener
+{
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        // エラーが発生した場合のためのログの書き出し
+        //require_once( 'schedule/application.csp' );
+        //$app = GRN_Schedule_Application::getInstance();
+        $this->_logger = &$this->_getLogger();// $app->getLogger();
+        if ( ! is_a($this->_logger, 'CB_Logger')) {
+            $this->_logger = null;
+        }
+    }
+
+    function _getLogger()
+    {
+        require_once('fw/logger.csp');
+        $logger_manager = CB_LoggerManager::getInstance();
+        $logger = $logger_manager->getLogger(GRN_SCHEDULE_MODULE_ID);
+
+        return $logger;
+    }
+
+    /**
+     * @access private
+     */
+    var $_logger = null;
+
+    /**
+     */
+    private static $_instance = null;
+
+    /**
+     * @return GRN_Schedule_MailErrorListener
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * ログの書き出し
+     *
+     * @param string $errno An error code that associated with the error.
+     *                      Positive number as protocol error or -1 as otherwise.
+     * @param string $msg   Human readable message text.
+     */
+    function error($errno, $msg)
+    {
+        if (is_null($this->_logger)) {
+            return;
+        }
+
+        // 2007/08/22 K.Yonekawa 通信エラーログとしてdebugに変更
+        $this->_logger->debug($msg);
+    }
+}
+
+class GRN_Schedule_Notify_Logic
+{
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+    }
+
+    private static $_instance = null;
+
+    /**
+     *
+     * @return GRN_Schedule_Notify_Logic
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * @access private
+     */
+    var $_base_logic = null;
+
+    /**
+     * @access private
+     */
+    function _getEventBaseLogic()
+    {
+        if (is_null($this->_base_logic)) {
+            require_once('schedule/event_base_logic.csp');
+            $this->_base_logic = new GRN_Schedule_EventBaseLogic();
+        }
+
+        return $this->_base_logic;
+    }
+
+    /**
+     * @access private
+     */
+    var $_db = null;
+
+    /**
+     * @access private
+     */
+    function _getDBConnection()
+    {
+        // 初期化されいなければ初期化
+        if (is_null($this->_db)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->_db = $app_locator->getConnection('schedule');
+        }
+
+        return $this->_db;
+    }
+
+    /**
+     * 通知の設定
+     *
+     * @param    string      $module_id grn.schedule
+     * @param   array of CB_User $members        参加者 each index of this array doesn't have to be the CB_User's ID of its value.
+     * @param   object CB_User   $user           通知者
+     * @param   object       $event     イベント
+     * @param   CB_Date      $date      日付
+     * @param   string       $subject   内容
+     * @param   string       $abstract  フォローの内容
+     * @param    int         $mode      通知のモード
+     * @param   CB_TimeStamp $timestamp タイムスタンプ
+     */
+    function setNotify(
+        $module_id,
+        $members,
+        & $user,
+        $event,
+        $date,
+        $subject,
+        $abstract,
+        $mode,
+        $timestamp
+    ) {
+        if ( ! is_array($members) || count($members) == 0) {
+            return;
+        }
+
+        // 通知側に内容を登録
+        require_once('grn/notification.csp');
+        $eid = $event->id;
+
+        $notify_properties = new GRN_Notification_Data();
+        $notify_properties->setModuleId($module_id);
+        $notify_properties->setUniqueId($eid);
+
+        $org_datas = [
+            'event' => $eid,
+            'bdate' => $date->format(),
+            'type'  => $event->getEventType()
+        ];
+        switch ($mode) {
+            case GRN_SCHEDULE_NOTIFY_FOLLOWENTRY:
+                $org_datas['follow'] = true;
+                $notify_properties->setAbstractData($abstract);
+                $notify_properties->setActionId(GRN_NOTIFICATION_ACTION_UPDATE_ID);
+                break;
+            case GRN_SCHEDULE_NOTIFY_ENTRY:
+                $notify_properties->setAbstractData($this->cb_msg('grn.schedule',
+                    'notify_entry'));
+                $notify_properties->setActionId(GRN_NOTIFICATION_ACTION_CREATE_ID);
+                break;
+            case GRN_SCHEDULE_NOTIFY_DELETE:
+                $notify_properties->setAbstractData($this->cb_msg('grn.schedule',
+                    'notify_delete'));
+                $notify_properties->setActionId(GRN_NOTIFICATION_ACTION_DELETE_ID);
+                break;
+            case GRN_SCHEDULE_NOTIFY_MODIFY:
+                $notify_properties->setAbstractData($this->cb_msg('grn.schedule',
+                    'notify_modify'));
+                $notify_properties->setActionId(GRN_NOTIFICATION_ACTION_UPDATE_ID);
+                break;
+            case GRN_SCHEDULE_NOTIFY_FIX:
+                $notify_properties->setAbstractData($this->cb_msg('grn.schedule',
+                    'notify_fix'));
+                $notify_properties->setActionId(GRN_NOTIFICATION_ACTION_FIXED_ID);
+                break;
+            case GRN_SCHEDULE_NOTIFY_FOLLOWDELETE:
+                $notify_properties->setAbstractData($this->cb_msg('grn.schedule',
+                    'notify_modify'));
+                $notify_properties->setActionId(GRN_NOTIFICATION_ACTION_UPDATE_ID);
+                break;
+        }
+
+        $user_id = $user->getOID();
+
+        $notify_properties->setOrgData($org_datas);
+        $notify_properties->setSubjectData($subject);
+        $notify_properties->setSenderData($user->get('display_name'), $user_id);
+        $notify_properties->setTimeStampData($timestamp);
+
+        // Unix timeに変更する。イベントのタイムゾーンで日時を渡し、タイムスタンプ（event_start_ts）を得る。
+        require_once('fw/i18n.csp');
+        $timezone = $event->timezone;
+        $event_start_tsex = new CB_TimeStampEx();
+
+        $event_type = $event->getEventType();
+        // 仮予定
+        if ($event_type & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY) {
+            $event_start_tsex->setDateTime($event->getFirstDate($date),
+                $timezone);
+        } //　通常予定
+        elseif ($event_type & GRN_SCHEDULE_EVENT_TYPE_NORMAL) {
+            // 開始時間があるイベント
+            if ($event_type == GRN_SCHEDULE_EVENT_TYPE_NORMAL
+                || $event_type & GRN_SCHEDULE_EVENT_TYPE_START
+            ) {
+                $event_start_tsex->setDateTime($event->setdatetime, $timezone);
+            } else {
+                $datetime = new CB_DateTime();
+                $datetime->year = $event->setdatetime->year;
+                $datetime->month = $event->setdatetime->month;
+                $datetime->day = $event->setdatetime->day;
+                $datetime->hour = 0;
+                $datetime->minute = 0;
+                $datetime->second = 0;
+                $event_start_tsex->setDateTime($datetime, $timezone);
+            }
+        } // 繰り返し予定
+        elseif ($event_type & GRN_SCHEDULE_EVENT_TYPE_REPEAT) {
+            $datetime = new CB_DateTime();
+            $datetime->year = $date->year;
+            $datetime->month = $date->month;
+            $datetime->day = $date->day;
+            // 開始時間があるイベント
+            if ($event_type == GRN_SCHEDULE_EVENT_TYPE_REPEAT
+                || $event_type & GRN_SCHEDULE_EVENT_TYPE_START
+            ) {
+                $datetime->hour = $event->settime->hour;
+                $datetime->minute = $event->settime->minute;
+                $datetime->second = $event->settime->second;
+            } else {
+                $datetime->hour = 0;
+                $datetime->minute = 0;
+                $datetime->second = 0;
+            }
+            $event_start_tsex->setDateTime($datetime, $timezone);
+        } //　バナーとか
+        else {
+            $datetime = new CB_DateTime();
+            $datetime->year = $event->setdate->year;
+            $datetime->month = $event->setdate->month;
+            $datetime->day = $event->setdate->day;
+            $datetime->hour = 0;
+            $datetime->minute = 0;
+            $datetime->second = 0;
+            $event_start_tsex->setDateTime($datetime, $timezone);
+        }
+
+        $event_start_ts = $event_start_tsex->unix_ts;
+        $notify_properties->setEventStartTs($event_start_ts);
+
+        //予定の登録以外では、通知を更新状態として発行する
+        if ($mode == GRN_SCHEDULE_NOTIFY_ENTRY) {
+            $notify_properties->setStatusToUnread();
+        } else {
+            $notify_properties->setStatusToUpdate();
+        }
+
+        $notify_service = GRN_Notification_Service::getInstance();
+
+        $users = [];
+        foreach (array_keys($members) as $key) {
+            $member =& $members[$key];
+            $users[$member->getOID()] =& $member;
+        }
+        $old_notifications
+            = $notify_service->getNotifyDataListPropertiesByUser($users,
+            $module_id, $eid);
+        if ( ! is_array($old_notifications)
+             || count($old_notifications) === 0
+        ) {
+            $old_notifications = false;
+        }
+
+        $delete_users = [];
+        $add_users = [];
+        $unread_users = [];
+        $update_users = [];
+        foreach (array_keys($members) as $key) {
+            $member = &$members[$key];
+            $member_id = $member->getOID();
+
+            // 登録（変更）者には通知しない
+            if ($member_id == $user_id) {
+                continue;
+            }
+
+            switch ($mode) {
+                // フォローの削除の場合は、メンバーにより処理を変更
+                case GRN_SCHEDULE_NOTIFY_FOLLOWDELETE:
+                    if ( ! $this->_checkConfirmTime($member_id, $eid,
+                        $notify_properties)
+                    ) {
+                        // 通知の削除
+                        $delete_users[$member_id] =& $member;
+                        continue;
+                    }
+                    $notify_service->modifyNotifyData($member,
+                        $notify_properties, true);
+                    break;
+                case GRN_SCHEDULE_NOTIFY_ENTRY:
+                    // 登録は何もしない
+                    $add_users[$member_id] =& $member;
+                    break;
+                default:
+                    // 登録以外は、現状の通知状態を見る
+                    if ($old_notifications !== false) {
+                        if (array_key_exists($member_id, $old_notifications)) {
+                            if (GRN_NOTIFICATION_DATA_STATUS_UNREAD
+                                == $old_notifications[$member_id]['col_status']
+                            ) {
+                                $unread_users[$member_id] =& $member;
+                                break;
+                            }
+                        }
+                    }
+                    $update_users[$member_id] =& $member;
+                    break;
+            }
+        }
+
+        if (0 < count($delete_users)) {
+            $notify_service->deleteNotifyDataListByUser($delete_users,
+                $module_id, $eid);
+        }
+        if (0 < count($add_users)) {
+            $notify_service->modifyNotifyDataListByUser($add_users,
+                $notify_properties, true);
+        }
+        if (0 < count($unread_users)) {
+            $notify_properties->setStatusToUnread();
+            $notify_service->modifyNotifyDataListByUser($unread_users,
+                $notify_properties, true);
+        }
+        if (0 < count($update_users)) {
+            $notify_properties->setStatusToUpdate();
+            $notify_service->modifyNotifyDataListByUser($update_users,
+                $notify_properties, true);
+        }
+    }
+
+    /**
+     * フォロー削除の場合の更新データのチェック
+     *
+     * @access private
+     */
+    function _checkConfirmTime($user_id, $eid, & $notify_properties)
+    {
+        $timestamp = 0;
+        // 確認した時間を取得
+        $row = $this->_getConfirmData($user_id, $eid);
+        if ($row) {
+            $timestamp = intval($row['col_timestamp']);
+        }
+
+        static $event = null;
+        static $ctime = null;
+        static $mtime = null;
+        static $ftime = null;
+        static $event_creator_id = null;
+        static $event_creator_name = null;
+        static $event_modifier_id = null;
+        static $event_modifier_name = null;
+        static $follow_data = null;
+        static $follow_creator_id = null;
+        static $follow_cname = null;
+        if (is_null($event)) {
+            $logic = $this->_getEventBaseLogic();
+            $event = $logic->getEventRow($eid);
+
+            // 最終操作の時間を取得
+            $ctime = $event->get('ctime');
+            $ctime = $ctime->unix_ts;
+            $event_mtime = $event->get('mtime');
+
+            $mtime = 0;
+            if (($event_mtime)) {
+                $mtime = $event_mtime->unix_ts;
+            } else {
+                $mtime = 0;
+            }
+
+            $event_creator = $event->get('creator');
+            if ($event_creator) {
+                $event_creator_id = $event_creator->getOID();
+                $event_creator_name = $event_creator->get('display_name');
+            } else {
+                $event_creator_name = $event->get('creator_name');
+            }
+            $event_modifier = $event->get('modifier');
+            if ($event_modifier) {
+                $event_modifier_id = $event_modifier->getOID();
+                $event_modifier_name = $event_modifier->get('display_name');
+            } else {
+                $event_modifier_name = $event->get('modifier_name');
+            }
+
+            // フォローの時間
+            $ftime = 0;
+            $follow = $this->_getLastFollowData($user_id, $eid);
+            $follow_data = null;
+            if ($follow) {
+                $follow_data = $follow->get('follow');
+                $follow_creator = &$follow->get('creator');
+                if ($follow_creator) {
+                    $follow_creator_id = $follow_creator->getOID();
+                    $follow_cname = $follow_creator->get('display_name');
+                } else {
+                    $follow_cname = $follow->get('creator_name');
+                }
+                $ftime = $follow->get('ctime');
+                $ftime = $ftime->unix_ts;
+            }
+        }
+
+        $action_time = 0;
+        $type = GRN_SCHEDULE_NOTIFY_ENTRY;
+        $sender_name = '';
+        $sender_id = '';
+        // 更新が後
+        if ($ctime < $mtime) {
+            if ($mtime < $ftime) {
+                $action_time = $ftime;
+                $notify_properties->setAbstractData($follow_data);
+                $sender_id = $follow_creator_id;
+                $sender_name = $follow_cname;
+            } else {
+                $action_time = $mtime;
+                $notify_properties->setAbstractData($this->cb_msg('grn.schedule',
+                    'notify_modify'));
+                $sender_id = $event_modifier_id;
+                $sender_name = $event_modifier_name;
+            }
+        } else {
+            // フォローの書き込みが後
+            if ($ctime < $ftime) {
+                $action_time = $ftime;
+                $notify_properties->setAbstractData($follow_data);
+                $sender_id = $follow_creator_id;
+                $sender_name = $follow_cname;
+            } else {
+                $action_time = $ctime;
+                $notify_properties->setAbstractData($this->cb_msg('grn.schedule',
+                    'notify_entry'));
+                $sender_id = $event_creator_id;
+                $sender_name = $event_creator_name;
+
+                // 通知が自分の登録なので通知は削除
+                if ($sender_id == $user_id) {
+                    return false;
+                }
+            }
+        }
+
+        // このデータが確認済みの場合は、通知しない
+        if ($action_time <= $timestamp) {
+            $notify_properties->setStatusToConfirm();
+        } else {
+            $notify_properties->setStatusToUnread();
+        }
+
+
+        $timestamp = new CB_TimeStamp();
+        $timestamp->unix_ts = $action_time;
+        $notify_properties->setTimeStampData($timestamp);
+        $notify_properties->setSenderData($sender_name, $sender_id);
+
+        return true;
+    }
+
+    /**
+     * 通知用の最後のフォローを取得する
+     *
+     * @access private
+     */
+    function _getLastFollowData($user_id, $eid)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('schedule');
+
+        $table = $tm->getTableInfo(GRN_EVENTFOLLOW);
+        $user_table = $tm->getTableInfo('CB_User');
+        $real_table_name = CB_DATABASE_TABLE_PREFIX
+                           . strtolower(GRN_EVENTFOLLOW);
+
+        $rowset = new CB_RowSet($table);
+        $rowset->addJoin($user_table, $real_table_name . '.col_creator = u._id',
+            CB_DATABASE_LEFT_JOIN, 'u');
+        $rowset->addCondition($rowset->queryf("col_event = '@S' AND ( col_creator <> '@S' OR u.col_deleted IS NOT NULL )",
+            (string)$eid, (string)$user_id));
+        $rowset->limit(0, 1);
+        $rowset->addOrderColumn('col_ctime', true);
+
+        $row = $rowset->iterate();
+
+        return $row;
+    }
+
+    /**
+     * 通知のデータを取得
+     *
+     * @access private
+     */
+    function _getConfirmData($user_id, $eid)
+    {
+        $db = $this->_getDBConnection();
+
+        // ユーザー削除フラグをチェック
+        $join
+            = 'INNER JOIN tab_cb_user AS u ON tab_grn_schedule_readstatus.col_user = u._id AND u.col_deleted IS NULL';
+        $query = cb_queryf($db,
+            "SELECT * FROM tab_grn_schedule_readstatus " . $join
+            . " WHERE col_event_id = '@S' AND col_user = '@S'", (string)$eid,
+            (string)$user_id);
+
+        $query = $db->select_format($query);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $retval = false;
+        while ($row = $db->fetch_assoc($result)) {
+            $retval = $row;
+        }
+
+        return $retval;
+    }
+
+    /**
+     * 通知のデータを取得
+     *
+     * @access private
+     */
+    function _getConfirmDataRow($user, $eid)
+    {
+        $table = $this->_getReadStatusTable();
+        $rowset = new CB_RowSet($table);
+        $rowset->addCondition($rowset->queryf('col_user = \'@S\' AND col_event_id = \'@S\'',
+            $user->getOID(), (string)$eid));
+
+        $row = $rowset->iterate();
+
+        return $row;
+    }
+
+    /**
+     * スケジュールが管理する通知テーブルの取得
+     *
+     * @access  private
+     * @return  object CB_TableInfo     通知の確認テーブル
+     */
+    function _getReadStatusTable()
+    {
+        require_once('schedule/table.csp');
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('schedule');
+
+        $table = $tm->getTableInfo(GRN_SCHEDULE_READSTATUS);
+
+        return $table;
+    }
+
+    /**
+     * 通知の確認
+     *
+     * @param   object CB_User      $user       ユーザー
+     * @param   string       $module_id モジュールID
+     * @param   string       $unique_id イベントID
+     * @param   array        $org_datas パラメータ
+     * @param   CB_TimeStamp $timestamp 確認時間
+     */
+    function confirmApplicationData(
+        & $user,
+        $module_id,
+        $unique_id,
+        $org_datas,
+        $timestamp
+    ) {
+        // イベントがあるかどうか
+        $row = $this->_getConfirmDataRow($user, $unique_id);
+        // はじめてみる場合
+        if ( ! $row) {
+            $status_table = $this->_getReadStatusTable();
+            $row = $status_table->newRow();
+            $row->set('event_id', $unique_id);
+            $row->set('user', $user);
+        }
+
+        return $this->_confirmApplicationData($row, $timestamp);
+    }
+
+    /**
+     * @access private
+     */
+    function _confirmApplicationData(& $row, $timestamp)
+    {
+        if ( ! is_a($row, 'GRN_Schedule_ReadStatus')) {
+            return false;
+        }
+
+        $row->set('timestamp', $timestamp);
+
+        return true;
+    }
+
+    /**
+     * 予定の閲覧
+     *
+     * @param   object CB_User  $user
+     * @param   string       $eid
+     * @param   CB_TimeStamp $timestamp
+     */
+    function readEvent($module_id, & $user, $eid, $timestamp = null)
+    {
+        if ( ! $timestamp) {
+            $timestamp = new CB_TimeStampEx();
+        }
+
+        $base_logic = $this->_getEventBaseLogic();
+
+        // 予定の取得
+        $event = $base_logic->getEventRow($eid);
+
+        $read_ts = new CB_TimeStampEx;
+        $last_ts = new CB_TimeStampEx;
+        $read_ts->unix_ts = 0;
+        $row = $this->_getConfirmDataRow($user, $eid);
+        if ($row) {
+            $read_ts = $row->get('timestamp');
+        }
+
+        if ($event) {
+            $last_ts = $event->get('mtime');
+            $temp
+                = (new \grn\schedule\AttendanceStatusLogic())->getLastConfirmationTime($eid);
+            if ($last_ts->unix_ts < $temp->unix_ts) {
+                $last_ts = $temp;
+            }
+            $lastApprovalTime
+                = (new \grn\schedule\FacilityApprovalLogic())->getLastApprovalTime($eid);
+            if ( ! ($lastApprovalTime instanceof CB_TimeStamp)) {
+                $temp = new \CB_TimeStampEx();
+                $temp->unix_ts = $lastApprovalTime ? (int)$lastApprovalTime : 0;
+                if ($last_ts->unix_ts < $temp->unix_ts) {
+                    $last_ts = $temp;
+                }
+            }
+        } else {
+            $last_ts->unix_ts = $read_ts->unix_ts + 1;
+        }
+
+        $follow = $this->_getLastFollowData($user->getOID(), $eid);
+        if ($follow) {
+            $temp = $follow->get('ctime');
+            // フォローがあたらしい
+            if ($last_ts->unix_ts < $temp->unix_ts) {
+                $last_ts = $temp;
+            }
+        }
+
+        // 見た時間を記録
+        if ($row) {
+            $this->_confirmApplicationData($row, $timestamp);
+        } else {
+            $this->confirmApplicationData($user, null, $eid, null, $timestamp);
+        }
+
+        // 通知するかどうか見た後で変更されていれば履歴に登録
+        if ($read_ts->unix_ts < $last_ts->unix_ts) {
+            require_once('grn/notification.csp');
+            $service = GRN_Notification_Service::getInstance();
+
+            $notify_data = $service->getNotifyDataProperties($user, $module_id,
+                $eid);
+            // 未確認の場合のみ確認して履歴に追加
+            if (is_a($notify_data, 'GRN_Notification_Data')
+                && ! $notify_data->isStatusConfirmed()
+            ) {
+                $service->confirmNotifyData($user, $module_id, $eid, $timestamp,
+                    false);
+            }
+        }
+    }
+
+    /**
+     * 通知の表題の取得
+     *
+     * @param   string $title
+     *
+     * @return  string
+     */
+    function getNotifyTitle($title)
+    {
+        $str = '';
+
+        $str = $this->cb_msg(
+            'grn.schedule',
+            'notify_title',
+            ['title' => $title]
+        );
+
+        return html_entity_decode($str);
+    }
+
+    /**
+     * メール通知の表題を取得する
+     *
+     * @param   int    $action
+     * @param   string $title
+     *
+     * @return  string
+     */
+    function getForwardMailSubject($action, $title, $locale = null)
+    {
+        // 操作からリソースのIDを取得
+        switch ($action) {
+            case GRN_SCHEDULE_NOTIFY_ENTRY:
+                $action = 'notify_entry';
+                break;
+            case GRN_SCHEDULE_NOTIFY_DELETE:
+                $action = 'notify_delete';
+                break;
+            case GRN_SCHEDULE_NOTIFY_MODIFY:
+                $action = 'notify_modify';
+                break;
+            case GRN_SCHEDULE_NOTIFY_FIX:
+                $action = 'notify_fix';
+                break;
+            default:
+                return false;
+        }
+
+        $str = $this->cb_msg('grn.schedule', 'forawrdmail_title',
+            [
+                'action' => $this->cb_msg('grn.schedule', $action, null,
+                    $locale),
+                'title'  => $title,
+            ], $locale);
+
+        return html_entity_decode($str);
+    }
+
+    /**
+     * 通知メールの本文の作成
+     *
+     * @param GRN_Schedule_EventBase $event
+     * @param                        $temporary_id
+     * @param array                  $forwardMailInfo
+     * @param CB_User                $operator
+     * @param                        $userNameAttenders
+     * @param bool                   $isAttendanceCheckEvent
+     *
+     * @return string
+     */
+    function getForwardMailContents(
+        GRN_Schedule_EventBase $event,
+        $temporary_id,
+        array $forwardMailInfo,
+        CB_User $operator,
+        $userNameAttenders,
+        $isAttendanceCheckEvent = false
+    ) {
+        $str = '';
+
+        // 日付
+        $str .= $this->_getEventDateTime(
+            $event, $temporary_id, $forwardMailInfo["userId"],
+            $forwardMailInfo["languageCode"], $operator,
+            "forwardmail_date"
+        );
+        //期間
+        if ($event instanceof GRN_Schedule_RepeatEvent) {
+            $str .= $this->cb_msg(
+                'grn.schedule',
+                'forwardmail_date_limit',
+                [
+                    'start_date' => cb_date_format('DateFull_YMDW',
+                        $event->setdate, $forwardMailInfo["userId"], null,
+                        $forwardMailInfo["languageCode"]),
+                    'end_date'   => cb_date_format('DateFull_YMDW',
+                        $event->enddate, $forwardMailInfo["userId"], null,
+                        $forwardMailInfo["languageCode"])
+                ],
+                $forwardMailInfo['languageCode']
+            );
+        }
+        // 予定名
+        $str .= $this->cb_msg('grn.schedule', 'forwardmail_event',
+            ['title' => html_entity_decode($event->getTitle())],
+            $forwardMailInfo["languageCode"]);
+
+        // ネット連携がある場合
+        if ( ! is_null($event->company_name)
+             ||
+             ! is_null($event->zip_code)
+             ||
+             ! is_null($event->physical_address)
+             ||
+             ! is_null($event->company_telephone_number)
+        ) {
+            $str .= $this->cb_msg('grn.schedule', 'forwardmail_company_name',
+                ['company_name' => $event->company_name],
+                $forwardMailInfo["languageCode"]);
+            $str .= $this->cb_msg('grn.schedule', 'forwardmail_zip_code',
+                ['zip_code' => $event->zip_code],
+                $forwardMailInfo["languageCode"]);
+            $str .= $this->cb_msg('grn.schedule',
+                'forwardmail_physical_address',
+                ['physical_address' => $event->physical_address],
+                $forwardMailInfo["languageCode"]);
+            $str .= $this->cb_msg('grn.schedule',
+                'forwardmail_company_telephone_number',
+                ['company_telephone_number' => $event->company_telephone_number],
+                $forwardMailInfo["languageCode"]);
+        }
+
+        //GTM-1632
+        if ($isAttendanceCheckEvent) {
+            $languageCode = $forwardMailInfo["languageCode"];
+            if (is_array($event->users)) {
+                $str .= $this->cb_msg(
+                    'grn.schedule', 'forwardMailMembersAttendees',
+                    ['members' => $userNameAttenders[AttendanceStatus::STATUS_ALL]],
+                    $languageCode
+                );
+                $str .= $this->cb_msg(
+                    'grn.schedule', 'forwardMailMembersAccepted',
+                    ['members' => $userNameAttenders[AttendanceStatus::STATUS_ATTENDANT]],
+                    $languageCode
+                );
+                $str .= $this->cb_msg(
+                    'grn.schedule', 'forwardMailMembersDeclined',
+                    ['members' => $userNameAttenders[AttendanceStatus::STATUS_ABSENT]],
+                    $languageCode
+                );
+                $str .= $this->cb_msg(
+                    'grn.schedule', 'forwardMailMembersPending',
+                    ['members' => $userNameAttenders[AttendanceStatus::STATUS_UNCONFIRMED]],
+                    $languageCode
+                );
+            } else {
+                $str .= $this->cb_msg(
+                    'grn.schedule', 'forwardMailMembersAttendees',
+                    ['members' => ''],
+                    $languageCode
+                );
+                $str .= $this->cb_msg(
+                    'grn.schedule', 'forwardMailMembersAccepted',
+                    ['members' => ''],
+                    $languageCode
+                );
+                $str .= $this->cb_msg(
+                    'grn.schedule', 'forwardMailMembersDeclined',
+                    ['members' => ''],
+                    $languageCode
+                );
+                $str .= $this->cb_msg(
+                    'grn.schedule', 'forwardMailMembersPending',
+                    ['members' => ''],
+                    $languageCode
+                );
+            }
+        } else {
+            // 参加ユーザー
+            if (is_array($event->users)) {
+
+                $str .= $this->cb_msg('grn.schedule', 'forwardmail_members',
+                    ['members' => $userNameAttenders],
+                    $forwardMailInfo["languageCode"]);
+            } else {
+                $str .= $this->cb_msg('grn.schedule', 'forwardmail_members',
+                    ['members' => ''], $forwardMailInfo["languageCode"]);
+            }
+        }
+
+        // 施設
+        if (is_array($event->facilities)) {
+            $names = [];
+            foreach (array_keys($event->facilities) as $key) {
+                $facility = &$event->facilities[$key];
+                if ( ! is_a($facility, 'GRN_Facility_Facility')) {
+                    continue;
+                }
+
+                $names[] = $facility->get('name');
+            }
+
+            if (count($names) > 0) {
+                $str .= $this->cb_msg('grn.schedule', 'forwardmail_faciliteies',
+                    ['facilities' => join(',', $names)],
+                    $forwardMailInfo["languageCode"]);
+            }
+        }
+
+        // メモ
+        $str .= $this->cb_msg('grn.schedule', 'forwardmail_memo',
+            ['memo' => $event->memo], $forwardMailInfo["languageCode"]);
+
+        //start GTM-1136
+        //Attachment
+        require_once('schedule/system_logic.csp');
+        $systemlogic = GRN_Schedule_SystemLogic::getInstance();
+        if ($systemlogic->getAllowFileAttachment() == '1') {
+            require_once('schedule/file.csp');
+            require_once('grn/controller.csp');
+            $utility = new GRN_ControllerUtil();
+            $fm = GRN_Schedule_FileManager::getInstance();
+            $files = $fm->getFiles($event->id);
+            $attechment = [];
+            foreach (array_keys($files) as $fid) {
+                $file =& $files[$fid];
+                $file_info = $utility->getFileView($file);
+                $attechment[] = $file_info['filename'];
+            }
+            if (count($attechment) > 0) {
+                $str .= $this->cb_msg('grn.schedule', 'forwardmail_files',
+                    ['files' => join(',', $attechment)],
+                    $forwardMailInfo["languageCode"]);
+            }
+        }
+        //end GTM-1136
+
+        // エンコードされた内容をデコードして返す
+        return html_entity_decode($str);
+    }
+
+    /**
+     * 送信メールの日付の部分の作成
+     * スケジュール詳細の日時欄に表示される情報をメール通知にも利用する。
+     *
+     * @param GRN_Schedule_EventBase  $event
+     * @param                         $temporary_id
+     * @param                         $user_id
+     * @param                         $locale
+     * @param CB_User                 $operator
+     * @param string                  $eventDatetimeTemplate
+     *
+     * @return string
+     */
+    private function _getEventDateTime(
+        GRN_Schedule_EventBase $event,
+        $temporary_id,
+        $user_id,
+        $locale,
+        CB_User $operator,
+        $eventDatetimeTemplate
+    ) {
+        $format_id = '';
+        $params = [];
+        //GRN2-4093
+        require_once('schedule/view_util.csp');
+        //GRN2-4093
+        require_once('fw/i18n.csp');
+        $event_timezone = $event->timezone;
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $user = $uum->getUser($user_id);
+        $userTimezone = CB_I18n::getUserTimezone($user);
+        // 日付
+        if ($event instanceof GRN_Schedule_BannerEvent) {
+            $tmp_start_date = new CB_Date();
+            $tmp_start_date->parse($event->setdate->format());
+            $tmp_start_datetime
+                = CB_DateTimeEx::createByDateAndTime($tmp_start_date,
+                GRN_Schedule_View_Util::getAlldayStartTime());
+            $tmp_end_date = new CB_Date();
+            $tmp_end_date->parse($event->enddate->format());
+            $tmp_end_datetime
+                = CB_DateTimeEx::createByDateAndTime($tmp_end_date,
+                GRN_Schedule_View_Util::getAlldayEndTime());
+            $params['setdate'] = cb_date_format("DateFull_YMDW",
+                CB_I18N::translateDatetimeTimezone($tmp_start_datetime,
+                    $event_timezone, $userTimezone), $user_id,
+                null, $locale);
+            $params['enddate'] = cb_date_format("DateFull_YMDW",
+                CB_I18N::translateDatetimeTimezone($tmp_end_datetime,
+                    $event_timezone, $userTimezone), $user_id, null,
+                $locale);
+            if ($event_timezone == $userTimezone) {
+                $format_id = 'event_date_banner';
+            } else {
+                $format_id = 'event_date_YMDW_HM_YMDW_HM';
+                $params['settime'] = cb_date_format("TimeShort_HM",
+                    CB_I18N::translateDatetimeTimezone($tmp_start_datetime,
+                        $event_timezone, $userTimezone), $user_id,
+                    null, $locale);
+                $params['endtime'] = cb_date_format("TimeShort_HM",
+                    CB_I18N::translateDatetimeTimezone($tmp_end_datetime,
+                        $event_timezone, $userTimezone), $user_id,
+                    null, $locale);
+            }
+        } elseif ($event instanceof GRN_Schedule_RepeatEvent) {
+            require_once('schedule/repeat_event_logic.csp');
+            $view_util = GRN_Schedule_View_Util::getInstance();
+            $params['condition']
+                = $view_util->getRepeatData($event->repeat_type,
+                $event->wday, $event->day, $locale);
+
+            $start_time = $event->settime;
+            if (is_null($start_time)) {
+                $start_time = GRN_Schedule_View_Util::getAlldayStartTime();
+            }
+            $end_time = $event->endtime;
+            if (is_null($end_time)) {
+                $end_time = GRN_Schedule_View_Util::getAlldayEndTime();
+            }
+            $start_datetime
+                = CB_I18N::translateDatetimeTimezone(CB_DateTimeEx::createByDateAndTime($event->setdate,
+                $start_time),
+                $event_timezone, $userTimezone);
+            $end_datetime
+                = CB_I18N::translateDatetimeTimezone(CB_DateTimeEx::createByDateAndTime($event->enddate,
+                $end_time),
+                $event_timezone, $userTimezone);
+
+            if (($event->getEventType() & GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+                == GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+            ) {
+                if ($event_timezone === $userTimezone) {
+                    $format_id = 'event_date_repeat_all';
+                } else {
+                    $format_id = 'event_date_repeat_HM_HM_all';
+                    $params['settime'] = cb_date_format('TimeShort_HM',
+                        $start_datetime, $user_id, null, $locale);
+                    $params['endtime'] = cb_date_format('TimeShort_HM',
+                        $end_datetime, $user_id, null, $locale);
+                }
+            } elseif (($event->getEventType() & GRN_SCHEDULE_EVENT_TYPE_START)
+                      == GRN_SCHEDULE_EVENT_TYPE_START
+            ) {
+                $format_id = 'event_date_repeat_HM';
+                $params['settime'] = cb_date_format('TimeShort_HM',
+                    $start_datetime, $user_id, null, $locale);
+            } else {
+                $format_id = 'event_date_repeat_HM_HM';
+                $params['settime'] = cb_date_format('TimeShort_HM',
+                    $start_datetime, $user_id, null, $locale);
+                $params['endtime'] = cb_date_format('TimeShort_HM',
+                    $end_datetime, $user_id, null, $locale);
+            }
+        } elseif ($event instanceof GRN_Schedule_TemporaryEvent
+                  && ! $temporary_id
+        ) {
+            require_once('schedule/temporary_event_logic.csp');
+            $b_first = true;
+            $str_dates = '';
+            foreach ($event->setdates as $dates) {
+                if (array_key_exists('facility', $dates)
+                    && is_a($dates['facility'], 'GRN_Facility_Facility')
+                ) {
+                    // 施設名
+                    if ($b_first) {
+                        $str_dates .= $this->cb_msg('grn.schedule',
+                            'forwardmail_datecandidate',
+                            ['date' => $dates['facility']->get('name')],
+                            $locale);
+                        $b_first = false;
+                    } else {
+                        $str_dates .= $this->cb_msg('grn.schedule',
+                            'forwardmail_datepadding',
+                            ['date' => $dates['facility']->get('name')],
+                            $locale);
+                    }
+                    // 日付
+                    foreach ($dates['dates'] as $temp_dates) {
+                        $str = $this->cb_msg('grn.schedule',
+                            'event_date_YMDW_HM_YMDW_HM', [
+                                'setdate' => cb_date_format('DateFull_YMDW',
+                                    CB_I18N::translateDatetimeTimezone($temp_dates['setdatetime'],
+                                        $event_timezone,
+                                        $userTimezone), $user_id, null,
+                                    $locale),
+                                'settime' => cb_date_format('TimeLong_HM',
+                                    CB_I18N::translateDatetimeTimezone($temp_dates['setdatetime'],
+                                        $event_timezone,
+                                        $userTimezone), $user_id, null,
+                                    $locale),
+                                'enddate' => cb_date_format('DateFull_YMDW',
+                                    CB_I18N::translateDatetimeTimezone($temp_dates['enddatetime'],
+                                        $event_timezone,
+                                        $userTimezone), $user_id, null,
+                                    $locale),
+                                'endtime' => cb_date_format('TimeLong_HM',
+                                    CB_I18N::translateDatetimeTimezone($temp_dates['enddatetime'],
+                                        $event_timezone,
+                                        $userTimezone), $user_id, null, $locale)
+                            ], $locale);
+
+                        $str_dates .= $this->cb_msg('grn.schedule',
+                            'forwardmail_datepadding',
+                            ['date' => $str], $locale);
+                    }
+                } else {
+                    $str = $this->cb_msg('grn.schedule',
+                        'event_date_YMDW_HM_YMDW_HM', [
+                            'setdate' => cb_date_format('DateFull_YMDW',
+                                CB_I18N::translateDatetimeTimezone($dates['setdatetime'],
+                                    $event_timezone, $userTimezone),
+                                $user_id, null, $locale),
+                            'settime' => cb_date_format('TimeLong_HM',
+                                CB_I18N::translateDatetimeTimezone($dates['setdatetime'],
+                                    $event_timezone, $userTimezone),
+                                $user_id, null, $locale),
+                            'enddate' => cb_date_format('DateFull_YMDW',
+                                CB_I18N::translateDatetimeTimezone($dates['enddatetime'],
+                                    $event_timezone, $userTimezone),
+                                $user_id, null, $locale),
+                            'endtime' => cb_date_format('TimeLong_HM',
+                                CB_I18N::translateDatetimeTimezone($dates['enddatetime'],
+                                    $event_timezone, $userTimezone),
+                                $user_id, null, $locale)
+                        ], $locale);
+                    // 日付候補
+                    if ($b_first) {
+                        $str_dates .= $this->cb_msg('grn.schedule',
+                            'forwardmail_datecandidate', ['date' => $str],
+                            $locale);
+                        $b_first = false;
+                    } else {
+                        $str_dates .= $this->cb_msg('grn.schedule',
+                            'forwardmail_datepadding', ['date' => $str],
+                            $locale);
+                    }
+                }
+            }
+
+            return $str_dates;
+        } elseif ($event instanceof GRN_Schedule_TemporaryEvent
+                  && $temporary_id
+        ) {
+            require_once('schedule/temporary_event_logic.csp');
+            if ($event->isORSearch()) {
+                foreach ($event->setdates as $facility_dates) {
+                    if (array_key_exists($temporary_id,
+                        $facility_dates['dates'])
+                    ) {
+                        $dates = $facility_dates['dates'][$temporary_id];
+                        $format_id = 'event_date_YMDW_HM_YMDW_HM';
+                        $params['setdate'] = cb_date_format('DateFull_YMDW',
+                            CB_I18N::translateDatetimeTimezone($dates['setdatetime'],
+                                $event_timezone, $userTimezone),
+                            $user_id, null, $locale);
+                        $params['settime'] = cb_date_format('TimeShort_HM',
+                            CB_I18N::translateDatetimeTimezone($dates['setdatetime'],
+                                $event_timezone, $userTimezone),
+                            $user_id, null, $locale);
+                        $params['enddate'] = cb_date_format('DateFull_YMDW',
+                            CB_I18N::translateDatetimeTimezone($dates['enddatetime'],
+                                $event_timezone, $userTimezone),
+                            $user_id, null, $locale);
+                        $params['endtime'] = cb_date_format('TimeShort_HM',
+                            CB_I18N::translateDatetimeTimezone($dates['enddatetime'],
+                                $event_timezone, $userTimezone),
+                            $user_id, null, $locale);
+                        break;
+                    }
+                }
+            } else {
+                $dates = $event->setdates[$temporary_id];
+                $format_id = 'event_date_YMDW_HM_YMDW_HM';
+                $params['setdate'] = cb_date_format('DateFull_YMDW',
+                    CB_I18N::translateDatetimeTimezone($dates['setdatetime'],
+                        $event_timezone, $userTimezone),
+                    $user_id, null, $locale);
+                $params['settime'] = cb_date_format('TimeShort_HM',
+                    CB_I18N::translateDatetimeTimezone($dates['setdatetime'],
+                        $event_timezone, $userTimezone),
+                    $user_id, null, $locale);
+                $params['enddate'] = cb_date_format('DateFull_YMDW',
+                    CB_I18N::translateDatetimeTimezone($dates['enddatetime'],
+                        $event_timezone, $userTimezone),
+                    $user_id, null, $locale);
+                $params['endtime'] = cb_date_format('TimeShort_HM',
+                    CB_I18N::translateDatetimeTimezone($dates['enddatetime'],
+                        $event_timezone, $userTimezone),
+                    $user_id, null, $locale);
+            }
+        } else {
+            if (($event->getEventType() & GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+                == GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+            ) {
+                $format_id = 'event_date_YMDW_HM_YMDW_HM_all';
+                $tmp_start_date = new CB_Date();
+                $tmp_start_date->parse($event->setdatetime->format());
+                $tmp_start_datetime
+                    = CB_DateTimeEx::createByDateAndTime($tmp_start_date,
+                    GRN_Schedule_View_Util::getAlldayStartTime());
+                if ($event->enddatetime) {
+                    $tmp_end_date = new CB_Date();
+                    $tmp_end_date->parse($event->enddatetime->format());
+                    $tmp_end_datetime
+                        = CB_DateTimeEx::createByDateAndTime($tmp_end_date,
+                        GRN_Schedule_View_Util::getAlldayEndTime());
+                }
+            } else {
+                $tmp_start_datetime = $event->setdatetime;
+                if ($event->enddatetime) {
+                    $format_id = 'event_date_YMDW_HM_YMDW_HM';
+                    $tmp_end_datetime = $event->enddatetime;
+                } else {
+                    $format_id = 'event_date_YMDW_HM';
+                }
+            }
+
+            $params['setdate'] = cb_date_format("DateFull_YMDW",
+                CB_I18N::translateDatetimeTimezone($tmp_start_datetime,
+                    $event_timezone, $userTimezone), $user_id,
+                null, $locale);
+            $params['settime'] = cb_date_format("TimeShort_HM",
+                CB_I18N::translateDatetimeTimezone($tmp_start_datetime,
+                    $event_timezone, $userTimezone), $user_id,
+                null, $locale);
+            if ($event->enddatetime) {
+                $params['enddate'] = cb_date_format("DateFull_YMDW",
+                    CB_I18N::translateDatetimeTimezone($tmp_end_datetime,
+                        $event_timezone, $userTimezone), $user_id,
+                    null, $locale);
+                $params['endtime'] = cb_date_format("TimeShort_HM",
+                    CB_I18N::translateDatetimeTimezone($tmp_end_datetime,
+                        $event_timezone, $userTimezone), $user_id,
+                    null, $locale);
+            }
+        }
+
+        return $this->cb_msg(
+            'grn.schedule', $eventDatetimeTemplate,
+            [
+                'date' => $this->cb_msg('grn.schedule', $format_id, $params,
+                    $locale)
+            ], $locale
+        );
+    }
+
+    /**
+     *
+     * Get receiver's Information
+     *
+     * @param string  $userId         receiver's user id
+     * @param boolean $isFacilityRely if is facility rely mail
+     */
+    private function getForwardMailInfo($userId, $isFacilityRely = false)
+    {
+        require_once('fw/i18n.csp');
+        $i18n = CB_I18N::getInstance();
+
+        require_once('grn/locale.csp');
+        $locale_manager = GRN_Locale_ConfigManager::getInstance();
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+
+        $userLanguage = $locale_manager->getUserLanguage($userId);
+        $user = $uum->getUser($userId);
+        $email = $this->_getFowardMailAddress($user);
+        if ($isFacilityRely) {
+            $email = $this->_getFowardFacilityRelyMailAddress($user);
+        }
+
+        if ( ! $email) {
+            return null;
+        }
+
+        $locale_personal = $locale_manager->getPersonalConfig($user);
+        // charset
+        $charset = $locale_personal->getReceivingEmailCharset();
+        if ($charset == 'auto') {
+            $charset = $i18n->getEncodingByLocale($userLanguage);
+        }
+        $userNameLanguages = CB_LocaleManager::getUserNameLanguages($userId,
+            false, true);
+        $strUserNameLanguages = "";
+        foreach ($userNameLanguages as $userNameLanguage) {
+            $strUserNameLanguages .= $userNameLanguage->getLanguage();
+        }
+        // The values of longDateFormat, shotDateFormat and timeFormat are only used to generate $mailListKey,
+        // The content of the notification mail depends on those information. 
+        return [
+            "userId"           => $userId,
+            "languageCode"     => $userLanguage,
+            "longDateFormat"   => CB_LocaleManager::getCurrentLongDateFormat($userId),
+            "shortDateFormat"  => CB_LocaleManager::getCurrentShortDateFormat($userId),
+            "timeFormat"       => CB_LocaleManager::getCurrentTimeFormat($userId),
+            "charset"          => $charset,
+            "mailAddress"      => new CB_MailAddress($email),
+            "userNameLanguage" => $strUserNameLanguages
+        ];
+    }
+
+    /**
+     * 予定通知のメールの転送本体
+     *
+     * @param   GRN_Schedule_EventBase $event        予定
+     * @param   array                  $list         操作とその通知先の配列
+     * @param   CB_User                $operator     操作した人
+     * @param   string                 $temporary_id 仮予定の特定の日付
+     *
+     * @return  boolean
+     */
+    function forwardMail(& $event, $list, & $operator, $temporary_id = null)
+    {
+        if ( ! is_a($event, 'GRN_Schedule_EventBase')) {
+            return false;
+        }
+
+        if ( ! is_array($list) || count($list) == 0) {
+            return false;
+        }
+
+        require_once('fw/mail_message.csp');
+        $operator_id = null;
+        if ($operator) {
+            $operator_id = $operator->getOID();
+        }
+
+        $title = html_entity_decode($event->getTitle());
+
+        //GTM-529
+        //Login User
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login = $uum->getLoginUser();
+
+        $mailList = [];
+        $userInfoAttenders = $this->getUserInfoAttender($event);
+        $attender_names = [];
+
+        //GTM-1632
+        $attendanceStatusLogic = new AttendanceStatusLogic();
+        $isAttendanceCheckEvent = $event->isAttendanceCheckEvent()
+                                  && $attendanceStatusLogic->isEnableAttendanceCheck();
+        if ($isAttendanceCheckEvent) {
+            $this->_setAttendanceStatus($event, $attendanceStatusLogic,
+                $userInfoAttenders);
+        }
+
+        foreach ($list as $action => $members) {
+            if ( ! is_array($members) || count($members) == 0) {
+                continue;
+            }
+            $uid_list = [];
+            foreach ($members as $member) {
+                $uid_list[] = $member->getOID();
+            }
+            // tuning GRB-15157
+            require_once('grn/controller.csp');
+            $users_info
+                = GRN_ControllerUtil::getUserInfoToShowUserName($uid_list,
+                $login, 'schedule');
+            foreach ($users_info as $uid => $user_info) {
+                if ($operator_id == $uid) {
+                    continue;
+                }
+
+                if ( ! array_key_exists($uid, $users_info)) {
+                    continue;
+                }
+
+                if ( ! $this->_canUserUseSchedule($users_info[$uid])) {
+                    continue;
+                }
+
+                $forwardMailInfo = $this->getForwardMailInfo($uid);
+                if (is_null($forwardMailInfo)) {
+                    continue;
+                }
+                $userNameLanguageInfo = $forwardMailInfo["userNameLanguage"];
+                if ( ! array_key_exists($userNameLanguageInfo,
+                    $attender_names)
+                ) {
+                    if ($isAttendanceCheckEvent) {
+                        $strUserNameAttender = $this->_getAttendanceStatus($uid,
+                            $userInfoAttenders);
+                    } else {
+                        $strUserNameAttender = $this->getUserNameAttender(
+                            $uid, $userInfoAttenders, $isAttendanceCheckEvent
+                        );
+                    }
+                    $attender_names[$userNameLanguageInfo]
+                        = $strUserNameAttender;
+                }
+                $mailListKey = $forwardMailInfo["languageCode"]
+                               . $forwardMailInfo["longDateFormat"]
+                               . $forwardMailInfo["shortDateFormat"]
+                               . $forwardMailInfo["timeFormat"]
+                               . $forwardMailInfo["charset"]
+                               . $userNameLanguageInfo . $action;
+                if ( ! array_key_exists($mailListKey, $mailList)) {
+                    $mailList[$mailListKey] = [
+                        "languageCode"    => $forwardMailInfo["languageCode"],
+                        "longDateFormat"  => $forwardMailInfo["longDateFormat"],
+                        "shortDateFormat" => $forwardMailInfo["shortDateFormat"],
+                        "timeFormat"      => $forwardMailInfo["timeFormat"],
+                        "charset"         => $forwardMailInfo["charset"],
+                        "subject"         => $this->getForwardMailSubject($action,
+                            $title, $forwardMailInfo["languageCode"]),
+                        "content"         => $this->getForwardMailContents(
+                            $event, $temporary_id, $forwardMailInfo, $operator,
+                            $attender_names[$userNameLanguageInfo],
+                            $isAttendanceCheckEvent
+                        ),
+                        "mailAddress"     => [],
+                    ];
+                }
+                $mailList[$mailListKey]["mailAddress"][]
+                    = $forwardMailInfo["mailAddress"];
+            }
+        }
+
+        return $this->_sendForwardMail($mailList);
+    }
+
+    /** GTM-529
+     *
+     * @param $user_info
+     *
+     * @return bool
+     */
+    private function _canUserUseSchedule($user_info)
+    {
+        if (array_key_exists("col_valid", $user_info)
+            && ! is_null($user_info["col_valid"])
+        ) {
+            return false;
+        }
+
+        if (array_key_exists("col_using_app", $user_info)
+            && is_null($user_info["col_using_app"])
+        ) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @param $mail_list
+     *
+     * @return bool
+     */
+    private function _sendForwardMail($mail_list)
+    {
+        $addresses_send_fail = [];
+        if (count($mail_list) == 0) {
+            return false;
+        }
+
+        require_once('grn/system_mail.csp');
+        $system_mail = GRN_SystemMailConfigManager::getInstance();
+
+        // 使えるかどうか
+        if ( ! $system_mail->isAvailable()) {
+            return false;
+        }
+
+        $errMessage = null;
+        $sender = &$system_mail->getSystemMailSender($errMessage);
+        if ( ! $sender) {
+            $system_mail->logForwardMailFail(
+                $errMessage,
+                GRN_SCHEDULE_APPLICATION_ID,
+                GRN_SCHEDULE_MODULE_ID
+            );
+
+            return false;
+        }
+
+        // ログ書き出しの準備
+        $listener = GRN_Schedule_MailErrorListener::getInstance();
+        $sender->setErrorListener($listener);
+
+        // 送信者のアドレス
+        $from = $system_mail->getMailAddress();
+        if ( ! $from) {
+            return false;
+        }
+
+        $invalid_addresses = [];
+        $use_builtin_mail_server = $system_mail->useBuiltinMailServer();
+        foreach ($mail_list as $each_mail_list) {
+            $each_mail_addresses = $each_mail_list["mailAddress"];
+            // Check the mail address whether is a local address
+            if ($use_builtin_mail_server) {
+                /** @var CB_MailAddress $mail_addresses */
+                foreach ($each_mail_addresses as $key => $mail_addresses) {
+                    $addresses = explode(',', $mail_addresses->address);
+                    $system_mail->separateLocalMailAddress($addresses,
+                        $invalid_addresses);
+
+                    if (0 < count($addresses)) {
+                        require_once('fw/mail_message.csp');
+                        $each_mail_addresses[$key]
+                            = new CB_MailAddress(implode(',', $addresses));
+                    } else {
+                        unset($each_mail_addresses[$key]);
+                    }
+                }
+            }
+
+            if (count($each_mail_addresses) > 0) {
+                $sendMailResult = $this->sendForwardMail(
+                    $sender,
+                    $from,
+                    $each_mail_list["subject"],
+                    $each_mail_list["content"],
+                    $each_mail_addresses,
+                    $each_mail_list["languageCode"],
+                    $each_mail_list["charset"]
+                );
+                if (is_array($sendMailResult) && count($sendMailResult)) {
+                    $addresses_send_fail[] = implode(',', $sendMailResult);
+                }
+            }
+        }
+
+        if (count($addresses_send_fail) > 0) {
+            $system_mail->logForwardMailFail(
+                implode(',', $addresses_send_fail),
+                GRN_SCHEDULE_APPLICATION_ID,
+                GRN_SCHEDULE_MODULE_ID
+            );
+        }
+
+        // output log of invalid addresses
+        if (count($invalid_addresses) > 0) {
+            $log_message
+                = $system_mail->createInvalidAddressLogMessage($invalid_addresses);
+            $system_mail->logForwardMailFail($log_message,
+                GRN_SCHEDULE_APPLICATION_ID, GRN_SCHEDULE_MODULE_ID);
+        }
+
+        // コミット
+        $sender->commit();
+
+        // コネクションの切断（一応、CB_MailSender に disconnect がないかもしれないので確認してから）
+        if (method_exists($sender, 'disconnect')) {
+            $sender->disconnect();
+        }
+
+        return true;
+    }
+
+    /**
+     * @param $event
+     * @param $attendanceLogic
+     * @param $userInfoAttenders
+     *
+     * @return array
+     */
+    private function _setAttendanceStatus(
+        &$event,
+        $attendanceLogic,
+        &$userInfoAttenders
+    ) {
+        $locator = GRN_ApplicationLocator::instance();
+        $manager =& $locator->getTableManager('schedule');
+        $manager->registerNowAndUpdateNowAll();
+
+        $attendanceStatusList
+            = $attendanceLogic->getAttendanceStatusListByEventAndStatus(
+            $event, ""
+        ); // get all status
+
+        if ( ! is_array($event->users)) {
+            return;
+        }
+
+        foreach ($attendanceStatusList as $attendanceStatus) {
+            $userId = $attendanceStatus->getUserId();
+            switch ($attendanceStatus->getStatus()) {
+                case "1":
+                    $userInfoAttenders[$userId][AttendanceStatus::ATTENDANCE_CHECK_STATUS]
+                        = AttendanceStatus::STATUS_ATTENDANT;
+                    break;
+                case "0":
+                    $userInfoAttenders[$userId][AttendanceStatus::ATTENDANCE_CHECK_STATUS]
+                        = AttendanceStatus::STATUS_ABSENT;
+                    break;
+                default:
+                    $userInfoAttenders[$userId][AttendanceStatus::ATTENDANCE_CHECK_STATUS]
+                        = AttendanceStatus::STATUS_UNCONFIRMED;
+                    break;
+            }
+        }
+    }
+
+    /** GRB-16905
+     *
+     * @param GRN_Schedule_EventBase $event
+     * @param CB_User                $sender
+     *
+     * @return CB_User               $creator who can read appointment
+     */
+    function getEventCreatorForNotification(
+        \GRN_Schedule_EventBase $event,
+        \CB_User $sender
+    ) {
+        $creator = $event->creator;
+        $creatorExists = false;
+        if ( ! isset ($event->creatorDeleted)) {
+            $creator = grn_schedule_getUserObject($event->creator);
+            if ($creator instanceof \CB_User) {
+                $creatorExists = true;
+            }
+        }
+        if ( ! $creatorExists) {
+            return null;
+        }
+
+        //Don't send notification if registrant is inactivate
+        if ( ! is_null($creator->get('valid'))) {
+            return null;
+        }
+
+        if ( ! AppAccess::isAppAvailableInternalAccess(GRN_SCHEDULE_APPLICATION_ID,
+            $creator->getOID())
+        ) {
+            return null;
+        }
+
+        //Don't send notification if registrant can not read the appointment
+        require_once('schedule/access_logic.csp');
+        $accessLogic = \GRN_Schedule_Access_Logic::getInstance();
+        global $G_container_base;
+        $uum = $G_container_base->getInstance("uum");
+        $dynamicRoles = $uum->listGrantedRoles();
+        $access = $accessLogic->getEventAccess($creator, $event, ["read"],
+            $dynamicRoles);
+        if ($access["read"] == GRN_SCHD_ACCESS_DENY) {
+            return null;
+        }
+
+        //Don't send notification if the sender is registrant of appointment
+        if ($sender->getOID() == $creator->getOID()) {
+            return null;
+        }
+
+        return $creator;
+    }
+
+    /** GTM-1632
+     *
+     * @param \GRN_Schedule_EventBase $event
+     * @param \CB_User                $sender User who send a confirmation mail
+     * @param string                  $status
+     * @param string                  $message
+     */
+    function forwardAttendanceConfirmMail(
+        \GRN_Schedule_EventBase $event,
+        \CB_User $sender,
+        $status,
+        $message
+    ) {
+        //GRB-16905
+        $receiver = $this->getEventCreatorForNotification($event, $sender);
+        if (empty($receiver)) {
+            return;
+        }
+
+        $uid_list[] = $receiver->getOID();
+        $uid_list[] = $sender->getOID();
+        require_once('grn/controller.csp');
+        $users_info = \GRN_ControllerUtil::getUserInfoToShowUserName($uid_list,
+            $sender, 'schedule');
+
+        if ( ! array_key_exists($receiver->getOID(), $users_info)
+             || ! array_key_exists($sender->getOID(), $users_info)
+        ) {
+            return;
+        }
+
+        $eventCreatorInfo = $users_info[$receiver->getOID()];
+        $loginInfo = $users_info[$sender->getOID()];
+        if ( ! $this->_canUserUseSchedule($eventCreatorInfo)) {
+            return;
+        }
+
+        require_once('fw/mail_message.csp');
+        $forwardMailInfo = $this->getForwardMailInfo($eventCreatorInfo["_id"]);
+        if (is_null($forwardMailInfo)) {
+            return;
+        }
+        //GRB-16949
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $loginInfo["col_display_name"] = $uum->getNameOf($receiver, $loginInfo,
+            true);
+
+        //generate forward mail title
+        $subject = "";
+        $action = "";
+        switch ($status) {
+            case AttendanceStatus::STATUS_ABSENT:
+                $action = $this->cb_msg(
+                    'grn.schedule', 'forwardMailStatusDeclined', null,
+                    $forwardMailInfo["languageCode"]
+                );
+                break;
+            case AttendanceStatus::STATUS_ATTENDANT:
+                $action = $this->cb_msg(
+                    'grn.schedule', 'forwardMailStatusAccepted', null,
+                    $forwardMailInfo["languageCode"]
+                );
+                break;
+            default:
+                return;
+        }
+
+        $subject = $this->cb_msg(
+            'grn.schedule', 'forwardMailAttendanceConfirmTitle',
+            [
+                'action' => $action,
+                'member' => $loginInfo["col_display_name"],
+                'title'  => html_entity_decode($event->getTitle())
+            ],
+            $forwardMailInfo["languageCode"]
+        );
+        $subject = html_entity_decode($subject);
+
+        //generate forward mail content
+        $content = "";
+        $content .= $this->_getEventDateTime(
+            $event, $sender, $forwardMailInfo["userId"],
+            $forwardMailInfo["languageCode"], $receiver,
+            "forwardMailAttendanceConfirmDate"
+        );
+        $content .= $this->cb_msg(
+            'grn.schedule', 'forwardMailAttendanceConfirmEvent',
+            ['title' => html_entity_decode($event->getTitle())],
+            $forwardMailInfo["languageCode"]
+        );
+
+        $content .= $this->cb_msg(
+            'grn.schedule', 'forwardMailRespondent',
+            ['member' => $loginInfo["col_display_name"]],
+            $forwardMailInfo["languageCode"]
+        );
+        $content .= $this->cb_msg(
+            'grn.schedule', 'forwardMailResponse', ['action' => $action],
+            $forwardMailInfo["languageCode"]
+        );
+        $content .= $this->cb_msg(
+            'grn.schedule', 'forwardMailMessage', ['message' => $message],
+            $forwardMailInfo["languageCode"]
+        );
+
+        $content = html_entity_decode($content);
+
+        $forwardMailInfo["subject"] = $subject;
+        $forwardMailInfo["content"] = $content;
+        $forwardMailInfo["mailAddress"] = [$forwardMailInfo["mailAddress"]];
+
+        $this->_sendForwardMail([$forwardMailInfo]);
+    }
+
+    /**
+     * 予定通知のメールの送信
+     *
+     * @param   CB_MailSender $sender    送信するもの
+     * @param   string        $from      送信もとのアドレス
+     * @param   string        $subject   送信の表題
+     * @param   string        $contents  送信内容
+     * @param   array         $addresses 通知先のアドレス
+     *
+     * @return  boolean     成功した場合はTRUEそれ以外はFALSE
+     */
+    function sendForwardMail(
+        & $sender,
+        $from,
+        $subject,
+        $contents,
+        $addresses,
+        $locale,
+        $encoding
+    ) {
+        if ( ! is_a($sender, 'CB_MailSender')) {
+            return false;
+        }
+
+        require_once('fw/mail_message.csp');
+        $cp = new CB_MailComposer();
+
+        // 送信者
+        $cp->setFrom(new CB_MailAddress($from));
+
+        // 表題
+        $cp->setSubject(CB_MailComposer::escapeHalfWidthKana($subject,
+            $encoding));
+
+        // 内容
+        $cp->setTextBody(CB_MailComposer::escapeHalfWidthKana($contents,
+            $encoding));
+
+        $cp->setXMailer();
+
+        $mail_send_fail = [];
+        if (is_array($addresses)) {
+            if (count($addresses) > 50)//　50人ごとに送信
+            {
+                foreach (array_chunk($addresses, 50, true) as $values) {
+                    $cp->setHeader(new CB_MailHeader('Bcc',
+                        CB_MailAddress::static_format($values)), true);
+
+                    $temp_message = &$cp->getMailMessage();
+                    // common.iniの設定値を指定する。
+                    $temp_message->setForceEncoding($encoding);
+
+                    $msg = [];
+                    $msg[] = &$temp_message;
+
+                    $result = $sender->sendMails($msg, $locale);
+                    if ( ! $result) {
+                        $mail_send_fail[]
+                            = CB_MailAddress::static_format($values);
+                    }
+                }
+            } else {
+                $cp->setHeader(new CB_MailHeader('Bcc',
+                    CB_MailAddress::static_format($addresses)), true);
+
+                $temp_message = &$cp->getMailMessage();
+                // common.iniの設定値を指定する。
+                $temp_message->setForceEncoding($encoding);
+
+                $msg = [];
+                $msg[] = &$temp_message;
+
+                $result = $sender->sendMails($msg, $locale);
+                if ( ! $result) {
+                    $mail_send_fail[]
+                        = CB_MailAddress::static_format($addresses);
+                }
+            }
+        }
+
+        return $mail_send_fail;
+    }
+
+    /**
+     * 転送するときのメールアドレスの取得
+     *
+     * @param   CB_User $user
+     *
+     * @return  mixed   転送する設定がしてある場合は、転送先のメールアドレス、それ以外はFALSE
+     */
+    function _getFowardMailAddress(& $user)
+    {
+        if ( ! is_a($user, 'CB_User')) {
+            return false;
+        }
+
+        require_once('schedule/personal_logic.csp');
+        $peronal_logic = GRN_Schedule_PersonalLogic::getInstance();
+
+        // 転送する設定になっているかどうか
+        if ( ! $peronal_logic->getForwardMail($user)) {
+            return false;
+        }
+
+        return $this->_getMailAddress($user, $peronal_logic);
+    }
+
+    /**
+     * 転送先のメールアドレスの取得
+     *
+     * @param   object CB_User  $user
+     * @param   object GRN_Schedule_PersonalLogic  $personal_logic
+     *
+     * @return  string 転送先のメールアドレス
+     */
+    function _getMailAddress(
+        CB_User $user,
+        GRN_Schedule_PersonalLogic $personal_logic
+    ) {
+        $address = '';
+        $type = $personal_logic->getForwardMailType($user);
+        // 設定されているメールアドレス
+        if ($type == GRN_SCHD_FORWARD_TYPE_MAIL) {
+            $address = $user->get('email_address');
+        } // その他のメールアドレス
+        elseif ($type == GRN_SCHD_FORWARD_TYPE_OTHER) {
+            $address = $personal_logic->getForwardMailAddress($user);
+        }
+
+        // 文字列じゃない
+        if ( ! is_string($address)) {
+            return false;
+        }
+
+        // 空
+        require_once('fw/string_util.csp');
+        if (mb_strlen(cb_trim($address)) == 0) {
+            return false;
+        }
+
+        return $address;
+    }
+
+    function cb_msg($module, $resourceKey, $args = null, $locale = null)
+    {
+        require_once('fw/i18n.csp');
+        if ( ! $locale) {
+            $locale = GRN_SCHEDULE_NOTIFY_LOCALE;
+        }
+
+        return cb_msg($module, $resourceKey, $args, $locale);
+    }
+
+    function getUserInfoAttender($event)
+    {
+        $user_info = [
+            'col_display_name'          => 'display_name',
+            'col_valid'                 => 'valid',
+            'col_display_name_language' => 'display_name_language',
+            'col_nickname'              => 'nickname',
+            'col_position'              => 'position',
+            'col_foreign_key'           => 'foreign_key'
+        ];
+        $users_info_attender = [];
+        if (is_array($event->users)) {
+            foreach (array_keys($event->users) as $key) {
+                $user = $event->users[$key];
+                if ( ! is_a($user, 'CB_User')) {
+                    continue;
+                }
+                foreach ($user_info as $col => $val) {
+                    $users_info_attender[$user->getOID()][$col]
+                        = $user->get($val);
+                }
+            }
+        }
+
+        return $users_info_attender;
+    }
+
+    //GTM-1632
+    private function _getAttendanceStatus($receiver_id, $userInfoAttendees)
+    {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $user = $uum->getUser($receiver_id);
+        require_once("grn/controller.csp");
+        $attendanceStatus = [];
+        $attendanceStatus[AttendanceStatus::STATUS_ALL] = [];
+        $attendanceStatus[AttendanceStatus::STATUS_ATTENDANT] = [];
+        $attendanceStatus[AttendanceStatus::STATUS_ABSENT] = [];
+        $attendanceStatus[AttendanceStatus::STATUS_UNCONFIRMED] = [];
+
+        foreach ($userInfoAttendees as $attendee) {
+            $attendanceStatus[AttendanceStatus::STATUS_ALL][] = $uum->getNameOf(
+                $user, $attendee, true
+            );
+            switch ($attendee[AttendanceStatus::ATTENDANCE_CHECK_STATUS]) {
+                case AttendanceStatus::STATUS_ATTENDANT:
+                    $attendanceStatus[AttendanceStatus::STATUS_ATTENDANT][]
+                        = $uum->getNameOf(
+                        $user, $attendee, true
+                    );
+                    break;
+                case AttendanceStatus::STATUS_ABSENT:
+                    $attendanceStatus[AttendanceStatus::STATUS_ABSENT][]
+                        = $uum->getNameOf(
+                        $user, $attendee, true
+                    );
+                    break;
+                case AttendanceStatus::STATUS_UNCONFIRMED:
+                    $attendanceStatus[AttendanceStatus::STATUS_UNCONFIRMED][]
+                        = $uum->getNameOf(
+                        $user, $attendee, true
+                    );
+                    break;
+            }
+        }
+
+        $attendanceStatus[AttendanceStatus::STATUS_ALL] = implode(
+            ",", $attendanceStatus[AttendanceStatus::STATUS_ALL]
+        );
+        $attendanceStatus[AttendanceStatus::STATUS_ATTENDANT] = implode(
+            ",", $attendanceStatus[AttendanceStatus::STATUS_ATTENDANT]
+        );
+        $attendanceStatus[AttendanceStatus::STATUS_ABSENT] = implode(
+            ",", $attendanceStatus[AttendanceStatus::STATUS_ABSENT]
+        );
+        $attendanceStatus[AttendanceStatus::STATUS_UNCONFIRMED] = implode(
+            ",", $attendanceStatus[AttendanceStatus::STATUS_UNCONFIRMED]
+        );
+
+        return $attendanceStatus;
+    }
+
+    function getUserNameAttender($receiver_id, $userInfoAttenders)
+    {
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $user = $uum->getUser($receiver_id);
+        require_once("grn/controller.csp");
+        $userNameAttender = "";
+        $sign = "";
+        foreach ($userInfoAttenders as $attender) {
+            $userNameAttender .= $sign . $uum->getNameOf($user, $attender,
+                    true);
+            $sign = ",";
+
+        }
+
+        return $userNameAttender;
+
+    }
+
+    /**
+     * Get notification data for attendance response and facility approval features.
+     *
+     * @param GRN_Schedule_EventBase $event
+     * @param string                 $action The action id(GRN_NOTIFICATION_ACTION_STATUS_RESPONSE_ID | GRN_NOTIFICATION_ACTION_FACILITY_APPROVED_ID | GRN_NOTIFICATION_ACTION_FACILITY_REJECTED_ID | GRN_NOTIFICATION_ACTION_FACILITY_REQUESTED_ID)
+     *
+     * @return GRN_Notification_Data
+     */
+    function getNotificationData(\GRN_Schedule_EventBase $event, $action)
+    {
+        require_once("grn/notification.csp");
+        $notificationData = new GRN_Notification_Data();
+        $notificationData->setModuleId(GRN_SCHEDULE_MODULE_ID);
+        $notificationData->setUniqueId($event->id);
+
+        require_once('notification/resources.csp');
+        $subject = $this->getNotifyTitle($event->getTitle());
+        // Set OrgData
+        $timeStamp = new \CB_TimeStampEx();
+        $today = $timeStamp->getDate();
+        $date = $event->getFirstDate($today);
+        $orgData = [
+            'event' => $event->id,
+            'bdate' => $date->format(),
+            'type'  => $event->getEventType()
+        ];
+        $abstract = "";
+        switch ($action) {
+            case GRN_NOTIFICATION_ACTION_STATUS_RESPONSE_ID:
+                $orgData[\grn\schedule\bean\AttendanceStatus::STATUS_ATTENDANT]
+                    = true;
+                $abstract = $this->cb_msg(GRN_NOTIFICATION_MODULE_ID,
+                    GRN_NOTIFICATION_SCHEDULE_ATTENDANCE_RESPONSE);
+                break;
+            case GRN_NOTIFICATION_ACTION_FACILITY_APPROVED_ID:
+                $orgData[$action] = true;
+                $abstract = $this->cb_msg(GRN_NOTIFICATION_MODULE_ID,
+                    GRN_NOTIFICATION_SCHEDULE_FACILITY_APPROVED);
+                break;
+            case GRN_NOTIFICATION_ACTION_FACILITY_REJECTED_ID:
+                $orgData[$action] = true;
+                $abstract = $this->cb_msg(GRN_NOTIFICATION_MODULE_ID,
+                    GRN_NOTIFICATION_SCHEDULE_FACILITY_REJECTED);
+                break;
+            case GRN_NOTIFICATION_ACTION_FACILITY_REQUESTED_ID:
+                $orgData[$action] = true;
+                $abstract = $this->cb_msg(GRN_NOTIFICATION_MODULE_ID,
+                    GRN_NOTIFICATION_SCHEDULE_FACILITY_REQUESTED);
+                break;
+        }
+        $notificationData->setOrgData($orgData);
+        $notificationData->setSubjectData($subject);
+        $notificationData->setAbstractData($abstract);
+        $notificationData->setActionId($action);
+        $notificationData->setTimeStampData($timeStamp);
+        $notificationData->setStatusToUnread();
+
+        require_once('fw/i18n.csp');
+        $timezone = $event->timezone;
+        $eventStartTimeStamp = new \CB_TimeStampEx();
+        $eventType = $event->getEventType();
+        // Tentative event
+        if ($eventType & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY) {
+            $eventStartTimeStamp->setDateTime($event->getFirstDate($date),
+                $timezone);
+        } // Normal event
+        elseif ($eventType & GRN_SCHEDULE_EVENT_TYPE_NORMAL) {
+            // event which has start date and time
+            if ($eventType == GRN_SCHEDULE_EVENT_TYPE_NORMAL
+                || $eventType & GRN_SCHEDULE_EVENT_TYPE_START
+            ) {
+                $eventStartTimeStamp->setDateTime($event->setdatetime,
+                    $timezone);
+            } else {
+                $datetime = new CB_DateTime();
+                $datetime->year = $event->setdatetime->year;
+                $datetime->month = $event->setdatetime->month;
+                $datetime->day = $event->setdatetime->day;
+                $datetime->hour = 0;
+                $datetime->minute = 0;
+                $datetime->second = 0;
+                $eventStartTimeStamp->setDateTime($datetime, $timezone);
+            }
+        } // repeated event
+        elseif ($eventType & GRN_SCHEDULE_EVENT_TYPE_REPEAT) {
+            $datetime = new CB_DateTime();
+            $datetime->year = $date->year;
+            $datetime->month = $date->month;
+            $datetime->day = $date->day;
+            // event which has start date and time
+            if ($eventType == GRN_SCHEDULE_EVENT_TYPE_REPEAT
+                || $eventType & GRN_SCHEDULE_EVENT_TYPE_START
+            ) {
+                $datetime->hour = $event->settime->hour;
+                $datetime->minute = $event->settime->minute;
+                $datetime->second = $event->settime->second;
+            } else {
+                $datetime->hour = 0;
+                $datetime->minute = 0;
+                $datetime->second = 0;
+            }
+            $eventStartTimeStamp->setDateTime($datetime, $timezone);
+        } // banner & other
+        else {
+            $datetime = new CB_DateTime();
+            $datetime->year = $event->setdate->year;
+            $datetime->month = $event->setdate->month;
+            $datetime->day = $event->setdate->day;
+            $datetime->hour = 0;
+            $datetime->minute = 0;
+            $datetime->second = 0;
+            $eventStartTimeStamp->setDateTime($datetime, $timezone);
+        }
+        $notificationData->setEventStartTs($eventStartTimeStamp->unix_ts);
+
+        return $notificationData;
+    }
+
+    /**
+     * GTM-1680 Facility approval request notification.
+     *
+     * @param array                 $facilityList
+     * @param GRN_Notification_Data $requestNofData
+     * @param CB_User               $sender
+     */
+    public function sendFacilityApprovalRequestNotify(
+        array $facilityList,
+        \GRN_Notification_Data $requestNofData,
+        \CB_User $sender
+    ) {
+        $facilityApprovalLogic = new grn\schedule\FacilityApprovalLogic();
+        $facilityApprovalLogic->sendFacilityApprovalRequestNotify($facilityList,
+            $requestNofData, $sender);
+    }
+
+    /**
+     * Forward facility rely mail.
+     *
+     * @param GRN_Schedule_NormalEvent $event
+     * @param CB_User                  $operator
+     * @param GRN_Facility_Facility[]  $facilities (new added facility when edit appointment)
+     *
+     * @return boolean                    成功した場合はTRUEそれ以外はFALSE
+     */
+    function forwardFacilityRelyMail(& $event, & $operator, $facilities = [])
+    {
+        if ( ! is_a($event, 'GRN_Schedule_NormalEvent')) {
+            return false;
+        }
+
+        $logic = new FacilityApprovalLogic();
+        $approval_facilities_names = [];
+        if (count($facilities)) {
+            $approval_facilities_names
+                = $logic->getNamesForFacilitiesNeedApproval($facilities);
+        } else {
+            $approval_facilities_names
+                = $logic->getNamesForFacilitiesNeedApproval($event->facilities);
+        }
+        if (count($approval_facilities_names) == 0) {
+            return false;
+        }
+
+        require_once('fw/mail_message.csp');
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login_info = $this->getUserInfo($operator);
+
+        require_once('schedule/facility_system_logic.csp');
+        $facility_logic = GRN_Facility_SystemLogic::getInstance();
+
+        $approve_setting = new ScheduleFacilityApprovalSetting();
+
+        $mail_list = [];
+        $creator_name_cache = [];
+        foreach (array_keys($approval_facilities_names) as $faid) {
+            $facility_multi_lang_name
+                = $facility_logic->createFacilityMultiLanguageValuesArray($faid);
+
+            $operational_admins
+                = $approve_setting->getOperationalAdministrators($faid);
+            if (count($operational_admins) == 0) {
+                continue;
+            }
+            $id_list = [];
+            foreach ($operational_admins as $admin) {
+                $id_list[] = $admin->getOID();
+            }
+            require_once('grn/controller.csp');
+            $admin_infos
+                = GRN_ControllerUtil::getUserInfoToShowUserName($id_list,
+                $operator, 'schedule');
+            foreach ($admin_infos as $id => $admin_info) {
+                if (array_key_exists($id, $admin_infos)
+                    && array_key_exists("col_valid", $admin_infos[$id])
+                    && ! is_null($admin_infos[$id]["col_valid"])
+                ) {
+                    continue;
+                }
+                if (array_key_exists($id, $admin_infos)
+                    && array_key_exists("col_using_app", $admin_infos[$id])
+                    && is_null($admin_infos[$id]["col_using_app"])
+                ) {
+                    continue;
+                }
+                $forward_mail_info = $this->getForwardMailInfo($id, true);
+                $admin_obj = $uum->getUser($id);
+                if (is_null($forward_mail_info)) {
+                    continue;
+                }
+                $facility_name
+                    = array_key_exists($forward_mail_info["languageCode"],
+                    $facility_multi_lang_name)
+                    ? $facility_multi_lang_name[$forward_mail_info["languageCode"]]
+                    : $approval_facilities_names[$faid];
+                $user_name_lang = $forward_mail_info["userNameLanguage"];
+                if ( ! array_key_exists($user_name_lang, $creator_name_cache)) {
+                    $creator_name_cache[$user_name_lang]
+                        = $uum->getNameOf($admin_obj, $login_info, true);
+                }
+                $mail_list_key = $forward_mail_info["languageCode"]
+                                 . $forward_mail_info["longDateFormat"]
+                                 . $forward_mail_info["shortDateFormat"]
+                                 . $forward_mail_info["timeFormat"]
+                                 . $forward_mail_info["charset"]
+                                 . $user_name_lang . $faid;
+                if ( ! array_key_exists($mail_list_key, $mail_list)) {
+                    $mail_list[$mail_list_key] = [
+                        "languageCode"    => $forward_mail_info["languageCode"],
+                        "longDateFormat"  => $forward_mail_info["longDateFormat"],
+                        "shortDateFormat" => $forward_mail_info["shortDateFormat"],
+                        "timeFormat"      => $forward_mail_info["timeFormat"],
+                        "charset"         => $forward_mail_info["charset"],
+                        "subject"         => $this->getForwardFacilityRelyMailSubject($facility_name,
+                            $forward_mail_info["languageCode"]),
+                        "content"         => $this->getForwardFacilityRelyMailContent($facility_name,
+                            $event, $forward_mail_info, $operator,
+                            $creator_name_cache[$user_name_lang]),
+                        "mailAddress"     => [],
+                    ];
+                }
+                $mail_list[$mail_list_key]["mailAddress"][]
+                    = $forward_mail_info["mailAddress"];
+            }
+        }
+        if (count($mail_list) == 0) {
+            return false;
+        }
+
+        return $this->_sendForwardMail($mail_list);
+    }
+
+    /**
+     * Get user information.
+     *
+     * @param CB_User $user
+     *
+     * @return array
+     */
+    function getUserInfo($user)
+    {
+        $user_info = [];
+        $user_info_column = [
+            'col_display_name'          => 'display_name',
+            'col_valid'                 => 'valid',
+            'col_display_name_language' => 'display_name_language',
+            'col_nickname'              => 'nickname',
+            'col_position'              => 'position',
+            'col_foreign_key'           => 'foreign_key'
+        ];
+        foreach ($user_info_column as $col => $val) {
+            $user_info[$col] = $user->get($val);
+        }
+
+        return $user_info;
+    }
+
+    /**
+     * Get facility rely email address.
+     *
+     * @param CB_User $user
+     *
+     * @return mixed     false when not receive facility rely mail;string when receive mail and there's mail address
+     */
+    function _getFowardFacilityRelyMailAddress(& $user)
+    {
+        if ( ! is_a($user, 'CB_User')) {
+            return false;
+        }
+
+        require_once('schedule/personal_logic.csp');
+        $personal_logic = GRN_Schedule_PersonalLogic::getInstance();
+
+        // 転送する設定になっているかどうか
+        if ( ! $personal_logic->getForwardFacilityRelyMail($user)) {
+            return false;
+        }
+
+        return $this->_getMailAddress($user, $personal_logic);
+    }
+
+    /**
+     * Get subject of facility rely mail.
+     *
+     * @param string $title
+     * @param string $locale
+     *
+     * @return string
+     */
+    function getForwardFacilityRelyMailSubject($title, $locale = null)
+    {
+        $str = $this->cb_msg('grn.schedule',
+            'forawrd_facility_rely_mail_title',
+            ['title' => $title],
+            $locale);
+
+        return html_entity_decode($str);
+    }
+
+    /**
+     * Get content of facility rely mail.
+     *
+     * @param string                   $facility_name
+     * @param GRN_Schedule_NormalEvent $event
+     * @param array                    $forward_mail_info
+     * @param CB_User                  $operator
+     * @param string                   $creator_name
+     *
+     * @return string
+     */
+    function getForwardFacilityRelyMailContent(
+        $facility_name,
+        & $event,
+        $forward_mail_info,
+        $operator,
+        $creator_name
+    ) {
+        $str = '';
+        // 施設名
+        $str .= $this->cb_msg('grn.schedule',
+            'forawrd_facility_rely_mail_facility',
+            ['facility' => $facility_name],
+            $forward_mail_info['languageCode']);
+        // 日付
+        $str .= $this->getFacilityUseTime($event, $forward_mail_info["userId"],
+            $forward_mail_info["languageCode"], $operator);
+        // 利用目的
+        $str .= $this->cb_msg('grn.schedule',
+            'forawrd_facility_rely_mail_purpose',
+            ['purpose' => $event->usingPurpose],
+            $forward_mail_info["languageCode"]);
+        // 予定登録者
+        $str .= $this->cb_msg('grn.schedule',
+            'forawrd_facility_rely_mail_creator',
+            ['creator' => $creator_name],
+            $forward_mail_info["languageCode"]);
+
+        return html_entity_decode($str);
+    }
+
+    /**
+     * Get facility use time.
+     *
+     * @param GRN_Schedule_NormalEvent $event
+     * @param string                   $user_id
+     * @param string                   $locale
+     * @param CB_User                  $operator
+     *
+     * @return string
+     */
+    function getFacilityUseTime(& $event, $user_id, $locale = null, $operator)
+    {
+        $eventDatetimeTemplate = 'forawrd_facility_mail_time';
+        $format_id = '';
+        $params = [];
+        require_once('schedule/view_util.csp');
+        require_once('fw/i18n.csp');
+        $event_timezone = $event->timezone;
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $user = $uum->getUser($user_id);
+        $userTimezone = CB_I18n::getUserTimezone($user);
+        if (($event->getEventType() & GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+            == GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+        ) {
+            $format_id = 'event_date_YMDW_HM_YMDW_HM_all';
+            $tmp_start_date = new CB_Date();
+            $tmp_start_date->parse($event->setdatetime->format());
+            $tmp_start_datetime
+                = CB_DateTimeEx::createByDateAndTime($tmp_start_date,
+                GRN_Schedule_View_Util::getAlldayStartTime());
+            if ($event->enddatetime) {
+                $tmp_end_date = new CB_Date();
+                $tmp_end_date->parse($event->enddatetime->format());
+                $tmp_end_datetime
+                    = CB_DateTimeEx::createByDateAndTime($tmp_end_date,
+                    GRN_Schedule_View_Util::getAlldayEndTime());
+            }
+        } else {
+            $tmp_start_datetime = $event->setdatetime;
+            if ($event->enddatetime) {
+                $format_id = 'event_date_YMDW_HM_YMDW_HM';
+                $tmp_end_datetime = $event->enddatetime;
+            } else {
+                $format_id = 'event_date_YMDW_HM';
+            }
+        }
+
+        $params['setdate'] = cb_date_format("DateFull_YMDW",
+            CB_I18N::translateDatetimeTimezone($tmp_start_datetime,
+                $event_timezone, $userTimezone), $user_id, null,
+            $locale);
+        $params['settime'] = cb_date_format("TimeShort_HM",
+            CB_I18N::translateDatetimeTimezone($tmp_start_datetime,
+                $event_timezone, $userTimezone), $user_id, null,
+            $locale);
+        if ($event->enddatetime) {
+            $params['enddate'] = cb_date_format("DateFull_YMDW",
+                CB_I18N::translateDatetimeTimezone($tmp_end_datetime,
+                    $event_timezone, $userTimezone), $user_id, null,
+                $locale);
+            $params['endtime'] = cb_date_format("TimeShort_HM",
+                CB_I18N::translateDatetimeTimezone($tmp_end_datetime,
+                    $event_timezone, $userTimezone), $user_id, null,
+                $locale);
+        }
+
+        return $this->cb_msg('grn.schedule', $eventDatetimeTemplate,
+            [
+                'date' => $this->cb_msg('grn.schedule', $format_id, $params,
+                    $locale)
+            ], $locale);
+    }
+
+    /**
+     * Forward facility result(approve/reject) mail
+     *
+     * @param grn\schedule\bean\FacilityApproval $fa
+     *
+     * @return boolean                              成功した場合はTRUEそれ以外はFALSE
+     */
+    function forwardFacilityResultMail(grn\schedule\bean\FacilityApproval $fa)
+    {
+        $event = $fa->getEvent();
+
+        $facility_id = $fa->getFacility();
+        require_once('schedule/facility_system_logic.csp');
+        $fsl = GRN_Facility_SystemLogic::getInstance();
+        $facility = $fsl->getFacility($facility_id);
+        if ( ! is_a($event, 'GRN_Schedule_NormalEvent')
+             || ! is_a($event->creator, 'CB_User')
+        ) {
+            return false;
+        }
+        $creator_id = $event->creator->getOID();
+        require_once('fw/mail_message.csp');
+        $forward_mail_info = $this->getForwardMailInfo($creator_id);
+        if (is_null($forward_mail_info)) {
+            return false;
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login = $uum->getLoginUser();
+        if ($login->getOID() == $creator_id) {
+            return false;
+        }
+        require_once('grn/controller.csp');
+        $user_info
+            = GRN_ControllerUtil::getUserInfoToShowUserName([$creator_id],
+            $login, 'schedule');
+        if (count($user_info) == 0) {
+            return false;
+        }
+        if (array_key_exists($creator_id, $user_info)
+            && array_key_exists("col_valid", $user_info[$creator_id])
+            && ! is_null($user_info[$creator_id]["col_valid"])
+        ) {
+            return false;
+        }
+        if (array_key_exists($creator_id, $user_info)
+            && array_key_exists("col_using_app", $user_info[$creator_id])
+            && is_null($user_info[$creator_id]["col_using_app"])
+        ) {
+            return false;
+        }
+        $dynamic_roles = $uum->listGrantedRoles();
+        require_once('schedule/access_logic.csp');
+        $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+        $access = $acc_logic->getEventAccess($event->creator, $event,
+            ['read'], $dynamic_roles);
+        if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+            return false;
+        }
+
+        require_once('schedule/facility_system_logic.csp');
+        $facility_logic = GRN_Facility_SystemLogic::getInstance();
+        $facility_multi_lang_name
+            = $facility_logic->createFacilityMultiLanguageValuesArray($facility->getOID());
+        $facility_name
+            = array_key_exists($forward_mail_info["languageCode"],
+            $facility_multi_lang_name)
+            ? $facility_multi_lang_name[$forward_mail_info["languageCode"]]
+            : $facility->get('name');
+
+        $login_info = $this->getUserInfo($login);
+        $approver_name = $uum->getNameOf($event->creator, $login_info, true);
+
+        $mail = [
+            "languageCode"    => $forward_mail_info["languageCode"],
+            "longDateFormat"  => $forward_mail_info["longDateFormat"],
+            "shortDateFormat" => $forward_mail_info["shortDateFormat"],
+            "timeFormat"      => $forward_mail_info["timeFormat"],
+            "charset"         => $forward_mail_info["charset"],
+            "subject"         => $this->getForwardFacilityResultMailSubject($facility_name,
+                $fa, $forward_mail_info["languageCode"]),
+            "content"         => $this->getForwardFacilityResultMailContent($facility_name,
+                $event, $fa, $forward_mail_info, $login, $approver_name),
+            "mailAddress"     => [$forward_mail_info["mailAddress"]],
+        ];
+
+        return $this->_sendForwardMail([$mail]);
+    }
+
+    /**
+     * Get the subject of facility result mail.
+     *
+     * @param string                             $title
+     * @param grn\schedule\bean\FacilityApproval $fa
+     * @param string                             $locale
+     *
+     * @return string
+     */
+    function getForwardFacilityResultMailSubject(
+        $title,
+        grn\schedule\bean\FacilityApproval $fa,
+        $locale = null
+    ) {
+        $str = $this->cb_msg('grn.schedule',
+            'forawrd_facility_result_mail_title',
+            [
+                'result' => $fa->getStatus()
+                    ? $this->cb_msg('grn.schedule',
+                        'forawrd_facility_result_approve', null, $locale)
+                    : $this->cb_msg('grn.schedule',
+                        'forawrd_facility_result_reject', null, $locale),
+                'title'  => $title
+            ],
+            $locale);
+
+        return html_entity_decode($str);
+    }
+
+    /**
+     * Get content of facility result mail.
+     *
+     * @param string                             $facility_name
+     * @param GRN_Schedule_NormalEvent           $event
+     * @param grn\schedule\bean\FacilityApproval $fa
+     * @param array                              $forward_mail_info
+     * @param CB_User                            $operator
+     * @param string                             $approver_name
+     *
+     * @return string
+     */
+    function getForwardFacilityResultMailContent(
+        $facility_name,
+        & $event,
+        grn\schedule\bean\FacilityApproval $fa,
+        $forward_mail_info,
+        $operator,
+        $approver_name
+    ) {
+        $str = '';
+        // 施設
+        $str .= $this->cb_msg('grn.schedule',
+            'forawrd_facility_result_mail_facility',
+            ['facility' => $facility_name],
+            $forward_mail_info['languageCode']);
+        // 日付
+        $str .= $this->getFacilityUseTime($event, $forward_mail_info["userId"],
+            $forward_mail_info["languageCode"], $operator);
+        // スケジュールタイトル
+        $str .= $this->cb_msg('grn.schedule',
+            'forawrd_facility_result_mail_schedule_title',
+            ['title' => $event->getTitle()],
+            $forward_mail_info['languageCode']);
+        // ステータス
+        $str .= $this->cb_msg('grn.schedule',
+            'forawrd_facility_result_mail_status',
+            [
+                'status' => $fa->getStatus()
+                    ? $this->cb_msg('grn.schedule',
+                        'forawrd_facility_result_approve', null,
+                        $forward_mail_info['languageCode'])
+                    : $this->cb_msg('grn.schedule',
+                        'forawrd_facility_result_reject', null,
+                        $forward_mail_info['languageCode'])
+            ],
+            $forward_mail_info['languageCode']);
+        // 承認者
+        $str .= $this->cb_msg('grn.schedule',
+            'forawrd_facility_result_mail_approver',
+            ['approver' => $approver_name],
+            $forward_mail_info['languageCode']);
+        // コメント
+        $str .= $this->cb_msg('grn.schedule',
+            'forawrd_facility_result_mail_comment',
+            ['comment' => $fa->getComment()],
+            $forward_mail_info['languageCode']);
+
+        return html_entity_decode($str);
+    }
+}
+
+
+

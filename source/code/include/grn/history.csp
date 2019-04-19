@@ -1,0 +1,392 @@
+<?php
+
+class GRN_Uum_AbstractHistoryManager
+{
+    function _getDBConnection()
+    {
+    }
+
+    function _getDistributedTableName($table_name, $user_id)
+    {
+        return $table_name . CB_PERSISTENT_NAMESEPARATOR
+               . CB_DATABASE_USER_TABLE_PREFIX . ($user_id
+                                                  % cb_get_user_tables());
+    }
+
+    function _getAllDistributedTableNames($table_name)
+    {
+        $ret = [];
+        for ($i = 0; $i < cb_get_user_tables(); $i++) {
+            $ret[] = $table_name . CB_PERSISTENT_NAMESEPARATOR
+                     . CB_DATABASE_USER_TABLE_PREFIX . $i;
+        }
+
+        return $ret;
+    }
+
+    /**
+     * よく使う組織/施設グループを取得する
+     */
+    function _getOftenusedTargets($target_name, $user_id)
+    {
+        $ret = [];
+        $db = $this->_getDBConnection();
+        $table_prefix = $this->_getTablePrefix();
+
+        global $G_config_common;
+        if ($G_config_common->get('Database', 'merged')) {
+            $table_name = "tab_grn_{$table_prefix}_oftenused{$target_name}s";
+        } else {
+            $table_name
+                = $this->_getDistributedTableName("tab_grn_{$table_prefix}_oftenused{$target_name}s",
+                $user_id);
+        }
+        $query = "SELECT col_target FROM " . $table_name . " WHERE col_user = '"
+                 . $db->escape($user_id) . "' ORDER BY col_order;";
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        while (($row = $db->fetch_assoc($result)) !== false) {
+            $ret[] = $row['col_target'];
+        }
+        $db->free_result($result);
+
+        return $ret;
+    }
+
+    /**
+     * よく使う組織/施設グループを設定する
+     */
+    function _setOftenusedTargets($target_name, $user_id, $target_ids)
+    {
+        $db = $this->_getDBConnection();
+        $table_prefix = $this->_getTablePrefix();
+
+        global $G_config_common;
+        if ($G_config_common->get('Database', 'merged')) {
+            $table_name = "tab_grn_{$table_prefix}_oftenused{$target_name}s";
+        } else {
+            $table_name
+                = $this->_getDistributedTableName("tab_grn_{$table_prefix}_oftenused{$target_name}s",
+                $user_id);
+        }
+        $delete_query = cb_queryf($db,
+            "DELETE FROM {$table_name} WHERE col_user = '@S';", $user_id);
+        $result = $db->query($delete_query);
+        if ($result === false) {
+            $db->throwError(['query' => 'query failed: ' . $delete_query]);
+        }
+
+        $insert_query_template = "INSERT INTO {$table_name} SET col_user=\""
+                                 . $db->escape($user_id)
+                                 . "\", col_target=\"%s\", col_order=\"%s\";";
+        for ($i = 0; $i < count($target_ids); $i++) {
+            $insert_query = sprintf($insert_query_template,
+                $db->escape($target_ids[$i]), $db->escape($i));
+            $result = $db->query($insert_query);
+            if ($result === false) {
+                $db->throwError(['query' => 'query failed: ' . $insert_query]);
+            }
+        }
+    }
+
+    function _getHistoryTargets($target_name, $user_id, $limit = -1)
+    {
+        $db = $this->_getDBConnection();
+        $table_prefix = $this->_getTablePrefix();
+
+        global $G_config_common;
+        if ($G_config_common->get('Database', 'merged')) {
+            $table_name = "tab_grn_{$table_prefix}_{$target_name}history";
+        } else {
+            $table_name
+                = $this->_getDistributedTableName("tab_grn_{$table_prefix}_{$target_name}history",
+                $user_id);
+        }
+
+        $query
+            = sprintf("SELECT col_target FROM {$table_name} WHERE col_user='%s' ORDER BY col_last_selected DESC",
+            $db->escape($user_id));
+        $query = $db->select_format($query, 0, $limit, CB_DATABASE_NO_LOCK);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'query failed: ' . $query]);
+        }
+        $ret = [];
+        while (($row = $db->fetch_assoc($result))) {
+            $ret[] = $row['col_target'];
+        }
+        $db->free_result($result);
+
+        return $ret;
+    }
+
+    function _selectTargets($target_name, $user_id, $target_ids)
+    {
+        if ( ! is_array($target_ids) || count($target_ids) == 0) {
+            return;
+        }
+        $target_ids = array_unique($target_ids);
+        $db = $this->_getDBConnection();
+        $table_prefix = $this->_getTablePrefix();
+
+        global $G_config_common;
+        if ($G_config_common->get('Database', 'merged')) {
+            $table_name = "tab_grn_{$table_prefix}_{$target_name}history";
+        } else {
+            $table_name
+                = $this->_getDistributedTableName("tab_grn_{$table_prefix}_{$target_name}history",
+                $user_id);
+        }
+
+        $stored_ids = $this->_getHistoryTargets($target_name, $user_id);
+        $insert_ids = [];
+        $update_ids = [];
+
+        // $now is value that used when order by col_last_selected to delete residual items
+        $now = time();
+
+        foreach ($target_ids as $target_id) {
+            if ($target_id && is_numeric($target_id)) {
+                if (array_search($target_id, $stored_ids) === false) {
+                    $stored_ids[] = $target_id;
+                    $insert_ids[] = ['target_id' => $target_id, 'now' => $now];
+                } else {
+                    $update_ids[] = ['target_id' => $target_id, 'now' => $now];
+                }
+                $now = $now + 1;
+            }
+        }
+
+        $this->_insertTargets($target_name, $user_id, $insert_ids);
+        $this->_updateTargets($target_name, $user_id, $update_ids);
+
+        $count = count(array_unique($stored_ids));
+        $max_count = $this->_getMaxHistory($user_id, $target_name);
+
+        if ($count > $max_count) {
+            $query = "DELETE FROM {$table_name} WHERE col_user='"
+                     . $db->escape($user_id)
+                     . "' ORDER BY col_last_selected LIMIT " . ($count
+                                                                - $max_count);
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError(['query' => 'query failed: ' . $query]);
+            }
+        }
+    }
+
+    function _updateTargets($target_name, $user_id, $target_ids)
+    {
+        if ( ! is_array($target_ids) || count($target_ids) == 0) {
+            return;
+        }
+
+        $db = $this->_getDBConnection();
+        $table_prefix = $this->_getTablePrefix();
+
+        global $G_config_common;
+        if ($G_config_common->get('Database', 'merged')) {
+            $table_name = "tab_grn_{$table_prefix}_{$target_name}history";
+        } else {
+            $table_name
+                = $this->_getDistributedTableName("tab_grn_{$table_prefix}_{$target_name}history",
+                $user_id);
+        }
+
+        foreach ($target_ids as $target_id) {
+            $query
+                = "UPDATE {$table_name} SET col_last_selected = {$target_id['now']} "
+                  . " WHERE col_user = " . cb_queryf($db, '"@S"', $user_id)
+                  . " AND col_target = " . cb_queryf($db, '"@S"',
+                    $target_id['target_id']) . ";";
+
+            $result = $db->query($query);
+
+            if ($result === false) {
+                $db->throwError(['query' => 'query failed: ' . $query]);
+            }
+        }
+    }
+
+    function _insertTargets($target_name, $user_id, $target_ids)
+    {
+        if ( ! is_array($target_ids) || count($target_ids) == 0) {
+            return;
+        }
+
+        $db = $this->_getDBConnection();
+        $table_prefix = $this->_getTablePrefix();
+
+        global $G_config_common;
+        if ($G_config_common->get('Database', 'merged')) {
+            $table_name = "tab_grn_{$table_prefix}_{$target_name}history";
+        } else {
+            $table_name
+                = $this->_getDistributedTableName("tab_grn_{$table_prefix}_{$target_name}history",
+                $user_id);
+        }
+
+        $query
+            = "INSERT INTO {$table_name} (col_user, col_target, col_last_selected ) VALUES";
+        $query_values = [];
+        foreach ($target_ids as $target_id) {
+            $query_values[] = '("' . $db->escape($user_id) . '","'
+                              . $db->escape($target_id['target_id']) . '", '
+                              . $target_id['now'] . ' )';
+        }
+        if (count($query_values) <= 0) {
+            return;
+        }
+
+        $query .= implode(',', $query_values);
+        $query .= " ON DUPLICATE KEY UPDATE col_last_selected=VALUES(col_last_selected)";
+
+        $result = $db->query($query);
+
+        if ($result === false) {
+            $db->throwError(['query' => 'query failed: ' . $query]);
+        }
+    }
+
+    function _clearHistoryTarget($target_name, $user_id)
+    {
+        $db = $this->_getDBConnection();
+        $table_prefix = $this->_getTablePrefix();
+        global $G_config_common;
+        if (is_null($user_id)) {
+            if ($G_config_common->get('Database', 'merged')) {
+                $table_name = "tab_grn_{$table_prefix}_{$target_name}history";
+                $query = "DELETE FROM {$table_name};";
+                $result = $db->query($query);
+                if ($result === false) {
+                    $db->throwError(['query' => 'query failed: ' . $query]);
+                }
+            } else {
+                $table_names
+                    = $this->_getAllDistributedTableNames("tab_grn_{$table_prefix}_{$target_name}history");
+                foreach ($table_names as $table_name) {
+                    $query = "DELETE FROM {$table_name};";
+                    $result = $db->query($query);
+                    if ($result === false) {
+                        $db->throwError(['query' => 'query failed: ' . $query]);
+                    }
+                }
+            }
+        } else {
+            $escaped_user_id = $db->escape($user_id);
+            if ($G_config_common->get('Database', 'merged')) {
+                $table_name = "tab_grn_{$table_prefix}_{$target_name}history";
+            } else {
+                $table_name
+                    = $this->_getDistributedTableName("tab_grn_{$table_prefix}_{$target_name}history",
+                    $user_id);
+            }
+            $query = "DELETE FROM {$table_name} WHERE col_user=\""
+                     . $escaped_user_id . '";';
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError(['query' => 'query failed: ' . $query]);
+            }
+        }
+    }
+}
+
+class GRN_Uum_HistoryManager extends GRN_Uum_AbstractHistoryManager
+{
+    /**
+     * @return GRN_Uum_HistoryManager
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_Uum_HistoryManager();
+        }
+
+        return $_instance;
+    }
+
+    function _getDBConnection()
+    {
+        global $G_container_base;
+
+        return $G_container_base->getInstance('dbconn');
+    }
+
+    function _getTablePrefix()
+    {
+        return 'user';
+    }
+
+    /**
+     * よく使うグループを取得
+     */
+    function getOftenusedGroups($user_id)
+    {
+        return $this->_getOftenusedTargets('group', $user_id);
+    }
+
+    /**
+     * よく使うグループを設定
+     */
+    function setOftenusedGroups($user_id, $group_ids)
+    {
+        $this->_setOftenusedTargets('group', $user_id, $group_ids);
+    }
+
+    function getGroupHistory($user_id, $limit = -1)
+    {
+        return $this->_getHistoryTargets('group', $user_id, $limit);
+    }
+
+    function getUserHistory($user_id, $limit = -1)
+    {
+        return $this->_getHistoryTargets('user', $user_id, $limit);
+    }
+
+    function selectGroups($user_id, $group_ids)
+    {
+        $this->_selectTargets('group', $user_id, $group_ids);
+    }
+
+    function selectUsers($user_id, $user_ids)
+    {
+        $this->_selectTargets('user', $user_id, $user_ids);
+    }
+
+    function clearGroupHistory($user_id = null)
+    {
+        $this->_clearHistoryTarget('group', $user_id);
+    }
+
+    function clearUserHistory($user_id = null)
+    {
+        $this->_clearHistoryTarget('user', $user_id);
+    }
+
+    function _getMaxHistory($user_id, $target_name)
+    {
+        assert('in_array( $target_name, array( \'user\', \'group\' ) )');
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $user = $uum->getUser($user_id);
+
+        require_once('grn/ui.csp');
+        $manager = GRN_UIConfigManager::getInstance();
+        $config = $manager->getUserConfig($user);
+
+        switch ($target_name) {
+            case 'user':
+                return $config->getMaxHistoryUser();
+                break;
+            case 'group':
+                return $config->getMaxHistoryGroup();
+        }
+    }
+}

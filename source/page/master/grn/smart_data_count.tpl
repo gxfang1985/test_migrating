@@ -1,0 +1,1 @@
+( {$start_num}-{$end_num} {cb_msg module='grn.grn' key='GRN_GRN-115' replace='true'} {$all_num} {cb_msg module='grn.grn' key='GRN_GRN-114' replace='true'} )

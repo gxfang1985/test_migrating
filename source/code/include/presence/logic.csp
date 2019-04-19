@@ -1,0 +1,447 @@
+<?php
+require_once('presence/access_logic.csp');
+require_once('presence/error_code.csp');
+
+/*
+ * Presence logic
+ */
+
+class GRN_Presence_Logic
+{
+    private static $_instance = null;
+
+    private function __construct()
+    {
+        $this->dao = \grn\presence\dao\PresenceDao::getInstance();
+    }
+
+    /**
+     * @return GRN_Presence_Logic
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * check active Presence Application
+     *
+     * @return bool
+     */
+    function isActivePresence()
+    {
+        require_once('grn/application.csp');
+        $locator = GRN_ApplicationLocator::instance();
+
+        return $locator->isActive('presence');
+    }
+
+    /**
+     * @param CB_User $user
+     *
+     * @return array
+     */
+    function getAccess(& $user)
+    {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login_user = $uum->getLoginUser();
+
+        $access_logic = GRN_Presence_Access_Logic::getInstance();
+        $access = $access_logic->evaluateAccessForPresence($login_user,
+            $user);
+
+        return $access;
+    }
+
+    /**
+     * @param string $uid
+     * @param bool   $throw_error
+     * @param array  $users_info
+     *
+     * @return bool
+     */
+    function checkAccessModify($uid, $throw_error = true, $users_info = [])
+    {
+        //get login user
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+
+        $has_error = false;
+        $error_code = null;
+
+        //get user own presence information
+        $user = $uum->getUser($uid, false);
+        // exist user
+        if ( ! $user) {
+            $has_error = true;
+            $error_code = E_GRN_USER_NOT_FOUND;
+        }
+
+        // disabled user
+        if ( ! $has_error) {
+            if (array_key_exists($uid, $users_info)
+                && array_key_exists('col_valid', $users_info[$uid])
+            ) {
+                $active_user = is_null($users_info[$uid]['col_valid']) ? true
+                    : false;
+            } else {
+                $active_user = $uum->isActiveUser($uid);
+            }
+            if ( ! $active_user) {
+                $has_error = true;
+                $error_code = E_GRN_USER_DISABLED;
+            }
+        }
+
+        // check access modify authority
+        if ( ! $has_error) {
+            $access = $this->getAccess($user);
+            if ( ! $access) {
+                $has_error = true;
+                $error_code = E_GRN_PRESENCE_ACCESSDENY_MODIFY;
+            }
+        }
+
+        // not authority
+        if ($has_error) {
+            if ($throw_error) {
+                cb_throw_error($error_code);
+            } else {
+                return false;
+            }
+        } else {
+            return true;
+        }
+    }
+
+    /**
+     * @param string $uid
+     *
+     * @return array|null
+     */
+    function _getPresence($uid)
+    {
+        $presence_info = $this->dao->getPresence($uid);
+        if ( ! $presence_info) {
+            return null;
+        }
+
+        $mtime = new CB_TimeStamp();
+        $mtime->unix_ts = (int)$presence_info['col_mtime'];
+
+        return [
+            'status' => $presence_info['col_status'],
+            'memo'   => $presence_info['col_memo'],
+            'mode'   => $presence_info['col_mode'],
+            'mtime'  => $mtime
+        ];
+    }
+
+    /**
+     * Get Presence information for view
+     *
+     * @param string $uid
+     * @param array  $users_info
+     *
+     * @return array
+     */
+    function getPresence($uid, $users_info = [])
+    {
+        // Presence stop then not get
+        if ( ! $this->isActivePresence()) {
+            return null;
+        }
+
+        // not facility or group with schedule
+        if ( ! is_numeric($uid)) {
+            return null;
+        }
+
+        // presence to view
+        $mtime = null;
+        $status = '';
+        $memo = '';
+        $mode = '';
+
+        // get current presence
+        $presence_data = $this->_getPresence($uid);
+        if ($presence_data) {
+            $status = $presence_data['status'];
+            $memo = $presence_data['memo'];
+            $mode = $presence_data['mode'];
+        }
+
+        // get real info for view
+        $info = cb_msg('grn.presence', 'no_registration');; // default
+        $mtime = null;
+        $status_view = $status;
+        $memo = (trim($memo)) ? $memo : '';
+        if ($status || $memo) {
+            // get real status for view
+            if ($mode === 'default') {
+                if ($status === 'attend') {
+                    $status_view = cb_msg('grn.presence', 'attend');
+                } else {
+                    $status_view = cb_msg('grn.presence', 'absence');
+                }
+            }
+
+            $info = $status_view;
+            if ((0 < strlen($status)) && (0 < strlen($memo))) {
+                $info .= cb_msg('grn.presence', 'attendee_separator');
+            }
+            $info .= $memo;
+            $mtime = $presence_data['mtime'];
+        }
+
+        // get current time start today
+        $start_today_time = new CB_TimeStampEx();
+        $current_date = $start_today_time->getDateTime();
+        $current_date->hour = 0;
+        $current_date->minute = 0;
+        $current_date->second = 0;
+        $start_today_time->setDateTime($current_date);
+
+        // specify this is old or new attendee
+        $old = false;
+        if ($mtime && $start_today_time->compare($mtime) > 0) {
+            $old = true;
+        }
+
+        // check access modify authority
+        $authority_modify = $this->checkAccessModify($uid, false, $users_info);
+        $disable_modify = ! $authority_modify;
+
+        // return
+        $ret = [];
+        $ret['uid'] = $uid;
+        $ret['page'] = 'presence/modify';
+        $ret['image'] = 'presence20.png';
+        $ret['info'] = $info;
+        $ret['status'] = $status;
+        $ret['status_view'] = $status_view;
+        $ret['memo'] = $memo;
+        $ret['mode'] = $mode;
+        $ret['mtime'] = $mtime;
+        $ret['old'] = $old;
+        $ret['disabled'] = $disable_modify;
+
+        return $ret;
+    }
+
+    /**
+     * write presence info and write log.
+     *
+     * @param string       $uid           id of user owner presence info
+     * @param array        $presence_info array('status'=>'','memo'=>'','mode'=>'default/custom')
+     * @param CB_TimeStamp $time
+     * @param bool         $write_log     yes/no
+     */
+    function setPresence($uid, $presence_info, $time, $write_log = true)
+    {
+        // Presence stop then not set
+        if ( ! $this->isActivePresence()) {
+            return;
+        }
+
+        $this->dao->setPresence($uid, $presence_info, $time);
+
+        //write log
+        if ($write_log) {
+            //convert presence info to writtable log format
+            $presence_info_for_log
+                = $this->_convertPresenceInfoToLogFormat($presence_info);
+            $login_user = cb_get_login_user();
+            $this->writeLog('modify', 'presence information',
+                [
+                    'mid'  => $login_user->getOID(),
+                    'uid'  => $uid,
+                    'info' => $presence_info_for_log
+                ]);
+        }
+    }
+
+    function _convertPresenceInfoToLogFormat($presence_info)
+    {
+        $mode = $presence_info['mode'];
+        $status = $presence_info['status'];
+        $memo = $presence_info['memo'];
+
+        $info = cb_msg('grn.presence', 'no_registration'); // default
+        $status_view = $status;
+        $memo = (trim($memo)) ? $memo : '';
+
+        if ($status || $memo) {
+            // get real status for view
+            if ($mode === 'default') {
+                if ($status === 'attend') {
+                    $status_view = cb_msg('grn.presence', 'attend');
+                } else {
+                    $status_view = cb_msg('grn.presence', 'absence');
+                }
+            }
+
+            $info = $status_view;
+            if ((0 < strlen($status)) && (0 < strlen($memo))) {
+                $info .= cb_msg('grn.presence', 'attendee_separator');
+            }
+            $info .= $memo;
+        }
+
+        return $info;
+    }
+
+    /**
+     * Write presence with check for modify presence
+     *
+     * @param string $uid    id of user owner presence info
+     * @param string $status (default:attend/absence, custom:xxx)
+     * @param string $memo
+     */
+    function setPresenceWithCheck($uid, $status, $memo)
+    {
+        // get user
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+        $user =& $uum->getUser($uid, false);
+
+        $status_write = '';
+        $mode = '';
+        // check status
+        if ($status) {
+            if ($status === 'default:attend') {
+                $status_write = 'attend';
+                $mode = 'default';
+            } elseif ($status === 'default:absence') {
+                $status_write = 'absence';
+                $mode = 'default';
+            } else // custom form PE and SYS
+            {
+                if (strpos($status, 'custom:') === 0) {
+                    $status_input = substr($status, strlen('custom:'));
+
+                    require_once('presence/config.csp');
+                    $config_manager = GRN_Presence_ConfigManager::getInstance();
+                    $personal_config
+                        =& $config_manager->getPersonalConfig($user);
+                    $system_config =& $config_manager->getSystemConfig();
+                    $pe_sys_status
+                        = array_merge($system_config->getStatuses(),
+                        $personal_config->getStatuses());
+
+                    if (false !== array_search($status_input, $pe_sys_status)) {
+                        $status_write = $status_input;
+                        $mode = 'custom';
+                    }
+                }
+            }
+        }
+
+        // check write or no
+        $memo = (trim($memo)) ? $memo : '';
+        global $G_INPUT;
+        if ($status_write || array_key_exists('memo', $G_INPUT)) {
+            $presence_info = [
+                'status' => $status_write,
+                'memo'   => $memo,
+                'mode'   => $mode
+            ];
+
+            $mtime = new CB_TimeStamp();
+            $mtime->unix_ts = time();
+
+            $this->setPresence($uid, $presence_info, $mtime);
+        }
+    }
+
+    /**
+     * Write log
+     *
+     * @param string $action
+     * @param string $msg
+     * @param array  $params
+     */
+    function writeLog($action, $msg, $params)
+    {
+        require_once('grn/logger.csp');
+        $lm = CB_LoggerManager::getInstance();
+        $logger =& $lm->getLogger('grn.presence');
+        $logger->noticeEx($action, $msg, $params);
+    }
+
+    /**
+     * get previous page info from session
+     *
+     * @return array
+     */
+    function getPreviousPage()
+    {
+        require_once('fw/session_manager.csp');
+        $session_manager = CB_SessionManager::getInstance();
+        $session =& $session_manager->getSession('grn.common.presence');
+        $param_list = $session->get('param_list');
+        if ($param_list) {
+            $page = $param_list['page'];
+            // portlet
+            if (strpos($page, '/portlet/') !== false) {
+                require_once('grn/application.csp');
+                $locator = GRN_ApplicationLocator::instance();
+                // get app name
+                $page_title = htmlspecialchars($locator->getName('portal'));
+                $param_list['page'] = 'portal/index';
+                $param_list['name'] = $page_title;
+            } else // normal page
+            {
+                $param_list['name']
+                    = grn_get_page_display_name($param_list['page']);
+            }
+        } else // access url directly
+        {
+            $param_list['page'] = 'address/user_list';
+            $param_list['name']
+                = grn_get_page_display_name($param_list['page']);
+        }
+
+        return $param_list;
+    }
+
+    /**
+     * write previous page info to session
+     *
+     * @param array
+     */
+    function setPreviousPage($previous_page, $input_params = [])
+    {
+        require_once('fw/session_manager.csp');
+        $session_manager = CB_SessionManager::getInstance();
+        $session = $session_manager->getSession('grn.common.presence');
+        $param_list = $input_params;
+        global $G_INPUT;
+        if (array_key_exists('sp', $G_INPUT)) {
+            require_once('grn/controller.csp');
+            $controller_util = new GRN_ControllerUtil();
+            $offset = $controller_util->getNaviStartPosition();
+            $param_list['sp'] = $offset;
+        }
+        if (array_key_exists('sf', $G_INPUT)) {
+            $param_list['sf'] = $G_INPUT['sf'];
+        }
+        $param_list['page'] = $previous_page;
+        $session->set('param_list', $param_list);
+    }
+
+    /**
+     * @param string[] $user_id_list
+     */
+    public function loadAndCache($user_id_list)
+    {
+        $this->dao->loadAndCache($user_id_list);
+    }
+}
+

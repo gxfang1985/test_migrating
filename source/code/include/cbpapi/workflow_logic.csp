@@ -1,0 +1,2564 @@
+<?php
+require_once('workflow/resources.csp');
+require_once('workflow/controller_util.csp');
+require_once('workflow/error_code.csp');
+
+class GRN_CBPApi_Workflow_Logic
+{
+    /**
+     * @return GRN_CBPApi_Workflow_Logic
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_CBPApi_Workflow_Logic();
+        }
+
+        return $_instance;
+    }
+
+    var $_dbconn = null;
+
+    function _getDBConnection()
+    {
+        if (is_null($this->_dbconn)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->_dbconn = $app_locator->getConnection('workflow');
+        }
+
+        return $this->_dbconn;
+    }
+
+    function getAppsForViewByIds(
+        &$login,
+        $application_id_list,
+        $folder = [],
+        $lock_path_step = CB_DATABASE_DEFAULT_LOCK
+    ) {
+        if ( ! is_array($application_id_list)
+             || count($application_id_list) <= 0
+        ) {
+            return [];
+        }
+        $applications_for_view = [];
+        $user_id = $login->getOID();
+        foreach ($application_id_list as $key => $app_id) {
+            $agent_id = '';
+            $folder_type = '';
+            $folder_id = '';
+            $folder_user_id = '';
+            if ($folder && is_array($folder) && count($folder) > 0) {
+                $folder_type = array_key_exists('col_folder_type', $folder)
+                    ? $folder['col_folder_type'] : '';
+                $folder_id = array_key_exists('_id', $folder)
+                    ? $folder['_id'] : '';
+                $folder_user_id = array_key_exists('col_user', $folder)
+                    ? $folder['col_user'] : '';
+                if ($user_id != $folder_user_id) {
+                    //代理承認の検証
+                    if ($folder_type
+                        == GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID
+                    ) {
+                        require_once('workflow/config.csp');
+                        $configs = GRN_Workflow_Configs::getInstance();
+                        $config = $configs->getSystemConfig();
+                        if ($config->isProxyApproval($user_id,
+                            $folder_user_id)
+                        ) {
+                            // 代理承認
+                            $agent_id = $user_id;
+                            $user_id = $folder_user_id;
+                        }
+                    }
+                }
+            }
+            $petition = [];
+            //Create Parameter Translation Map
+            $translation_map_petition = [
+                'id'                  => '_id',
+                //Petition ID
+                'petition_number'     => 'petition_number',
+                //Petition Number
+                'name'                => 'name',
+                //Petition Name
+                'form'                => 'form',
+                //Petition Form ID
+                'form_name'           => 'form_name',
+                //Petition Form Name
+                'ctime'               => 'ctime',
+                //Petition Create Time
+                'creator'             => 'creator',
+                //Petition Creator
+                'creator_name'        => 'creator_name',
+                //Petition Creator Name
+                'creator_foreign_key' => 'creator_foreign_key',
+                //Petition Creator Foreign Key
+                'status'              => 'status',
+                'transactor'          => 'transactor',
+                'transactor_name'     => 'transactor_name',
+                'user'                => 'user',
+                'user_name'           => 'user_name',
+                'mtime'               => 'mtime',
+                'ptime'               => 'ptime',
+                'priority'            => 'priority',
+                'reapply'             => 'reapply',
+                'agent_user'          => 'agent_user',
+                'agent_user_name'     => 'agent_user_name',
+            ];
+            $petition_util
+                = GRN_Workflow_Petition_Controller_Utility::getInstance();
+
+            //Get Petition for view
+            $petition = $petition_util->getView($app_id,
+                $translation_map_petition);
+
+            // get petition version 
+            $version = array_key_exists('mtime', $petition)
+                ? $petition['mtime']->unix_ts : null;
+            $ptime = array_key_exists('ptime', $petition) ? $petition['ptime']
+                : null;
+            if ( ! is_null($ptime) && $ptime > $version) {
+                $version = $ptime;
+            }
+            $petition['version'] = $version;
+            require_once('cbpapi/util.csp');
+            if (array_key_exists('ctime', $petition)) {
+                $create_time = $petition['ctime'];
+                unset($petition['ctime']);
+                $petition['ctime'] = grn_cbpapi_iso8601($create_time);
+            }
+            // get path step information
+            $path_info = $this->getPathInfoForView($user_id, $app_id, $petition,
+                $folder_id, $lock_path_step);
+
+            $path_steps = $path_info['path_steps'];
+            $in_path = $path_info['in_path'];
+
+            // handle_mode
+            $operation_mode = $path_info['handle_mode'];
+
+            $cancel_confirm = $path_info['cancel_confirm'];
+            // processing_step
+            $controller_util = new GRN_Workflow_ControllerUtil();
+            $in_process = null;
+            $path_steps_current = current($path_steps);
+            $in_process
+                = $controller_util->getInProcessPathStepId($path_steps_current);
+
+            $petition['processing_step'] = intval($in_process);
+
+            $petition['path_steps'] = $path_steps;
+
+            if (array_key_exists('status', $petition)) {
+                $status = $petition['status'];
+                if ($folder_type == GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID
+                    && $status == GRN_WORKFLOW_RESULT_REJECT
+                ) {
+                    if ( ! is_null($agent_id) && strlen($agent_id) > 0) {
+                        if ($petition['user'] == $agent_id
+                            || $petition['agent_user'] == $agent_id
+                        ) {
+                            //この場合は、代理承認での表示を解除する
+                            $user_id = $agent_id;
+                            $agent_id = '';
+                            $folder_id = '';
+                            $operation_mode = 'view_only';
+                        }
+                    }
+                    if ($petition['agent_user'] == ''
+                        || $petition['agent_user'] < 1
+                    ) {
+                        $operation_mode = 'view_only';
+                    } else {
+                        $operation_mode = null;
+                    }
+                }
+                if ($user_id == @ $petition['user']
+                    || $user_id == @ $petition['agent_user']
+                ) {
+                    if ( ! $in_process
+                         && GRN_WORKFLOW_STATUS_REMAND == $petition['status']
+                    ) {
+                        // 申請者本人に差し戻された
+                        $operation_mode = null;
+                    }
+                }
+                $status_type = '';
+                switch ($status) {
+                    case GRN_WORKFLOW_STATUS_UNPROCESSING: // 未処理
+                        $status_type = 'unprocessing';
+                        break;
+                    case GRN_WORKFLOW_STATUS_IN_PROCESS: // 進行中
+                        $status_type = 'inprogress';
+                        break;
+                    case GRN_WORKFLOW_STATUS_ACCEPTANCE: // 承認
+                        $status_type = 'approved';
+                        break;
+                    case GRN_WORKFLOW_STATUS_REJECTION: // 却下
+                        $status_type = 'rejected';
+                        break;
+                    case GRN_WORKFLOW_STATUS_REMAND: // 差し戻し
+                        $status_type = 'sent_back';
+                        break;
+                    case GRN_WORKFLOW_STATUS_UNPROCESSING_CANCEL: // 取り戻し
+                        $status_type = 'withdrawn';
+                        break;
+                    case GRN_WORKFLOW_STATUS_IN_PROCESS_CANCEL: // 取り消し
+                        $status_type = 'cancelled';
+                        break;
+                    case GRN_WORKFLOW_STATUS_FINISHED: // 完了
+                        $status_type = 'completed';
+                        break;
+                }
+                $petition['status_type'] = $status_type;
+            }
+
+            // get items list
+            $item_data_list = $this->getItemDataList($app_id);
+            $item_data_list = $this->checkItemAccess($item_data_list,
+                $path_steps, $user_id, $in_process, $operation_mode, $petition,
+                $in_path, $folder, $agent_id);
+
+            $petition['items'] = $item_data_list;
+
+            $petition['operation_mode'] = $operation_mode;
+            $petition['login_id'] = $user_id;
+
+            //Get Folder Relation By Petition ID
+            $petition_folder_relation_list
+                = $this->getListFolderByPetitionId($user_id,
+                $app_id);
+            $has_operation = false;
+            $folders = [];
+            foreach (
+                array_keys($petition_folder_relation_list) as
+                $petition_folder_relation_id
+            ) {
+                $folder_id
+                    = $petition_folder_relation_list[$petition_folder_relation_id]['col_folder'];
+                $folder_type
+                    = $petition_folder_relation_list[$petition_folder_relation_id]['col_folder_type'];
+                $folders[$petition_folder_relation_id]['folder_id']
+                    = $folder_id;
+                $folder_type_str = '';
+                switch ($folder_type) {
+                    case GRN_WORKFLOW_FOLDER_TYPE_IN_ID:
+                        $folder_type_str = 'received';
+                        break;
+                    case GRN_WORKFLOW_FOLDER_TYPE_OUT_ID:
+                        $folder_type_str = 'sent';
+                        if ((GRN_WORKFLOW_STATUS_IN_PROCESS_CANCEL == $status
+                             && $cancel_confirm)
+                            || GRN_WORKFLOW_STATUS_IN_PROCESS_CANCEL == $status
+                            || GRN_WORKFLOW_STATUS_FINISHED == $status
+                            || GRN_WORKFLOW_STATUS_REJECTION == $status
+                        ) {
+                            $has_operation = false;
+                        } elseif ($status == GRN_WORKFLOW_STATUS_UNPROCESSING
+                                  || $status == GRN_WORKFLOW_STATUS_IN_PROCESS
+                                  || $status == GRN_WORKFLOW_STATUS_REMAND
+                        ) {
+                            $has_operation = true;
+                        }
+                        break;
+                    case GRN_WORKFLOW_FOLDER_TYPE_FINISH_ID:
+                        $folder_type_str = 'finish';
+                        break;
+                    case GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID:
+                        $folder_type_str = 'unprocessed';
+                        $has_operation = true;
+                        break;
+                    case GRN_WORKFLOW_FOLDER_TYPE_TEMP_ID:
+                        $folder_type_str = 'draft';
+                        break;
+                }
+                $folders[$petition_folder_relation_id]['folder_type']
+                    = $folder_type_str;
+            }
+
+            $petition['folders'] = $folders;
+            $petition['has_operation'] = $has_operation;
+
+            require_once('workflow/config.csp');
+            $configs = GRN_Workflow_Configs::getInstance();
+            $config = $configs->getSystemConfig();
+            $remand = $config->getRemand();
+            $petition['is_remand'] = $remand;
+
+            $applications_for_view[$app_id] = $petition;
+        }
+
+        return $applications_for_view;
+    }
+
+    /**
+     * @param       $login
+     * @param       $application_id_list
+     * @param array $folder
+     * @param int   $lock_path_step
+     *
+     * @return array
+     */
+    function getAppsVersionForViewByIds(
+        &$login,
+        $application_id_list,
+        $folder = [],
+        $lock_path_step = CB_DATABASE_DEFAULT_LOCK
+    ) {
+        if ( ! is_array($application_id_list)
+             || count($application_id_list) <= 0
+        ) {
+            return [];
+        }
+        $applications_for_view = [];
+        $user_id = $login->getOID();
+        foreach ($application_id_list as $key => $app_id) {
+            $agent_id = '';
+            $folder_type = '';
+            $folder_id = '';
+            if ($folder && is_array($folder) && count($folder) > 0) {
+                $folder_type = array_key_exists('col_folder_type', $folder)
+                    ? $folder['col_folder_type'] : '';
+                $folder_id = array_key_exists('_id', $folder)
+                    ? $folder['_id'] : '';
+                $folder_user_id = array_key_exists('col_user', $folder)
+                    ? $folder['col_user'] : '';
+                if ($user_id != $folder_user_id) {
+                    //代理承認の検証
+                    if ($folder_type
+                        == GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID
+                    ) {
+                        require_once('workflow/config.csp');
+                        $configs = GRN_Workflow_Configs::getInstance();
+                        $config =& $configs->getSystemConfig();
+                        if ($config->isProxyApproval($user_id,
+                            $folder_user_id)
+                        ) {
+                            // 代理承認
+                            $agent_id = $user_id;
+                            $user_id = $folder_user_id;
+                        }
+                    }
+                }
+            }
+            //Create Parameter Translation Map
+            $translation_map_petition = [
+                'id'         => '_id',                  //Petition ID
+                'ctime'      => 'ctime',                //Petition Create Time
+                'creator'    => 'creator',              //Petition Creator
+                'status'     => 'status',
+                'user'       => 'user',
+                'mtime'      => 'mtime',
+                'ptime'      => 'ptime',
+                'reapply'    => 'reapply',
+                'agent_user' => 'agent_user',
+            ];
+            $petition_util
+                = GRN_Workflow_Petition_Controller_Utility::getInstance();
+
+            //Get Petition for view
+            $petition = $petition_util->getView($app_id,
+                $translation_map_petition);
+            // get petition version
+            $version = array_key_exists('mtime', $petition)
+                ? $petition['mtime']->unix_ts : null;
+            $ptime = array_key_exists('ptime', $petition) ? $petition['ptime']
+                : null;
+            if ( ! is_null($ptime) && $ptime > $version) {
+                $version = $ptime;
+            }
+            $petition['version'] = $version;
+            require_once('cbpapi/util.csp');
+            if (array_key_exists('ctime', $petition)) {
+                $create_time = $petition['ctime'];
+                unset($petition['ctime']);
+                $petition['ctime'] = grn_cbpapi_iso8601($create_time);
+            }
+            // get path step information
+            $path_info = $this->getPathInfoForView($user_id, $app_id, $petition,
+                $folder_id, $lock_path_step);
+
+            $path_steps = $path_info['path_steps'];
+            $in_path = $path_info['in_path'];
+
+            // handle_mode
+            $operation_mode = $path_info['handle_mode'];
+
+            // processing_step
+            $controller_util = new GRN_Workflow_ControllerUtil();
+            $in_process = null;
+            $path_steps_current = current($path_steps);
+            $in_process
+                = $controller_util->getInProcessPathStepId($path_steps_current);
+            if (array_key_exists('status', $petition)) {
+                $status = $petition['status'];
+                if ($folder_type == GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID
+                    && $status == GRN_WORKFLOW_RESULT_REJECT
+                ) {
+                    if ( ! is_null($agent_id) && strlen($agent_id) > 0) {
+                        if ($petition['user'] == $agent_id
+                            || $petition['agent_user'] == $agent_id
+                        ) {
+                            //この場合は、代理承認での表示を解除する
+                            $user_id = $agent_id;
+                            $agent_id = '';
+                        }
+                    }
+                    if ($petition['agent_user'] == ''
+                        || $petition['agent_user'] < 1
+                    ) {
+                        $operation_mode = 'view_only';
+                    } else {
+                        $operation_mode = null;
+                    }
+                }
+                if ($user_id == @ $petition['user']
+                    || $user_id == @ $petition['agent_user']
+                ) {
+                    if ( ! $in_process
+                         && GRN_WORKFLOW_STATUS_REMAND == $petition['status']
+                    ) {
+                        // 申請者本人に差し戻された
+                        $operation_mode = null;
+                    }
+                }
+            }
+
+            // get items list
+            $item_data_list = $this->getItemDataList($app_id);
+            $item_data_list = $this->checkItemAccess($item_data_list,
+                $path_steps, $user_id, $in_process, $operation_mode, $petition,
+                $in_path, $folder, $agent_id);
+
+            $petition['items'] = $item_data_list;
+
+            $petition['operation_mode'] = $operation_mode;
+
+            $applications_for_view[$app_id] = $petition;
+        }
+
+        return $applications_for_view;
+    }
+
+    function getListFolderByPetitionId($user_id, $petition_id)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('workflow');
+
+        $condition = cb_queryf($dbconn,
+            "fr.col_petition='@S' AND f.col_user='@S' ", $petition_id,
+            $user_id);
+
+        $join
+            = " INNER JOIN tab_grn_workflow_folder AS f ON fr.col_folder=f._id";
+        $join .= " INNER JOIN tab_cb_user AS u ON (f.col_user=u._id AND u.col_deleted IS NULL)";
+        $query
+            = "SELECT fr._id,fr.col_folder,f.col_folder_type FROM tab_grn_workflow_folderrelation AS fr {$join} WHERE ({$condition}) ORDER BY col_folder";
+
+        $query = $dbconn->select_format($query, 0, -1,
+            CB_DATABASE_DEFAULT_LOCK);
+        $result = $dbconn->query($query);
+        if (false === $result) {
+            $dbconn->throwError(['query' => "failed query on SELECT: {$query}"]);
+        }
+
+        $rows = [];
+        while ($row = $dbconn->fetch_assoc($result)) {
+            $rows[$row['col_folder']] = $row;
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Set col_ptime in $path_step to iso8601 format
+     *
+     * @param array $path_step
+     */
+    public function setPathStepPtime(& $path_step)
+    {
+        foreach (array_keys($path_step['users']) as $user_key) {
+            if (array_key_exists('col_ptime', $path_step['users'][$user_key])) {
+                $ptime = $path_step['users'][$user_key]['col_ptime'];
+                if ($ptime) {
+                    require_once('cbpapi/util.csp');
+                    $path_step['users'][$user_key]['col_ptime']
+                        = grn_cbpapi_iso8601($ptime);
+                }
+            }
+        }
+    }
+
+    function getPathInfoForView(
+        $user_id,
+        $petition_id,
+        $petition,
+        $folder_id,
+        $lock = CB_DATABASE_DEFAULT_LOCK
+    ) {
+        $controller_util = new GRN_Workflow_ControllerUtil();
+        $path_steps = $controller_util->getPathInfo($petition_id, true, 0,
+            -1, $lock);
+        $path_step_total = $controller_util->getPathStepCount($path_steps);
+
+        $view = false;
+        $handle_mode = 'confirm';
+        if (@ $petition['reapply']) {
+            $handle_mode = 'reapply';
+        }
+
+        require_once('workflow/change_path_history.csp');
+        $logic = GRN_Workflow_ChangePathHistories::getInstance();
+        $columns = [
+            '_id',
+            'col_path_step_data',
+            'col_comment',
+            'col_creator',
+            'col_creator_name',
+            'col_creator_foreign_key',
+            'col_ctime'
+        ];
+        $change_path_histories = $logic->getListByPetitionId($petition_id,
+            $columns, 0, -1, $lock);
+
+        $deleted_users = [];
+        if (is_array($change_path_histories)
+            && 0 < count($change_path_histories)
+        ) {
+            $logic = GRN_Workflow_ChangePathDeletedUsers::getInstance();
+            $columns = [
+                '_id',
+                'col_change_path_history',
+                'col_user'
+            ];
+            $tmp = $logic->getList(array_keys($change_path_histories),
+                $user_id, $columns);
+            foreach ($tmp as $deleted_user) {
+                $change_path_history_id
+                    = $deleted_user['col_change_path_history'];
+                $change_path_history
+                    = $change_path_histories[$change_path_history_id];
+                $path_step_data_id
+                    = $change_path_history['col_path_step_data'];
+                if (array_key_exists($path_step_data_id, $deleted_users)) {
+                    $deleted_users[$path_step_data_id] = [];
+                }
+                $deleted_users[$path_step_data_id][$deleted_user['col_user']]
+                    = $deleted_user;
+            }
+        }
+
+        $in_process = null;
+        $in_path = false;
+        $in_evaluated_path = false;
+        $cancel_confirm = false;
+        $col_finished = GRN_WORKFLOW_FINISHED_NONE;
+        $change_path_history = [];
+        foreach (array_keys($path_steps) as $path_step_id) {
+            $path_step =& $path_steps[$path_step_id];
+            $path_step_data_id = $path_step['_id'];
+
+            if ($path_step['col_activate']) {
+                if ($path_step['col_skip']) {
+                    // Skip
+                    foreach (array_keys($path_step['users']) as $user_key) {
+                        $path_step['users'][$user_key]['col_display_name']
+                            = cb_msg('grn.workflow', 'skip');
+                    }
+                    if (array_key_exists($path_step_data_id, $deleted_users)) {
+                        if (array_key_exists($user_id,
+                            $deleted_users[$path_step_data_id])
+                        ) {
+                            $handle_mode = 'change_transactor';
+                            $in_path = true;
+                            $in_evaluated_path = true;
+
+                            $deleted_user
+                                = $deleted_users[$path_step_data_id][$user_id];
+                            $change_path_history_id
+                                = $deleted_user['col_change_path_history'];
+                            $change_path_history
+                                = $change_path_histories[$change_path_history_id];
+
+                            $timestamp = new CB_TimeStamp();
+                            $timestamp->unix_ts
+                                = $change_path_history['col_ctime'];
+                            $change_path_history['col_ctime'] = $timestamp;
+
+                            $logic
+                                = GRN_Workflow_ChangePathDeletedUsers::getInstance();
+                            $columns = [
+                                'tab_grn_workflow_changepathdeleteduser' => [
+                                    '_id'              => 'pkey',
+                                    'col_user'         => '_id',
+                                    'col_display_name' => 'col_old_display_name',
+                                    'col_foreign_key'  => 'col_foreign_key'
+                                ],
+                                'tab_cb_user'                            => [
+                                    'col_display_name' => 'col_display_name',
+                                    'col_valid'        => 'col_valid'
+                                ]
+                            ];
+                            $change_path_history['deleted_users']
+                                = $logic->getSortedList([$change_path_history_id],
+                                $columns);
+
+                            $logic
+                                = GRN_Workflow_ChangePathAddUsers::getInstance();
+                            $columns = [
+                                'tab_grn_workflow_changepathadduser' => [
+                                    '_id'              => 'pkey',
+                                    'col_user'         => '_id',
+                                    'col_display_name' => 'col_old_display_name',
+                                    'col_foreign_key'  => 'col_foreign_key'
+                                ],
+                                'tab_cb_user'                        => [
+                                    'col_display_name' => 'col_display_name',
+                                    'col_valid'        => 'col_valid'
+                                ]
+                            ];
+                            $change_path_history['add_users']
+                                = $logic->getSortedList([$change_path_history_id],
+                                $columns);
+                        }
+                    }
+                } else {
+                    // Processor
+                    $this->setPathStepPtime($path_step);
+                    if ( ! $in_process) {
+                        // 処理中/完了した経路ステップ
+                        if ( ! $path_step['col_finished']) {
+                            // 処理中の経路ステップ
+                            $path_step['in_process'] = true;
+                            $in_process = $path_step_id;
+
+                            if (false !== array_search($user_id,
+                                    $path_step['uids'])
+                            ) {
+                                $view = true;
+                                $handle_mode = null;
+                                $in_path = true;
+                                $in_evaluated_path = true;
+                                if (GRN_WORKFLOW_STATUS_IN_PROCESS_CANCEL
+                                    == $petition['status']
+                                ) {
+                                    foreach ($path_step['users'] as $user) {
+                                        if (GRN_WORKFLOW_RESULT_CONFIRM
+                                            == $user['col_result']
+                                        ) {
+                                            $cancel_confirm = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                break;
+                            } else {
+                                $psdids = [];
+                                while ($path_step) {
+                                    if ($path_step['col_activate']) {
+                                        $path_step_data_id = $path_step['_id'];
+                                        $psdids[] = $path_step_data_id;
+                                        if (false !== ($result
+                                                = array_search($user_id,
+                                                $path_step['uids']))
+                                        ) {
+                                            if (GRN_WORKFLOW_RESULT_ACCEPT
+                                                <= $path_step['users'][$result]['col_result']
+                                            ) {
+                                                $view = true;
+                                                $handle_mode = 'view_only';
+                                            } else {
+                                                $view = true;
+                                            }
+                                            $in_path = true;
+                                            $in_evaluated_path = true;
+                                            break;
+                                        } elseif (array_key_exists($path_step_data_id,
+                                            $deleted_users)
+                                        ) {
+                                            if (array_key_exists($user_id,
+                                                $deleted_users[$path_step_data_id])
+                                            ) {
+                                                $handle_mode
+                                                    = 'change_transactor';
+                                                $in_path = true;
+                                                $in_evaluated_path = true;
+
+                                                $deleted_user
+                                                    = $deleted_users[$path_step_data_id][$user_id];
+                                                $change_path_history_id
+                                                    = $deleted_user['col_change_path_history'];
+                                                $change_path_history
+                                                    = $change_path_histories[$change_path_history_id];
+
+                                                $timestamp = new CB_TimeStamp();
+                                                $timestamp->unix_ts
+                                                    = $change_path_history['col_ctime'];
+                                                $change_path_history['col_ctime']
+                                                    = $timestamp;
+
+                                                $logic
+                                                    = GRN_Workflow_ChangePathDeletedUsers::getInstance();
+                                                $columns = [
+                                                    'tab_grn_workflow_changepathdeleteduser' => [
+                                                        '_id'              => 'pkey',
+                                                        'col_user'         => '_id',
+                                                        'col_display_name' => 'col_old_display_name',
+                                                        'col_foreign_key'  => 'col_foreign_key'
+                                                    ],
+                                                    'tab_cb_user'                            => [
+                                                        'col_display_name' => 'col_display_name',
+                                                        'col_valid'        => 'col_valid'
+                                                    ]
+                                                ];
+                                                $change_path_history['deleted_users']
+                                                    = $logic->getSortedList([$change_path_history_id],
+                                                    $columns);
+
+                                                $logic
+                                                    = GRN_Workflow_ChangePathAddUsers::getInstance();
+                                                $columns = [
+                                                    'tab_grn_workflow_changepathadduser' => [
+                                                        '_id'              => 'pkey',
+                                                        'col_user'         => '_id',
+                                                        'col_display_name' => 'col_old_display_name',
+                                                        'col_foreign_key'  => 'col_foreign_key'
+                                                    ],
+                                                    'tab_cb_user'                        => [
+                                                        'col_display_name' => 'col_display_name',
+                                                        'col_valid'        => 'col_valid'
+                                                    ]
+                                                ];
+                                                $change_path_history['add_users']
+                                                    = $logic->getSortedList([$change_path_history_id],
+                                                    $columns);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    $path_step =& $path_step['previous'];
+                                }
+                            }
+                        } else {
+                            // 完了した経路ステップ
+                            if (false !== array_search($user_id,
+                                    $path_step['uids'])
+                            ) {
+                                $in_path = true;
+                                if (GRN_WORKFLOW_STATUS_REJECTION
+                                    == $petition['status']
+                                    || GRN_WORKFLOW_STATUS_REMAND
+                                       == $petition['status']
+                                ) {
+                                    if (GRN_WORKFLOW_FINISHED_REJECTION
+                                        != $col_finished
+                                        && GRN_WORKFLOW_FINISHED_REMAND
+                                           != $col_finished
+                                    ) {
+                                        $view = true;
+                                        $in_evaluated_path = true;
+                                    }
+                                } else {
+                                    $view = true;
+                                    $in_evaluated_path = true;
+                                }
+                            } else {
+                                if (array_key_exists($path_step_data_id,
+                                    $deleted_users)
+                                ) {
+                                    if (array_key_exists($user_id,
+                                        $deleted_users[$path_step_data_id])
+                                    ) {
+                                        $handle_mode = 'change_transactor';
+                                        $in_path = true;
+                                        $in_evaluated_path = true;
+
+                                        $deleted_user
+                                            = $deleted_users[$path_step_data_id][$user_id];
+                                        $change_path_history_id
+                                            = $deleted_user['col_change_path_history'];
+                                        $change_path_history
+                                            = $change_path_histories[$change_path_history_id];
+
+                                        $timestamp = new CB_TimeStamp();
+                                        $timestamp->unix_ts
+                                            = $change_path_history['col_ctime'];
+                                        $change_path_history['col_ctime']
+                                            = $timestamp;
+
+                                        $logic
+                                            = GRN_Workflow_ChangePathDeletedUsers::getInstance();
+                                        $columns
+                                            = [
+                                            'tab_grn_workflow_changepathdeleteduser' => [
+                                                '_id'              => 'pkey',
+                                                'col_user'         => '_id',
+                                                'col_display_name' => 'col_old_display_name',
+                                                'col_foreign_key'  => 'col_foreign_key'
+                                            ],
+                                            'tab_cb_user'                            => [
+                                                'col_display_name' => 'col_display_name',
+                                                'col_valid'        => 'col_valid'
+                                            ]
+                                        ];
+                                        $change_path_history['deleted_users']
+                                            = $logic->getSortedList([$change_path_history_id],
+                                            $columns);
+
+                                        $logic
+                                            = GRN_Workflow_ChangePathAddUsers::getInstance();
+                                        $columns = [
+                                            'tab_grn_workflow_changepathadduser' => [
+                                                '_id'              => 'pkey',
+                                                'col_user'         => '_id',
+                                                'col_display_name' => 'col_old_display_name',
+                                                'col_foreign_key'  => 'col_foreign_key'
+                                            ],
+                                            'tab_cb_user'                        => [
+                                                'col_display_name' => 'col_display_name',
+                                                'col_valid'        => 'col_valid'
+                                            ]
+                                        ];
+                                        $change_path_history['add_users']
+                                            = $logic->getSortedList([$change_path_history_id],
+                                            $columns);
+                                    }
+                                }
+                            }
+
+                            if (GRN_WORKFLOW_STATUS_REJECTION
+                                == $petition['status']
+                                || GRN_WORKFLOW_STATUS_REMAND
+                                   == $petition['status']
+                            ) {
+                                if (GRN_WORKFLOW_FINISHED_REJECTION
+                                    == $path_step['col_finished']
+                                    || GRN_WORKFLOW_FINISHED_REMAND
+                                       == $path_step['col_finished']
+                                ) {
+                                    $col_finished = $path_step['col_finished'];
+                                }
+                            }
+                        }
+                        $path_step['not_modify'] = true;
+                        $path_step['send_back'] = $path_step_data_id;
+                    } else {
+                        // 未処理の経路ステップ
+                        if (false !== array_search($user_id,
+                                $path_step['uids'])
+                        ) {
+                            $in_path = true;
+                            if (GRN_WORKFLOW_STATUS_REJECTION
+                                == $petition['status']
+                                || GRN_WORKFLOW_STATUS_REMAND
+                                   == $petition['status']
+                            ) {
+                                if (GRN_WORKFLOW_FINISHED_REJECTION
+                                    != $col_finished
+                                    && GRN_WORKFLOW_FINISHED_REMAND
+                                       != $col_finished
+                                ) {
+                                    $view = true;
+                                    $in_evaluated_path = true;
+                                }
+                            }
+                            break;
+                        }
+
+                        if (GRN_WORKFLOW_STATUS_REJECTION == $petition['status']
+                            || GRN_WORKFLOW_STATUS_REMAND == $petition['status']
+                        ) {
+                            if (GRN_WORKFLOW_FINISHED_REJECTION
+                                == $path_step['col_finished']
+                                || GRN_WORKFLOW_FINISHED_REMAND
+                                   == $path_step['col_finished']
+                            ) {
+                                $col_finished = $path_step['col_finished'];
+                            }
+                        }
+                        $path_step['not_modify'] = false;
+                    }
+                }
+            }
+        }
+
+        if (GRN_WORKFLOW_STATUS_UNPROCESSING_CANCEL == $petition['status']) {
+            $view = false;
+        }
+
+        if ($user_id == @ $petition['creator']
+            || $user_id == @ $petition['agent_user']
+            || $user_id == @ $petition['user']
+        ) {
+            // ログインユーザーは申請者
+            $view = true;
+            if ( ! $in_process
+                 && GRN_WORKFLOW_STATUS_REMAND == $petition['status']
+            ) {
+                // 申請者本人に差し戻された
+                $handle_mode = null;
+            }
+            $in_path = true;
+            $in_evaluated_path = true;
+        }
+
+        $error = false;
+        if ( ! $in_evaluated_path) {
+            if (@ $petition['reapply']) {
+                // 再申請された
+                $handle_mode = 'reapply';
+            } else {
+                if ($in_path
+                    && GRN_WORKFLOW_STATUS_UNPROCESSING_CANCEL
+                       != $petition['status']
+                ) {
+                    // まだ処理が回ってきてない（進行中、差し戻し）
+                    $error = true;
+                    $handle_mode = 'confirm';
+                }
+            }
+        }
+
+        require_once('workflow/folderrelation_logic.csp');
+        $logic = GRN_Workflow_FolderRelation_Logic::getInstance();
+        $folder_relation = $logic->getSpecific($folder_id, $petition_id);
+        if ( ! is_array($folder_relation) || 0 == count($folder_relation)) {
+            require_once('workflow/folder_logic.csp');
+            $logic = GRN_Workflow_Folder_Logic::getInstance();
+            $folder = $logic->getByForeignKey($user_id,
+                'FINISH_FOLDER_FOREIGN_KEY');
+
+            $fids = [];
+            $fids[] = $folder['_id'];
+
+            require_once('workflow/folder_logic.csp');
+            $logic = GRN_Workflow_Folder_Logic::getInstance();
+            $folder = $logic->getByForeignKey($user_id,
+                'TEMP_FOLDER_FOREIGN_KEY');
+
+            $fids[] = $folder['_id'];
+
+            require_once('workflow/folderrelation_logic.csp');
+            $logic = GRN_Workflow_FolderRelation_Logic::getInstance();
+            $folder_relations = $logic->getSpecificList($fids, $petition_id);
+            if ( ! is_array($folder_relations)
+                 || 0 == count($folder_relations)
+            ) {
+                if ($petition['agent_user'] == ''
+                    || $petition['agent_user'] < 1
+                ) {
+                    $handle_mode = 'view_only';
+                } else {
+                    $handle_mode = null;
+                }
+            }
+        }
+        // ベースサービスの通知を確認済みに変更
+        require_once('workflow/notification.csp');
+        $logic = GRN_Workflow_Notification::getInstance();
+        if ($logic->isConfirmed($user_id, $petition_id)) {
+
+            require_once('workflow/folder_logic.csp');
+            $logic = GRN_Workflow_Folder_Logic::getInstance();
+            $folder = $logic->getByForeignKey($user_id,
+                'UNPROCESSED_FOLDER_FOREIGN_KEY');
+
+            $fids = [];
+            $fids[] = $folder['_id'];
+
+            require_once('workflow/folderrelation_logic.csp');
+            $logic = GRN_Workflow_FolderRelation_Logic::getInstance();
+            $folder_relations = $logic->getSpecificList($fids, $petition_id);
+            if ( ! is_array($folder_relations)
+                 || 0 == count($folder_relations)
+            ) {
+                $handle_mode = 'view_only';
+            }
+        }
+
+        return [
+            'path_steps'          => $path_steps,
+            'path_step_total'     => $path_step_total,
+            'handle_mode'         => $handle_mode,
+            'view'                => $view,
+            'in_path'             => $in_path,
+            'in_process'          => $in_process,
+            'cancel_confirm'      => $cancel_confirm,
+            'error'               => $error,
+            'change_path_history' => $change_path_history
+        ];
+    }
+
+    function checkItemAccess(
+        $item_data_list,
+        $path_steps,
+        $user_id,
+        $in_process,
+        $operation_mode,
+        $petition,
+        $in_path,
+        $folder,
+        $agent_id
+    ) {
+        // Check view/edit access right of Item.
+        require_once('workflow/change_access_data.csp');
+        $change_access_data_logic
+            = GRN_Workflow_ChangeAccessData::getInstance();
+
+        $folder_type = '';
+        if (array_key_exists('type', $folder)) {
+            $folder_type = $folder['type'];
+        }
+        if (array_key_exists('col_folder_type', $folder)) {
+            $folder_type = $folder['col_folder_type'];
+        }
+        if (array_key_exists('f_col_folder_type', $folder)) {
+            $folder_type = $folder['f_col_folder_type'];
+        }
+
+        if ($folder_type == GRN_WORKFLOW_FOLDER_APPROVAL_PLAN_ID) {
+            //承認予定一覧
+            $path_step_ids = array_keys($path_steps);
+            $path_step_ids = array_reverse($path_step_ids);
+            $user_path_step_id = null;
+            // 経路にユーザーが含まれているかどうか
+            for ($i = 0; $i < count($path_step_ids); $i++) {
+                $path_step =& $path_steps[$path_step_ids[$i]];
+                if ( ! $path_step['col_activate'] || $path_step['col_skip']) {
+                    // 非アクティブと省略の経路ステップは外す
+                    continue;
+                }
+                if ($path_step['col_type'] == GRN_WORKFLOW_CIRCULAR) {
+                    //回覧は飛ばす
+                    continue;
+                }
+
+                $users = $path_step['users'];
+                for ($j = 0; $j < count($users); $j++) {
+                    if ($user_id == $users[$j]['col_user']) {
+                        $user_path_step_id = $path_step_ids[$i];
+                        break 2;
+                    }
+                }
+            }
+            if ( ! is_null($user_path_step_id)) {
+                $access_list
+                    = new GRN_CBApiWorkflow_ChangeAccessDataList($user_path_step_id);
+                foreach (array_keys($item_data_list) as $item_data_id) {
+                    if ($item_data_list[$item_data_id]['foreign_key']
+                        == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                        || $item_data_list[$item_data_id]['foreign_key']
+                           == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                        || $item_data_list[$item_data_id]['foreign_key']
+                           == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                        || $item_data_list[$item_data_id]['foreign_key']
+                           == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                        || $item_data_list[$item_data_id]['foreign_key']
+                           == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                    ) {
+                        $change_access_data
+                            = $access_list->evaluateEx($item_data_list[$item_data_id]['iid']);
+                        if ($change_access_data['col_view'] == 1) {
+                            $item_data_list[$item_data_id]['view_mode']
+                                = 'view';
+                        } else {
+                            $item_data_list[$item_data_id]['view_mode']
+                                = 'disable';
+                        }
+                    }
+                }
+            } else {
+                //すべて非表示
+                foreach (array_keys($item_data_list) as $item_data_id) {
+                    if ($item_data_list[$item_data_id]['foreign_key']
+                        == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                        || $item_data_list[$item_data_id]['foreign_key']
+                           == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                        || $item_data_list[$item_data_id]['foreign_key']
+                           == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                        || $item_data_list[$item_data_id]['foreign_key']
+                           == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                        || $item_data_list[$item_data_id]['foreign_key']
+                           == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                    ) {
+                        $item_data_list[$item_data_id]['view_mode'] = 'disable';
+                    }
+                }
+            }
+        } else {
+            if ($in_process) {
+                if ($operation_mode == 'change_transactor') {
+                    //経路変更
+                    if ($petition['user'] != $user_id
+                        && $petition['agent_user'] != $user_id
+                    ) {
+                        $users = $path_steps[$in_process]['uids'];
+                        $user_step_id = null;
+                        $access_mode_view_only = false;
+                        if (($r = array_search($user_id, $users)) === false) {
+                            //現在の経路にいない
+                            //経路にいるかどうかの判定
+                            //申請者の方向に向かって判定
+                            $access_mode_view_only = true;
+                            $path_step_ids_tmp = array_keys($path_steps);
+                            $path_step_ids = [];
+                            foreach ($path_step_ids_tmp as $path_step_id) {
+                                if ($path_step_id == $in_process) {
+                                    $path_step_ids[] = $path_step_id;
+                                    break;
+                                }
+                                $path_step_ids[] = $path_step_id;
+                            }
+                            $path_step_ids = array_reverse($path_step_ids);
+
+                            // 経路にユーザーが含まれているかどうか
+                            for ($i = 0; $i < count($path_step_ids); $i++) {
+                                $path_step_temp
+                                    =& $path_steps[$path_step_ids[$i]];
+                                if ( ! $path_step_temp['col_activate']
+                                     || $path_step_temp['col_skip']
+                                ) {
+                                    // アクティブではないか省略の経路ステップは外す
+                                    continue;
+                                }
+                                $users = $path_step_temp['users'];
+                                for ($j = 0; $j < count($users); $j++) {
+                                    if ($user_id == $users[$j]['col_user']) {
+                                        $user_step_id = $path_step_ids[$i];
+                                        break 2;
+                                    }
+                                }
+                            }
+                        } else {
+                            $user_step_id = $in_process;
+                        }
+                        if ( ! is_null($user_step_id)) {
+                            $access_list
+                                = new GRN_CBApiWorkflow_ChangeAccessDataList($user_step_id);
+                            foreach (
+                                array_keys($item_data_list) as $item_data_id
+                            ) {
+                                $change_access
+                                    = $access_list->evaluateEx($item_data_list[$item_data_id]['iid']);
+                                if ($change_access['col_view'] == 1
+                                    && $change_access['col_edit'] == 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'edit';
+                                } elseif ($change_access['col_view'] == 1
+                                          && $change_access['col_edit'] != 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'view';
+                                } elseif ($change_access['col_view'] != 1) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'disable';
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    if ($operation_mode == 'confirm' && $in_path == false
+                        && ($petition['user'] == $user_id
+                            || $petition['agent_user'] == $user_id)
+                    ) {
+                        //確認で経路にいなくて申請者なら
+                        foreach (array_keys($item_data_list) as $item_data_id) {
+                            if ($item_data_list[$item_data_id]['foreign_key']
+                                == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                            ) {
+                                $api_change_access
+                                    = GRN_CBApiWorkflow_ChangeAccessData::getInstance();
+                                $change_access
+                                    = $api_change_access->apiEvaluateEx($item_data_list[$item_data_id]['iid']);
+                                if ($change_access['col_view'] == 1
+                                    && $change_access['col_edit'] == 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'edit';
+                                } elseif ($item_data_list[$item_data_id]['attach_file_view']
+                                          == 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'view';
+                                } else {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'disable';
+                                }
+                            }
+                        }
+                    } else {
+                        $users = $path_steps[$in_process]['uids'];
+                        $user_step_id = null;
+                        $access_mode_view_only = false;
+                        if (($r = array_search($user_id, $users)) === false) {
+                            //承認予定一覧
+                            $path_step_ids = array_keys($path_steps);
+                            $path_step_ids = array_reverse($path_step_ids);
+                            $user_path_step_id = null;
+                            // 経路にユーザーが含まれているかどうか
+                            for ($i = 0; $i < count($path_step_ids); $i++) {
+                                $path_step =& $path_steps[$path_step_ids[$i]];
+                                if ( ! $path_step['col_activate']
+                                     || $path_step['col_skip']
+                                ) {
+                                    // 非アクティブと省略の経路ステップは外す
+                                    continue;
+                                }
+                                if ($path_step['col_type']
+                                    == GRN_WORKFLOW_CIRCULAR
+                                ) {
+                                    //回覧は飛ばす
+                                    continue;
+                                }
+
+                                $users = $path_step['users'];
+                                for ($j = 0; $j < count($users); $j++) {
+                                    if ($user_id == $users[$j]['col_user']) {
+                                        $user_step_id = $path_step_ids[$i];
+                                        break 2;
+                                    }
+                                }
+                            }
+                        } else {
+                            $user_step_id = $in_process;
+                        }
+                        if ( ! is_null($user_step_id)) {
+                            $access_list
+                                = new GRN_CBApiWorkflow_ChangeAccessDataList($user_step_id);
+                            foreach (
+                                array_keys($item_data_list) as $item_data_id
+                            ) {
+                                $change_access
+                                    = $access_list->evaluateEx($item_data_list[$item_data_id]['iid']);
+                                if ($change_access['col_view'] == 1
+                                    && $change_access['col_edit'] == 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'edit';
+                                } elseif ($change_access['col_view'] == 1
+                                          && $change_access['col_edit'] != 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'view';
+                                } elseif ($change_access['col_view'] != 1) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'disable';
+                                }
+                            }
+                        } else {
+                            //申請者かどうか
+                            if ($petition['user'] == $user_id
+                                || $petition['agent_user'] == $user_id
+                            ) {
+                                //申請者なら
+                                foreach (
+                                    array_keys($item_data_list) as $item_data_id
+                                ) {
+                                    if ($item_data_list[$item_data_id]['foreign_key']
+                                        == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                                    ) {
+                                        $api_change_access
+                                            = GRN_CBApiWorkflow_ChangeAccessData::getInstance();
+                                        $change_access
+                                            = $api_change_access->apiEvaluateEx($item_data_list[$item_data_id]['iid']);
+
+                                        if ($change_access['col_view'] == 1
+                                            && $change_access['col_edit'] == 1
+                                        ) {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'edit';
+                                        } elseif ($item_data_list[$item_data_id]['attach_file_view']
+                                                  == 1
+                                        ) {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'view';
+                                        } else {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'disable';
+                                        }
+                                    }
+                                }
+                            } else {
+                                //どこの経路にもいない
+                                foreach (
+                                    array_keys($item_data_list) as $item_data_id
+                                ) {
+                                    if ($item_data_list[$item_data_id]['foreign_key']
+                                        == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                                    ) {
+                                        $api_change_access
+                                            = GRN_CBApiWorkflow_ChangeAccessData::getInstance();
+                                        $change_access
+                                            = $api_change_access->apiEvaluateEx($item_data_list[$item_data_id]['iid']);
+
+                                        if ($change_access['col_view'] == 1
+                                            && $change_access['col_edit'] == 1
+                                        ) {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'edit';
+                                        } else {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'disable';
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                if ($folder_type == GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID
+                    && $petition['status']
+                       == GRN_WORKFLOW_STATUS_IN_PROCESS_CANCEL
+                ) {
+                    //未処理一覧で、取り消された申請の場合
+
+                    $path_step_ids_tmp = array_keys($path_steps);
+                    $path_step_ids = [];
+                    foreach ($path_step_ids_tmp as $path_step_id) {
+                        $path_step =& $path_steps[$path_step_id];
+                        if ($path_step['col_type'] == GRN_WORKFLOW_CIRCULAR) {
+                            //回覧は飛ばす
+                            continue;
+                        }
+                        $path_step_ids[] = $path_step_id;
+                    }
+                    $user_path_step_id = null;
+                    // 経路にユーザーが含まれているかどうか
+                    for ($i = 0; $i < count($path_step_ids); $i++) {
+                        $path_step =& $path_steps[$path_step_ids[$i]];
+                        if ( ! $path_step['col_activate']
+                             || $path_step['col_skip']
+                        ) {
+                            // アクティブではないか省略の経路ステップは外す
+                            continue;
+                        }
+
+                        $users = $path_step['users'];
+                        for ($j = 0; $j < count($users); $j++) {
+                            if ($user_id == $users[$j]['col_user']) {
+                                $user_path_step_id = $path_step_ids[$i];
+                                break 2;
+                            }
+                        }
+                    }
+                    if ( ! is_null($user_path_step_id)) {
+                        $access_list
+                            = new GRN_CBApiWorkflow_ChangeAccessDataList($user_path_step_id);
+                        foreach (array_keys($item_data_list) as $item_data_id) {
+                            if ($item_data_list[$item_data_id]['foreign_key']
+                                == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                            ) {
+                                $change_access_data
+                                    = $access_list->evaluateEx($item_data_list[$item_data_id]['iid']);
+                                if ($change_access_data['col_view'] == 1
+                                    && $change_access_data['col_edit'] == 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'edit';
+                                } elseif ($change_access_data['col_view'] == 1
+                                          && $change_access_data['col_edit']
+                                             != 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'view';
+                                } else {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'disable';
+                                }
+                            }
+                        }
+                    } else {
+                        if ($petition['user'] == $user_id
+                            || $petition['agent_user'] == $user_id
+                        ) {
+                            //申請者なら
+                            foreach (
+                                array_keys($item_data_list) as $item_data_id
+                            ) {
+                                if ($item_data_list[$item_data_id]['foreign_key']
+                                    == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                                ) {
+                                    $api_change_access
+                                        = GRN_CBApiWorkflow_ChangeAccessData::getInstance();
+                                    $change_access
+                                        = $api_change_access->apiEvaluateEx($item_data_list[$item_data_id]['iid']);
+                                    if ($change_access['col_view'] == 1
+                                        && $change_access['col_edit'] == 1
+                                    ) {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'edit';
+                                    } elseif ($item_data_list[$item_data_id]['attach_file_view']
+                                              == 1
+                                    ) {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'view';
+                                    } else {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'disable';
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } elseif ($folder_type
+                          == GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID
+                          && $petition['status'] == GRN_WORKFLOW_STATUS_REMAND
+                ) {
+                    if ($petition['user'] == $user_id
+                        || $petition['agent_user'] == $user_id
+                    ) {
+                        //申請者なら
+                        foreach (array_keys($item_data_list) as $item_data_id) {
+                            if ($item_data_list[$item_data_id]['foreign_key']
+                                == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                            ) {
+                                $api_change_access
+                                    = GRN_CBApiWorkflow_ChangeAccessData::getInstance();
+                                $change_access
+                                    = $api_change_access->apiEvaluateEx($item_data_list[$item_data_id]['iid']);
+                                if ($change_access['col_view'] == 1
+                                    && $change_access['col_edit'] == 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'edit';
+                                } elseif ($item_data_list[$item_data_id]['attach_file_view']
+                                          == 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'view';
+                                } else {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'disable';
+                                }
+                            }
+                        }
+                    } else {
+                        $path_step_ids_tmp = array_keys($path_steps);
+                        $path_step_ids = [];
+                        foreach ($path_step_ids_tmp as $path_step_id) {
+                            $path_step =& $path_steps[$path_step_id];
+                            if ($path_step['col_type']
+                                == GRN_WORKFLOW_CIRCULAR
+                            ) {
+                                //回覧は飛ばす
+                                continue;
+                            }
+                            $path_step_ids[] = $path_step_id;
+                        }
+                        $user_path_step_id = null;
+                        // 経路にユーザーが含まれているかどうか
+                        for ($i = 0; $i < count($path_step_ids); $i++) {
+                            $path_step =& $path_steps[$path_step_ids[$i]];
+                            if ( ! $path_step['col_activate']
+                                 || $path_step['col_skip']
+                            ) {
+                                // アクティブではないか省略の経路ステップは外す
+                                continue;
+                            }
+
+                            $users = $path_step['users'];
+                            for ($j = 0; $j < count($users); $j++) {
+                                if ($user_id == $users[$j]['col_user']) {
+                                    $user_path_step_id = $path_step_ids[$i];
+                                    break 2;
+                                }
+                            }
+                        }
+                        if ( ! is_null($user_path_step_id)) {
+                            $access_list
+                                = new GRN_CBApiWorkflow_ChangeAccessDataList($user_path_step_id);
+                            foreach (
+                                array_keys($item_data_list) as $item_data_id
+                            ) {
+                                if ($item_data_list[$item_data_id]['foreign_key']
+                                    == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                                ) {
+                                    $change_access_data
+                                        = $access_list->evaluateEx($item_data_list[$item_data_id]['iid']);
+                                    if ($change_access_data['col_view'] == 1
+                                        && $change_access_data['col_edit'] == 1
+                                    ) {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'edit';
+                                    } elseif ($change_access_data['col_view']
+                                              == 1
+                                              && $change_access_data['col_edit']
+                                                 != 1
+                                    ) {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'view';
+                                    } else {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'disable';
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } elseif ($folder_type
+                          == GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID
+                          && $petition['status'] == GRN_WORKFLOW_RESULT_REJECT
+                ) {
+                    if ( ! is_null($agent_id) && strlen($agent_id) > 0) {
+                        //URLアクセス処理
+                        //本来アクセスしてはいけない代理申請
+                        //未処理で却下の場合
+                        //ただし代理申請者なら、申請者の権限でみてもいい
+                        if ($petition['user'] == $agent_id
+                            || $petition['agent_user'] == $agent_id
+                        ) {
+                            //申請者の権限で表示する
+                            foreach (
+                                array_keys($item_data_list) as $item_data_id
+                            ) {
+                                if ($item_data_list[$item_data_id]['foreign_key']
+                                    == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                                ) {
+                                    $api_change_access
+                                        = GRN_CBApiWorkflow_ChangeAccessData::getInstance();
+                                    $change_access
+                                        = $api_change_access->apiEvaluateEx($item_data_list[$item_data_id]['iid']);
+                                    if ($change_access['col_view'] == 1
+                                        && $change_access['col_edit'] == 1
+                                    ) {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'edit';
+                                    } elseif ($item_data_list[$item_data_id]['attach_file_view']
+                                              == 1
+                                    ) {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'view';
+                                    } else {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'disable';
+                                    }
+                                }
+                            }
+                            //この場合は、代理承認での表示を解除する
+                            $user_id = $agent_id;
+                            $agent_id = '';
+                            $folder_id = '';
+                            $handle_mode = 'view_only';
+                        } else {
+                            $path_step_ids_tmp = array_keys($path_steps);
+                            $path_step_ids = [];
+                            foreach ($path_step_ids_tmp as $path_step_id) {
+                                $path_step =& $path_steps[$path_step_id];
+                                if ($path_step['col_type']
+                                    == GRN_WORKFLOW_CIRCULAR
+                                ) {
+                                    //回覧は飛ばす
+                                    continue;
+                                }
+                                $path_step_ids[] = $path_step_id;
+                            }
+                            $user_path_step_id = null;
+                            // 経路にユーザーが含まれているかどうか
+                            for ($i = 0; $i < count($path_step_ids); $i++) {
+                                $path_step =& $path_steps[$path_step_ids[$i]];
+                                if ( ! $path_step['col_activate']
+                                     || $path_step['col_skip']
+                                ) {
+                                    // アクティブではないか省略の経路ステップは外す
+                                    continue;
+                                }
+
+                                $users = $path_step['users'];
+                                for ($j = 0; $j < count($users); $j++) {
+                                    if ($user_id == $users[$j]['col_user']) {
+                                        $user_path_step_id = $path_step_ids[$i];
+                                        break 2;
+                                    }
+                                }
+                            }
+                            if ( ! is_null($user_path_step_id)) {
+                                $access_list
+                                    = new GRN_CBApiWorkflow_ChangeAccessDataList($user_path_step_id);
+                                foreach (
+                                    array_keys($item_data_list) as $item_data_id
+                                ) {
+                                    if ($item_data_list[$item_data_id]['foreign_key']
+                                        == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                                    ) {
+                                        $change_access_data
+                                            = $access_list->evaluateEx($item_data_list[$item_data_id]['iid']);
+                                        if ($change_access_data['col_view'] == 1
+                                            && $change_access_data['col_edit']
+                                               == 1
+                                        ) {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'edit';
+                                        } elseif ($change_access_data['col_view']
+                                                  == 1
+                                                  && $change_access_data['col_edit']
+                                                     != 1
+                                        ) {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'view';
+                                        } else {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'disable';
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } elseif ($petition['user'] == $user_id) {
+                        //申請者なら
+                        foreach (array_keys($item_data_list) as $item_data_id) {
+                            if ($item_data_list[$item_data_id]['foreign_key']
+                                == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                            ) {
+                                $api_change_access
+                                    = GRN_CBApiWorkflow_ChangeAccessData::getInstance();
+                                $change_access
+                                    = $api_change_access->apiEvaluateEx($item_data_list[$item_data_id]['iid']);
+                                if ($change_access['col_view'] == 1
+                                    && $change_access['col_edit'] == 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'edit';
+                                } elseif ($item_data_list[$item_data_id]['attach_file_view']
+                                          == 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'view';
+                                } else {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'disable';
+                                }
+                            }
+                        }
+                    } else {
+                        $path_step_ids_tmp = array_keys($path_steps);
+                        $path_step_ids = [];
+                        foreach ($path_step_ids_tmp as $path_step_id) {
+                            $path_step =& $path_steps[$path_step_id];
+                            if ($path_step['col_type']
+                                == GRN_WORKFLOW_CIRCULAR
+                            ) {
+                                //回覧は飛ばす
+                                continue;
+                            }
+                            $path_step_ids[] = $path_step_id;
+                        }
+                        $user_path_step_id = null;
+                        // 経路にユーザーが含まれているかどうか
+                        for ($i = 0; $i < count($path_step_ids); $i++) {
+                            $path_step =& $path_steps[$path_step_ids[$i]];
+                            if ( ! $path_step['col_activate']
+                                 || $path_step['col_skip']
+                            ) {
+                                // アクティブではないか省略の経路ステップは外す
+                                continue;
+                            }
+
+                            $users = $path_step['users'];
+                            for ($j = 0; $j < count($users); $j++) {
+                                if ($user_id == $users[$j]['col_user']) {
+                                    $user_path_step_id = $path_step_ids[$i];
+                                    break 2;
+                                }
+                            }
+                        }
+                        if ( ! is_null($user_path_step_id)) {
+                            $access_list
+                                = new GRN_CBApiWorkflow_ChangeAccessDataList($user_path_step_id);
+                            foreach (
+                                array_keys($item_data_list) as $item_data_id
+                            ) {
+                                if ($item_data_list[$item_data_id]['foreign_key']
+                                    == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                                ) {
+                                    $change_access_data
+                                        = $access_list->evaluateEx($item_data_list[$item_data_id]['iid']);
+                                    if ($change_access_data['col_view'] == 1
+                                        && $change_access_data['col_edit'] == 1
+                                    ) {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'edit';
+                                    } elseif ($change_access_data['col_view']
+                                              == 1
+                                              && $change_access_data['col_edit']
+                                                 != 1
+                                    ) {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'view';
+                                    } else {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'disable';
+                                    }
+                                }
+                            }
+                        } else {
+                            if ($petition['user'] == $user_id
+                                || $petition['agent_user'] == $user_id
+                            ) {
+                                //申請者なら
+                                foreach (
+                                    array_keys($item_data_list) as $item_data_id
+                                ) {
+                                    if ($item_data_list[$item_data_id]['foreign_key']
+                                        == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                                    ) {
+                                        $api_change_access
+                                            = GRN_CBApiWorkflow_ChangeAccessData::getInstance();
+                                        $change_access
+                                            = $api_change_access->apiEvaluateEx($item_data_list[$item_data_id]['iid']);
+                                        if ($change_access['col_view'] == 1
+                                            && $change_access['col_edit'] == 1
+                                        ) {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'edit';
+                                        } elseif ($item_data_list[$item_data_id]['attach_file_view']
+                                                  == 1
+                                        ) {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'view';
+                                        } else {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'disable';
+                                        }
+                                    }
+                                }
+                            } else {
+                                foreach (
+                                    array_keys($item_data_list) as $item_data_id
+                                ) {
+                                    if ($item_data_list[$item_data_id]['foreign_key']
+                                        == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                        || $item_data_list[$item_data_id]['foreign_key']
+                                           == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                                    ) {
+                                        $api_change_access
+                                            = GRN_CBApiWorkflow_ChangeAccessData::getInstance();
+                                        $change_access
+                                            = $api_change_access->apiEvaluateEx($item_data_list[$item_data_id]['iid']);
+                                        if ($change_access['col_view'] == 1
+                                            && $change_access['col_edit'] == 1
+                                        ) {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'edit';
+                                        } else {
+                                            $item_data_list[$item_data_id]['view_mode']
+                                                = 'disable';
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } elseif ($folder_type
+                          == GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID
+                          && $petition['status'] == GRN_WORKFLOW_STATUS_FINISHED
+                ) {
+                    //未処理で完了通知なら
+                    //申請者の方向に向かって判定
+                    $path_step_ids_tmp = array_keys($path_steps);
+                    $path_step_ids = array_reverse($path_step_ids_tmp);
+                    $user_path_step_id = null;
+                    // 経路にユーザーが含まれているかどうか
+                    for ($i = 0; $i < count($path_step_ids); $i++) {
+                        $path_step =& $path_steps[$path_step_ids[$i]];
+                        if ( ! $path_step['col_activate']
+                             || $path_step['col_skip']
+                        ) {
+                            // アクティブではないか省略の経路ステップは外す
+                            continue;
+                        }
+                        $users = $path_step['users'];
+                        for ($j = 0; $j < count($users); $j++) {
+                            if ($user_id == $users[$j]['col_user']) {
+                                $user_path_step_id = $path_step_ids[$i];
+                                break 2;
+                            }
+                        }
+                    }
+                    if ( ! is_null($user_path_step_id)) {
+                        // ユーザーが経路にいる
+                        $access_list
+                            = new GRN_CBApiWorkflow_ChangeAccessDataList($user_path_step_id);
+                        foreach (array_keys($item_data_list) as $item_data_id) {
+                            if ($item_data_list[$item_data_id]['foreign_key']
+                                == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                || $item_data_list[$item_data_id]['foreign_key']
+                                   == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                            ) {
+                                $change_access_data
+                                    = $access_list->evaluateEx($item_data_list[$item_data_id]['iid']);
+                                if ($change_access_data['col_view'] == 1
+                                    && $change_access_data['col_edit'] == 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'edit';
+                                } elseif ($change_access_data['col_view'] == 1
+                                          && $change_access_data['col_edit']
+                                             != 1
+                                ) {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'view';
+                                } else {
+                                    $item_data_list[$item_data_id]['view_mode']
+                                        = 'disable';
+                                }
+                            }
+                        }
+                    } else {
+                        //ユーザーが経路にいない
+                        if ($petition['user'] == $user_id
+                            || $petition['agent_user'] == $user_id
+                        ) {
+                            //申請者なら
+                            foreach (
+                                array_keys($item_data_list) as $item_data_id
+                            ) {
+                                if ($item_data_list[$item_data_id]['foreign_key']
+                                    == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                                    || $item_data_list[$item_data_id]['foreign_key']
+                                       == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                                ) {
+                                    $api_change_access
+                                        = GRN_CBApiWorkflow_ChangeAccessData::getInstance();
+                                    $change_access
+                                        = $api_change_access->apiEvaluateEx($item_data_list[$item_data_id]['iid']);
+                                    if ($change_access['col_view'] == 1
+                                        && $change_access['col_edit'] == 1
+                                    ) {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'edit';
+                                    } elseif ($item_data_list[$item_data_id]['attach_file_view']
+                                              == 1
+                                    ) {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'view';
+                                    } else {
+                                        $item_data_list[$item_data_id]['view_mode']
+                                            = 'disable';
+                                    }
+                                }
+                            }
+                        } else {
+                            //存在しない
+                        }
+                    }
+                } elseif ($folder_type == GRN_WORKFLOW_FOLDER_TYPE_OUT_ID
+                          || $folder_type == GRN_WORKFLOW_FOLDER_TYPE_IN_ID
+                ) {
+                    foreach (array_keys($item_data_list) as $item_data_id) {
+                        if ($item_data_list[$item_data_id]['foreign_key']
+                            == GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE
+                            || $item_data_list[$item_data_id]['foreign_key']
+                               == GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE
+                            || $item_data_list[$item_data_id]['foreign_key']
+                               == GRN_WORKFLOW_CONDITION_ITEM_DATE
+                            || $item_data_list[$item_data_id]['foreign_key']
+                               == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                            || $item_data_list[$item_data_id]['foreign_key']
+                               == GRN_WORKFLOW_CONDITION_ITEM_NUMERIC
+                        ) {
+                            $api_change_access
+                                = GRN_CBApiWorkflow_ChangeAccessData::getInstance();
+                            $change_access
+                                = $api_change_access->apiEvaluateEx($item_data_list[$item_data_id]['iid']);
+                            if ($change_access['col_view'] == 1
+                                && $change_access['col_edit'] == 1
+                            ) {
+                                $item_data_list[$item_data_id]['view_mode']
+                                    = 'edit';
+                            } elseif ($change_access['col_view'] == 1) {
+                                $item_data_list[$item_data_id]['view_mode']
+                                    = 'view';
+                            } else {
+                                $item_data_list[$item_data_id]['view_mode']
+                                    = 'disable';
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        $this->setItemDataListView($item_data_list);
+
+        return $item_data_list;
+    }
+
+    function setItemDataListView(& $item_data_list)
+    {
+        //Create Item Layout
+        $current = null;
+        $previous = null;
+        foreach (array_keys($item_data_list) as $item_data_id) {
+            $view_str = "";
+            $item_data_list[$item_data_id]['org_text']
+                = $item_data_list[$item_data_id]['text'];
+            switch ($item_data_list[$item_data_id]['foreign_key']) {
+                case GRN_WORKFLOW_CONDITION_ITEM_STRING_SINGLE:
+                case GRN_WORKFLOW_CONDITION_ITEM_STRING_MULTIPLE:
+                case GRN_WORKFLOW_CONDITION_ITEM_MENU_STRING:
+                case GRN_WORKFLOW_CONDITION_ITEM_RADIO:
+                    $view_str = $item_data_list[$item_data_id]['text'];
+                    break;
+                case GRN_WORKFLOW_CONDITION_ITEM_DATE:  // grn.workflow.date
+                    $view_str = "";
+                    if (array_key_exists('text',
+                        $item_data_list[$item_data_id])
+                    ) {
+                        $text = $item_data_list[$item_data_id]['text'];
+                        $settings
+                            = $item_data_list[$item_data_id]['settings'];
+                        $has_hour_minute_fields = (cb_at($settings, 'date_type')
+                                                   == 1);
+                        unset($item_data_list[$item_data_id]['text']);
+                        //Unserialize Text
+                        $date = cb_unserialize($text,
+                            ["allowed_classes" => false]);
+
+                        // Check empty filed
+                        $has_empty_field = false;
+                        if ( ! cb_at($date, 'year') || ! cb_at($date, 'month')
+                             || ! cb_at($date, 'day')
+                        ) {
+                            $has_empty_field = true;
+                        }
+                        if ($has_hour_minute_fields) {
+                            if (cb_at($date, 'hour') == ''
+                                || cb_at($date, 'minute') == ''
+                            ) {
+                                $has_empty_field = true;
+                            }
+                        }
+                        if ($has_empty_field) {
+                            $item_data_list[$item_data_id]['org_text'] = '';
+                        }
+
+                        // Format display value
+                        $format = '';
+                        if ($date['year']) {
+                            $format .= sprintf('%04d年', $date['year']);
+                        } else {
+                            $format .= '年';
+                        }
+                        if ($date['month']) {
+                            $format .= sprintf(' %d月', $date['month']);
+                        } else {
+                            $format .= ' 月';
+                        }
+                        if ($date['day']) {
+                            $format .= sprintf(' %d日', $date['day']);
+                        } else {
+                            $format .= ' 日';
+                        }
+
+                        if ($has_hour_minute_fields) {
+                            if ($date['hour'] != '') {
+                                if (strlen($date['hour']) == 1) {
+                                    $date['hour'] = '0' . $date['hour'];
+                                    $format .= sprintf(' %s時',
+                                        $date['hour']);
+                                } else {
+                                    $format .= sprintf(' %d時', $date['hour']);
+                                }
+                            } else {
+                                $format .= ' 時';
+                            }
+                            if ($date['minute'] != '') {
+                                if (strlen($date['minute']) == 1) {
+                                    $date['minute'] = '0' . $date['minute'];
+                                    $format .= sprintf(' %s分',
+                                        $date['minute']);
+                                } else {
+                                    $format .= sprintf(' %d分', $date['minute']);
+                                }
+                            } else {
+                                $format .= ' 分';
+                            }
+                        }
+                        $item_data_list[$item_data_id]['text'] = $format;
+                        $view_str = $format;
+                    }
+                    break;
+                case GRN_WORKFLOW_CONDITION_ITEM_FILE:
+                    if ($item_data_list[$item_data_id]['br'] != 1) {
+                        $item_data_list[$item_data_id]['br'] = 1;
+                    }
+                    break;
+                case GRN_WORKFLOW_CONDITION_ITEM_CHECK:
+                    $view_str = cb_msg(GRN_WORKFLOW_MODULE_ID,
+                        'item_check_box_state_0');
+                    if ($item_data_list[$item_data_id]['number']) {
+                        $view_str = cb_msg(GRN_WORKFLOW_MODULE_ID,
+                            'item_check_box_state_1');
+                    }
+                    break;
+                case GRN_WORKFLOW_CONDITION_ITEM_ROUTE_SEARCH:
+                    if (intval($item_data_list[$item_data_id]['settings']['search_type'])
+                        === 0
+                    ) {
+                        $view_str = " 経路："
+                                    . $item_data_list[$item_data_id]['text']
+                                    . "\n";
+                        $view_str .= " 運賃："
+                                     . $item_data_list[$item_data_id]['number']
+                                     . "円";
+                    } elseif (intval($item_data_list[$item_data_id]['settings']['search_type'])
+                              === 1
+                    ) {
+                        $view_str = " 経路："
+                                    . $item_data_list[$item_data_id]['text']
+                                    . "\n";
+                    } else // 2
+                    {
+                        $view_str .= " 運賃："
+                                     . $item_data_list[$item_data_id]['number']
+                                     . "円";
+                    }
+                    break;
+                case GRN_WORKFLOW_CONDITION_ITEM_CALC_NUMERIC:
+                    if ($item_data_list[$item_data_id]['settings']['not_display']
+                        == 1
+                    ) {
+                        unset($item_data_list[$item_data_id]);
+                        continue 2;
+                    }
+                    if ( ! is_null($item_data_list[$item_data_id]['number'])) {
+                        //Format Effective Figures and Split Rank
+                        $rank_splitter
+                            = $item_data_list[$item_data_id]['settings']['split_rank']
+                            ? ',' : '';
+                        $item_data_list[$item_data_id]['number']
+                            = number_format(
+                            floatval($item_data_list[$item_data_id]['number']),
+                            $item_data_list[$item_data_id]['settings']['effective_figures'],
+                            '.',
+                            $rank_splitter
+                        );
+
+                        //Format Minus Type
+                        $minus_char = cb_msg(GRN_WORKFLOW_MODULE_ID,
+                            'minus_type_'
+                            . $item_data_list[$item_data_id]['settings']['minus_type']);
+                        $item_data_list[$item_data_id]['number']
+                            = str_replace('-', $minus_char,
+                            $item_data_list[$item_data_id]['number']);
+                    }
+                    $view_str = $item_data_list[$item_data_id]['number'];
+                    break;
+                case GRN_WORKFLOW_CONDITION_ITEM_NUMERIC:
+                    //Format Effective Figures and Split Rank
+                    if ('' !== trim($item_data_list[$item_data_id]['number'])) {
+                        $rank_splitter
+                            = $item_data_list[$item_data_id]['settings']['split_rank']
+                            ? ',' : '';
+                        $item_data_list[$item_data_id]['number']
+                            = number_format(
+                            floatval($item_data_list[$item_data_id]['number']),
+                            $item_data_list[$item_data_id]['settings']['effective_figures'],
+                            '.',
+                            $rank_splitter
+                        );
+                        //Format Minus Type
+                        $minus_char = cb_msg(GRN_WORKFLOW_MODULE_ID,
+                            'minus_type_'
+                            . $item_data_list[$item_data_id]['settings']['minus_type']);
+                        $item_data_list[$item_data_id]['number']
+                            = str_replace('-', $minus_char,
+                            $item_data_list[$item_data_id]['number']);
+                    }
+                    $view_str = $item_data_list[$item_data_id]['number'];
+                    break;
+            }
+
+            $item_data_list[$item_data_id]['view_str'] = "";
+            if ($item_data_list[$item_data_id]['option_string_type']
+                == 1
+            )    //pre
+            {
+                $item_data_list[$item_data_id]['view_str'] .= " "
+                                                              . $item_data_list[$item_data_id]['option_string']
+                                                              . " ";
+            }
+            $item_data_list[$item_data_id]['view_str'] .= $view_str;
+            if ($item_data_list[$item_data_id]['option_string_type']
+                == 2
+            )    //post
+            {
+                $item_data_list[$item_data_id]['view_str'] .= " "
+                                                              . $item_data_list[$item_data_id]['option_string']
+                                                              . " ";
+            }
+
+            if ( ! isset($item_data_list[$item_data_id]['view_mode'])) {
+                $item_data_list[$item_data_id]['view_mode'] = 'view';
+            }
+
+            //Check Previous Item
+            if ( ! is_null($previous)) {
+                if ($previous['type'] != 0) {
+                    //Force Set br Flag
+                    $item_data_list[$item_data_id]['br'] = 1;
+                }
+                if ($previous['foreign_key']
+                    == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                ) {
+                    $item_data_list[$item_data_id]['br'] = 1;
+                }
+            } else {
+                //Force Set br Flag
+                $item_data_list[$item_data_id]['br'] = 1;
+            }
+
+            //Set Previous Item
+            $previous =& $item_data_list[$item_data_id];
+
+            //Check Current or Sub Item
+            if ($item_data_list[$item_data_id]['br'] == 1) {
+                $current =& $item_data_list[$item_data_id];
+                $current['total_required'] = $current['required'];
+                if (array_key_exists('right_align',
+                        $item_data_list[$item_data_id]['settings'])
+                    && $item_data_list[$item_data_id]['settings']['right_align']
+                ) {
+                    $current['right_align_flag'] = 1;
+                }
+                if ($item_data_list[$item_data_id]['view_mode'] == 'disable') {
+                    $current['view_str'] = "";
+                }
+            } else {
+                if (array_key_exists('right_align',
+                        $item_data_list[$item_data_id]['settings'])
+                    && $item_data_list[$item_data_id]['settings']['right_align']
+                ) {
+                    $current['right_align_flag'] = 1;
+                }
+                if ($item_data_list[$item_data_id]['view_mode'] == 'disable') {
+                    $item_data_list[$item_data_id]['view_str'] = "";
+                }
+                if ($item_data_list[$item_data_id]['separator'] != '') {
+                    $current['view_str'] .= " "
+                                            . $item_data_list[$item_data_id]['separator']
+                                            . " ";
+                }
+                $current['view_str'] .= $item_data_list[$item_data_id]['view_str'];
+                if ($item_data_list[$item_data_id]['required'] == 1) {
+                    $current['total_required'] = 1;
+                }
+                unset($item_data_list[$item_data_id]);
+            }
+        }
+    }
+
+    function getItemDataList($app_id)
+    {
+        //Create Parameter Translation Map
+        $translation_map_item_data = [
+            //Item Data Information
+            'iid'                => 'itemdata_id',
+            //Item Data ID
+            'petition'           => 'petition',
+            //Petition ID
+            'display_name'       => 'itemdata_display_name',
+            //Item Data Display Name
+            'type'               => 'itemdata_type',
+            //Item Data Type
+            'option_string'      => 'itemdata_option_string',
+            //Item Data Option String
+            'option_string_type' => 'itemdata_option_string_type',
+            //Item Data Option String Type
+            'foreign_key'        => 'itemdata_foreign_key',
+            //Item Data foreign_key
+            'attach_file'        => 'itemdata_attach_file',
+            //Item Data Attach File
+            'attach_file_view'   => 'itemdata_attach_file_view',
+            //Item Data Attach File View
+            'settings'           => 'itemdata_settings',
+            //Item Data Settings
+            'br'                 => 'itemdata_br',
+            //Item Data <br> Flag
+            'separator'          => 'itemdata_separator',
+            //Item Data Separator
+            'required'           => 'itemdata_required',
+            //Item Data Reuired Flag
+            'list_index'         => 'itemdata_list_index',
+            //Item Data List Index
+            'number'             => 'itemdata_number',
+            //Item Data Number Value
+            'text'               => 'itemdata_text',
+            //Item Data text Value
+            //Item Data File Information
+            'fid'                => 'itemdatafile_id',
+            //Item Data File ID
+            'file'               => 'itemdatafile_file',
+            //Item Data File ID
+            'files'              => 'itemdata_files',
+            //Item Data File ID
+        ];
+
+        $item_data_util
+            = GRN_Workflow_ItemData_Controller_Utility::getInstance();
+        //Get Item Data List for view
+        $item_data_list
+            = $item_data_util->getListViewEx($translation_map_item_data,
+            $app_id);
+
+        return $item_data_list;
+    }
+
+    function getAppicationByFolderID(
+        $user_id,
+        $folder_id,
+        $start = null,
+        $end = null
+    ) {
+        $dbconn = $this->_getDBConnection();
+        //Check Arguments
+        require_once('workflow/error_code.csp');
+        cb_trim_check($folder_id,
+            E_GRN_WRKF_FOLDER_INVALID_FOLDER_ID); //Folder ID
+        cb_trim_check($user_id, E_GRN_WRKF_FOLDER_INVALID_USER_ID); //User ID
+
+        //Create Table Name
+
+        $table_name_folder = sprintf('tab_%s',
+            strtolower(GRN_WORKFLOW_TABLE_FOLDER));
+        $table_name_folderrelation = sprintf('tab_%s',
+            strtolower(GRN_WORKFLOW_TABLE_FOLDERRELATION));
+        $table_name_petition = sprintf('tab_%s',
+            strtolower(GRN_WORKFLOW_TABLE_PETITION));
+
+        //Create Join
+        $join = null;
+        $join_list = [];
+        $join_list[]
+            = 'tab_cb_user u ON (f.col_user=u._id AND u.col_deleted IS NULL)';
+        $join_list[]
+            = sprintf('%s r FORCE INDEX(idx_folder_petition) ON f._id = r.%s',
+            $table_name_folderrelation, GRN_WORKFLOW_COLUMN_FOLDER);
+        $join_list[]
+            = sprintf('%s p FORCE INDEX(idx_ctime_list_index) ON p._id = r.%s',
+            $table_name_petition, GRN_WORKFLOW_COLUMN_PETITION);
+        $join = implode(' INNER JOIN ', $join_list);
+        if ($join) {
+            $join = 'INNER JOIN ' . $join;
+        }
+
+        //Create Condition
+        $condition_list = [];
+        if ($user_id == -1) {
+            $condition_list[] = 'f.col_user IS NULL';
+        } elseif ($user_id != 0) {
+            $condition_list[] = cb_queryf($dbconn, 'f.col_user = "@S"',
+                $user_id);
+        }
+        $condition_list[] = cb_queryf($dbconn, 'f._id = "@S"', $folder_id);
+
+        $condition = implode(' AND ', $condition_list);
+        if ($condition) {
+            $condition = 'WHERE ' . $condition;
+        }
+        if ($start) {
+            if ($end) {
+                $condition .= ' AND ( ' . cb_queryf($dbconn,
+                        'p.col_ctime >= "@S" AND p.col_ctime <= "@S" ) ',
+                        $start->unix_ts, $end->unix_ts);
+            } else {
+                $condition .= ' AND ( ' . cb_queryf($dbconn,
+                        'p.col_ctime >= "@S" ) ', $start->unix_ts);
+            }
+        }
+        $order_by_string
+            = ' ORDER BY p.col_ctime DESC, p.col_list_index, p._id';
+        //Create Query
+        $query
+            = sprintf('SELECT p._id, p.col_mtime, p.col_status FROM %s AS f FORCE INDEX(idx_user) %s %s %s',
+            $table_name_folder, $join, $condition, $order_by_string);
+        $query = $dbconn->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+        $result = $dbconn->query($query);
+        if ($result === false) {
+            $dbconn->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+        $applications = [];
+        while ($row = $dbconn->fetch_assoc($result)) {
+            $application = [];
+            $application['id'] = $row['_id'];
+            $application['version'] = $row['col_mtime'];
+            $application['status'] = $row['col_status'];
+            $applications[$row['_id']] = $application;
+        }
+
+        // 結果の開放
+        $dbconn->free_result($result);
+
+        return $applications;
+    }
+
+    //GRN2-2255
+    //param: $form_request_id : fid in Garron
+    //return : name and id of Category 
+    //Admin -> Manage Request
+    public function getCategoryByFormRequestID($form_request_id)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('workflow');
+        $sql_string
+            = "select ifNull(c._id,-1) as CategoryID ,ifNull(c.col_name,'Uncategory') as CategoryName from ";
+        $sql_string .= "(select * from tab_grn_workflow_form as a where a._id = '{$dbconn->escape( $form_request_id )}') as b left join tab_grn_workflow_category as c on b.col_category = c._id ";
+        $query = $dbconn->select_format($sql_string, 0, -1,
+            CB_DATABASE_DEFAULT_LOCK);
+        $result = $dbconn->query($query);
+        if (false === $result) {
+            $dbconn->throwError(['query' => "failed query on SELECT: {$query}"]);
+        }
+        $category_type = [];
+        $row = $dbconn->fetch_assoc($result);
+        $category_type = [
+            "CategoryID"   => $row['CategoryID'],
+            "CategoryName" => $row['CategoryName']
+        ];
+
+        return $category_type;
+    }
+
+    public function getChildRootCategory()
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('workflow');
+        //get list data of root category
+        $select_string
+            = "_id,col_creator,col_creator_name,col_ctime,col_foreign_key,col_memo,col_modifier,col_modifier_name,col_mtime,col_name,col_parent";
+        $sql_string
+            = "select $select_string from tab_grn_workflow_category where col_parent = 1";
+        $query = $dbconn->select_format($sql_string, 0, -1,
+            CB_DATABASE_DEFAULT_LOCK);
+        $result = $dbconn->query($query);
+        if (false === $result) {
+            $dbconn->throwError(['query' => "failed query on SELECT: {$query}"]);
+        }
+        $category_data = [];
+        while ($row = $dbconn->fetch_assoc($result)) {
+            $category_data[$row['_id']] = $row;
+            $this->getChildCategory($row['_id'], $category_data);
+        }
+
+        return $category_data;
+    }
+
+    public function getChildCategory($id_category, & $category_data)
+    {
+        //Get list child each category
+        //check category have child
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('workflow');
+        $select_string
+            = "_id,col_creator,col_creator_name,col_ctime,col_foreign_key,col_memo,col_modifier,col_modifier_name,col_mtime,col_name,col_parent";
+        $sql_string
+            = "select $select_string from tab_grn_workflow_category where col_parent=$id_category";
+        $query = $dbconn->select_format($sql_string, 0, -1,
+            CB_DATABASE_DEFAULT_LOCK);
+        $result = $dbconn->query($query);
+        if (false === $result) {
+            $dbconn->throwError(['query' => "failed query on SELECT: {$query}"]);
+        }
+        while ($row = $dbconn->fetch_assoc($result)) {
+            $category_data[$id_category]['childrent'][$row['_id']] = $row;
+            $this->getChildCategory($row['_id'],
+                $category_data[$id_category]['childrent']);
+        }
+
+        return $category_data;
+    }
+    //GRN2-2255
+}
+
+require_once('workflow/change_access_data.csp');
+
+class GRN_CBApiWorkflow_ChangeAccessData extends GRN_Workflow_ChangeAccessData
+{
+    /**
+     * @return GRN_CBApiWorkflow_ChangeAccessData
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_CBApiWorkflow_ChangeAccessData();
+        }
+
+        return $_instance;
+    }
+
+    function apiEvaluateEx($item_data_id)
+    {
+        cb_trim_check($item_data_id, E_GRN_WRKF_ITEMDATA_INVALID_ID);
+        $condition = cb_queryf($this->_dbconn, "col_item_data='@S'",
+            $item_data_id);
+        $rows = $this->_selectRecords(['col_view', 'col_edit'], '_id', 0,
+            1, null, $condition);
+
+        if (count($rows)) {
+            $ret = array_shift($rows);
+        } else {
+            // default setting.
+            $ret = [
+                'col_view' => 1,
+                'col_edit' => null
+            ];
+        }
+
+        return $ret;
+    }
+
+}
+
+class GRN_CBApiWorkflow_ChangeAccessDataList
+{
+    private $_access_data_list;
+
+    public function __construct($path_step_data_id)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('workflow');
+        $query = cb_queryf($dbconn,
+            "select col_item_data as item_data,col_view,col_edit FROM tab_grn_workflow_accesschangedata WHERE col_path_step_data = '@S'",
+            $path_step_data_id);
+        $result = $dbconn->query($query);
+        if (false === $result) {
+            $dbconn->throwError(['query' => "failed query on SELECT: {$query}"]);
+        }
+
+        $this->_access_data_list = [];
+        while ($row = $dbconn->fetch_assoc($result)) {
+            $this->_access_data_list[$row['item_data']] = $row;
+        }
+    }
+
+    public function evaluateEx($item_data_id)
+    {
+        if (isset($this->_access_data_list[$item_data_id])) {
+            $change_access = $this->_access_data_list[$item_data_id];
+        } else {
+            $change_access = ['col_view' => 1, 'col_edit' => null];
+        }
+
+        return $change_access;
+    }
+}

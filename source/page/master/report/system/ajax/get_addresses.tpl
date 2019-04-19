@@ -1,0 +1,1 @@
+{include file='report/ajax/get_addresses.tpl'}

@@ -1,0 +1,254 @@
+<?php
+
+namespace grn\schedule;
+
+require_once('fw/session_manager.csp');
+
+/**
+ * The ViewState is handler for saving state of Scheduler view and page transition
+ *
+ * @package grn\schedule
+ */
+class ViewState
+{
+    private $_sessionManager;
+    private $_viewStateSession;
+    private $_refererSession;
+    private $_refererKey;
+    private $_inputParams;
+
+    public function __construct()
+    {
+        $this->_inputParams = [];
+
+        $this->_sessionManager = \CB_SessionManager::getInstance();
+        $this->_viewStateSession
+            = $this->_sessionManager->getSession('grn.common_multiple_user_select');
+        $this->_refererSession
+            = $this->_sessionManager->getSession('schedule.referer');
+    }
+
+    /**
+     * @param $input_params array The $G_INPUT
+     */
+    public function handleRequest(array $input_params)
+    {
+        $this->_inputParams = $input_params;
+
+        $this->_initReferer();
+    }
+
+    /**
+     * @return string Referer key (GUID) for identifying the view
+     */
+    public function getRefererKey()
+    {
+        return $this->_refererKey;
+    }
+
+    /**
+     * @return array|null List of users/organizations/facilities
+     */
+    public function getMembers()
+    {
+        $param_uid = cb_at($this->_inputParams, 'uid');
+        $param_gid = cb_at($this->_inputParams, 'gid');
+        $members = [];
+        $logged_in_user = cb_get_login_user();
+
+        if ($param_uid) {
+
+            $member = EventMemberParamUtil::parseParamValue($param_uid);
+            if (EventMemberListUtil::getMember($logged_in_user, $member['type'],
+                $member['id'])
+            ) {
+                $members = [$member];
+            }
+
+        } elseif ($param_gid) {
+
+            $group = EventMemberParamUtil::parseParamValue($param_gid,
+                EventMemberParamUtil::TYPE_ORGANIZATION);
+
+            switch ($group['type']) {
+                case EventMemberParamUtil::TYPE_LOGGED_IN_USER:
+                    $members = [
+                        [
+                            'id'   => $logged_in_user->getOID(),
+                            'type' => EventMemberParamUtil::TYPE_USER
+                        ]
+                    ];
+                    break;
+
+                case EventMemberParamUtil::TYPE_SELECTED:
+                    $members = $this->getMembersInSession();
+                    $members
+                        = EventMemberListUtil::filterMembersForView($logged_in_user,
+                        $members);
+                    break;
+
+                case EventMemberParamUtil::TYPE_SEARCH:
+                    $param_search_text = cb_at($this->_inputParams,
+                        'search_text');
+
+                    // search user
+                    require_once('grn/uum_util_search.csp');
+                    $uum_util = \GRN_UumUtil_Search::getInstance();
+                    $users
+                        = $uum_util->scheduleSearchUsersInfo($param_search_text);
+
+                    foreach (array_keys($users) as $user_id) {
+                        $members[] = [
+                            'id'   => $user_id,
+                            'type' => EventMemberParamUtil::TYPE_USER
+                        ];
+                    }
+
+                    // search facility
+                    require_once('schedule/facility_system_logic.csp');
+                    $facility_logic = \GRN_Facility_SystemLogic::getInstance();
+                    $facilities = $facility_logic->searchFacilitiesInfo(
+                        $param_search_text, CB_DATABASE_NO_LOCK, false
+                    );
+
+                    foreach (array_keys($facilities) as $facility_id) {
+                        $members[] = [
+                            'id'   => $facility_id,
+                            'type' => EventMemberParamUtil::TYPE_FACILITY
+                        ];
+                    }
+
+                    $members
+                        = EventMemberListUtil::filterMembersForView($logged_in_user,
+                        $members);
+                    break;
+
+                default:
+                    $members
+                        = EventMemberListUtil::getGroupMembersId($logged_in_user,
+                        $group['type'], $group['id']);
+            }
+        }
+
+        return $members;
+    }
+
+    /**
+     * @param array $members List of users/organizations/facilities
+     */
+    public function setMembers(array $members)
+    {
+        $properties_for_session = ['id', 'type', 'name', 'selected', 'colorId'];
+
+        array_walk($members, function (&$member) use ($properties_for_session) {
+            foreach (array_keys($member) as $property) {
+                if (array_search($property, $properties_for_session)
+                    === false
+                ) {
+                    unset($member[$property]);
+                }
+            }
+
+            // following attribute is set for backward compatible with the legacy code
+            if ($member['type'] === EventMemberParamUtil::TYPE_USER) {
+                $member['value'] = $member['id'];
+            } else {
+                $member['value']
+                    = EventMemberParamUtil::createParamValue($member['id'],
+                    $member['type']);
+            }
+
+            if ($member['type'] == EventMemberParamUtil::TYPE_ORGANIZATION) {
+                $member['type'] = 'group';
+            }
+        }
+        );
+
+        $this->_viewStateSession->set('schedule', $members);
+    }
+
+    /**
+     * @return array|null List of users/organizations/facilities
+     */
+    public function getMembersInSession()
+    {
+        $members = $this->_viewStateSession->get('schedule');
+
+        if ( ! is_array($members)) {
+            return [];
+        }
+
+        array_walk($members, function (&$member) {
+            if ( ! array_key_exists('value', $member)) {
+                return;
+            }
+
+            // following attribute is set for backward compatible with the legacy code
+            $member['id']
+                = EventMemberParamUtil::parseParamValue($member['value'])['id'];
+
+            if ($member['type'] == 'group') {
+                $member['type'] = EventMemberParamUtil::TYPE_ORGANIZATION;
+            }
+        }
+        );
+
+        return $members;
+    }
+
+    /**
+     * Save referer data to session for going back to the previous view
+     *
+     * @param string $referer_key The referer key
+     * @param array  $values      Key-value pairs (bdate, gid)
+     */
+    public function setReferer($referer_key, array $values)
+    {
+        $old_values = $this->_refererSession->get($referer_key);
+
+        if ($old_values == null) {
+            return;
+        }
+
+        $new_values = array_merge($old_values, $values);
+        $this->_refererSession->set($referer_key, $new_values);
+    }
+
+    /**
+     * Initialize the referer info which keeps the parameters for page transition
+     */
+    private function _initReferer()
+    {
+        $current_page = cb_get_pagename();
+
+        $page_names = [
+            'schedule/personal_day',
+            'schedule/personal_week'
+        ];
+
+        if (array_search($current_page, $page_names) === false) {
+            return;
+        }
+
+        $referer = $this->_inputParams;
+
+        $referer['page'] = $current_page;
+        $referer['name'] = grn_get_current_page_display_name();
+
+        $session_values = $this->_refererSession->getValues();
+        $unset_keys = [];
+
+        foreach ($session_values as $key => $value) {
+            if (isset($value['page']) && $value['page'] == $referer['page']) {
+                $unset_keys[] = $key;
+            }
+        }
+
+        foreach ($unset_keys as $key) {
+            $this->_refererSession->unset_by($key);
+        }
+
+        $this->_refererKey = md5(uniqid(rand(), true));
+        $this->_refererSession->set($this->_refererKey, $referer);
+    }
+}

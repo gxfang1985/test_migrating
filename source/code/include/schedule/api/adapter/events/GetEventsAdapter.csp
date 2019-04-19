@@ -1,0 +1,166 @@
+<?php
+declare(strict_types=1);
+
+namespace grn\schedule\api\adapter\events;
+
+require_once('schedule/api_eventfactory.csp');
+require_once('schedule/search_logic.csp');
+
+use grn\schedule\api\EventModelArranger;
+use grn\schedule\api\model\Event;
+use grn\schedule\rest_api\EventCheckUtil;
+use grn\schedule\ScheduleMemberLogic;
+
+class GetEventsAdapter
+{
+    /**
+     * @param \CB_User    $login
+     * @param array       $search_options
+     * @param string|null $search_text
+     * @param int         $offset
+     * @param int         $limit
+     * @param int         $setdate
+     * @param int         $enddate
+     * @param array       $order_by
+     *
+     * @return array
+     */
+    public function getResponse(
+        \CB_User $login,
+        array $search_options,
+        ?string $search_text,
+        int $offset,
+        int $limit,
+        int $setdate,
+        int $enddate,
+        array $order_by
+    ): array {
+        $search_logic = \GRN_Schedule_SearchLogic::getInstance();
+        $events_body = $search_logic->search($login, $search_options,
+            $search_text, $offset, $limit, $setdate, $enddate,
+            $order_by, true);
+
+        $has_next = $this->getHasNext($events_body, $offset);
+
+        $event_ids = array_column($events_body, 'event_id');
+        $event_factory = \GRN_Schedule_API_EventFactory::getInstance();
+        $event_objects = $event_factory->getEventsByIDs($event_ids, true);
+        $event_objects = $this->expandRepeatAndTemporaryEvents($event_objects,
+            $events_body);
+        $event_objects
+            = $this->removeInaccessibleOrPrivateEvents($event_objects);
+        $files = $event_factory->getFilesByEventIDs($event_ids);
+
+        return $this->convertToResponse($event_objects, $files, $has_next);
+    }
+
+    /**
+     * @param array $events
+     * @param array $files
+     * @param bool  $has_next
+     *
+     * @return array
+     */
+    private function convertToResponse(
+        array $events,
+        array $files,
+        bool $has_next
+    ): array {
+        $event_arranger = new EventModelArranger($events, $files, true);
+        $event_models = $event_arranger->arrange();
+        $response = [];
+        $response['events'] = array_map(function (Event $event) {
+            return $event->toArray();
+        }, $event_models);
+        $response['hasNext'] = $has_next;
+
+        return $response;
+    }
+
+    /**
+     * @param array $events_body
+     * @param int   $offset
+     *
+     * @return bool
+     */
+    private function getHasNext(array &$events_body, int $offset): bool
+    {
+        $total = $events_body['total'];
+        unset($events_body['total']);
+        $count = count($events_body);
+
+        return $offset + $count < $total;
+    }
+
+    /**
+     * Expand $event_objects based on $events_body.
+     *
+     * @param array $event_objects
+     * @param array $events_body
+     *
+     * @return array
+     */
+    private function expandRepeatAndTemporaryEvents(
+        array $event_objects,
+        array $events_body
+    ) {
+        $result = [];
+        foreach ($events_body as $event_body) {
+            $event_type = $event_body['event_type'];
+            if (($event_type & GRN_SCHEDULE_EVENT_TYPE_REPEAT)
+                === GRN_SCHEDULE_EVENT_TYPE_REPEAT
+            ) {
+                $event_obj = clone $event_objects[$event_body['event_id']];
+                if (($event_type & GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+                    === GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+                ) {
+                    $start = $event_body["setdate"];
+                    $end = $event_body["enddate"];
+                } else {
+                    $start = $event_body["setdatetime"];
+                    $is_start_only = ($event_type
+                                      & GRN_SCHEDULE_EVENT_TYPE_START)
+                                     === GRN_SCHEDULE_EVENT_TYPE_START;
+                    $end = $is_start_only ? null
+                        : $event_body["enddatetime"];
+                }
+                $event_obj->setdatetime = $start;
+                $event_obj->enddatetime = $end;
+            } elseif (($event_type & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY)
+                      === GRN_SCHEDULE_EVENT_TYPE_TEMPORARY
+            ) {
+                /** @var \GRN_Schedule_TemporaryEvent $event_obj */
+                $event_obj = clone $event_objects[$event_body['event_id']];
+                $event_obj->setdatetime = $event_body["setdatetime"];
+                $event_obj->enddatetime = $event_body["enddatetime"];
+                $event_obj->candidateId = $event_body['candidate_id'];
+            } else {
+                $event_obj = $event_objects[$event_body['event_id']];
+            }
+            $result[] = $event_obj;
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param array $event_objects
+     *
+     * @return array
+     */
+    private function removeInaccessibleOrPrivateEvents(array $event_objects)
+    {
+        $login = cb_get_login_user();
+        $filter_func = function ($event_object) use ($login) {
+            return EventCheckUtil::hasAuthorityToEventObj($event_object,
+                    ['read'])
+                   && ( ! $event_object->private
+                        || ScheduleMemberLogic::getInstance()
+                                              ->isEventAvailableForUser($login,
+                                                  $event_object,
+                                                  GRN_SCHEDULE_GET_MEMBER_ID));
+        };
+
+        return array_filter($event_objects, $filter_func);
+    }
+}

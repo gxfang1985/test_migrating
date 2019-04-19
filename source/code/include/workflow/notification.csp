@@ -1,0 +1,226 @@
+<?php
+
+/**
+ * 通知
+ *
+ * @author  Hideyasu YOSHIDA 2006/02
+ * @version 1.0
+ * @package grn.workflow
+ */
+require_once('grn/application.csp');
+
+use grn\grn\push_notification\PushNotificationRegister;
+use grn\grn\push_notification\workflow\PushConversionData;
+
+class GRN_Workflow_Notification
+{
+    /**
+     * @access  private
+     * @var GRN_Uum
+     */
+    var $_uum = null;
+    /**
+     * @access  private
+     */
+    var $_dbconn = null;
+    /**
+     * @access  private
+     */
+    var $_service = null;
+
+    /**
+     * コンストラクタ
+     */
+    function __construct()
+    {
+        global $G_container_base;
+        $this->_uum = $G_container_base->getInstance('uum');
+        $app_locator = GRN_ApplicationLocator::instance();
+        $this->_dbconn = $app_locator->getConnection('workflow');
+
+        require_once('grn/notification.csp');
+        $this->_service = GRN_Notification_Service::getInstance();
+    }
+
+    /**
+     * シングルトンを取得
+     *
+     * @return GRN_Workflow_Notification
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_Workflow_Notification();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * （永続化レイヤで）ユーザーリストを取得
+     */
+    function _getUsers($uids)
+    {
+        $limit = count($uids);
+        $order_by = 'col_position,_id';
+        foreach ($uids as $key => $value) {
+            $uids[$key] = cb_queryf($this->_dbconn, "'@S'", $value);
+        }
+        $uids = implode(',', $uids);
+        $condition = "_id IN({$uids})";
+
+        return $this->_uum->getUsers(0, $limit, $order_by, $condition);
+    }
+
+    /**
+     * 通知を一括送信
+     */
+    function sendList(
+        $uids,
+        $foreign_key,
+        $petition_id,
+        $sender_name,
+        $sender_id,
+        $ptime,
+        $action_type = GRN_WORKFLOW_MAILNOTIFICATION_ACTION_TO_NEXT
+    ) {
+        require_once('workflow/folder_logic.csp');
+        $logic = GRN_Workflow_Folder_Logic::getInstance();
+        $folders = $logic->getSpecificList($uids, [$foreign_key]);
+
+        require_once('workflow/folderrelation_logic.csp');
+        $logic = GRN_Workflow_FolderRelation_Logic::getInstance();
+        $folder_relations = $logic->getSpecificList(array_keys($folders),
+            $petition_id, '_id');
+
+        $logic = GRN_Workflow_Petition_Logic::getInstance();
+        $petition = $logic->getDirect($petition_id);
+
+        $timestamp = new CB_TimeStamp();
+        $timestamp->unix_ts = $ptime;
+
+        require_once('grn/notification.csp');
+        $notification_data = new GRN_Notification_Data();
+        $notification_data->setModuleId(GRN_WORKFLOW_MODULE_ID);
+        $notification_data->setUniqueId($petition_id);
+        $notification_data->setOrgData([
+            'pid'      => $petition_id,
+            'priority' => $petition['col_priority']
+        ]);
+        $notification_data->setAbstractData($petition['col_form_name']);
+        $notification_data->setSubjectData($petition['col_name']);
+        $notification_data->setSenderData($sender_name, $sender_id);
+        $notification_data->setTimeStampData($timestamp);
+        $notification_data->setConfirmRequiredFlag(true);
+        $notification_data->setStatusToUnread();
+
+        $users = $this->_getUsers($uids);
+        $this->_service->modifyNotifyDataListByUser($users, $notification_data,
+            true);
+
+        require_once('workflow/config.csp');
+        $configs = GRN_Workflow_Configs::getInstance();
+        $system_config = $configs->getSystemConfig();
+        if ($system_config->getMailNotification()) {
+            // send mail notification
+            require_once('workflow/mail_notification.csp');
+            $mail_service
+                = GRN_Workflow_MailNotification_Service::getInstance();
+            $mail_service->sendMailNotification($petition, $uids, $action_type);
+        }
+
+        $this->sendPushNotification($petition, $users, $uids, $sender_id,
+            $folders);
+
+    }
+
+    /**
+     * @param array      $petition
+     * @param \CB_User[] $receivers
+     * @param int[]      $receiver_ids
+     * @param string     $sender_id
+     * @param array      $folders
+     */
+    private function sendPushNotification(
+        $petition,
+        $receivers,
+        $receiver_ids,
+        $sender_id,
+        $folders
+    ) {
+        $push_notification_register = new PushNotificationRegister();
+        if ($push_notification_register->isAvailable()) {
+            $sender = $this->_uum->getUser($sender_id);
+            if ( ! $sender) {
+                return;
+            }
+            $conversion_data = new PushConversionData(
+                $petition,
+                $sender,
+                $receivers,
+                $receiver_ids,
+                $folders
+            );
+            $push_notification_register->enqueuePushRequest($conversion_data);
+        }
+
+    }
+
+    /**
+     * 通知を確認
+     */
+    function confirm($user_id, $petition_id)
+    {
+        $user = $this->_uum->getUser($user_id);
+        $notification_data = $this->_service->getNotifyDataProperties($user,
+            GRN_WORKFLOW_MODULE_ID, $petition_id);
+        if ($notification_data) {
+            if ($notification_data->isStatusUnread()) {
+                $notification_data->setStatusToConfirm();
+                $this->_service->modifyNotifyData($user, $notification_data,
+                    true, false);
+            }
+        }
+    }
+
+    /**
+     * 通知を一括削除
+     */
+    function removeList($uids, $petition_id)
+    {
+        foreach ($uids as $key => $value) {
+            $uids[$key] = cb_queryf($this->_dbconn, "'@S'", $value);
+        }
+        $uids = implode(',', $uids);
+        $condition = "_id IN({$uids})";
+        $users = $this->_uum->getUsers(0, -1, 'col_position,_id',
+            $condition);
+
+        if (is_array($users) && 0 < count($users)) {
+            $user = current($users);
+            $this->_service->deleteNotifyDataListByUser($users,
+                GRN_WORKFLOW_MODULE_ID, $petition_id);
+        }
+    }
+
+    function removeAll($petition_id)
+    {
+        require_once('grn/notification.csp');
+        $this->_service->deleteNotifyDataForAllUser(GRN_WORKFLOW_MODULE_ID,
+            $petition_id);
+    }
+
+    function isConfirmed($user_id, $petition_id)
+    {
+        $user = $this->_uum->getUser($user_id);
+        $notification_data = $this->_service->getNotifyDataProperties($user,
+            GRN_WORKFLOW_MODULE_ID, $petition_id);
+        if ($notification_data) {
+            return $notification_data->isStatusConfirmed();
+        }
+
+        return true;
+    }
+}
+

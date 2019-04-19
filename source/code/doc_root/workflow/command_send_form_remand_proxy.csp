@@ -1,0 +1,193 @@
+<?php
+
+use grn\grn\JSONResponse;
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    global $G_INPUT;
+    $json = JSONResponse::create();
+
+    //Instantiate Smarty Object
+    require_once("grn/smarty.csp");
+    $t = new GRN_Smarty;
+
+    //Get Session Key
+    require_once('workflow/controller_util.csp');
+    require_once('grn/controller.csp');
+    $tmp_key = grn_get_temporary_key();
+
+    //Validation Check
+    require_once('SmartyValidate.class.php');
+    SmartyValidate::connect($t);
+    $target_name = 'workflow/send_form_remand_proxy';
+    $session_target = $target_name . $tmp_key;
+    SmartyValidate::register_form($session_target);
+
+    //Skip form validation if no required item exists
+    $skip_validation_flag = false;
+    if (array_key_exists('SmartyValidate', $_SESSION)
+        && array_key_exists($session_target, $_SESSION['SmartyValidate'])
+        && array_key_exists('validators',
+            $_SESSION['SmartyValidate'][$session_target])
+        && ! count($_SESSION['SmartyValidate'][$session_target]['validators'])
+    ) {
+        $skip_validation_flag = true;
+    }
+
+    $command = isset($G_INPUT['cmd']) ? $G_INPUT['cmd'] : '';   //Command
+    //Check Command Parameter
+    switch ($command) {
+        case 'cancel':
+            grn_workflow_cleanup_session($t, 'remand_proxy', $tmp_key);
+            //Redirect Cancel Page
+            $cpsf = isset($G_INPUT['cpsf']) ? $G_INPUT['cpsf'] : '';
+            if ($cpsf) {
+                $params = ['cpsf' => $cpsf, 'tmp_key' => $tmp_key];
+            } else {
+                $params = [
+                    'fid' => isset($G_INPUT['fid']) ? $G_INPUT['fid'] : '',
+                    'pid' => isset($G_INPUT['pid']) ? $G_INPUT['pid'] : '',
+                ];
+            }
+            if (defined('AJAX_REQUEST')) {
+                $json->response([
+                    'link' => cb_get_full_url('workflow/handle', $params)
+                ]);
+                cb_safe_exit();
+            }
+            cb_redirect('workflow/handle', $params);
+            break;
+        default:
+            break;
+    }
+
+    //Get Session
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session =& $session_manager->getSession($session_target);
+
+    //Update Petition and Item Data List
+    $send_form_data_list = [];
+    require_once('workflow/item_resources.csp');
+    $petition =& $session->get('petition');
+    $item_data_list =& $session->get('item_list');
+    if ( ! is_array($item_data_list) || 0 == count($item_data_list)) {
+        // フォームがない
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_DENY_REQUEST_DATA);
+    }
+
+    foreach (array_keys($item_data_list) as $item_data_id) {
+        $item_util
+            =& grn_workflow_get_item_util($item_data_list[$item_data_id]['foreign_key']);
+        if ($item_util) {
+            //Parse Item Data
+            $parsed_input_data = $item_util->parseItemData($G_INPUT,
+                'item', $item_data_list[$item_data_id]);
+            $send_form_data_list[$item_data_id] = $parsed_input_data;
+
+            if ($item_data_list[$item_data_id]['type'] == 1) {
+                if (0 == strlen($parsed_input_data)) {
+                    $parsed_input_data = cb_msg(GRN_WORKFLOW_MODULE_ID,
+                        'untitled');
+                }
+                $petition['subject'] = $parsed_input_data;
+            }
+        }
+    }
+    //Priority
+    $petition_properties =& $session->get('properties');
+    $priority = $G_INPUT['priority'];
+    $petition_properties['priority'] = $priority;
+
+    $session->set('petition', $petition);
+    $session->set('item_list', $item_data_list);
+    $session->set('send_form_data_list', $send_form_data_list);
+    $session->set('properties', $petition_properties);
+
+    //Create Parameter Translation Map for Petition
+    $translation_map_petition = [
+        'ptid' => '_id',  //Petition ID
+        'user' => 'user', //User
+    ];
+
+    //Check Petition Owner
+    global $G_workflow_login_user;
+    if ($petition['user'] != $G_workflow_login_user->getOID()
+        && $petition['agent_user'] != $G_workflow_login_user->getOID()
+    ) {
+        //Petition Not Found
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_PETITION_NOT_FOUND);
+    }
+
+    //Validate After POST
+    if ($skip_validation_flag
+        || SmartyValidate::is_valid($G_INPUT, $session_target)
+    ) {
+        //Create Parameter Translation Map
+        $translation_map = [
+            'fid'    => '_fid',
+            'pid'    => '_pid',
+            'mode'   => 'mode',
+            'simple' => 'simple',
+            'cpsf'   => 'cpsf',
+            'handle' => 'handle',
+            'sf'     => 'sf',
+        ];
+
+        //Do Parameter Translation
+        $properties = [];
+        foreach ($translation_map as $view_name => $model_name) {
+            $properties[$model_name] = @ $G_INPUT[$view_name];
+        }
+
+        $form_id = $petition['form'];
+        require_once('workflow/controller_util.csp');
+        $grn_controller = new GRN_Workflow_ControllerUtil();
+        $pop_up_check = $grn_controller->checkScheduleRegister($form_id,
+            $session_target, $petition['agent_user']);
+        $response
+            = [
+            'link' => cb_get_full_url('workflow/send_path_remand_proxy', [
+                'fid'     => $properties['_fid'],
+                'pid'     => $properties['_pid'],
+                'mode'    => $properties['mode'],
+                'simple'  => $properties['simple'],
+                'cpsf'    => $properties['cpsf'],
+                'handle'  => $properties['handle'],
+                'sf'      => $properties['sf'],
+                'tmp_key' => $tmp_key
+            ])
+        ];
+
+        if ($pop_up_check) {
+            $response['success_do'] = "pop_up";
+        }
+        //Redirect Next Page
+        if (defined('AJAX_REQUEST')) {
+            $json->response($response);
+            cb_safe_exit();
+        }
+        cb_redirect('workflow/send_path_remand_proxy', [
+            'fid'     => $properties['_fid'],
+            'pid'     => $properties['_pid'],
+            'mode'    => $properties['mode'],
+            'simple'  => $properties['simple'],
+            'cpsf'    => $properties['cpsf'],
+            'handle'  => $properties['handle'],
+            'sf'      => $properties['sf'],
+            'tmp_key' => $tmp_key
+        ]);
+    } else {
+        if (defined('AJAX_REQUEST')) {
+            header(CB_ERROR_HEADER . 'error_validation');
+            $json->response([
+                'validation'    => false,
+                'error_message' => $t->fetch('grn/show_validation_errors.tpl')
+            ]);
+            cb_safe_exit();
+        }
+    }
+}
+
+

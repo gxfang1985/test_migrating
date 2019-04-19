@@ -1,0 +1,1192 @@
+<?php
+
+namespace grn\space\screen\application\todo;
+
+use grn\grn\MemberLogic;
+use grn\space\common\data\bean\SpaceMember;
+use grn\space\common\logic\SpaceMemberLogic;
+use grn\space\common\exception\GrnDataNotFoundException;
+use grn\space\data\bean\Thread;
+use grn\space\data\collection\FolderCollection;
+use grn\space\data\collection\ThreadCollection;
+use grn\space\service\DiscussionService;
+use grn\space\service\TodoService;
+use grn\space\service\SpaceService;
+use grn\space\data\bean\SpaceUser;
+use grn\space\data\bean\TodoUser;
+use grn\space\data\collection\SpaceUserCollection;
+use grn\space\data\collection\TodoCollection;
+use grn\space\data\collection\TodoUserCollection;
+use grn\space\data\condition\TodoSearchCondition;
+use grn\space\data\condition\ThreadSearchCondition;
+use grn\space\data\condition\SpaceUserSearchCondition;
+use grn\space\common\data\bean\Application;
+use grn\space\common\data\bean\Authority;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\exception\GrnInvalidPermissionException;
+use grn\space\common\exception\GrnInvalidArgumentException;
+use grn\space\common\utility\ValidateUtility;
+use grn\fts\Application as FtsApplication;
+use grn\space\data\condition\FolderSearchCondition;
+use grn\space\utility\TodoUtility;
+
+/**
+ * Class TodoIndex
+ */
+class TodoIndex extends TodoBase
+{
+    const ARG_TODO_STATUS = 's';
+    const ARG_USER_ID = 'uid';
+    const ARG_SEARCH_BITS = 'search_bits';
+    const ARG_SEARCH_TEXT = 'search_text';
+    const ARG_ACTION = 'action';
+    const SESSION_KEY_SEARCH_SELECTION = 'search_selection';
+    const SEARCH_SELECTION_FTS = 'fts';
+    const SEARCH_SELECTION_USER = 'user';
+    const TODO_COUNT = 'count';
+    const MAX_NUM_SHOWING_MEMBER = 20;
+
+    const COUNT_USER_INCOMPLETE_TODO = "count_user_incomplete_todo";
+    private $_count_user_incomplete_todo = [];
+    const COUNT_ALL_INCOMPLETE_TODO = "count_all_incomplete_todo";
+    private $_count_all_incomplete_todo = [];
+    const MAX_COUNT_USER_INCOMPLETE_TODO = "max_count_user_incomplete_todo";
+    private $_max_count_user_incomplete_todo;
+
+    /**
+     * Return raw HTML which will be used without being escaped.
+     */
+    public function fetch()
+    {
+        $input = $this->getInput();
+
+        $parameter = [self::ARG_SPACE_ID];
+        $this->checkArgFromInput($parameter, $input);
+        $space_id = $this->getSpaceId();
+        $login_id = $this->getLoginUserId();
+
+        $thread_id = $this->getArrayValue(self::ARG_THREAD_ID, $input);
+        $user_id = $this->getArrayValue(self::ARG_USER_ID, $input);
+        $todo_status = $this->getArrayValue(self::ARG_TODO_STATUS, $input);
+        $search_bits = $this->getArrayValue(self::ARG_SEARCH_BITS, $input);
+        $search_text = $this->getArrayValue(self::ARG_SEARCH_TEXT, $input);
+        $action = $this->getArrayValue(self::ARG_ACTION, $input);
+        $offset = $this->getArrayValue(self::ARG_NAVI_TAG, $input);
+
+        $including_login_user_for_space_member = array_key_exists($login_id,
+            $this->getSpaceUserIds($space_id));
+        $is_select_unspecified = ($user_id == '0');
+        $is_set_default_user
+            = ($including_login_user_for_space_member
+               && ! $todo_status
+               && ! $user_id
+               && ! $is_select_unspecified);
+
+        if (($action == 'reset' && $is_set_default_user)
+            || ($is_set_default_user)
+        ) {
+            // set default display user
+            $user_id = $login_id;
+        }
+
+        if ( ! ValidateUtility::isNumber($thread_id,
+            ValidateUtility::ENABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            throw new GrnInvalidArgumentException(ErrorCode::GRN_INVALID_THREAD_ID);
+        }
+        if ( ! ValidateUtility::isIn($todo_status,
+            [
+                TodoSearchCondition::STATUS_COMPLETE,
+                TodoSearchCondition::STATUS_INCOMPLETE,
+                TodoSearchCondition::STATUS_INCOMPLETE_PARTICIPANT_USER
+            ], ValidateUtility::DISABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            $todo_status = TodoSearchCondition::STATUS_INCOMPLETE;
+        }
+        if (ValidateUtility::isNumber($user_id, ValidateUtility::DISABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            if ($user_id
+                == TodoSearchCondition::SEARCH_PARTICIPANT_USER_NOUSER
+            ) {
+                $todo_status = TodoSearchCondition::STATUS_INCOMPLETE;
+            } elseif ( ! $todo_status) {
+                $todo_status
+                    = TodoSearchCondition::STATUS_INCOMPLETE_PARTICIPANT_USER;
+            }
+        } else {
+            $user_id = null;
+        }
+        if ( ! ValidateUtility::isNumber($offset,
+            ValidateUtility::DISABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            $offset = 0;
+        }
+
+        require_once('grn/smarty.csp');
+        $t = new \GRN_Smarty();
+
+        $todo_root_category_id = $this->getTodoRootCategoryId($space_id);
+
+        $this->assignCommonValues($t, $space_id);
+        $this->assignTodoMemberList($t, $space_id, $thread_id,
+            $todo_root_category_id, $user_id, $search_bits,
+            $search_text);
+        $this->assignThreadList($t, $space_id);
+        $this->assignTodoList($t, $space_id, $thread_id, $user_id, $todo_status,
+            $offset, $todo_root_category_id,
+            $search_bits, $search_text);
+        parent::assignTodoDialog($t, $space_id, $thread_id);
+
+        $t->assign('space_id', $space_id);
+        $t->assign('thread_id', $thread_id);
+        $t->assign('user_id', $user_id);
+        $t->assign('todo_status', $todo_status);
+        $t->assign('search_bits', $search_bits);
+        $t->assign('search_text', $search_text);
+        $t->assign(self::SESSION_KEY_SEARCH_SELECTION,
+            $this->getSearchSelection($search_bits));
+
+        return $t->fetch('space/application/todo/index.tpl');
+    }
+
+    /**
+     * @param int $search_bits
+     *
+     * @return string
+     */
+    public function getSearchSelection($search_bits)
+    {
+        if (FtsApplication::isViewable()) {
+            if (TodoUtility::isSearchTodoAssignees($search_bits)) {
+                return self::SEARCH_SELECTION_USER;
+            }
+            $session = $this->getSession(self::TODO_SESSION_KEY);
+            $search_selection
+                = $session->get(self::SESSION_KEY_SEARCH_SELECTION);
+            if ($search_selection) {
+                return $search_selection;
+            }
+
+            return self::SEARCH_SELECTION_FTS;
+        }
+
+        return self::SEARCH_SELECTION_USER;
+    }
+
+    /**
+     *
+     * @param string $search_selection
+     */
+    public function setSearchSelection($search_selection)
+    {
+        $session = $this->getSession(self::TODO_SESSION_KEY);
+        $session->set(self::SESSION_KEY_SEARCH_SELECTION, $search_selection);
+    }
+
+    /**
+     * @param string $space_id
+     *
+     * @return string
+     */
+    private function getTodoRootCategoryId($space_id)
+    {
+        $todo_service = TodoService::getInstance();
+        $todo_root_category
+            = $todo_service->getApplicationRootCategory($space_id,
+            Application::APPLICATION_CODE_TODO,
+            $this->getLanguageCode());
+
+        return $todo_root_category->getId();
+    }
+
+    /**
+     * @param \GRN_Smarty $t
+     * @param string      $space_id
+     */
+    private function assignCommonValues(&$t, $space_id)
+    {
+        $space_service = SpaceService::getInstance();
+
+        $login_id = $this->getLoginUserId();
+        $t->assign('login_id', $login_id);
+
+        $space_write_auth
+            = $space_service->hasSpaceAccessControl(Authority::AUTHORITY_CODE_WRITE,
+            $space_id, $login_id);
+        $t->assign('space_write_auth', $space_write_auth);
+
+        // generate upload ticket
+        include('grn/_upload_prepend.csp');
+        $t->assign('todo_upload_ticket', \GRN_UploadTicket::create($login_id));
+
+        $t->assign('fts', FtsApplication::isViewable());
+    }
+
+    /**
+     * @param \GRN_Smarty $t
+     * @param string      $space_id
+     * @param string      $thread_id
+     * @param string      $todo_root_category_id
+     * @param string      $user_id
+     * @param string      $search_bits
+     * @param string      $search_text
+     *
+     * @throws GrnInvalidPermissionException
+     */
+    private function assignTodoMemberList(
+        &$t,
+        $space_id,
+        $thread_id,
+        $todo_root_category_id,
+        &$user_id,
+        $search_bits,
+        $search_text
+    ) {
+        $space_service = SpaceService::getInstance();
+        $todo_service = TodoService::getInstance();
+
+        $login_id = $this->getLoginUserId();
+
+        // check todo category authority
+        if (ValidateUtility::isNull($thread_id)) {
+            $todo_write_auth = false;
+        } else {
+            $todo_write_auth
+                = $todo_service->hasTodoCategoryAccessControl(Authority::AUTHORITY_CODE_WRITE,
+                $space_id, $thread_id,
+                $todo_root_category_id, $login_id);
+            $read_auth
+                = $todo_service->hasTodoCategoryAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+                $space_id,
+                $thread_id, $todo_root_category_id, $login_id);
+            if ( ! $read_auth) {
+                throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_ACCESS_PERMISSION);
+            }
+        }
+
+        $todo_search_condition = new TodoSearchCondition();
+        $todo_search_condition->setSearchCategoryId($todo_root_category_id);
+        $todo_search_condition->setSearchThreadId($thread_id);
+
+        // count all incomplete todo
+        $this->countIncompleteTodo($todo_search_condition);
+
+        $is_search_user_from_selected = false;
+        $is_search_user = false;
+        if ($this->isSearchUser($search_text, $search_bits)) {
+            $is_search_user = true;
+        } elseif ((TodoUtility::isSearchIncremental($search_bits))) {
+            $is_search_user_from_selected = true;
+        }
+        $is_from_search = $is_search_user || $is_search_user_from_selected;
+
+        $space_user_collection = $this->getTodoUserCollection($space_id,
+            ['is_search' => $is_from_search]);
+
+        if ($is_search_user_from_selected) {
+            $spaceMember = $space_user_collection->getSpaceMember($user_id);
+            $space_user_collection = new SpaceUserCollection();
+            if ($spaceMember) {
+                $space_user_collection->appendBean($spaceMember);
+            }
+            $is_space_member = false;
+        } elseif ($is_search_user) {
+            $search_user_ids = [];
+            foreach ($space_user_collection as $eachSpaceUser) {
+                $search_user_ids[] = $eachSpaceUser->getMemberID();
+            }
+            $space_user_collection = $this->searchTodoAssignee($space_id,
+                $search_text, $search_user_ids);
+            $is_space_member = false;
+        } else {
+            if ($todo_write_auth) {
+                $is_space_member = true;
+            } else {
+                $is_space_member = $space_service->isSpaceMember($login_id,
+                    $space_id, $login_id);
+            }
+        }
+
+        if ($is_space_member) {
+            $append_login_user = new SpaceUser([SpaceUser::USER => $login_id],
+                SpaceUser::NOT_CHECK_INPUT);
+            $space_user_collection->appendBean($append_login_user);
+        }
+
+        $space_service->addSimpleUserInfo($space_user_collection);
+
+        $space_user_list = [];
+        $show_user_count
+            = $this->calculateNumberOfDisplayedTodoUsers($is_from_search,
+            $is_space_member);
+
+        $login_user = null;
+        require_once('grn/application.csp');
+
+        $candidate_user_ids = $this->getCandidateUserIds($space_user_collection,
+            $this->_count_user_incomplete_todo);
+
+        $user_count = 0;
+        $skip_user_count = 0;
+        $has_more_user = false;
+        /** @var SpaceUser $space_user */
+        foreach ($space_user_collection as $space_user) {
+            $is_display
+                = isset($candidate_user_ids[$space_user->getMemberID()]);
+            if ( ! $is_display) {
+                $skip_user_count++;
+                continue;
+            }
+
+            $user_count++;
+            if ($show_user_count > 0
+                && $space_user->getMemberID() != $login_id
+            ) {
+                $space_user_list[] = [
+                    'id'               => $space_user->getMemberID(),
+                    'name'             => $space_user->getDisplayName(),
+                    'incomplete_count' => $this->_getCountUserIncompleteTodo($space_user->getMemberID()),
+                    'inactive_user'    => $space_user->isInvalidUser(),
+                    //GTM-529
+                    'using_space'      => ! $space_user->isNotUsingApp()
+                ];   //GTM-529;
+                $show_user_count--;
+            }
+
+            if ($space_user->getMemberID() == $login_id
+                && ($is_from_search)
+            ) {
+                $space_user_list[] = [
+                    'id'               => $space_user->getMemberID(),
+                    'name'             => $space_user->getDisplayName(),
+                    'incomplete_count' => $this->_getCountUserIncompleteTodo($space_user->getMemberID()),
+                    'inactive_user'    => $space_user->isInvalidUser(),
+                    //GTM-529
+                    'using_space'      => ! $space_user->isNotUsingApp()
+                ];   //GTM-529;
+                $show_user_count--;
+            }
+
+            if ($is_from_search && $show_user_count == 0) {
+                $has_more_user = count($space_user_collection)
+                                 > self::MAX_NUM_SHOWING_MEMBER;
+                break;
+            }
+
+            if ($is_space_member && $space_user->getMemberID() == $login_id
+                && $login_user == null
+            ) {
+                $login_user = [
+                    'id'               => $login_id,
+                    'name'             => $space_user->getDisplayName(),
+                    'incomplete_count' => $this->_getCountUserIncompleteTodo($login_id)
+                ];
+            }
+        }
+
+        if ($is_from_search) {
+            if (is_null($user_id)) {
+                if (current($space_user_list) > 0) {
+                    $space_user = current($space_user_list);
+                    $user_id = $space_user["id"];
+                } else {
+                    $user_id = "-1";
+                }
+            }
+        } else {
+            array_unshift($space_user_list, [
+                'id'               => '0',
+                'name'             => cb_msg('grn.space.todo', 'no_user'),
+                'incomplete_count' => $this->_getCountUserIncompleteTodo()
+            ]);
+        }
+
+        if ($login_user) {
+            array_unshift($space_user_list, $login_user);
+        }
+        if ($is_from_search) {
+            if ($has_more_user) {
+                $has_left_remaining_member = true;
+            } else {
+                $has_left_remaining_member = $user_count
+                                             > self::MAX_NUM_SHOWING_MEMBER;
+            }
+        } else {
+            $all_count = $space_user_collection->getCountNoLimit()
+                         - $skip_user_count;
+            // -1 is (Unspecified)
+            $display_count = count($space_user_list) - 1;
+
+            $has_left_remaining_member = $all_count - $display_count > 0;
+        }
+
+        $t->assign('space_user_list', $space_user_list);
+        $t->assign('has_left_remaining_member', $has_left_remaining_member);
+        $t->assign('todo_write_auth', $todo_write_auth);
+
+        $out_of_space_members = $this->getTodoOutOfSpaceMembers($space_id);
+        $t->assign('exists_out_of_members', count($out_of_space_members) > 0);
+
+    }
+
+    private function getFromGroupRoleUserIds(
+        SpaceUserCollection $todo_user_collection
+    ) {
+        $space_members = SpaceService::getInstance()
+                                     ->getSpaceUserCollection($this->getSpaceId(),
+                                         $this->getLoginUserId());
+
+        $user_ids = [];
+        $group_ids = [];
+        $role_ids = [];
+
+        /** @var SpaceMember $space_member */
+        foreach ($space_members as $space_member) {
+            $member_id = $space_member->getMemberID();
+
+            if ($space_member->isTypeEqualsUser()) {
+                $user_ids[$member_id] = $member_id;
+                continue;
+            }
+
+            if ($space_member->isTypeEqualsOrganization()) {
+                $group_ids[$member_id] = $member_id;
+                continue;
+            }
+
+            if ($space_member->isTypeEqualsRole()) {
+                $role_ids[$member_id] = $member_id;
+                continue;
+            }
+        }
+
+        $uum = cb_lwc_uum();
+        $group_users = $uum->getGroupsUsers($group_ids);
+        $role_users = $uum->getRolesUserIds($role_ids);
+
+        $result = [];
+        /** @var SpaceUser $todo_user */
+        foreach ($todo_user_collection as $todo_user) {
+            $member_id = $todo_user->getMemberID();
+
+            $is_from_user = isset($user_ids[$member_id]);
+            if ($is_from_user) {
+                continue;
+            }
+
+            $is_from_group = isset($group_users[$member_id]);
+            $is_from_role = isset($role_users[$member_id]);
+            if ($is_from_group || $is_from_role) {
+                $result[$member_id] = $member_id;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param SpaceUserCollection $space_user_collection
+     * @param array               $incomplete_todo_array
+     *
+     * @return array
+     */
+    public function getCandidateUserIds(
+        SpaceUserCollection $space_user_collection,
+        array $incomplete_todo_array
+    ) {
+        $result = [];
+        $from_group_role_user_ids
+            = $this->getFromGroupRoleUserIds($space_user_collection);
+
+        /** @var SpaceUser $space_user */
+        foreach ($space_user_collection as $space_user) {
+            $member_id = $space_user->getMemberID();
+
+            $is_set_as_user = ! isset($from_group_role_user_ids[$member_id]);
+            if ($is_set_as_user) {
+                $result[$member_id] = $member_id;
+                continue;
+            }
+
+            if ( ! $space_user->isNotUsingApp()) {
+                $result[$member_id] = $member_id;
+                continue;
+            } else {
+                $todo_count_array = cb_at($incomplete_todo_array, $member_id,
+                    $this->_createTodoCountArray());
+                $has_incomplete_todo = ($todo_count_array[self::TODO_COUNT]
+                                        !== 0);
+                if ($has_incomplete_todo) {
+                    $result[$member_id] = $member_id;
+                    continue;
+                }
+            }
+
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param $space_id
+     * @param $options
+     *
+     * @return SpaceUserCollection
+     */
+    public function getTodoUserCollection($space_id, $options = [])
+    {
+        $is_search = $options['is_search'] ?? true;
+
+        $space_service = SpaceService::getInstance();
+        $login_user_id = cb_lwc_uum()->getLoginUser()->getOID();
+
+        $space_user_collection
+            = $space_service->getSpaceUserCollectionOfUserOnly($space_id,
+            $login_user_id);
+
+        if ( ! $is_search) {
+            $result = $space_user_collection->getTop(0,
+                self::MAX_NUM_SHOWING_MEMBER);
+            $result->setCountNoLimit($space_user_collection->getCountNoLimit());
+            $space_service->addSimpleUserInfo($result);
+
+            return $result;
+        }
+
+        $space_service->addSimpleUserInfo($space_user_collection);
+
+        return $space_user_collection;
+    }
+
+    /**
+     * @param \GRN_Smarty $t
+     * @param string      $space_id
+     */
+    private function assignThreadList(&$t, $space_id)
+    {
+        $space_service = SpaceService::getInstance();
+
+        $login_id = $this->getLoginUserId();
+        $language_code = $this->getLanguageCode();
+
+        // get thread list
+        $discussion_service = DiscussionService::getInstance();
+        $thread_root_category
+            = $discussion_service->getApplicationRootCategory($space_id,
+            Application::APPLICATION_CODE_DISCUSSION,
+            $language_code);
+        $thread_search_condition = new ThreadSearchCondition();
+        $thread_search_condition->setSearchCategoryId($thread_root_category->getId());
+        $thread_search_condition->setOrderSortArray([ThreadSearchCondition::SORT_CREATE_TIME_ASC]);
+        $thread_collection
+            = $discussion_service->searchThreadBySearchConditionWithAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $thread_search_condition, $login_id);
+
+        //GTM-2201
+        $folder_condition = new FolderSearchCondition();
+        $folder_condition->setSpaceId($space_id);
+        $folder_collection
+            = $space_service->getFolderListByCondition($folder_condition);
+
+        $has_folder_view = false;
+        if (count($folder_collection) > 0) {
+            $has_folder_view = true;
+        }
+
+        $thread_collection_for_view = [];
+        if ($has_folder_view) {
+            $thread_collection_for_view = $this->_createThreadCollectionForView(
+                $thread_collection, $folder_collection
+            );
+        }
+
+        $t->assign('thread_collection', $thread_collection);
+        //GTM-2201
+        $t->assign('thread_collection_for_view', $thread_collection_for_view);
+        $t->assign('has_folder_view', $has_folder_view);
+    }
+
+    /**
+     * @param \GRN_Smarty $t
+     * @param string      $space_id
+     * @param string      $thread_id
+     * @param string      $user_id
+     * @param string      $todo_status
+     * @param int         $offset
+     * @param string      $todo_root_category_id
+     * @param string      $search_bits
+     * @param string      $search_text
+     */
+    private function assignTodoList(
+        &$t,
+        $space_id,
+        $thread_id,
+        $user_id,
+        $todo_status,
+        $offset,
+        $todo_root_category_id,
+        $search_bits,
+        $search_text
+    ) {
+        $todo_service = TodoService::getInstance();
+
+        $limit = $this->getUserConfig()->getListMax();
+        $login_id = $this->getLoginUserId();
+
+        $count_every_status_todo = $this->_getCountEveryStatusIncompleteTodo();
+
+        $todo_search_condition = new TodoSearchCondition();
+        $todo_search_condition->setSearchCategoryId($todo_root_category_id);
+        $todo_search_condition->setSearchThreadId($thread_id);
+        $todo_search_condition->setSearchParticipantUserId($user_id);
+        $todo_search_condition->setSearchStatus($todo_status);
+        $todo_search_condition->setOffset($offset);
+        $todo_search_condition->setLimit($limit);
+        if ($todo_status == TodoSearchCondition::STATUS_COMPLETE) {
+            $todo_search_condition->setOrderSortArray([
+                TodoSearchCondition::SORT_DEADLINE_TIMESTAMP_DESC,
+                TodoSearchCondition::SORT_CREATE_TIME_DESC
+            ]);
+        } else {
+            $todo_search_condition->setOrderSortArray([
+                TodoSearchCondition::SORT_DEADLINE_TIMESTAMP_ASC,
+                TodoSearchCondition::SORT_CREATE_TIME_DESC
+            ]);
+        }
+
+        if ($user_id == "-1") {
+            $todo_collection = new TodoCollection();
+        } else {
+            $todo_collection
+                = $todo_service->searchTodoBySearchConditionWithAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+                $todo_search_condition, $login_id);
+        }
+
+        $todo_service->addTodoCollectionUserInfo($todo_collection);
+        $todos = [];
+        foreach ($todo_collection as $todo) {
+            /** @var \grn\space\data\bean\Todo $todo */
+            if ($todo_status == TodoSearchCondition::STATUS_COMPLETE) {
+                $todo_user_collection = $todo->getTodoUserCollection();
+                $user_number = $todo_user_collection->count() - 1;
+                $todo_user_for_view = $user_number >= 0
+                    ? $todo_user_collection->getBean(0) : null;
+            } else {
+                if ($user_id != null && $user_id != 0) {
+                    $user = new TodoUser();
+                    $user->setId($user_id);
+                    $user->setMemberID($user_id);
+                    $user->setMemberType(MemberLogic::TYPE_USER);
+                    $todo_user_collection = new TodoUserCollection();
+                    $todo_user_collection->appendBean($user);
+                    $todo_service->addSimpleUserInfo($todo_user_collection);
+                    $todo_user_for_view = $todo_user_collection->getBean(0);
+                    $user_number = 0;
+                } else {
+                    $todo_users = [];
+                    $todo_user_collection = $todo->getTodoUserCollection();
+                    foreach ($todo_user_collection as $todo_user) {
+                        if ( ! $todo_user->isComplete()) {
+                            $todo_users[] = $todo_user;
+                        }
+                    }
+                    $user_number = count($todo_users) - 1;
+                    $todo_user_for_view = $user_number >= 0 ? $todo_users[0]
+                        : null;
+                    unset($todo_users);
+                }
+            }
+
+            $deadline = $this->transferTimestampToDateEx($todo,
+                $todo->getDeadlineTimestamp());
+            $todo_for_view = [
+                'id'          => $todo->getId(),
+                'deadline'    => $deadline,
+                'title'       => $todo->getTitle(),
+                'user'        => $todo_user_for_view,
+                'user_number' => $user_number,
+                'thread_name' => $todo->getParentThreadTitle(),
+                'thread_id'   => $todo->getParentThreadId(),
+                'content'     => $todo->getContent(),
+                'status'      => $this->getTodoStatus($todo)
+            ];
+            $todos[] = $todo_for_view;
+            unset($todo_for_view);
+        }
+
+        // Make page navi
+        $controllerUtil = new \GRN_ControllerUtil();
+        $navi_for_view
+            = $controllerUtil->makeNaviInformation($todo_search_condition->getOffset(),
+            $limit,
+            $todo_collection->getCountNoLimit(),
+            [
+                self::ARG_SPACE_ID    => $space_id,
+                self::ARG_THREAD_ID   => $thread_id,
+                self::ARG_USER_ID     => $user_id,
+                self::ARG_TODO_STATUS => $todo_status,
+                self::ARG_SEARCH_TEXT => $search_text,
+                self::ARG_SEARCH_BITS => $search_bits
+            ]);
+
+        $t->assign('navi', $navi_for_view);
+        $t->assign('count_every_status_todo', $count_every_status_todo);
+        $t->assign('max_count_user_incomplete_todo',
+            $this->_max_count_user_incomplete_todo
+                ? $this->_max_count_user_incomplete_todo : 1);
+        $t->assign('todos', $todos);
+        $t->assign('from_todo_index', self::FROM_TODO_INDEX);
+    }
+
+
+    /**
+     * @param $space_id
+     *
+     * @return array
+     */
+    private function getTodoOutOfSpaceMembers($space_id)
+    {
+        $login_id = $this->getLoginUserId();
+
+        $todo_service = TodoService::getInstance();
+
+        $no_space_member_ids = $todo_service->getNoSpaceMemberIds($space_id,
+            $login_id);
+
+        return $no_space_member_ids;
+
+    }
+
+    /**
+     * @return mixed|string
+     */
+    public function getSpaceOutOfMembers()
+    {
+        $input = $this->getInput();
+        $parameter = [self::ARG_SPACE_ID];
+        $this->checkArgFromInput($parameter, $input);
+        $space_id = $this->getSpaceId();
+        $thread_id = cb_at($input, self::ARG_THREAD_ID);
+        $user_id = cb_at($input, self::ARG_USER_ID);
+
+        $todo_service = TodoService::getInstance();
+        $todo_root_category
+            = $todo_service->getApplicationRootCategory($space_id,
+            Application::APPLICATION_CODE_TODO,
+            $this->getLanguageCode());
+        $todo_root_category_id = $todo_root_category->getId();
+
+        // count all incomplete todo
+        $todo_search_condition = new TodoSearchCondition();
+        $todo_search_condition->setSearchCategoryId($todo_root_category_id);
+        $todo_search_condition->setSearchThreadId($thread_id);
+        $this->countIncompleteTodo($todo_search_condition);
+
+        $out_of_member_ids = $this->getTodoOutOfSpaceMembers($space_id);
+
+        $display_info_condition = [];
+        foreach ($out_of_member_ids as $member_id) {
+            $display_info_condition[$member_id] = [
+                MemberLogic::MEMBER_TYPE => MemberLogic::TYPE_USER,
+                MemberLogic::MEMBER_ID   => $member_id
+            ];
+        }
+        $space_member_logic = SpaceMemberLogic::getInstance();
+        $display_infos
+            = $space_member_logic->getDisplayMemberListOfNotDeletedUsers($display_info_condition);
+
+        $space_user_list = [];
+        foreach ($display_infos as $display_info) {
+            $space_user_list[] = [
+                'id'               => $display_info[MemberLogic::MEMBER_ID],
+                'name'             => $display_info[MemberLogic::DISPLAY_NAME],
+                'incomplete_count' => $this->_getCountUserIncompleteTodo($display_info[MemberLogic::MEMBER_ID]),
+                'inactive_user'    => $display_info[MemberLogic::IS_INVALID_USER],
+                'using_space'      => ! $display_info[MemberLogic::IS_NOT_USING_APP]
+            ];
+        }
+
+        require_once('grn/smarty.csp');
+        $t = new \GRN_Smarty();
+        $t->assign('space_id', $space_id);
+        $t->assign('thread_id', $thread_id);
+        $t->assign('user_id', $user_id);
+        $t->assign('login_id', $this->getLoginUserId());
+        $t->assign('space_user_list', $space_user_list);
+        $t->assign('max_count_user_incomplete_todo',
+            $this->_max_count_user_incomplete_todo
+                ? $this->_max_count_user_incomplete_todo : 1);
+
+        return $t->fetch('space/application/todo/left_member_list.tpl');
+    }
+
+    /**
+     * @param $search_text
+     * @param $search_bits
+     *
+     * @return bool
+     */
+    private function isSearchUser($search_text, $search_bits): bool
+    {
+        return $search_text && (TodoUtility::isSearchUser($search_bits));
+    }
+
+    /**
+     * @param $space_id
+     * @param $search_text
+     * @param $search_user_ids
+     *
+     * @return SpaceUserCollection
+     */
+    private function searchTodoAssignee(
+        $space_id,
+        $search_text,
+        $search_user_ids
+    ): SpaceUserCollection {
+        $search_keys = cb_parse_search_text($search_text);
+        if (count($search_user_ids) > 0 && count($search_keys) > 0) {
+            $search_condition = new SpaceUserSearchCondition();
+            $search_condition->setSearchSpaceId($space_id);
+            $search_condition->setSearchItemBit(SpaceUserSearchCondition::SEARCH_ITEM_USER_NAME);
+            $search_condition->setSearchStringArray($search_keys);
+            $search_condition->setSearchUserCandidate($search_user_ids);
+            $search_condition->setOrderSortArray([SpaceUserSearchCondition::SORT_FIELD_USER_CANDIDATE]);
+
+            $space_service = SpaceService::getInstance();
+            $space_user_collection
+                = $space_service->searchSpaceUserBySearchCondition($search_condition,
+                cb_get_login_user_id());
+        } else {
+            $space_user_collection = new SpaceUserCollection();
+        }
+
+        return $space_user_collection;
+    }
+
+    public function getLeftRemainingMember()
+    {
+        $input = $this->getInput();
+        $parameter = [self::ARG_SPACE_ID];
+        $this->checkArgFromInput($parameter, $input);
+        $space_id = $this->getSpaceId();
+        $language_code = $this->getLanguageCode();
+        $login_id = $this->getLoginUserId();
+        $thread_id = cb_at($input, self::ARG_THREAD_ID);
+        $user_id = cb_at($input, self::ARG_USER_ID);
+
+        $search_text = cb_at($input, self::ARG_SEARCH_TEXT);
+        $search_bits = cb_at($input, self::ARG_SEARCH_BITS);
+        $is_search_user = $this->isSearchUser($search_text, $search_bits);
+
+        $space_service = SpaceService::getInstance();
+        try {
+            $space_service->getSpace($space_id, $login_id, $language_code);
+        } catch (GrnDataNotFoundException $e) {
+            $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+            throw $e;
+        }
+
+        $todo_service = TodoService::getInstance();
+        $todo_root_category
+            = $todo_service->getApplicationRootCategory($space_id,
+            Application::APPLICATION_CODE_TODO, $language_code);
+        $todo_root_category_id = $todo_root_category->getId();
+
+        // check todo category authority
+        if (ValidateUtility::isNotNull($thread_id)) {
+            $read_auth
+                = $todo_service->hasTodoCategoryAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+                $space_id,
+                $thread_id, $todo_root_category_id, $login_id);
+            if ( ! $read_auth) {
+                throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_ACCESS_PERMISSION);
+            }
+        }
+
+        $todo_search_condition = new TodoSearchCondition();
+        $todo_search_condition->setSearchCategoryId($todo_root_category_id);
+        $todo_search_condition->setSearchThreadId($thread_id);
+
+        // count all incomplete todo
+        $this->countIncompleteTodo($todo_search_condition);
+
+        // get remaining user
+        $is_space_member = $space_service->isSpaceMember($login_id, $space_id,
+            $login_id);
+
+        if ($is_search_user) {
+            $space_user_collection = $this->getTodoUserCollection($space_id,
+                ['is_search' => true]);
+            $search_user_ids = [];
+            foreach ($space_user_collection as $eachSpaceUser) {
+                $search_user_ids[] = $eachSpaceUser->getMemberID();
+            }
+            $space_user_collection = $this->searchTodoAssignee($space_id,
+                $search_text, $search_user_ids);
+        } else {
+            $space_user_collection
+                = $space_service->getSpaceUserCollectionOfUserOnly($space_id,
+                $login_id);
+        }
+
+        $space_user_list = [];
+        $space_service->addSimpleUserInfo($space_user_collection);
+
+        if ($is_search_user) {
+            $offset = self::MAX_NUM_SHOWING_MEMBER + 1;
+        } else {
+            if ($is_space_member) {
+                $hidden_member_collection
+                    = $space_user_collection->getTop(self::MAX_NUM_SHOWING_MEMBER
+                                                     - 2, -1);
+                $is_login_member_hidden
+                    = $hidden_member_collection->getSpaceMember($login_id);
+                if ($is_login_member_hidden) {
+                    $offset = self::MAX_NUM_SHOWING_MEMBER - 1;
+                } else {
+                    $offset = self::MAX_NUM_SHOWING_MEMBER;
+                }
+
+            } else {
+                $offset = self::MAX_NUM_SHOWING_MEMBER;
+            }
+        }
+        $space_user_collection = $space_user_collection->getTop($offset, -1);
+
+        /** @var SpaceUser $space_user */
+        foreach ($space_user_collection as $space_user) {
+            if ($space_user->getMemberID() == $login_id && ! $is_search_user) {
+                continue;
+            }
+
+            $space_user_list[] = [
+                'id'               => $space_user->getMemberID(),
+                'name'             => $space_user->getDisplayName(),
+                'incomplete_count' => $this->_getCountUserIncompleteTodo($space_user->getMemberID()),
+                'inactive_user'    => $space_user->isInvalidUser(),
+                'using_space'      => ! $space_user->isNotUsingApp()
+            ];
+        }
+
+        require_once('grn/smarty.csp');
+        $t = new \GRN_Smarty();
+        $t->assign('space_id', $space_id);
+        $t->assign('thread_id', $thread_id);
+        $t->assign('user_id', $user_id);
+        $t->assign('login_id', $login_id);
+        $t->assign('space_user_list', $space_user_list);
+        $t->assign('max_count_user_incomplete_todo',
+            $this->_max_count_user_incomplete_todo
+                ? $this->_max_count_user_incomplete_todo : 1);
+
+        return $t->fetch('space/application/todo/left_member_list.tpl');
+    }
+
+    /**
+     * Count every status of incomplete todo( incomplete, late, inTerm, today, noTerm )
+     *
+     * @param TodoSearchCondition $todo_search_condition
+     *
+     * @return array
+     */
+    public function countIncompleteTodo(
+        TodoSearchCondition $todo_search_condition
+    ) {
+        $todo_service = TodoService::getInstance();
+
+        $todo_search_condition->setSearchStatus(TodoSearchCondition::STATUS_INCOMPLETE);
+        $todo_collection
+            = $todo_service->searchTodoBySearchConditionWithAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $todo_search_condition, $this->getLoginUserId(), false, true);
+        $user_incomplete_todo = [
+            0 => $this->_createTodoCountArray() // no user
+        ];
+
+        $all_incomplete_todo = $this->_createTodoCountArray();
+        $all_incomplete_todo[self::TODO_COUNT] = $todo_collection->count();
+
+        /** @var \grn\space\data\bean\Todo $todo */
+        foreach ($todo_collection as $todo) {
+            $status = $this->getTodoStatus($todo);
+
+            $all_incomplete_todo[$status]++;
+
+            $todo_user_collection = $todo->getTodoUserCollection();
+            if ($todo_user_collection->count() < 1) {
+                $user_incomplete_todo[0][$status]++;
+                $user_incomplete_todo[0][self::TODO_COUNT]++;
+                continue;
+            }
+            /** @var \grn\space\data\bean\TodoUser $todo_user */
+            foreach ($todo_user_collection as $todo_user) {
+                if ( ! $todo_user->isComplete()) {
+                    $user_id = $todo_user->getMemberID();
+                    if ( ! array_key_exists($user_id, $user_incomplete_todo)) {
+                        $user_incomplete_todo[$user_id]
+                            = $this->_createTodoCountArray();
+                    }
+                    $user_incomplete_todo[$user_id][$status]++;
+                    $user_incomplete_todo[$user_id][self::TODO_COUNT]++;
+                }
+            }
+        }
+        $this->_count_user_incomplete_todo = $user_incomplete_todo;
+        $this->_count_all_incomplete_todo = $all_incomplete_todo;
+
+        $user_todo_count = [];
+        foreach ($user_incomplete_todo as $count_info) {
+            $user_todo_count[] = $count_info[self::TODO_COUNT];
+        }
+        $this->_max_count_user_incomplete_todo = max($user_todo_count);
+
+        return [
+            self::COUNT_USER_INCOMPLETE_TODO     => $this->_count_user_incomplete_todo,
+            self::COUNT_ALL_INCOMPLETE_TODO      => $this->_count_all_incomplete_todo,
+            self::MAX_COUNT_USER_INCOMPLETE_TODO => $this->_max_count_user_incomplete_todo
+        ];
+    }
+
+    /**
+     * get user's incomplete todo( incomplete, late, inTerm, today, noTerm )
+     *
+     * @param int $user_id Default is TodoSearchCondition::SEARCH_PARTICIPANT_USER_NOUSER
+     *                     If don't set $user_id, it will count todo(no user).
+     *
+     * @return array
+     */
+    private function _getCountUserIncompleteTodo(
+        $user_id = TodoSearchCondition::SEARCH_PARTICIPANT_USER_NOUSER
+    ) {
+        $count_info = null;
+        if ($user_id == TodoSearchCondition::SEARCH_PARTICIPANT_USER_NOUSER) {
+            $user_id = 0;
+        }
+        $count_info = cb_at($this->_count_user_incomplete_todo, $user_id,
+            $this->_createTodoCountArray());
+
+        return $count_info;
+    }
+
+    /**
+     * get every status of incomplete todo( incomplete, late, inTerm, today, noTerm )
+     *
+     * @return array
+     */
+    private function _getCountEveryStatusIncompleteTodo()
+    {
+        return $this->_count_all_incomplete_todo;
+    }
+
+    /**
+     * @return array
+     */
+    private function _createTodoCountArray()
+    {
+        return [
+            self::TODO_COUNT     => 0,
+            self::STATUS_LATE    => 0,
+            self::STATUS_IN_TERM => 0,
+            self::STATUS_TODAY   => 0,
+            self::STATUS_NO_TERM => 0
+        ];
+    }
+
+    /**
+     * @param ThreadCollection $thread_collection
+     * @param FolderCollection $folder_collection
+     *
+     * @return array
+     */
+    private function _createThreadCollectionForView(
+        $thread_collection,
+        $folder_collection
+    ) {
+        $thread_collection_for_view = [];
+        foreach ($folder_collection as $folder) {
+            $folder_id = $folder->getId();
+            $thread_collection_for_view[$folder_id] = [];
+            $thread_collection_for_view[$folder_id]["folder_name"]
+                = $folder->getFolderName();
+            $thread_collection_for_view[$folder_id]["threads"] = [];
+            foreach ($thread_collection as $thread) {
+                if ($folder_id === $thread->getFolderId()) {
+                    $thread_collection_for_view[$folder_id]["threads"][]
+                        = $thread;
+                }
+            }
+            if (count($thread_collection_for_view[$folder_id]["threads"]) < 1) {
+                unset($thread_collection_for_view[$folder_id]);
+            }
+        }
+
+        $no_folder = false;
+        /** @var Thread $thread */
+        foreach ($thread_collection as $thread) {
+            if (SpaceService::UNCATEGORIED == $thread->getFolderId()) {
+                $no_folder = true;
+                break;
+            }
+        }
+
+        if ($no_folder) {
+            $thread_collection_for_view[SpaceService::UNCATEGORIED] = [];
+            $thread_collection_for_view[SpaceService::UNCATEGORIED]["folder_name"]
+                = cb_msg('grn.space.todo',
+                'no_folder');
+            $thread_collection_for_view[SpaceService::UNCATEGORIED]["threads"]
+                = [];
+            /** @var Thread $thread */
+            foreach ($thread_collection as $thread) {
+                if (SpaceService::UNCATEGORIED == $thread->getFolderId()) {
+                    $thread_collection_for_view[SpaceService::UNCATEGORIED]["threads"][]
+                        = $thread;
+                }
+            }
+            if (count($thread_collection_for_view[SpaceService::UNCATEGORIED]["threads"])
+                < 1
+            ) {
+                unset($thread_collection_for_view[SpaceService::UNCATEGORIED]);
+            }
+        }
+
+        return $thread_collection_for_view;
+    }
+
+    /**
+     * @return array
+     */
+    public function getSitePosition()
+    {
+        return [['page' => '', 'name' => $this->getTitle(),]];
+    }
+
+    /**
+     * @return string
+     */
+    public function getTitle()
+    {
+        return grn_get_page_display_name('space/todo/index');
+    }
+
+    /**
+     * @param bool $is_from_search
+     * @param bool $is_space_member
+     *
+     * @return int
+     */
+    public function calculateNumberOfDisplayedTodoUsers(
+        bool $is_from_search,
+        bool $is_space_member
+    ): int {
+        if ($is_from_search) {
+            return self::MAX_NUM_SHOWING_MEMBER;
+        }
+
+        return $is_space_member ? (self::MAX_NUM_SHOWING_MEMBER - 2)
+            : (self::MAX_NUM_SHOWING_MEMBER - 1);
+    }
+}

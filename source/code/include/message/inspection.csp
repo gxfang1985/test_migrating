@@ -1,0 +1,938 @@
+<?php
+
+require_once('grn/application.csp');
+
+/**
+ * Message Application Inspection Logic
+ *
+ * @author   Eiji TAEN
+ * @date     2005/05
+ * @package  grn.message
+ */
+
+/**
+ * Message Inspection class
+ *
+ * @package  grn.message
+ */
+class GRN_Message_Inspection
+{
+    private $_matched_mids;
+    private $_rowset;
+
+    /**
+     * constructor
+     */
+    function __construct()
+    {
+        $this->_matched_mids = [];
+        $this->_rowset = null;
+    }
+
+    /**
+     * search messages
+     *
+     * @param string       $keywords
+     * @param string[]     $user_list list of user ID
+     * @param CB_TimeStamp $start
+     * @param CB_TimeStamp $end
+     * @param array        $item_list list of item types (types: subject, data, sender, addressee, follow)
+     * @param int          $offset
+     * @param int          $limit
+     *
+     * @return array|false
+     */
+    function search_fast(
+        $keywords,
+        $user_list,
+        $start,
+        $end,
+        $item_list,
+        $offset,
+        $limit
+    ) {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('message');
+        $tab_message = $tm->getTableInfo('GRN_Message_Messages');
+        $db = $tab_message->getDBConnection();
+
+        // parse keywords
+        require_once('fw/string_util.csp');
+        $unwashed_keyword_list = cb_parse_search_text($keywords);
+        if (count($unwashed_keyword_list) == 0) {
+            return false;
+        }
+        $keyword_list = [];
+        foreach ($unwashed_keyword_list as $keyword) {
+            $keyword_list[] = $db->escapeLike($keyword);
+        }
+
+        // check item_list
+        if ( ! is_array($item_list)) {
+            return false;
+        }
+        $items = ['subject', 'data', 'sender', 'addressee', 'follow'];
+        $exists = false;
+        foreach ($items as $item) {
+            if (in_array($item, $item_list)) {
+                $exists = true;
+                break;
+            }
+        }
+        if ( ! $exists) {
+            return false;
+        }
+
+        // get tager message id list
+        $target_mid_list = [];
+        if (is_array($user_list) && count($user_list) > 0) {
+            $target_mid_list = $this->_getTargetMessageIDs($user_list, $start,
+                $end);
+            if (count($target_mid_list) == 0) {
+                return false;
+            }
+        }
+
+        // join tables and select column
+        $join_tables = [];
+        $columns = [];
+        $join_tables['message'] = "tab_grn_message_messages AS m";
+        $columns['common']
+            = 'm._id as B, m.col_last_mtime as A, m.col_subject as m_subject, m.col_last_mtime as m_last_mtime, m.col_file_num as m_file_num';
+        $columns['message_columns'] = [
+            'm.col_creator as creater',
+            'm.col_creator_name as creator_name',
+            'm.col_data as data'
+        ];
+        foreach ($item_list as $item) {
+            switch ($item) {
+                case 'sender':
+                    $join_tables['user']
+                        = "LEFT JOIN tab_cb_user AS u ON m.col_creator = u._id";
+                    $columns['user'] = [
+                        'u._id as uid',
+                        'u.col_deleted as deleted'
+                    ];
+                    break;
+                case 'follow':
+                    $join_tables['follows']
+                        = "LEFT JOIN tab_grn_message_follows AS f ON m._id = f.col_message LEFT JOIN tab_cb_user AS fu ON f.col_creator = fu._id";
+                    $columns['follow_columns'] = [
+                        'f._id as fid',
+                        'f.col_creator as creater',
+                        'f.col_creator_name as creator_name',
+                        'f.col_data as data',
+                        'fu.col_deleted as fdeleted'
+                    ];
+                    break;
+            }
+        }
+
+        $query = '';
+        // for follow table
+        if (in_array('follow', $item_list)) {
+            $condition = $this->_getCondition_follow($keyword_list, $start,
+                $end, $item_list, $target_mid_list);
+            if (is_null($condition) || strlen($condition) < 1) {
+                return false;
+            }
+            $condition .= ' AND isnull(m.col_original_message) AND m.col_last_mtime >= '
+                          . $start->unix_ts . ' AND m.col_last_mtime <= '
+                          . $end->unix_ts . ' AND m.col_message_type = '
+                          . GRN_MESSAGE_TYPE_GENERAL;
+
+            $query .= 'SELECT SQL_CALC_FOUND_ROWS ';
+            $columns_follow = [$columns['common']];
+            if (isset($columns['user'])) {
+                $columns_follow = array_merge($columns_follow,
+                    $columns['user']);
+            }
+            $columns_follow = array_merge($columns_follow,
+                $columns['follow_columns']);
+
+            $query .= implode(',', $columns_follow);
+            $query .= ', f.col_ctime as C ';
+            $query .= 'FROM ';
+            $query .= implode(' ', $join_tables);
+            $query .= ' WHERE ';
+            $query .= $condition;
+            unset($join_tables['follows']);
+
+            $condition = '';
+            if (count($target_mid_list) > 0) {
+                $condition .= " AND m._id IN (";
+                foreach ($target_mid_list as $target_mid) {
+                    $condition .= cb_queryf($db, "'@S',", $target_mid);
+                }
+                $pos = strlen($condition) - 1;
+                $condition = substr_replace($condition, ")", $pos);
+            }
+            if ( ! is_null($condition) || strlen($condition) > 0) {
+                $query .= $condition;
+                unset($condition);
+            }
+        }
+
+        // for message body
+        if (count($item_list) != 1 || ! in_array('follow', $item_list)) {
+            $condition = $this->_getCondition_message($keyword_list, $start,
+                $end, $item_list, $target_mid_list);
+            if ( ! is_null($condition) && strlen($condition) > 0) {
+                $condition .= ' AND isnull(m.col_original_message) AND m.col_last_mtime >= '
+                              . $start->unix_ts . ' AND m.col_last_mtime <= '
+                              . $end->unix_ts . ' AND m.col_message_type = '
+                              . GRN_MESSAGE_TYPE_GENERAL;
+                if ( ! in_array('follow', $item_list)) {
+                    $query .= 'SELECT SQL_CALC_FOUND_ROWS ';
+                } else {
+                    $query .= ' UNION ALL SELECT ';
+                }
+                $columns_message = [$columns['common']];
+                if (isset($columns['user'])) {
+                    $columns_message = array_merge($columns_message,
+                        $columns['user']);
+                }
+                if (isset($columns['follow_columns'])) {
+                    $columns_message = array_merge($columns_message, ['1']);
+                }
+                $columns_message = array_merge($columns_message,
+                    $columns['message_columns']);
+                $columns_message = array_merge($columns_message,
+                    ['NULL as fdeleted']);
+
+                $query .= implode(',', $columns_message);
+                $query .= ', NULL as C ';
+                $query .= 'FROM ';
+                $query .= implode(' ', $join_tables);
+                $query .= ' WHERE ';
+                $query .= $condition;
+
+                $condition = '';
+                if (count($target_mid_list) > 0) {
+                    $condition .= " AND m._id IN (";
+                    foreach ($target_mid_list as $target_mid) {
+                        $condition .= cb_queryf($db, "'@S',", $target_mid);
+                    }
+                    $pos = strlen($condition) - 1;
+                    $condition = substr_replace($condition, ")", $pos);
+                }
+
+                if ( ! is_null($condition) || strlen($condition) > 0) {
+                    $query .= $condition;
+                }
+            }
+        }
+
+        if (is_null($query) || strlen($query) == 0) {
+            return false;
+        }
+        $query .= " ORDER BY A DESC, B DESC, C DESC ";
+        $query = $db->select_format($query, $offset, $limit,
+            CB_DATABASE_SHARED_LOCK, false);
+        $query_calc = 'SELECT FOUND_ROWS()';
+
+        //Execute Query
+        $r = $db->query($query);
+        $r_calc = $db->query($query_calc);
+
+        $result = [];
+        $k = 0;
+        $row = $db->fetch_assoc($r_calc);
+        if ($row === false) {
+            return false;
+        }
+        $total = $row['FOUND_ROWS()'];
+
+        while (($row = $db->fetch_assoc($r)) !== false) {
+            $_result = [];
+            if (array_key_exists('fid', $row)
+                && $row['fid'] !== GRN_MESSAGE_DUMMY_FOLLOW_ID
+            ) {
+                $_result['fid'] = $row['fid'];
+                if (is_null($row['creater'])
+                    || (array_key_exists('deleted', $row)
+                        && ! is_null($row['deleted']))
+                ) {
+                    $creator_id = '';
+                } else {
+                    $creator_id = $row['creater'];
+                }
+                $creator_name = $row['creator_name'];
+                $data = $row['data'];
+            } else {
+                if (is_null($row['creater'])
+                    || (array_key_exists('deleted', $row)
+                        && ! is_null($row['deleted']))
+                ) {
+                    $creator_id = '';
+                } else {
+                    $creator_id = $row['creater'];
+                }
+                $creator_name = $row['creator_name'];
+                $data = $row['data'];
+            }
+            $_result['mid'] = $row['B'];
+            $_result['subject'] = $row['m_subject'];
+            $_result['creator_id'] = $creator_id;
+            $_result['creator_name'] = $creator_name;
+            $ts = new CB_TimeStamp;
+            $ts->unix_ts = $row['m_last_mtime'];
+            $_result['mtime'] = $ts;
+            $_result['data'] = $data;
+
+            //$_result['attached']     = $row['m_file_num'];
+            require_once('message/file.csp');
+            $fm = new GRN_Message_FileManager();
+            $_result['attached'] = $fm->getMessageFileNum($_result['mid'],
+                false);
+
+            $result[] = $_result;
+        }
+
+        // Workaround for the following bug.
+        // - https://bugs.mysql.com/bug.php?id=83110
+        // - https://bozuman.cybozu.com/k/4731/show#record=18409
+        // Note that if the total count is truly 1 and $offset is not 0,
+        // $total value will be incorrect.
+        if (empty($result) && $total == 1) {
+            $total = 0;
+        }
+
+        $result['k'] = $k;
+        $result['total'] = $total;
+
+        return $result;
+    }
+
+    function _getCondition_message(
+        $keyword_list,
+        $start,
+        $end,
+        $item_list,
+        $mid_list
+    ) {
+        $condition_list = [];
+        // for message body
+        if (count($item_list) != 1 || ! in_array('follow', $item_list)) {
+            foreach ($keyword_list as $keyword) {
+                $_condition = $this->_getColumnCondition($keyword, $start, $end,
+                    $item_list, $mid_list, false);
+                if ( ! $_condition) {
+                    return false;
+                }
+                $condition_list[] = $_condition;
+            }
+        }
+        $condition = '';
+        if (count($condition_list) > 0) {
+            $condition .= implode(' AND ', $condition_list);
+        }
+
+        return $condition;
+    }
+
+    function _getCondition_follow(
+        $keyword_list,
+        $start,
+        $end,
+        $item_list,
+        $mid_list
+    ) {
+        $condition_list = [];
+        // for message body
+        if (count($item_list) != 1 || ! in_array('follow', $item_list)) {
+            foreach ($keyword_list as $keyword) {
+                $_condition = $this->_getColumnCondition($keyword, $start, $end,
+                    $item_list,
+                    $mid_list, true);
+                if ( ! $_condition) {
+                    return false;
+                }
+                $condition_list[] = $_condition;
+            }
+        }
+        // for follow
+        if (in_array('follow', $item_list)) {
+            $f_data_list = [];
+            foreach ($keyword_list as $keyword) {
+                $f_data_list[] = $this->_getKeywordCondition($keyword,
+                    'f.col_data');
+            }
+            $condition_list[] = '(' . implode(' OR ', $f_data_list) . ')';
+        }
+        $condition = '';
+        if (count($condition_list) > 0) {
+            $condition .= implode(' AND ', $condition_list);
+        }
+
+        return $condition;
+    }
+
+    /**
+     * @access   private
+     */
+    function _getTargetMessageIDs($user_list, $start, $end)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('message');
+        $tab_message = $tm->getTableInfo('GRN_Message_Messages');
+        $db = $tab_message->getDBConnection();
+
+        require_once("message/query/GrnMessageByAddresseeIds.csp");
+        $query = new GrnMessageByAddresseeIds();
+        $query->setUserIdList($user_list);
+        $query->setStartTimestamp($start->unix_ts);
+        $query->setEndTimestamp($end->unix_ts);
+        $query->setDatabaseConnection($db);
+
+        $message_id_list = [];
+        foreach ($query->execute() as $row) {
+            $message_id_list[] = $row["_id"];
+        }
+
+        return array_unique($message_id_list);
+    }
+
+    /**
+     * @access   private
+     */
+    function _getColumnCondition(
+        $keyword,
+        $start,
+        $end,
+        $item_list,
+        $mid_list,
+        $for_follow
+    ) {
+        $condition_list = [];
+        foreach ($item_list as $item) {
+            switch ($item) {
+                case 'subject':
+                    $condition_list[] = $this->_getKeywordCondition($keyword,
+                        'col_subject');
+                    break;
+                case 'data':
+                    $condition_list[] = $this->_getKeywordCondition($keyword,
+                        'm.col_data');
+                    break;
+                case 'sender':
+                    $condition_list[] = $this->_getKeywordCondition($keyword,
+                        'm.col_creator_name');
+                    $condition_list[] = $this->_getKeywordCondition($keyword,
+                        'u.col_display_name');
+                    $condition_list[] = $this->_getKeywordCondition($keyword,
+                        'u.col_nickname');
+                    break;
+                case 'addressee':
+                    $message_id_list = $this->_getMatchedMessageIDs($keyword,
+                        $start, $end, $mid_list);
+                    if (count($message_id_list) > 0) {
+                        $condition_list[] = 'm._id IN (' . implode(',',
+                                $message_id_list) . ')';
+                    }
+                    break;
+                case 'follow':
+                    if ($for_follow) {
+                        $condition_list[]
+                            = $this->_getKeywordCondition($keyword,
+                            'f.col_data');
+                    }
+                    break;
+            }
+        }
+
+        if (count($condition_list) == 0) {
+            return false;
+        }
+
+        $condition = '(' . implode(' OR ', $condition_list) . ')';
+
+        return $condition;
+    }
+
+    /**
+     * @access   private
+     */
+    function _getKeywordCondition($keyword, $column)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('message');
+
+        $keyword_condition = $column . ' LIKE \'%'
+                             . $dbconn->escapeLike($keyword) . '%\'';
+
+        return $keyword_condition;
+    }
+
+    /**
+     * @access   private
+     */
+    function _getMatchedMessageIDs($keyword, $start, $end, $mid_list)
+    {
+        if (array_key_exists($keyword, $this->_matched_mids)) {
+            return $this->_matched_mids[$keyword];
+        }
+        $application_locator = GRN_ApplicationLocator::instance();
+        $db = $application_locator->getConnection('message');
+
+        require_once("message/query/GrnMessageSearchByAddresseeMessage.csp");
+        $query = new GrnMessageSearchByAddresseeMessage();
+        $query->setDatabaseConnection($db);
+        $query->setKeyword($keyword);
+        $query->setStartTimestamp($start->unix_ts);
+        $query->setEndTimestamp($end->unix_ts);
+        $query->setmessagedList($mid_list);
+
+        $result = $query->execute();
+
+        $message_id_list = [];
+        foreach ($result as $row) {
+            $message_id_list[] = $row["_id"];
+        }
+
+        $this->_matched_mids[$keyword] = array_unique($message_id_list);
+
+        return $this->_matched_mids[$keyword];
+    }
+
+}
+
+function grn_message_inspection_total_follow_num($mid)
+{
+    $app_locator = GRN_ApplicationLocator::instance();
+    $tm = $app_locator->getTableManager('message');
+    $tab_follow = $tm->getTableInfo('GRN_Message_Follows');
+    $db = $tab_follow->getDBConnection();
+
+    $rowset = new CB_RowSet($tab_follow);
+    $rowset->addCondition(cb_queryf($db, 'col_message = \'@S\'', $mid));
+    $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+    $result = $rowset->iterate();
+    $rowset->destroy();
+
+    return $result['count'];
+}
+
+/**
+ * @param    string $mid message oid
+ * @param           $offset
+ * @param           $limit
+ *
+ * @return   mixed    array
+ *                    if specified message doesn't exist, return FALSE.
+ *
+ * return['message_id']    => string   message oid
+ *       ['creator_id']    => string   sender oid
+ *       ['creator_name']  => string   sender name
+ *       ['ctime']         => object   CB_TimeStamp sent time
+ *       ['modifier_id']   => string   modifier oid
+ *       ['modified_name'] => string   modifier name
+ *       ['mtime']         => object   CB_TimeStamp modified time
+ *       ['subject']       => string   message subject
+ *       ['data']          => string   body/HTML body
+ *       ['format_type']   => int      format type (0: plain text, 1: HTML)
+ *       ['files']         => array    attached file list
+ *       ['addressees']    => array    addressee list
+ *       ['follows']       => array    follow list
+ *
+ * ['files']                  => array
+ *         [file id]          => array    key: file oid
+ *                   ['name'] => string   file name
+ *                   ['size'] => string   file size
+ *                   ['mime'] => string   file mime type
+ *
+ * ['addressees']                   => array
+ *               []                 => array
+ *                 ['id']           => string   addressee oid
+ *                 ['name']         => string   addressee name
+ *                 ['dtime']        => object   CB_TimeStamp deleted time
+ *                 ['delete_flag']  => int  1: deleted
+ *
+ * ['follows']                            => array
+ *            [follow id]                 => array    key: follow oid
+ *                       ['creator_id']   => string   follower oid
+ *                       ['creator_name'] => string   follower name
+ *                       ['ctime']        => object   CB_TimeStamp followed time
+ *                       ['id']           => int      follow id (NOT oid)
+ *                       ['data']         => string   body/HTML body
+ *                       ['format_type']  => int      format type (0: plain text, 1: HTML)
+ *                       ['files']        attached file list
+ */
+function grn_message_inspection_get_message($mid, $offset, $limit)
+{
+    require_once('message/message_logic.csp');
+    $message_logic = new GRN_Message_Logic();
+
+    $app_locator = GRN_ApplicationLocator::instance();
+    $tm = $app_locator->getTableManager('message');
+    $tab_message = $tm->getTableInfo('GRN_Message_Messages');
+
+    // message
+    $message_row = $tab_message->getRow($mid);
+    if ( ! $message_row) {
+        return false;
+    }
+
+    $message = [];
+    $message['message_id'] = $mid;
+    $creator = $message_row->get('creator');
+    if ( ! is_null($creator)) {
+        $message['creator_id'] = $creator->getOID();
+    } else {
+        $message['creator_id'] = '';
+    }
+    $message['creator_name'] = $message_row->get('creator_name');
+    $message['ctime'] = $message_row->get('ctime');
+    $modifier = $message_row->get('modifier');
+    if ( ! is_null($modifier)) {
+        $message['modifier_id'] = $modifier->getOID();
+    } else {
+        $message['modifier_id'] = '';
+    }
+    $message['modifier_name'] = $message_row->get('modifier_name');
+    $message['mtime'] = $message_row->get('mtime');
+    $message['delegator_name'] = $message_row->get('delegator_name');
+    $message['dtime'] = $message_row->get('dtime');
+    $message['subject'] = $message_row->get('subject');
+    $message['data'] = $message_row->get('html_data');
+    $message['format_type'] = 1;
+    if ($message['data'] == '') {
+        $message['data'] = $message_row->get('data');
+        $message['format_type'] = 0;
+    }
+
+    // attached files
+    $message['files'] = $message_logic->getMessageFiles($mid);
+
+    // addressees
+    $addressee_list = [];
+    $tab_addressee = $tm->getTableInfo('GRN_Message_Addressees');
+    $db = $tab_addressee->getDBConnection();
+    $rowset = new CB_RowSet($tab_addressee);
+    $rowset->addCondition(cb_queryf($db, 'col_message = \'@S\'', $mid)
+                          . ' AND col_is_sender = \'0\'');
+    $rowset->addOrderColumn('col_view_order');
+    while ( ! is_null($row = $rowset->iterate())) {
+        $addressee = [];
+        $addressee_row = $row->get('addressee');
+        if ( ! is_null($addressee_row)) {
+            $addressee['id'] = $addressee_row->getOID();
+        } else {
+            $addressee['id'] = '';
+        }
+        $addressee['name'] = $row->get('addressee_name');
+        $addressee['dtime'] = $row->get('dtime');
+        $addressee['delete_flag'] = $row->get('delete_flag');
+        $addressee_list[] = $addressee;
+    }
+    $message['addressees'] = $addressee_list;
+
+    // follow
+    $follow_list = [];
+    $tab_follow = $tm->getTableInfo('GRN_Message_Follows');
+    $db = $tab_follow->getDBConnection();
+    $rowset = new CB_RowSet($tab_follow);
+    $rowset->addCondition(cb_queryf($db, 'col_message = \'@S\'', $mid));
+    $rowset->addOrderColumn('_id', true);
+    $rowset->limit($offset, $limit);
+    while ( ! is_null($row = $rowset->iterate())) {
+        $fid = $row->getOID();
+
+        $follow = [];
+        $creator_row = $row->get('creator');
+        if ( ! is_null($creator_row)) {
+            $creator_id = $creator_row->getOID();
+        } else {
+            $creator_id = '';
+        }
+        $follow['creator_id'] = $creator_id;
+        $follow['creator_name'] = $row->get('creator_name');
+        $follow['ctime'] = $row->get('ctime');
+        $follow['id'] = $row->get('id');
+        $follow['data'] = $row->get('html_data');
+        $follow['format_type'] = 1;
+        if ($follow['data'] == '') {
+            $follow['data'] = $row->get('data');
+            $follow['format_type'] = 0;
+        }
+
+        // attached files
+        $follow['files'] = $message_logic->getFollowFiles($mid, $fid);
+
+        $follow_list[$fid] = $follow;
+    }
+    $message['follows'] = $follow_list;
+
+    return $message;
+
+}
+
+/**
+ * @param $mid
+ *
+ * @return   mixed   message information list
+ *                   if specified message doesn't exist, return FALSE.
+ *
+ * return['creator_id']   => creator oid
+ *       ['creator_name'] => creator name
+ *       ['subject']      => subject
+ *       ['abstract']     => abstract of the body
+ */
+function grn_message_inspection_get_message_info($mid)
+{
+    $app_locator = GRN_ApplicationLocator::instance();
+    $tm = $app_locator->getTableManager('message');
+    $tab_message = $tm->getTableInfo('GRN_Message_Messages');
+
+    $message_row = $tab_message->getRow($mid);
+    if ( ! $message_row) {
+        return false;
+    }
+
+    $message = [];
+    $creator = $message_row->get('creator');
+    $message['creator_id'] = ! is_null($creator) ? $creator->getOID() : '';
+    $message['creator_name'] = $message_row->get('creator_name');
+    $message['subject'] = $message_row->get('subject');
+    $message['abstract'] = $message_row->get('data');
+
+    return $message;
+}
+
+/**
+ * @param $mid
+ * @param $follow_id
+ * @param $limit
+ *
+ * @return array|bool
+ */
+function grn_message_inspection_get_message_byFID($mid, $follow_id, $limit)
+{
+    require_once('message/message_logic.csp');
+    $message_logic = new GRN_Message_Logic();
+
+    $app_locator = GRN_ApplicationLocator::instance();
+    $tm = $app_locator->getTableManager('message');
+    $tab_message = $tm->getTableInfo('GRN_Message_Messages');
+
+    // message
+    $message_row = $tab_message->getRow($mid);
+    if ( ! $message_row) {
+        return false;
+    }
+
+    $message = [];
+    $message['message_id'] = $mid;
+    $creator = $message_row->get('creator');
+    if ( ! is_null($creator)) {
+        $message['creator_id'] = $creator->getOID();
+    } else {
+        $message['creator_id'] = '';
+    }
+    $message['creator_name'] = $message_row->get('creator_name');
+    $message['ctime'] = $message_row->get('ctime');
+    $modifier = $message_row->get('modifier');
+    if ( ! is_null($modifier)) {
+        $message['modifier_id'] = $modifier->getOID();
+    } else {
+        $message['modifier_id'] = '';
+    }
+    $message['modifier_name'] = $message_row->get('modifier_name');
+    $message['mtime'] = $message_row->get('mtime');
+    $message['delegator_name'] = $message_row->get('delegator_name');
+    $message['dtime'] = $message_row->get('dtime');
+    $message['subject'] = $message_row->get('subject');
+    $message['data'] = $message_row->get('html_data');
+    $message['format_type'] = 1;
+    if ($message['data'] == '') {
+        $message['data'] = $message_row->get('data');
+        $message['format_type'] = 0;
+    }
+
+    // attached files
+    $message['files'] = $message_logic->getMessageFiles($mid);
+
+    // addressees
+    $addressee_list = [];
+    $tab_addressee = $tm->getTableInfo('GRN_Message_Addressees');
+    $db = $tab_addressee->getDBConnection();
+    $rowset = new CB_RowSet($tab_addressee);
+    $rowset->addCondition(cb_queryf($db, 'col_message = \'@S\'', $mid)
+                          . ' AND col_is_sender = \'0\'');
+    $rowset->addOrderColumn('col_view_order');
+    while ( ! is_null($row = $rowset->iterate())) {
+        $addressee = [];
+        $addressee_row = $row->get('addressee');
+        if ( ! is_null($addressee_row)) {
+            $addressee['id'] = $addressee_row->getOID();
+        } else {
+            $addressee['id'] = '';
+        }
+        $addressee['name'] = $row->get('addressee_name');
+        $addressee['dtime'] = $row->get('dtime');
+        $addressee['delete_flag'] = $row->get('delete_flag');
+        $addressee_list[] = $addressee;
+    }
+    $message['addressees'] = $addressee_list;
+
+    // follow
+    $follow_list = [];
+    $tab_follow = $tm->getTableInfo('GRN_Message_Follows');
+    $db = $tab_follow->getDBConnection();
+    $rowset = new CB_RowSet($tab_follow);
+    $rowset->addCondition(cb_queryf($db, 'col_message = \'@S\'', $mid));
+
+    $rowset->addCondition($rowset->queryf("col_message = '@S' AND col_id <= '@S'",
+        $mid, $follow_id));
+
+    $rowset->addOrderColumn('_id', true);
+    $rowset->limit(0, $limit);
+
+    while ( ! is_null($row = $rowset->iterate())) {
+        $fid = $row->getOID();
+
+        $follow = [];
+        $creator_row = $row->get('creator');
+        if ( ! is_null($creator_row)) {
+            $creator_id = $creator_row->getOID();
+        } else {
+            $creator_id = '';
+        }
+        $follow['creator_id'] = $creator_id;
+        $follow['creator_name'] = $row->get('creator_name');
+        $follow['ctime'] = $row->get('ctime');
+        $follow['id'] = $row->get('id');
+        $follow['data'] = $row->get('html_data');
+        $follow['format_type'] = 1;
+        if ($follow['data'] == '') {
+            $follow['data'] = $row->get('data');
+            $follow['format_type'] = 0;
+        }
+
+        // attached files
+        $follow['files'] = $message_logic->getFollowFiles($mid, $fid);
+
+        $follow_list[$fid] = $follow;
+    }
+    $message['follows'] = $follow_list;
+
+    return $message;
+
+}
+
+/**
+ * @param $mid
+ * @param $follow_id
+ *
+ * @return mixed
+ */
+function grn_message_inspection_getFollowOffset($mid, $follow_id)
+{
+    $app_locator = GRN_ApplicationLocator::instance();
+    $tm = $app_locator->getTableManager('message');
+    $tab_message = $tm->getTableInfo('GRN_Message_Messages');
+    $tab_follow = $tm->getTableInfo('GRN_Message_Follows');
+    $db = $tab_follow->getDBConnection();
+
+    // message
+    $message_row = $tab_message->getRow($mid);
+    $last_follow_id = $message_row->get('last_follow_id');
+
+    $rowset = new CB_RowSet($tab_follow);
+    $rowset->addCondition(
+        cb_queryf($db,
+            'col_message = \'@S\' AND col_id <= \'@S\' AND col_id > \'@S\'',
+            $mid, $last_follow_id, $follow_id));
+
+    $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+    $result = $rowset->iterate();
+    $rowset->destroy();
+
+    return $result['count'];
+}
+
+/**
+ * Logger class GR25
+ *
+ * @pakage grn.message
+ */
+class GRN_Message_Logger_25
+{
+    private $_logger;
+
+    function __construct()
+    {
+        require_once('grn/logger.csp');
+        require_once('message/resources.csp');
+        $logger_manager = CB_LoggerManager::getInstance();
+        $this->_logger = $logger_manager->getLogger(GRN_MESSAGE_MODULEID);
+    }
+
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Message_Logger_25
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    function& _modifyParamsList(& $params)
+    {
+        if (is_string($params)) {
+            return $params;
+        }
+
+        $temp = [];
+        foreach ($params as $key => $value) {
+            if ( ! is_array($value)) {
+                $temp[$key] = $value;
+                continue;
+            } else {
+                $counter = 0;
+                foreach ($value as $item) {
+                    $temp[$key . ++$counter] = $item;
+                }
+            }
+        }
+
+        return $temp;
+    }
+
+    function notice($action, $object, &$params)
+    {
+        //$this->_logger->log( CB_LOGGER_NOTICE, $this->_createMessage( $action, $object, &$params), $action, $object );
+        $params_list = $this->_modifyParamsList($params);
+        $this->_logger->noticeEx($action, $object, $params_list);
+    }
+
+    function info($action, $object, &$params)
+    {
+        //$this->_logger->log( CB_LOGGER_INFO, $this->_createMessage( $action, $object, &$params), $action, $object );
+        $param_list = $this->_modifyParamsList($params);
+        $this->_logger->infoEx($action, $object, $param_list);
+    }
+
+    function deleteFolderLogNotice($folder_tree)
+    {
+        $current_folder_tree = current($folder_tree);
+        $params
+            = ['folder_name' => $current_folder_tree['folder_name']];
+        $this->_logger->noticeEx('delete', 'folder', $params);
+        if (0 < $current_folder_tree['children_num']) {
+            foreach ($current_folder_tree['children'] as $key => $sub_values) {
+                $temp_sub_tree = [];
+                $temp_sub_tree[$key] = $sub_values;
+                $this->deleteFolderLogNotice($temp_sub_tree);
+            }
+        }
+    }
+}
+

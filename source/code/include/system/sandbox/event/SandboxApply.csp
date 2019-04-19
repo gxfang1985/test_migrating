@@ -1,0 +1,339 @@
+<?php
+
+namespace grn\system\sandbox\event;
+
+use grn\system\sandbox\dao\CbGroupSandboxDAO;
+use grn\system\sandbox\GRN_Uum_Sandbox;
+use grn\system\sandbox\GroupOperationService;
+use grn\system\sandbox\SandboxProfileData;
+
+class SandboxApply
+{
+    /** @var \GRN_Uum $uum */
+    protected $uum;
+
+    /** @var  GRN_Uum_Sandbox $uum_sandbox */
+    protected $uum_sandbox;
+
+    /** @var GroupOperationService $sandbox_service */
+    protected $sandbox_service;
+
+    private $groupForeignKey = [];
+    private $groupParent = [];
+
+    private $sandboxUserPrimaryGroups = null;
+
+    function __construct()
+    {
+        $this->uum = \cb_lwc_uum();
+        $this->uum_sandbox = GRN_Uum_Sandbox::getInstance();
+        $this->sandbox_service = new GroupOperationService();
+    }
+
+    /**
+     * @param string $contents
+     */
+    public function log($contents)
+    {
+        echo $contents . PHP_EOL;
+    }
+
+    public function run()
+    {
+        // check sandbox status
+        $profile = SandboxProfileData::getInstance();
+        if ($profile->getSandboxCreated() !== true) {
+            require_once('grn/error_code.csp');
+            cb_throw_error(E_GRN_SANDBOX_DOES_NOT_EXISTS);
+        }
+
+        // login as operator
+        $this->loginAsOperator();
+
+        // sync group data
+        $this->log("[Start]Sync Sandbox group data");
+        $this->syncGroupData();
+        $this->log("[End]  Sync sandbox group data");
+
+        // sync user data
+        $this->log("[Start]Sync sandbox user data");
+        $this->syncUserData();
+        $this->log("[End]  Sync sandbox user data");
+
+        $this->log("[Start]Sync sandbox finalize");
+        $this->finalize();
+        $this->log("[End]  Sync sandbox finalize");
+    }
+
+    protected function syncGroupData()
+    {
+        // update / add group
+        $rootGroups = $this->uum_sandbox->getRootGroups(false);
+        foreach ($rootGroups as $sandbox_group) {
+            $this->applyGroupRecursive($sandbox_group);
+        }
+
+        // set parent
+        $this->setGroupParent();
+
+        // delete group
+        $groupDao = new CbGroupSandboxDAO();
+        $deletedGroupIds = $groupDao->getDeletedGroups();
+        foreach ($deletedGroupIds as $deletedGroupId) {
+            $this->log("[Start]Remove group (Group id:{$deletedGroupId})");
+            $this->uum->removeGroup($deletedGroupId);
+            $this->log("[End]  Remove group (Group id:{$deletedGroupId})");
+        }
+
+        // update foreign_key
+        foreach ($this->groupForeignKey as $sandboxId => $foreignKey) {
+            $group = $this->getGroup($sandboxId);
+            $group->_setPrivately('foreign_key', $foreignKey);
+            $group->updateNow();
+        }
+    }
+
+    /**
+     * @param \CB_Group $sandbox_group
+     */
+    protected function applyGroupRecursive(\CB_Group $sandbox_group)
+    {
+        if ($this->getGroup($sandbox_group->getOID())) {
+            $this->updateGroup($sandbox_group);
+        } else {
+            $this->addGroup($sandbox_group);
+        }
+
+        $this->setGroupLocalName($sandbox_group);
+
+        $children = $this->uum_sandbox->getChildGroups($sandbox_group->getOID(),
+            false);
+        foreach ($children as $child) {
+            $this->applyGroupRecursive($child);
+        }
+    }
+
+    /**
+     * get group
+     *
+     * Grn_Uum[_Sandbox]::getGroup use cache.
+     * So this class needs to avoid it.
+     *
+     * @param $id
+     *
+     * @return \CB_Group
+     */
+    private function getGroup($id)
+    {
+        $rowset = new \CB_RowSet($this->uum->getGroupTable());
+        $rowset->addCondition($rowset->queryf("_id='@S'", $id));
+        $group = $rowset->iterate();
+        $rowset->destroy();
+
+        return $group;
+    }
+
+    protected function updateGroup(\CB_Group $sandbox_group)
+    {
+        $properties = [
+            'foreign_key' => $this->getTemporaryForeignKey(),
+            // insert temporary key and update after
+            'name'        => $sandbox_group->get('name'),
+            'description' => $sandbox_group->get('description'),
+            'list_index'  => $sandbox_group->get('list_index'),
+        ];
+        $this->groupForeignKey[$sandbox_group->getOID()]
+            = (string)$sandbox_group->get("foreign_key");
+        $this->groupParent[$sandbox_group->getOID()]
+            = $sandbox_group->getId("parent");
+        $this->log("[Start]Update group (Group id: {$sandbox_group->getOID()})");
+        $this->uum->setGroupProperties($sandbox_group->getOID(), $properties);
+        $this->log("[End]  Update group (Group id: {$sandbox_group->getOID()})");
+    }
+
+    protected function addGroup(\CB_Group $sandbox_group)
+    {
+        $properties = [
+            'foreign_key' => $this->getTemporaryForeignKey(),
+            // insert temporary key and update after
+            'name'        => $sandbox_group->get('name'),
+            'description' => $sandbox_group->get('description'),
+        ];
+        $this->groupForeignKey[$sandbox_group->getOID()]
+            = (string)$sandbox_group->get("foreign_key");
+        $this->groupParent[$sandbox_group->getOID()]
+            = $sandbox_group->getId("parent");
+        $this->log("[Start]Add group (Group id: {$sandbox_group->getOID()})");
+        $group = $this->uum->addGroupDefaultOnly($properties, null,
+            $sandbox_group->getOID());
+        $this->uum->setGroupProperties(
+            $group->getOID(),
+            ['list_index' => $sandbox_group->get('list_index')]
+        );
+        $this->log("[End]  Add group (Group id: {$sandbox_group->getOID()})");
+    }
+
+    /**
+     * @param \CB_Group $sandbox_group
+     */
+    private function setGroupLocalName(\CB_Group $sandbox_group)
+    {
+        $group_id = $sandbox_group->getOID();
+
+        $names = $this->uum_sandbox->createMultiLanguageValuesArray($group_id);
+        if ( ! $this->sandbox_service->checkConsistencyGroupLocals($group_id,
+            $this->uum, $this->uum_sandbox)
+        ) {
+            // On sandbox mode, available languages setting cannot be modified.
+            // So we can skip to check language status.
+            $this->log("[Start]Set group locals(Group id:{$group_id})");
+            $this->uum->modifyGroupLocals($group_id, $names, true);
+            $this->log("[End]  Set group locals(Group id:{$group_id})");
+        }
+    }
+
+    /**
+     * @return string
+     */
+    private function getTemporaryForeignKey()
+    {
+        return cb_create_uuid();
+    }
+
+    protected function finalize()
+    {
+        // rebuild tree
+        require_once("system/sandbox/misc.csp");
+        \grn\system\sandbox\_grn_rebuild_tree();
+
+        // delete sandbox data
+        (new SandboxDelete())->run();
+    }
+
+    /**
+     * login as operator
+     *
+     * operator is always Administrator
+     */
+    protected function loginAsOperator()
+    {
+        $user = $this->uum->getUser(GRN_UUM_ADMINISTRATION_USER);
+        $this->uum->loginAs($user);
+    }
+
+    private function setGroupParent()
+    {
+        foreach ($this->groupParent as $groupId => $parentId) {
+            if (is_null($parentId)) {
+                // parent is root
+                $this->log("[Start]Set parent group (Group id:{$groupId},Parent Group:Root)");
+                $this->uum->setParentGroup($groupId, null, true, false);
+                $this->log("[End]  Set parent group (Group id:{$groupId},Parent Group:Root)");
+            } else {
+                $parentGroup = $this->getGroup($parentId);
+                if ($parentGroup === false) {
+                    cb_throw_error();
+                }
+                $this->log("[Start]Set parent group (Group id:{$groupId},Parent Group:{$parentId})");
+                $this->uum->setParentGroup($groupId, $parentGroup->getOID(),
+                    true, false);
+                $this->log("[End]  Set parent group (Group id:{$groupId},Parent Group:{$parentId})");
+            }
+        }
+    }
+
+    protected function syncUserData()
+    {
+        // get update users
+        $updatedSandboxUserIds = $this->getUpdatedSandboxUser();
+
+        $this->sandboxUserPrimaryGroups
+            = $this->uum_sandbox->getManyUserPrimaryGroupInfoList($updatedSandboxUserIds);
+
+        foreach ($updatedSandboxUserIds as $updatedSandboxUserId) {
+            // update tab_cb_user
+            $updatedSandboxUser
+                = $this->uum_sandbox->getUser($updatedSandboxUserId);
+            $properties = [
+                "valid"    => $updatedSandboxUser->get('valid'),
+                "position" => $updatedSandboxUser->get('position'),
+            ];
+            $this->log("[Start]Update user (User id:{$updatedSandboxUserId})");
+            $this->uum->setUserProperties(
+                $updatedSandboxUserId, $properties,
+                false /* (4th arguments) sync = false */
+            );
+            $this->log("[End]  Update user (User id:{$updatedSandboxUserId})");
+
+            // update tab_cb_user_base_setting
+            $baseSetting
+                = $this->uum_sandbox->getBaseSettingByUser($updatedSandboxUser);
+            $this->log("[Start]Update user base setting (User id:{$updatedSandboxUserId}, Base id: {$baseSetting->getBase()})");
+            \CB_BaseManager::setUserBaseSetting($updatedSandboxUserId,
+                $baseSetting->getBase());
+            $this->log("[End]  Update user base setting (User id:{$updatedSandboxUserId}, Base id: {$baseSetting->getBase()})");
+
+            // update tab_cb_usergrouprelation
+            $sandboxBelongedGroups
+                = $this->uum_sandbox->getUserGroups($updatedSandboxUserId);
+            $sandboxBelongedGroupsId = array_keys($sandboxBelongedGroups);
+            $sandboxBelongedGroupsIdString = implode(',',
+                $sandboxBelongedGroupsId);
+            $this->log("[Start]Update user belonging group (User id:{$updatedSandboxUserId}, Groups id:{$sandboxBelongedGroupsIdString})");
+            $this->uum->setUserGroups($updatedSandboxUserId,
+                $sandboxBelongedGroupsId, false);
+            $this->log("[End]  Update user belonging group (User id:{$updatedSandboxUserId}, Groups id:{$sandboxBelongedGroupsIdString})");
+
+            // update tab_grn_userinfo.col_primary_group
+            $primaryGroup = $this->getUserPrimaryGroup($updatedSandboxUser);
+            $this->log("[Start]Update user primary group (User id:{$updatedSandboxUser->getOID()}, Group id:{$primaryGroup})");
+            $this->uum->setUserPrimaryGroup(
+                $updatedSandboxUserId, $primaryGroup, false, true
+            );
+            $this->log("[End]  Update user primary group (User id:{$updatedSandboxUser->getOID()}, Group id:{$primaryGroup})");
+
+            // update tab_cb_userrolerelation
+            $sandboxUserHavingRoles
+                = $this->uum_sandbox->getUserRoles($updatedSandboxUserId);
+            $sandboxUserHavingRolesIds
+                = array_keys($sandboxUserHavingRoles);
+            $sandboxUserHavingRolesIdsString = implode(',',
+                $sandboxUserHavingRolesIds);
+            $this->log("[Start]Update user having roles (User id:{$updatedSandboxUser->getOID()}, Role id: {$sandboxUserHavingRolesIdsString})");
+            $this->uum->setUserRoles($updatedSandboxUserId,
+                $sandboxUserHavingRolesIds);
+            $this->log("[End]  Update user having roles (User id:{$updatedSandboxUser->getOID()}, Role id: {$sandboxUserHavingRolesIdsString})");
+
+            $this->uum->resetCache();
+        }
+    }
+
+    /**
+     * @param \CB_User $updatedSandboxUser
+     *
+     * @return int id of primary group id.
+     */
+    private function getUserPrimaryGroup(\CB_User $updatedSandboxUser)
+    {
+        assert('!is_null($this->sandboxUserPrimaryGroups)');
+        $primaryGroup = cb_at($this->sandboxUserPrimaryGroups,
+            $updatedSandboxUser->getOID());
+        // Confirm that user has a primary group.data
+        if ( ! is_array($primaryGroup)) {
+            return null;
+        }
+        // Confirm user group relation.
+        if ($this->uum->getUserGroupRelation($updatedSandboxUser->getOID(),
+            $primaryGroup["_id"])
+        ) {
+            return $primaryGroup["_id"];
+        }
+
+        return null;
+    }
+
+    protected function getUpdatedSandboxUser()
+    {
+        return $this->uum_sandbox->getUpdatedUserIds();
+    }
+}

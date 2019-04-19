@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="{$encoding}"?>
+<methodResponse>
+  <params>
+    <param>
+      <value>
+        <struct>
+          <member>
+            <name>apiver</name>
+            <value><double>{$api_ver}</double></value>
+          </member>
+          <member>
+            <name>common_api_version</name>
+            <value><double>{$common_api_version}</double></value>
+          </member>
+          <member>
+            <name>wsdl</name>
+            <value>{$wsdl_path}</value>
+          </member>
+        </struct>
+      </value>
+    </param>
+  </params>
+</methodResponse>

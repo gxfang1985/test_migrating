@@ -1,0 +1,507 @@
+<?php
+
+use grn\schedule\AttendanceStatusLogic;
+use grn\schedule\bean\AttendanceStatus;
+
+// Smarty をインスタンス化
+require_once('grn/smarty.csp');
+$t = new GRN_Smarty;
+
+// SmartyValidate should be initialized when an input form is there.
+require('SmartyValidate.class.php');
+SmartyValidate::connect($t);
+
+$member_id = array_key_exists('uid', $G_INPUT) ? $G_INPUT['uid'] : null;
+$group_id = array_key_exists('gid', $G_INPUT) ? $G_INPUT['gid'] : null;
+$str_date = array_key_exists('bdate', $G_INPUT) ? $G_INPUT['bdate'] : null;
+
+global $G_container_base;
+/** @var GRN_Uum $uum */
+$uum = $G_container_base->getInstance('uum');
+$login = $uum->getLoginUser();
+$login_id = $login->getOID();
+
+
+//check enable ical export ---start
+global $G_config_common;
+$isEnableOnlyMyIcalExport = $G_config_common->get('Schedule',
+    'isEnableOnlyMyIcalExport');
+if ($isEnableOnlyMyIcalExport == '1') {
+    //ターゲットユーザーがログイン者と違う場合はエラー($member_idの値が無い場合はログイン者扱い)
+    if ((strlen($member_id) > 0) && ($login_id != $member_id)) {
+        cb_throw_error(E_GRN_SCHD_ACCESS_INVALID_USER_ID);
+    }
+}
+//check enable ical export ---end
+
+
+require_once('schedule/system_logic.csp');
+$logic = GRN_Schedule_SystemLogic::getInstance();
+if ($logic->getAllowFacilitiesName() == '1') {
+    $allowfacilitiesname = true;
+} else {
+    $allowfacilitiesname = false;
+}
+
+if ($logic->getAllowFacilitiesNameOnRight() == '1') {
+    $nameonright = true;
+} else {
+    $nameonright = false;
+}
+require_once('schedule/facility_system_logic.csp');
+$facility_logic = GRN_Facility_SystemLogic::getInstance();
+
+// 今日を求める
+$ts = new CB_TimeStamp();
+$ts->unix_ts = time();
+$tsex = new CB_TimeStampEx($ts);
+$today = $tsex->getDate();
+
+$date = new CB_Date();
+if ( ! $date->parse($str_date)) {
+    $date->year = $today->year;
+    $date->month = $today->month;
+    $date->day = $today->day;
+}
+
+require_once('schedule/personal_logic.csp');
+$personallogic = GRN_Schedule_PersonalLogic::getInstance();
+require_once('schedule/system_logic.csp');
+$systemlogic = GRN_Schedule_SystemLogic::getInstance();
+// ログインユーザーの各種設定の取得
+$unit = $systemlogic->getScheduleUnit();
+$startwday = $personallogic->getCalendarWeekStart($login);
+$hiddenprivate = $systemlogic->getHiddenPrivate();
+$showgroup = $systemlogic->getShowOrganize();
+
+// グループの処理
+$group = null;
+if ( ! $group_id) {
+    $group = $uum->getUserPrimaryGroup($login_id);
+    if ($group !== false) {
+        $group_id = $group->getOID();
+    }
+} elseif (mb_substr($group_id, 0, 1) == 'f') {
+    // 全施設
+    if ($group_id == 'f') {
+        $group = 'f';
+    } else {
+        $group = $facility_logic->getFacilityGroup(mb_substr($group_id, 1));
+        if ($group === false) {
+            $group_id = null;
+        }
+    }
+} // Myグループ
+elseif (mb_substr($group_id, 0, 1) == 'm') {
+    $group = $uum->getMyGroup(mb_substr($group_id, 1));
+    if ( ! $group) {
+        $group_id = null;
+    }
+} // よく利用するユーザー
+elseif ($group_id == 'r') {
+    $group = 'frequent';
+} else {
+    $group = $uum->getGroup($group_id);
+    if ( ! $group) {
+        $group_id = null;
+    }
+}
+// 表示するものにアクセス権があるかどうかのチェック
+$dynamic_roles = $uum->listGrantedRoles();
+require_once('schedule/access_logic.csp');
+$acc_logic = GRN_Schedule_Access_logic::getInstance();
+
+if (is_a($group, 'CB_Group')) {
+    $access = $acc_logic->evaluateAccess($login, $group, ['read'],
+        $dynamic_roles);
+    if ( ! $access) {
+        $group = null;
+        $group_id = null;
+    }
+}
+
+// ポップアップ画面からのIDは、変換する
+if (mb_substr($member_id, 0, 1) == 'i') {
+    $member_id = 'f' . mb_substr($member_id, 1);
+}
+
+$frequent_users = null;
+$member = null;
+// 指定されたメンバーの処理
+if ( ! $member_id && is_string($group) && $group == 'f') {
+    if ($systemlogic->getAllowAllFacilities()) {
+        $facilities = $facility_logic->getOrderedFacilityPartInfoList();
+        $facilities = $acc_logic->evaluateAccessesById($login, $facilities,
+            ['read'], $dynamic_roles, 'facility');
+        if (is_array($facilities) && count($facilities)) {
+            $first_facility = reset($facilities);
+            $member
+                = $facility_logic->getFacility($first_facility['_id']);
+            $member_id = 'f' . $member->getOID();
+        } else {
+            $member_id = $login_id;
+            $member = &$login;
+        }
+    } else {
+        $member_id = $login_id;
+        $member = &$login;
+    }
+
+} elseif ( ! $member_id && is_a($group, 'GRN_Facility_FacilityGroup')) {
+    // 施設と施設グループで、厳しいほうのアクセス権にする
+    $facilities = null;
+    $tmp_fgroups = [$group->getOID() => $group];
+
+    $fgroups = $acc_logic->evaluateAccessesById($login, $tmp_fgroups, ['read'],
+        $dynamic_roles, 'facilitygroup');
+    if (count($fgroups)) {
+        $facilities = $facility_logic->getGroupFacilities($group->getOID());
+        $facilities = $acc_logic->evaluateAccessesById($login, $facilities,
+            ['read'], $dynamic_roles, 'facility');
+        if (count($facilities)) {
+            $member = reset($facilities);
+            $member_id = 'f' . $member->getOID();
+        } else {
+            $member_id = $login_id;
+            $member = &$login;
+        }
+    } else {
+        $member_id = $login_id;
+        $member = &$login;
+    }
+} elseif ( ! $member_id && is_a($group, 'CB_Group')) {
+    $format = 'col_user = ' . $login_id;
+    $users = $uum->getGroupUsers($group->getOID(), 0, -1,
+        'tab_cb_user.col_position', $format);
+    // 自分が組織にいるかどうかチェック
+    if ( ! is_array($users) || count($users) == 0) {
+        // 組織スケジュールが表示できる場合は組織
+        if ($showgroup) {
+            $member = &$group;
+            $member_id = 'g' . $group->getOID();
+        } else {
+            $users = $uum->getGroupUsers($group->getOID());
+            $users = $acc_logic->evaluateAccesses($login, $users, ['read'],
+                $dynamic_roles, 'user');
+            // 自分がいない場合はリストの最初のユーザーを持ってくる
+            if (count($users) > 0) {
+                $member = reset($users);
+                $member_id = $member->getOID();
+            } // 組織スケジュールを表示する場合
+            else {
+                $member_id = $login_id;
+                $member = &$login;
+            }
+        }
+    } else {
+        $member_id = $login_id;
+        $member = &$login;
+    }
+} elseif ( ! $member_id && is_a($group, 'GRN_MyGroup')) {
+    $format = 'col_user = ' . $login_id;
+    $users = $uum->getMyGroupUsers($group->getOID(), 0, -1, $format);
+    // 自分が組織にいるかどうかチェック
+    if (count($users) == 0) {
+        // 自分がいない場合はリストの最初のユーザーを持ってくる
+        $users = $uum->getMyGroupUsers($group->getOID());
+        $users = $acc_logic->evaluateAccesses($login, $users, ['read'],
+            $dynamic_roles, 'user');
+        if (count($users) > 0) {
+            $member = reset($users);
+            $member_id = $member->getOID();
+        } // アクセス権でユーザーがいなくなった場合
+        else {
+            $member_id = $login_id;
+            $member = &$login;
+        }
+    } else {
+        $member_id = $login_id;
+        $member = &$login;
+    }
+} elseif ( ! $member_id && is_string($group) && $group == 'frequent') {
+    require_once('grn/uum_util.csp');
+    $frequent_users = $uum->getFrequentUsersInfo($login_id);
+    $frequent_users = $acc_logic->evaluateAccessesById($login, $frequent_users,
+        ['read'], $dynamic_roles, 'user');
+    $b_found = false;
+    // 最近選択したユーザーに自分がいるか
+    foreach (array_keys($frequent_users) as $key) {
+        if ($key == $login_id) {
+            $b_found = true;
+            break;
+        }
+    }
+
+    // ログインユーザーがいる場合
+    if ($b_found || 0 == count($frequent_users)) {
+        $member_id = $login_id;
+        $member = $login;
+    } else {
+        $member_info = reset($frequent_users);
+        $member = $uum->getUser($member_info['_id']);
+        $member_id = $member_info['_id'];
+    }
+} elseif ( ! $member_id) {
+    $member_id = $login_id;
+    $member = $login;
+} // 施設
+elseif (mb_substr($member_id, 0, 1) == 'f') {
+    $member = $facility_logic->getFacility(mb_substr($member_id, 1));
+    if ($member === false) {
+        cb_throw_error(E_GRN_FCLT_NOTFOUND_FACILITY);
+    }
+} // 組織
+elseif (mb_substr($member_id, 0, 1) == 'g') {
+    $member = $uum->getGroup(mb_substr($member_id, 1));
+    if ( ! $member) {
+        cb_throw_error(E_GRN_GROUP_NOT_FOUND);
+    }
+} elseif (mb_substr($member_id, 0, 1) == 'u') {
+    $member = $uum->getUser(mb_substr($member_id, 1));
+    if ( ! $member) {
+        cb_throw_error(E_GRN_USER_NOT_FOUND);
+    }
+
+    $member_id = $member->getOID();
+} // 人
+else {
+    $member = $uum->getUser($member_id);
+    if ( ! $member) {
+        cb_throw_error(E_GRN_USER_NOT_FOUND);
+    }
+}
+
+// 組み合わせが悪い場合は、ユーザーを優先する
+if (is_a($member, 'CB_User') && is_a($group, 'CB_Group')) {
+    $format = 'col_user = ' . $member->getOID();
+    $users = $uum->getGroupUsers($group->getOID(), 0, -1,
+        'tab_cb_user.col_position', $format);
+    if ( ! $users) {
+        $group = null;
+        $group_id = null;
+    }
+} elseif (is_a($member, 'CB_User') && is_a($group, 'GRN_MyGroup')) {
+    $format = 'col_user = ' . $member->getOID();
+    $users = $uum->getMyGroupUsers($group->getOID(), 0, -1, $format);
+    if ( ! $users) {
+        $group = null;
+        $group_id = null;
+    }
+} elseif (is_a($group, 'CB_Group') && is_a($member, 'CB_Group')) {
+    if ($group->getOID() != $member->getOID()) {
+        $group = null;
+        $group_id = null;
+    }
+} elseif (is_string($group) && $group == 'frequent'
+          && is_a($member, 'CB_User')
+) {
+    if (is_null($frequent_users)) {
+        require_once('grn/uum_util.csp');
+        $frequent_users = $uum->getFrequentUsersInfo($login_id);
+        $frequent_users = $acc_logic->evaluateAccessesById($login,
+            $frequent_users, ['read'], $dynamic_roles, 'user');
+    }
+    $b_found = false;
+    // よく利用するユーザーに自分がいるか
+    foreach (array_keys($frequent_users) as $key) {
+        if ($key == $member_id) {
+            $b_found = true;
+            break;
+        }
+    }
+    if ( ! $b_found) {
+        $group = null;
+        $group_id = null;
+    }
+} elseif (is_a($group, 'GRN_Facility_FacilityGroup')
+          && is_a($member, 'GRN_Facility_Facility')
+) {
+    $facilities = $facility_logic->getGroupFacilities($group->getOID());
+    if ( ! array_key_exists($member->getOID(), $facilities)) {
+        $group = null;
+        $group_id = null;
+    }
+} // グループIDとユーザーIDの組み合わせがぜんぜんだめ
+elseif ((is_a($member, 'CB_User') || is_a($member, 'CB_Group'))
+        && (is_a($group, 'GRN_Facility_FacilityGroup')
+            || $group == 'f')
+) {
+    $group = null;
+    $group_id = null;
+} elseif (is_a($member, 'GRN_Facility_Facility')
+          && ( ! is_a($group, 'GRN_Facility_FacilityGroup') && ($group != 'f'))
+) {
+    $group = null;
+    $group_id = null;
+}
+
+// 表示するものにアクセス権があるかどうかのチェック
+if (is_object($member)
+    && ( ! is_a($member, 'CB_User')
+         || ($member->getOID() != $login_id))
+) {
+    if (is_a($member, 'GRN_Facility_Facility')) {
+        // 施設のアクセス権はグループをたどって評価する
+        $tmp_array = [$member->getOID() => $member];
+        $access = $acc_logic->evaluateAccessesById($login, $tmp_array,
+            ['read'], $dynamic_roles, 'facility');
+    } else {
+        $access = $acc_logic->evaluateAccess($login, $member, ['read'],
+            $dynamic_roles);
+    }
+
+    if ( ! $access) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_VIEW);
+    }
+}
+
+require_once('schedule/view_util.csp');
+$util = GRN_Schedule_View_Util::getInstance();
+
+//get begin and end date of current display month
+$c_setdate = $util->getCalendarStartDate($date, $startwday);
+$c_enddate = $util->getCalendarEndDate($date, $startwday);
+
+require_once('schedule/application.csp');
+$app = GRN_Schedule_Application::getInstance();
+$sc_type = GRN_SCHEDULE_EVENT_TYPE_NORMAL + GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+           + GRN_SCHEDULE_EVENT_TYPE_BANNER
+           + GRN_SCHEDULE_EVENT_TYPE_DAILYEVENT;
+$app->checkDateTime($c_setdate, $c_enddate);
+
+//GTM-1632
+$attendanceStatusLogic = new AttendanceStatusLogic();
+$isEnableAttendanceCheck = $attendanceStatusLogic->isEnableAttendanceCheck();
+
+$events = $app->getEventsForExportIcs(
+    $member, $c_setdate, $c_enddate, $login, $sc_type, $hiddenprivate, false,
+    $isEnableAttendanceCheck
+);
+
+if (count($events) > 0) {
+    $repeat_ids = [];
+    foreach (array_keys($events) as $event_id) {
+        $event = [];
+        $event = $events[$event_id];
+
+        //GTM-1632
+        if ($event[AttendanceStatus::ATTENDANCE_CHECK_USING]
+            && $event[AttendanceStatus::ATTENDANCE_CHECK_STATUS]
+               == AttendanceStatus::STATUS_ABSENT
+        ) {
+            unset($events[$event_id]);
+            continue;
+        }
+
+        $str_event_detail = $event['event_detail'];
+        $str_event_detail = str_replace('\\', '\\\\', $str_event_detail);
+        $event['event_detail'] = $str_event_detail;
+
+        $str_event_menu = $event['event_menu'];
+        $str_event_menu = str_replace('\\', '\\\\', $str_event_menu);
+        $event['event_menu'] = $str_event_menu;
+
+        $str_memo = $event['memo'];
+        $str_memo = str_replace('\\', '\\\\', $str_memo);
+        $str_memo = preg_replace("/(\r\n|\n|\r)/i", "\\n", $str_memo);
+        $event['memo'] = $str_memo;
+        if (array_key_exists('banner', $event) && $event['banner'] == true) {
+            //with ical we need move 1 day for correct format
+            cb_date_move_days($event['enddate'], 1);
+        }
+        if (array_key_exists('repeat', $event) && $event['repeat'] == true) {
+            $allday = array_key_exists('allday', $event) ? $event['allday']
+                : null;
+            require_once('schedule/repeat_event_logic.csp');
+            $repeat_logic = GRN_Schedule_RepeatEventLogic::getInstance();
+            $until = $repeat_logic->getRepeatEndDate($event_id, $allday);
+            if (count($until) > 0) {
+                if ($allday) {
+                    $event['until'] = array_key_exists('end_date', $until)
+                        ? $until['end_date'] : null;
+                } else {
+                    $event['until'] = array_key_exists('end_datetime', $until)
+                        ? $until['end_datetime'] : null;
+                }
+            }
+            $repeat_ids[$event_id] = $event_id;
+        }
+        $events[$event_id] = $event;
+    }
+
+    $repeat_condition = [];
+    if (count($repeat_ids) > 0) {
+        require_once('schedule/repeat_event_logic.csp');
+        $repeat_logic = GRN_Schedule_RepeatEventLogic::getInstance();
+        $repeat_condition = $repeat_logic->getRepeatCondition($repeat_ids);
+        if (count($repeat_condition) > 0) {
+            foreach (array_keys($repeat_condition) as $key) {
+                if (array_key_exists($key, $events)) {
+                    $day_in_week = [
+                        '0' => 'SU',
+                        '1' => 'MO',
+                        '2' => 'TU',
+                        '3' => 'WE',
+                        '4' => 'TH',
+                        '5' => 'FR',
+                        '6' => 'SA'
+                    ];
+                    $repeat_type = $repeat_condition[$key]['repeat_type'];
+                    if ($repeat_type == GRN_REPEAT_TYPE_DAY) {
+                        $events[$key]['GRN_REPEAT_TYPE_DAY'] = true;
+                    } elseif ($repeat_type == GRN_REPEAT_TYPE_WEEKDAY) {
+                        $events[$key]['GRN_REPEAT_TYPE_WEEKDAY'] = true;
+                    } elseif ($repeat_type == GRN_REPEAT_TYPE_WEEK) {
+                        $events[$key]['GRN_REPEAT_TYPE_WEEK'] = true;
+                        $events[$key]['repeat_wday']
+                            = $day_in_week[$repeat_condition[$key]['repeat_wday']];
+                    } elseif ($repeat_type == GRN_REPEAT_TYPE_MONTH) {
+                        $events[$key]['GRN_REPEAT_TYPE_MONTH'] = true;
+                        $events[$key]['repeat_day']
+                            = $repeat_condition[$key]['repeat_day'];
+                    }
+                }
+            }
+        }
+        $exceptdates = $repeat_logic->getExceptDatesByIds($repeat_ids);
+        if (is_array($exceptdates)) {
+            foreach ($exceptdates as $event_id => $exdates) {
+                $event = $events[$event_id];
+                $suffix = '';
+                if ( ! isset($event['allday']) || false === $event['allday']) {
+                    $suffix = sprintf('T%02d%02d%02d',
+                        $event['setdatetime']->hour,
+                        $event['setdatetime']->minute,
+                        $event['setdatetime']->second);
+                }
+                foreach ($exdates as $key => $exdate) {
+                    $exdates[$key] = str_replace('-', '', $exdate) . $suffix;
+                }
+                $events[$event_id]['EXDATE'] = implode(',', $exdates);
+            }
+        }
+    }
+}
+
+$Filename = "schedule.ics";
+header("Content-Type: text/Calendar");
+header("Content-Disposition: inline; filename=$Filename");
+require_once("grn/smarty.csp");
+$t = new GRN_Smarty;
+$t->assign('events', $events);
+require_once('grn/system_logic.csp');
+$syslogic = GRN_System::getInstance();
+$t->assign('uuid', $syslogic->getSystemUUID());
+global $G_state_set;
+$G_state_set->set('copyright_should_be_written', false);
+$G_state_set->set('html_should_be_closed', false);
+$t->skipWarning();
+$t->display("schedule/personal/_event_ical_format.tpl");
+
+//Insert Log
+require_once('grn/logger.csp');
+$lm = CB_LoggerManager::getInstance();
+$l = $lm->getLogger(GRN_SCHEDULE_MODULE_ID);
+$log_params = [];
+$l->noticeEx('export_ical', 'personal_month_event', $log_params);
+

@@ -1,0 +1,228 @@
+<?php
+if (isset($cbpapi_service)) {
+    //response SOAP message
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty;
+    // get parameters of SOAP message
+    $node_parameters = $cbpapi_service->getRequestParameters();
+    $operations = [];
+    if (array_key_exists('children', $node_parameters)) {
+        $operations =& $node_parameters['children'];
+    }
+
+    $results = removeEventsFromRepeatEvent($operations);
+    $t->assign('results', $results);
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('schedule')]);
+    grn_cbpapi_response($t, __FILE__);
+}
+
+function removeEventsFromRepeatEvent(&$operations)
+{
+    if ( ! is_array($operations) || count($operations) <= 0) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'operation']);
+    }
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    $login_id = $login->getOID();
+    $operation_list = [];
+    $required_fields = ['event_id', 'type'];
+    foreach ($operations as $operation) {
+        if (array_key_exists('node_name', $operation)
+            && $operation['node_name'] == 'request_token'
+        ) {
+            continue;
+        }
+        $attributes = [];
+        if (array_key_exists('attributes', $operation)) {
+            $attributes = $operation['attributes'];
+            foreach ($required_fields as $field) {
+                if ( ! array_key_exists($field, $attributes)) {
+                    require_once('cbpapi/error_code.csp');
+                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                        ['param' => $field]);
+                }
+            }
+            $type = $attributes['type'];
+            $operation_list[] = $attributes;
+        }
+    }
+
+    require_once('cbpapi/schedule_logic.csp');
+    $logic = GRN_CBPApi_Schedule_Logic::getInstance();
+    $orginal_eventids = [];
+    $modify_eventids = [];
+    foreach ($operation_list as $operation) {
+        $event_id = $operation['event_id'];
+        $type = $operation['type'] ? $operation['type'] : null;
+        $str_date = array_key_exists('date', $operation) ? $operation['date']
+            : null;
+        $date = new CB_Date();
+        if ( ! $date->parse($str_date)) {
+            $date = null;
+        }
+        $date = $logic->translateDateToUserTimezone($event_id, $date);
+
+        require_once('schedule/application.csp');
+        $app = GRN_Schedule_Application::getInstance();
+        if ( ! is_numeric($event_id)) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        $event = $app->getEvent($login, $event_id, $date);
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        if ( ! is_a($event, 'GRN_Schedule_RepeatEvent')) {
+            cb_throw_error(E_GRN_SCHD_IS_NOT_REPEAT_EVENT);
+        }
+        // アクセス権のチェック
+        require_once('schedule/access_logic.csp');
+        $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+        $dynamic_role = $uum->listGrantedRoles();
+        $access = $acc_logic->getEventAccess($login, $event,
+            ['read', 'delete'], $dynamic_role);
+        if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+        }
+        if ($access['delete'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_DELETE);
+        }
+        if (is_a($event, 'GRN_Schedule_RepeatEvent')) {
+            // 繰り返しの変更条件が入っていないのでNG
+            if ( ! $type) {
+                cb_throw_error(E_GRN_SCHD_NOT_REPEAT_DELET_TYPE);
+            }
+            if ($type != 'all') {
+                if (is_null($date)) {
+                    cb_throw_error(E_GRN_SCHD_NOT_SPECIFIED_DATE);
+                }
+            }
+        }
+
+        require_once('schedule/facility_system_logic.csp');
+        $facility_logic = GRN_Facility_SystemLogic::getInstance();
+        if (is_array($event->facilities) && count($event->facilities) > 0) {
+            $f_settings
+                = $facility_logic->getFacilitySetting(array_keys($event->facilities));
+            foreach (array_keys($event->facilities) as $key) {
+                $object = &$event->facilities[$key];
+                $faid = $object->getOID();
+                $modify_user
+                    = $facility_logic->getModifyUserByPriority($f_settings,
+                    $faid);
+                // 登録者にのみ変更を許可する
+                if ($modify_user === 'creator') {
+                    // 施設で登録者しか変更を許していない場合
+                    if (is_array($event->facilities)
+                        && count($event->facilities) > 0
+                    ) {
+                        require_once('schedule/facility_privilege.csp');
+                        $privilege_logic
+                            = GRN_Facility_Privilege_Logic::getInstance();
+                        if ( ! $privilege_logic->hasPrivilegeOfFacilities($login,
+                                $event->facilities, 'OR')
+                             && ((is_a($event->creator, 'CB_User')
+                                  && $login_id != $event->creator->getOID())
+                                 || is_string($event->creator))
+                        ) {
+                            cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+                        }
+                    }
+                } // 登録者と共有メンバーに変更を許可する
+                elseif ($modify_user === 'member') {
+                    // 施設で登録者と共有メンバーしか変更を許していない場合
+                    if (is_array($event->facilities)
+                        && count($event->facilities) > 0
+                    ) {
+                        require_once('schedule/facility_privilege.csp');
+                        $privilege_logic
+                            = GRN_Facility_Privilege_Logic::getInstance();
+                        if ( ! $privilege_logic->hasPrivilegeOfFacilities($login,
+                                $event->facilities, 'OR')
+                             && (
+                                 (is_array($event->users)
+                                  && ! array_key_exists($login_id,
+                                         $event->users))
+                                 || is_null($event->users)
+                             )
+                             && ((is_a($event->creator, 'CB_User')
+                                  && $login_id !== $event->creator->getOID())
+                                 || is_string($event->creator))
+                        ) {
+                            cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ----- GRN2-4506 -----
+        if ($event->setdatetime instanceof CB_Date) {
+            // 終日予定の場合、イベントとユーザーのタイムゾーンの時差を見る。
+            // その時差によって、終日予定が1日早くなっているかどうか確認する。
+            $dateTimeZoneEvent = new DateTimeZone($event->timezone);
+            $dateTimeZoneUser = new DateTimeZone(CB_I18N::getInstance()
+                                                        ->getCurrentTimezone());
+            $dateTimeEvent = new DateTime("now", $dateTimeZoneEvent);
+            $dateTimeUser = new DateTime("now", $dateTimeZoneUser);
+            $timeOffset = $dateTimeZoneEvent->getOffset($dateTimeUser);
+            if ($timeOffset <= 0) {
+                // イベントのタイムゾーンがユーザーのタイムゾーンと同じか、遅い場合。
+                // 開始日はイベントのタイムゾーンと同じなので、そのまま。終了日を同日にしておく。
+                $event->enddatetime = $event->setdatetime;
+            } else {
+                // イベントのタイムゾーンがユーザーのタイムゾーンより早い場合。
+                // イベントのタイムゾーンの開始日は1日後となるので、変更する。
+                // enddatetimeはsetdatetimeの1日後になっているため、それを利用する。
+                $event->setdatetime = $event->enddatetime;
+            }
+        }
+        // ----- GRN2-4506 -----
+
+        // create notification
+        $logic->createNotification($login, $event, null, $date,
+            GRN_SCHEDULE_NOTIFY_DELETE);
+        //get event id before delete
+        $orginal_eventids[] = $event_id;
+        // 削除
+        $event_type = $event->getEventType();
+        $result = $app->deleteEvent($login, $event_id, $event_type, $date,
+            $type);
+        if ($result) {
+            if ($type === 'this' || $type === 'after') {
+                $modify_eventids[] = $event_id;
+            }
+            if ($type === 'all') {
+                $orginal_eventids = [];
+                $modify_eventids = [];
+            }
+        }
+    }
+
+    $logic->saveNow();
+
+    $events_for_view_original = [];
+    $events_for_view_original = $logic->getEventsForViewByIds($login,
+        $orginal_eventids);
+    $events_for_view_modify = [];
+    $events_for_view_modify = $logic->getEventsForViewByIds($login,
+        $modify_eventids);
+
+    $events_for_view = [];
+    foreach ($orginal_eventids as $index_key => $event_ori_key) {
+        $events_for_view_original[$event_ori_key]['root'] = 'original';
+        $events_for_view_modify[$modify_eventids[$index_key]]['root']
+            = 'modified';
+        $events_for_view[]
+            = [
+            $events_for_view_original[$event_ori_key],
+            $events_for_view_modify[$modify_eventids[$index_key]]
+        ];
+    }
+
+    return $events_for_view;
+
+}

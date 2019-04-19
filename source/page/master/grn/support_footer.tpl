@@ -1,0 +1,10 @@
+<div class="clear_both_1px">&nbsp;</div>
+<div id="footer" class="footer_grn">
+ <table width="100%">
+  <tr>
+   <td width="90%" class="nowrap-grn"><span class="footer_back_base_grn">{grn_backlink_system positions=$site_position}</span></td>
+   <td class="move_top_base_grn"><a class="move_top_grn" href="javascript:void(0);" onclick="jQuery('html, body').animate({ldelim} scrollTop:0 {rdelim}, 500 ); return false;"></a></td>
+  </tr>
+ </table>
+</div>
+</div><!--body_end-->

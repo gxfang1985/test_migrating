@@ -1,0 +1,189 @@
+<?php
+
+require_once('grn/application.csp');
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty;
+
+    //for escape
+    $app_locator = GRN_ApplicationLocator::instance();
+    $dbconn =& $app_locator->getConnection('phonemessage');
+
+    // 電話メモを取得する
+    require_once('phonemessage/application.csp');
+    $app_locator = GRN_ApplicationLocator::instance();
+    /** @var GRN_PhoneMessage_Application $app */
+    $app =& $app_locator->getInstance(GRN_PHONEMESSAGE_APPLICATION_ID);
+    if ( ! is_object($app) || ! is_a($app, 'GRN_PhoneMessage_Application')) {
+        cb_throw_error(E_GRN_APPLICATION_NOT_AVAILABLE);
+    }
+    $message_manager =& $app->getMessageManager();
+
+    // GET/POSTされたパラメータを取得する
+    $cid = null;
+    if (array_key_exists('cid', $G_INPUT)) {
+        $cid = $G_INPUT['cid'];
+    }
+    $gid = null;
+    if (array_key_exists('gid', $G_INPUT)) {
+        $gid = $G_INPUT['gid'];
+    }
+    $uid = null;
+    if (array_key_exists('uid', $G_INPUT)) {
+        $uid = $G_INPUT['uid'];
+    }
+    if (0 == strlen($uid)) {
+        cb_throw_error(E_GRN_PHONEMESSAGE_INVALID_USER_ID);
+    }
+    $mid = null;
+    if (array_key_exists('mids', $G_INPUT)) {
+        $mid = $G_INPUT['mids'];
+    }
+    if ( ! is_array($mid) || 0 == count($mid)) {
+        cb_throw_error(E_GRN_PHONEMESSAGE_INVALID_MESSAGE_ID);
+    }
+
+    // ログインユーザーを取得する
+    global $G_container_base;
+    $uum =& $G_container_base->getInstance('uum');
+    $login =& $uum->getLoginUser();
+    if ( ! is_object($login) || ! is_a($login, 'CB_User')) {
+        cb_throw_error(E_GRN_USER_NOT_FOUND);
+    }
+    $login_id = $login->getOID();
+
+    // ユーザーを取得する
+    $user =& $uum->getUser($uid);
+    if ( ! is_object($user) || ! is_a($user, 'CB_User')) {
+        cb_throw_error(E_GRN_USER_NOT_FOUND);
+    }
+
+    // ユーザー情報を取得する
+    require_once('phonemessage/controller.csp');
+    $controller_util = new GRN_PhoneMessage_ControllerUtil();
+    $user_for_view = $controller_util->getUser($user);
+
+    // ダイナミックロールを取得する
+    $dynamic_roles = $uum->listGrantedRoles();
+
+    // ユーザーにおけるアクセスの制限を評価する
+    require_once('phonemessage/access.csp');
+    $access_manager = GRN_PhoneMessage_AccessManager::getInstance();
+    $users = [$uid => & $user];
+    $user_info = $access_manager->getObjectInfo($users);
+    $authorities = ['browse', 'add'];
+    if (0 < count($user_info['objects'])) {
+        $user_info['accesses']
+            = $access_manager->evaluateAccesses($user_info['objects'], $login,
+            $dynamic_roles, $authorities);
+    } else {
+        $user_info['accesses'] = [];
+    }
+
+    // 組織一覧を取得する
+    $groups = $uum->getGroupList();
+
+    // 組織におけるアクセスの制限を評価する
+    $group_info = $access_manager->getObjectInfo($groups);
+    if (0 < count($group_info['objects'])) {
+        $group_info['accesses']
+            = $access_manager->evaluateAccesses($group_info['objects'], $login,
+            $dynamic_roles, $authorities);
+    } else {
+        $group_info['accesses'] = [];
+    }
+
+    // スタティックロール一覧を取得する
+    $roles = $uum->listStaticRoles();
+
+    // スタティックロールにおけるアクセスの制限を評価する
+    $role_info = $access_manager->getObjectInfo($roles);
+    if (0 < count($role_info['objects'])) {
+        $role_info['accesses']
+            = $access_manager->evaluateAccesses($role_info['objects'], $login,
+            $dynamic_roles, $authorities);
+    } else {
+        $role_info['accesses'] = [];
+    }
+
+    // ユーザー、組織、スタティックロールにおけるアクセスの制限を評価する
+    $accesses_for_view = $controller_util->evaluateAccesses($users, $user_info,
+        $group_info, $role_info);
+    // 自分自身のアクセス権は無視する
+    if (array_key_exists($login_id, $accesses_for_view)) {
+        $accesses_for_view[$login_id] = [];
+    }
+    if (array_key_exists($uid, $accesses_for_view)) {
+        if (array_key_exists('browse', $accesses_for_view[$uid])) {
+            cb_throw_error(E_GRN_PHONEMESSAGE_ACCESS_DENY_BROWSE);
+        }
+    } else {
+        assert('FALSE');
+    }
+
+    // _idが削除フラグ対応で重複してしまうのでテーブル名を取得
+    $real_table_name = $message_manager->getRealTableName();
+    $offset = 0;
+    $limit = -1;
+    $order_by = $real_table_name . '._id';
+    $conditions = [];
+    foreach ($mid as $message_id) {
+        $conditions[] = cb_queryf($dbconn, $real_table_name . "._id = '@S'",
+            $message_id);
+    }
+    $condition = implode(' OR ', $conditions);
+    $messages = $message_manager->getList($offset, $limit, $order_by,
+        $condition);
+
+    require_once('grn/notification.csp');
+    $notify_service = GRN_Notification_Service::getInstance();
+    $module_id = GRN_PHONEMESSAGE_MODULE_ID;
+    foreach (array_keys($messages) as $message_id) {
+        if (array_key_exists($message_id, $messages)) {
+            $message =& $messages[$message_id];
+
+            // メッセージの送信者、受信者がログインユーザーか判定する
+            $receiver =& $message->get('receiver');
+            $sender =& $message->get('sender');
+            if ($login_id != $receiver->getOID()
+                && $login_id != $sender->getOID()
+            ) {
+                cb_throw_error(E_GRN_PHONEMESSAGE_INVALID_DELETE);
+            }
+
+            $confirm_time =& $message->get('confirm_time');
+            if ($login_id != $receiver->getOID() && ! is_null($confirm_time)) {
+                cb_throw_error(E_GRN_PHONEMESSAGE_INVALID_DELETE);
+            }
+            // 未確認の通知データを削除する
+            if ($notify_data
+                = $notify_service->getNotifyDataProperties($receiver,
+                $module_id, $message_id)
+            ) {
+                if ($notify_data->isStatusUnread()) {
+                    $notify_service->deleteNotifyData($receiver, $module_id,
+                        $message_id);
+                }
+            }
+
+            // 削除する
+            $message->delete();
+
+            // 監査する
+            require_once('phonemessage/inspection.csp');
+            $inspection = GRN_PhoneMessage_Inspection::getInstance();
+            if ($inspection->isEnabled()) {
+                $section = GRN_PHONEMESSAGE_INSPECTION_DELETE;
+                $message = GRN_PHONEMESSAGE_INSPECTION_PHONEMESSAGE;
+                $params = ['mid' => $message_id];
+                $inspection->record($section, $message, $params);
+            }
+        }
+    }
+
+    cb_redirect('phonemessage/history',
+        ['cid' => $cid, 'gid' => $gid, 'uid' => $uid]);
+}
+
+

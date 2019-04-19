@@ -1,0 +1,1034 @@
+<?php
+require_once("fw/i18n.csp");
+require_once("fw/i18n/locale.csp");
+
+class GrnImportUserCSV
+{
+    static $SKIPPED_CHAR = "*";
+    static $BLANK_CHAR = "";
+
+    private $charSet = false;
+    private $skip = 0;
+    private $oldFormat = false;
+
+    /**
+     * @param $input
+     * @param $filePath
+     */
+    public function execute($input, $filePath)
+    {
+        $this->initWithInput($input);
+        $columnPropertyList = $this->createColumnPropertyList();
+
+        // エラーフックの登録
+        require_once('fw/csv.csp');
+        $csv = $this->createCsvReader($this->getCharSet(), $filePath);
+        while (($line = $csv->readline()) !== false) {
+            if ($this->getSkip()) {
+                $this->setSkip($this->getSkip() - 1);
+                continue;
+            }
+            $this->setColumnValue($columnPropertyList, $line);
+            $this->validate($columnPropertyList);
+            $this->process($columnPropertyList);
+        }
+        unset($csv);
+
+        $err_handler = CB_ErrorHandler::getInstance();
+        $err_handler->removeHook('cb_csv_error_hook');
+
+        $uum = $this->getUum();
+        if ( ! $uum->checkLincense()) {
+            cb_throw_error(E_GRN_LICENSE_DENY_USER_ADD);
+        }
+    }
+
+    /**
+     * @param $charSet
+     * @param $filePath
+     *
+     * @return CB_CSVReader
+     */
+    protected function createCsvReader($charSet, $filePath)
+    {
+        return new CB_CSVReader($charSet, $filePath);
+    }
+
+    /**
+     * get the column body names of tab_cb_user.
+     *
+     * @return array
+     */
+    private function getUpdatingBasicColumnNames()
+    {
+        require_once("fw/i18n/system_config.csp");
+        $ret = ["display_name"];
+
+        if ( ! $this->isOldFormat() && CB_I18N_SystemConfig::isNickname()) {
+            $ret[] = "display_name_language";
+            $ret[] = "nickname";
+        }
+        $ret[] = "foreign_key";
+        $ret[] = "password";
+        $ret[] = "position";
+        $ret[] = "valid";
+        $ret[] = "delete_flag";
+
+        return $ret;
+    }
+
+    /**
+     * @param $userId
+     */
+    private function updatePasswordExpired($userId)
+    {
+        $uum = $this->getUum();
+        // Set Password Expired
+        $expired = null;
+        require_once('grn/system_logic.csp');
+        $system = GRN_System::getInstance();
+
+        $interval = $system->getPasswordExpirationInterval();
+        if ($interval > 0) {
+            $expired = new CB_TimeStamp();
+            $expired->unix_ts = time() + ($interval * 60 * 60 * 24);
+        }
+        $uum->setPasswordExpired($userId, $expired);
+    }
+
+    /**
+     * @param $columnPropertyList
+     */
+    private function process($columnPropertyList)
+    {
+        $userId = $this->updateBasicColumns($columnPropertyList);
+
+        if ( ! is_null($userId)) {
+            if ( ! $this->isOldFormat()) {
+                $this->updateLocaleData($userId, $columnPropertyList);
+                $this->updateBaseData($userId, $columnPropertyList);
+            }
+
+            //監査実行
+            $uum = $this->getUum();
+            $user_object = $uum->getUser($userId);
+            $uum->execInspection('user', 'import', [
+                'uid'     => $user_object->getOID(),
+                'name'    => $user_object->get('display_name'),
+                'account' => $user_object->get('foreign_key')
+            ]);
+        }
+    }
+
+    /**
+     * @param                        $userId
+     * @param GrnCsvColumnProperty[] $columnPropertyList
+     */
+    private function updateLocaleData($userId, $columnPropertyList)
+    {
+        require_once("fw/i18n/locale.csp");
+        $value = $columnPropertyList["locale"]->getValue();
+        $user_locale_setting = CB_UserLocaleSetting::select($userId);
+        if ($value == self::$SKIPPED_CHAR) {
+            if ( ! is_null($user_locale_setting)) {
+                return;
+            }
+
+            CB_LocaleManager::setUserLocaleSetting($userId, null);
+        } elseif ($value !== self::$BLANK_CHAR) {
+            $locale = CB_Locale::selectByCode($value);
+            if (is_null($locale)) {
+                cb_throw_error(E_COMMON_LOCALE_WAS_NOT_FOUND);
+            }
+
+            if ( ! is_null($user_locale_setting)
+                 && $locale->getId() == $user_locale_setting->getLocale()
+            ) {
+                return;
+            }
+
+            CB_LocaleManager::setUserLocaleSetting($userId, $locale->getId());
+        } else {
+            if ( ! is_null($user_locale_setting)
+                 && is_null($user_locale_setting->getLocale())
+            ) {
+                return;
+            }
+
+            CB_LocaleManager::setUserLocaleSetting($userId, null);
+        }
+    }
+
+    /**
+     * @param                        $userId
+     * @param GrnCsvColumnProperty[] $columnPropertyList
+     */
+    private function updateBaseData($userId, $columnPropertyList)
+    {
+        require_once("fw/i18n/base.csp");
+        $value = $columnPropertyList['base']->getValue();
+        $user_base_setting = CB_UserBaseSetting::select($userId);
+        if ($value == self::$SKIPPED_CHAR) {
+            if ( ! is_null($user_base_setting)) {
+                return;
+            }
+
+            CB_BaseManager::setUserBaseSetting($userId, null);
+        } elseif ($value !== self::$BLANK_CHAR) {
+            $base = CB_Base::selectByCode($value);
+            if (is_null($base)) {
+                cb_throw_error(E_COMMON_BASE_WAS_NOT_FOUND);
+            }
+
+            if ( ! is_null($user_base_setting)
+                 && $base->getId() == $user_base_setting->getBase()
+            ) {
+                return;
+            }
+
+            CB_BaseManager::setUserBaseSetting($userId, $base->getId());
+        } else {
+            if ( ! is_null($user_base_setting)
+                 && is_null($user_base_setting->getBase())
+            ) {
+                return;
+            }
+
+            CB_BaseManager::setUserBaseSetting($userId, null);
+        }
+    }
+
+    /**
+     *
+     * @param string                 $userId
+     * @param GrnCsvColumnProperty[] $columnPropertyList
+     */
+    private function updateBuiltinColumns($userId, $columnPropertyList)
+    {
+        $uum = $this->getUum();
+        $defaultColumnIds = array_keys($uum->listDefaultItemIds());
+        $defaultColumnIds[] = "valid";
+        $defaultColumnIds[] = "position";
+        $array = $this->toArray($columnPropertyList,
+            $defaultColumnIds);
+
+        $uum = $this->getUum();
+        $user_info = [];
+        //組み込み項目のデータを設定
+        $uum->setDefaultItemDatas($uum->getUserInfo($userId), $array);
+    }
+
+    /**
+     *
+     * @param string                 $userId
+     * @param GrnCsvColumnProperty[] $columnPropertyList
+     */
+    private function updateExtentionColumns($userId, $columnPropertyList)
+    {
+        //拡張項目のデータを設定
+        $uum = $this->getUum();
+        $user_object = $uum->getUser($userId);
+        foreach (
+            array_keys($this->getExtensionColumnPropertyList()) as $columnId
+        ) {
+            if (array_key_exists($columnId, $columnPropertyList)) {
+                $uum->setExtensionItemData(
+                    $user_object,
+                    $columnId,
+                    $columnPropertyList[$columnId]->getValue(), true);
+            }
+        }
+    }
+
+    /**
+     *
+     * Create/Update a record on tab_cb_user table.
+     *
+     * @param GrnCsvColumnProperty[] $columnPropertyList
+     *
+     * @return string User ID
+     */
+    private function updateBasicColumns($columnPropertyList)
+    {
+        //現ログイン名のユーザーが存在し、削除フラグがたっている場合は削除
+        //新ログイン名のみが指定されている場合は新規ユーザーの作成
+        //現ログイン名のみが指定されている場合は既存ユーザーの変更
+        //両方指定されていて、現ログイン名が存在すれば、既存ユーザーの変更（新ログイン名がユーザーの新たなログイン名となる）
+        //両方指定されていて、現ログイン名が存在しなければ、新規ユーザーの作成（新ログイン名がユーザーの新たなログイン名となる）
+
+        $uum = $this->getUum();
+        $userArray = $this->getTargetUserArray($columnPropertyList);
+        if ($columnPropertyList['delete_flag']->getValue() === '1') {
+            //Remove User
+            if ( ! is_null($userArray)) {
+                $uum->removeUser($userArray['_id']);
+            }
+
+            return null;
+        } elseif ($columnPropertyList['key']->getValue() === self::$SKIPPED_CHAR
+                  || ($columnPropertyList['foreign_key']->getValue()
+                      !== self::$SKIPPED_CHAR
+                      && is_null($userArray))
+        ) {
+            return $this->addUser($columnPropertyList);
+        } else {
+            return $this->modifyUser($userArray, $columnPropertyList);
+        }
+        assert(false);
+
+        return null;
+    }
+
+    /**
+     *
+     * @param GrnCsvColumnProperty[] $columnPropertyList
+     *
+     * @return string ID of added user
+     */
+    private function addUser($columnPropertyList)
+    {
+        foreach ($columnPropertyList as $columnProperty) {
+            if ($columnProperty->getValue() == self::$SKIPPED_CHAR) {
+                $columnProperty->setValue(self::$BLANK_CHAR);
+            }
+            $columnProperty->validate();
+        }
+
+        //Add User
+        $array = $this->toArray($columnPropertyList,
+            $this->getUpdatingBasicColumnNames());
+        //Default Setting
+        if (strlen($array['valid']) === 0) {
+            unset($array['valid']);
+            unset($columnPropertyList['valid']);
+        }
+        if (strlen($array['position']) === 0) {
+            $array['position'] = GRN_UUM_USER_MAX_POSITION;
+            unset($columnPropertyList['position']);
+        }
+        $uum = $this->getUum();
+        if ( ! $user = $uum->addUser($array, null)) {
+            cb_throw_error(E_GRN_CSV_FAILED_USER_CREATE);
+        }
+
+        $this->updatePasswordExpired($user->getOID());
+        $this->updateBuiltinColumns($user->getOID(), $columnPropertyList);
+        $this->updateExtentionColumns($user->getOID(), $columnPropertyList);
+
+        return $user->getOID();
+    }
+
+    /**
+     *
+     * CSVのデータを使って、ユーザーを変更する
+     *
+     * @param array                  $userArray
+     * @param GrnCsvColumnProperty[] $columnPropertyList
+     *
+     * @return string ID of the modified user
+     */
+    private function modifyUser($userArray, $columnPropertyList)
+    {
+        //Modify User
+        if (is_null($userArray)) {
+            cb_throw_error(E_GRN_CSV_USER_NOT_FOUND);
+        }
+
+        $specifiedColumnList = [];
+        foreach ($columnPropertyList as $columnName => $columnProperty) {
+            $tmp = $columnProperty->getValue();
+            if ($columnProperty->getValue() !== self::$SKIPPED_CHAR) {
+                $specifiedColumnList[$columnName] = $columnProperty;
+                $columnProperty->validate();
+            }
+        }
+
+        //情報変更
+        $this->updateBuiltinColumns($userArray['_id'], $specifiedColumnList);
+        $this->updateExtentionColumns($userArray['_id'], $specifiedColumnList);
+
+        //パスワード
+        if (array_key_exists('password', $specifiedColumnList)) {
+            $uum = $this->getUum();
+            $uum->changePassword($userArray['_id'], '',
+                $specifiedColumnList['password']->getValue(), true);
+        }
+
+        return $userArray["_id"];
+    }
+
+    /**
+     * @param GrnCsvColumnProperty[] $columnPropetyList
+     *
+     * @return array|bool|null
+     */
+    private function getTargetUserArray($columnPropetyList)
+    {
+        $uum = $this->getUum();
+        $user = null;
+        if ($columnPropetyList['key']->getValue() !== self::$SKIPPED_CHAR) {
+            $user
+                = $uum->getUserInfoByForeignKey($columnPropetyList['key']->getValue());
+            if ( ! $user) {
+                $user = null;
+            }
+
+            if ( ! $this->isAdminUser() && ! is_null($user)) {
+                if ( ! $this->isPrivilegedUser($uum->getLoginUser(),
+                    $user['_id'])
+                ) {
+                    cb_throw_error(
+                        E_GRN_CSV_NO_USER_PRIVILEGE,
+                        null,
+                        ['foreign_key' => $columnPropetyList['key']->getValue()]);
+                }
+            }
+        }
+
+        return $user;
+    }
+
+    /**
+     *
+     * Validate each line of the CSV
+     *
+     * @param GrnCsvColumnProperty[] $columnPropertyList
+     */
+    private function validate($columnPropertyList)
+    {
+        // Both the old login name(key) and the new login name(foreign_key) should >= 1.
+        if (strlen($columnPropertyList['key']->getValue()) === 0
+            || strlen($columnPropertyList['foreign_key']->getValue()) === 0
+        ) {
+            cb_throw_error(
+                E_GRN_CSV_EMPTY_EACH_USER_KEY,
+                null,
+                [
+                    'property1' => $columnPropertyList['key']->getName(),
+                    'property2' => $columnPropertyList['foreign_key']->getName()
+                ]);
+        }
+
+        // Either the old login name or the new login name should be specified
+        if ($columnPropertyList['key']->getValue() === self::$SKIPPED_CHAR
+            && $columnPropertyList['foreign_key']->getValue()
+               === self::$SKIPPED_CHAR
+        ) {
+            cb_throw_error(
+                E_GRN_CSV_MISSING_BOTH_USER_KEY,
+                null,
+                [
+                    'property1' => $columnPropertyList['key']->getName(),
+                    'property2' => $columnPropertyList['foreign_key']->getName()
+                ],
+                [
+                    'property1' => $columnPropertyList['key']->getName(),
+                    'property2' => $columnPropertyList['foreign_key']->getName()
+                ]);
+        }
+
+        // The value of 'position' should be nonnegative number (<=GRN_UUM_USER_MAX_POSITION) if it is specified
+        if ($columnPropertyList['position']->getValue() !== self::$SKIPPED_CHAR
+            && strlen($columnPropertyList['position']->getValue()) !== 0
+            &&
+            ! (is_numeric($columnPropertyList['position']->getValue())
+               && $columnPropertyList['position']->getValue() >= 0
+               && $columnPropertyList['position']->getValue()
+                  < GRN_UUM_USER_MAX_POSITION)
+        ) {
+            cb_throw_error(
+                E_GRN_CSV_INVALID_USER_POSITION,
+                null,
+                [
+                    'data'     => $columnPropertyList['position']->getValue(),
+                    'property' => $columnPropertyList['position']->getName()
+                ],
+                [
+                    'low'  => 0,
+                    'high' => GRN_UUM_USER_MAX_POSITION - 1
+                ]);
+        }
+
+        // The value of 'valid' should be 0, 1, or * if it is specified.
+        if ( ! in_array($columnPropertyList['valid']->getValue(),
+                ['0', '1', self::$SKIPPED_CHAR])
+             && strlen($columnPropertyList['valid']->getValue()) > 0
+        ) {
+            cb_throw_error(
+                E_GRN_CSV_INVALID_USER_PROPERTY,
+                null,
+                [
+                    'data'     => $columnPropertyList['valid']->getValue(),
+                    'property' => $columnPropertyList['valid']->getName()
+                ]);
+        }
+
+        // The value of 'delete_flag' should be either 0, 1 , '' or * if it is specified.
+        if ( ! in_array($columnPropertyList['delete_flag']->getValue(),
+                ['0', '1', self::$BLANK_CHAR, self::$SKIPPED_CHAR])
+             && strlen($columnPropertyList['delete_flag'] !== 0)
+        ) {
+            cb_throw_error(
+                E_GRN_CSV_INVALID_USER_PROPERTY,
+                null,
+                [
+                    'data'     => $columnPropertyList['delete_flag']->getValue(),
+                    'property' => $columnPropertyList['delete_flag']->getName()
+                ]);
+        }
+    }
+
+    /**
+     * @param GrnCsvColumnProperty[] $columnPropertyList
+     * @param                        $line
+     */
+    private function setColumnValue($columnPropertyList, $line)
+    {
+        $columnNumber = 0;
+        foreach ($columnPropertyList as $columnProperty) {
+            $value = $this->readValue($line, $columnNumber++);
+            if ($columnProperty->isTrim()) {
+                $columnProperty->setValue(cb_trim($value));
+            } else {
+                $columnProperty->setValue($value);
+            }
+        }
+    }
+
+    /**
+     * @param $line
+     * @param $index
+     *
+     * @return string
+     */
+    private function readValue($line, $index)
+    {
+        if (array_key_exists($index, $line)) {
+            return $line[$index];
+        }
+
+        return self::$SKIPPED_CHAR;
+    }
+
+    /**
+     * @return bool
+     */
+    private function isAdminUser()
+    {
+        require_once('grn/org_privilege.csp');
+        $logic = GRN_OrganizationPrivilegeLogic::getInstance();
+
+        return $logic->isAdmin();
+    }
+
+    /**
+     * @param $user
+     * @param $userId
+     *
+     * @return bool
+     */
+    private function isPrivilegedUser($user, $userId)
+    {
+        require_once('grn/org_privilege.csp');
+        $logic = GRN_OrganizationPrivilegeLogic::getInstance();
+
+        return $logic->isPrivilegedUser($user, $userId);
+    }
+
+    /**
+     * @param $input
+     */
+    private function initWithInput($input)
+    {
+        if (isset($input['charset'])) {
+            $this->setCharSet($input['charset']);
+        }
+
+        if (isset($input['skip'])) {
+            $this->setSkip($input['skip']);
+        }
+
+        if (isset($input['old']) && $input['old']) {
+            $this->setOldFormat(true);
+        }
+
+        if ( ! $this->getCharSet()) {
+            $this->setCharSet($this->getDefaultExternalEncoding());
+        }
+    }
+
+    /**
+     * @return mixed
+     */
+    private function getCharSet()
+    {
+        return $this->charSet;
+    }
+
+    /**
+     * @param $charSet
+     */
+    private function setCharSet($charSet)
+    {
+        $this->charSet = $charSet;
+    }
+
+    /**
+     * @return mixed
+     */
+    private function getSkip()
+    {
+        return $this->skip;
+    }
+
+    /**
+     * @param $skip
+     */
+    private function setSkip($skip)
+    {
+        $this->skip = $skip;
+    }
+
+    /**
+     * @return mixed
+     */
+    private function isOldFormat()
+    {
+        return $this->oldFormat;
+    }
+
+    /**
+     * @param mixed $oldFormat
+     */
+    private function setOldFormat($oldFormat)
+    {
+        $this->oldFormat = $oldFormat;
+    }
+
+    /**
+     * @return mixed
+     */
+    private function getDefaultExternalEncoding()
+    {
+        global $G_config_common;
+
+        return $G_config_common->get('I18N', 'default_external_encoding');
+    }
+
+    /**
+     * @param GrnCsvColumnProperty[] $columnPropertyList
+     * @param                        $columnNames
+     *
+     * @return array
+     */
+    private function toArray($columnPropertyList, $columnNames)
+    {
+        $ret = [];
+        foreach ($columnNames as $columnName) {
+            if (array_key_exists($columnName, $columnPropertyList)) {
+                $ret[$columnName]
+                    = $columnPropertyList[$columnName]->getValue();
+            }
+        }
+
+        return $ret;
+    }
+
+
+    /**
+     * Define the CSV format
+     *
+     * @return GrnCsvColumnProperty[]
+     */
+    private function createColumnPropertyList()
+    {
+        $ret = [];
+
+        //Set properties of some special columns.
+        $ret["key"] = new GrnCsvColumnProperty([
+            'type'      => 'string',
+            'name'      => cb_msg('grn.common', 'user_key'),
+            'trim'      => true,
+            'necessary' => false
+        ]);
+        $ret["display_name"] = new GrnCsvColumnProperty([
+            'type'      => 'string',
+            'name'      => cb_msg('grn.common', 'user_display_name'),
+            'trim'      => true,
+            'necessary' => true
+        ]);
+
+        require_once("fw/i18n/system_config.csp");
+        if ( ! $this->isOldFormat() && CB_I18N_SystemConfig::isNickname()) {
+            $ret["display_name_language"] = new GrnCsvColumnProperty([
+                'type'      => 'string',
+                'name'      => cb_msg('grn.common',
+                    'user_display_name_language'),
+                'trim'      => true,
+                'necessary' => true
+            ]);
+            $ret["nickname"] = new GrnCsvColumnProperty([
+                'type'      => 'string',
+                'name'      => cb_msg('grn.common', 'user_nickname'),
+                'trim'      => true,
+                'necessary' => false
+            ]);
+        }
+
+        $ret["foreign_key"] = new GrnCsvColumnProperty([
+            'type'      => 'string',
+            'name'      => cb_msg('grn.common', 'user_foreign_key'),
+            'trim'      => true,
+            'necessary' => false
+        ]);
+        $ret["password"] = new GrnCsvColumnProperty([
+            'type'      => 'password',
+            'name'      => cb_msg('grn.common', 'user_password'),
+            'trim'      => false,
+            'necessary' => false
+        ]);
+
+        if ( ! $this->isOldFormat()) {
+            $ret["locale"] = new GrnCsvColumnProperty([
+                'type'      => 'string',
+                'name'      => cb_msg('grn.common', 'user_locale'),
+                'trim'      => true,
+                'necessary' => false
+            ]);
+            $ret["base"] = new GrnCsvColumnProperty([
+                'type'      => 'string',
+                'name'      => cb_msg('grn.common', 'user_base'),
+                'trim'      => true,
+                'necessary' => false
+            ]);
+        }
+
+        $ret["position"] = new GrnCsvColumnProperty([
+            'type'      => 'string',
+            'name'      => cb_msg('grn.common', 'user_position'),
+            'trim'      => true,
+            'necessary' => false
+        ]);
+        $ret["valid"] = new GrnCsvColumnProperty([
+            'type'      => 'string',
+            'name'      => cb_msg('grn.common', 'user_valid'),
+            'trim'      => true,
+            'necessary' => false
+        ]);
+        $ret["delete_flag"] = new GrnCsvColumnProperty([
+            'type'      => 'string',
+            'name'      => cb_msg('grn.common', 'user_delete_flag'),
+            'trim'      => true,
+            'necessary' => false
+        ]);
+
+        $uum = $this->getUum();
+        // Set properties of other builtin columns
+        foreach (
+            $this->getBuiltinColumnPropertyList() as $columnId =>
+            $columnProperty
+        ) {
+            if ( ! array_key_exists($columnId, $ret)) {
+                $ret[$columnId] = new GrnCsvColumnProperty([
+                    'type'      => $columnProperty['type'],
+                    'name'      => $uum->getRealDefaultItemName($columnId),
+                    'trim'      => $columnProperty['necessary'],
+                    'necessary' => $columnProperty['necessary']
+                ]);
+            }
+        }
+
+        // Set properties of extended columns.
+        foreach (
+            $this->getExtensionColumnPropertyList() as $columnId => $columnRow
+        ) {
+            if ( ! array_key_exists($columnId, $ret)) {
+                $ret[$columnId] = new GrnCsvColumnProperty([
+                    'type'      => $columnRow->get('type'),
+                    'name'      => $columnRow->get('display_name'),
+                    'trim'      => $columnRow->get('necessary'),
+                    'necesarry' => $columnRow->get('necessary'),
+                ]);
+            }
+        }
+
+        return $ret;
+    }
+
+    /**
+     * カスタマイズ項目の一覧を取得する
+     *
+     * @return CB_Row[]
+     */
+    private function getExtensionColumnPropertyList()
+    {
+        $ret = [];
+
+        $uum = $this->getUum();
+        foreach ($uum->listItems() as $columnId => $columnRow) {
+            if ( ! $columnRow->get('use')) {
+                continue;
+            }
+            if ($columnRow->get('type') === 'file') {
+                continue;
+            }
+
+            $ret[$columnId] = $columnRow;
+        }
+
+        return $ret;
+    }
+
+
+    /**
+     * tab_cb_user テーブルで更新するべきカラムリスト
+     * locale, base は除く。
+     *
+     * @return array<array>
+     */
+    private function getBuiltinColumnPropertyList()
+    {
+        $ret = [];
+
+        $uum = $this->getUum();
+        $item_values = $uum->getDefaultItemProperties();
+        foreach ($item_values as $id => $properties) {
+            if ($id == "locale" || $id == "base") {
+                continue;
+            }
+
+            if ($this->isOldFormat()) {
+                if (in_array($id, ["display_name_language", "nickname"])) {
+                    continue;
+                }
+            }
+
+            if ( ! $properties['use']) {
+                continue;
+            }
+
+            if (in_array($properties['type'],
+                ["file", "primary_group", "usergroups", "attendee"])
+            ) {
+                continue;
+            }
+
+            $ret[$id] = $properties;
+        }
+
+        return $ret;
+    }
+
+    private $uum = null;
+
+    /**
+     * @return GRN_Uum
+     */
+    private function getUum()
+    {
+        if (is_null($this->uum)) {
+            global $G_container_base;
+            $this->setUum($G_container_base->getInstance('uum'));
+        }
+
+        return $this->uum;
+    }
+
+    /**
+     * @param GRN_Uum $uum
+     */
+    private function setUum($uum)
+    {
+        $this->uum = $uum;
+    }
+}
+
+class GrnCsvColumnProperty
+{
+    private $type = null;
+    private $name = null;
+    private $trim = null;
+    private $necessary = null;
+    private $value = null;
+
+    /**
+     * set value of array if array has hash key of  type, name, trim, necessary.
+     *
+     * @param array $dataArray
+     */
+    public function __construct($dataArray = [])
+    {
+        if (array_key_exists("type", $dataArray)) {
+            $this->setType($dataArray["type"]);
+        }
+        if (array_key_exists("name", $dataArray)) {
+            $this->setName($dataArray["name"]);
+        }
+        if (array_key_exists("trim", $dataArray)) {
+            $this->setTrim($dataArray["trim"]);
+        }
+        if (array_key_exists("necessary", $dataArray)) {
+            $this->setNecessary($dataArray["necessary"]);
+        }
+    }
+
+    /**
+     * @return mixed
+     */
+    public function getType()
+    {
+        return $this->type;
+    }
+
+    /**
+     * @param mixed $type
+     */
+    public function setType($type)
+    {
+        $this->type = $type;
+    }
+
+    /**
+     * @return mixed
+     */
+    public function getName()
+    {
+        return $this->name;
+    }
+
+    /**
+     * @param $name
+     */
+    public function setName($name)
+    {
+        $this->name = $name;
+    }
+
+    /**
+     * @return mixed
+     */
+    public function isTrim()
+    {
+        return $this->trim;
+    }
+
+    /**
+     * @param $trim
+     */
+    public function setTrim($trim)
+    {
+        $this->trim = $trim;
+    }
+
+    /**
+     * @return mixed
+     */
+    public function isNecessary()
+    {
+        return $this->necessary;
+    }
+
+    /**
+     * @param $necessary
+     */
+    public function setNecessary($necessary)
+    {
+        $this->necessary = $necessary;
+    }
+
+    /**
+     * @return mixed
+     */
+    public function getValue()
+    {
+        return $this->value;
+    }
+
+    /**
+     * @param $value
+     */
+    public function setValue($value)
+    {
+        $this->value = $value;
+    }
+
+    /**
+     * @return mixed
+     */
+    public function validate()
+    {
+        switch ($this->getType()) {
+            case 'multiple_string':
+                if (mb_strlen($this->getValue()) > 65535) {
+                    cb_throw_error(
+                        E_GRN_CSV_TOO_LONG_USER_PROPERTY,
+                        null,
+                        [
+                            'property' => $this->getName(),
+                            'max'      => 65535
+                        ],
+                        [
+                            'property' => $this->getName(),
+                            'max'      => 65535
+                        ]);
+                }
+                break;
+
+            case 'password':
+                if (mb_strlen($this->getValue()) > 64) {
+                    cb_throw_error(
+                        E_GRN_CSV_TOO_LONG_USER_PROPERTY,
+                        null,
+                        [
+                            'property' => $this->getName(),
+                            'max'      => 64
+                        ],
+                        [
+                            'property' => $this->getName(),
+                            'max'      => 64
+                        ]);
+                }
+                break;
+
+            case 'url':
+            case 'image_url':
+                if (mb_strlen($this->getValue()) > 255) {
+                    cb_throw_error(
+                        E_GRN_CSV_TOO_LONG_USER_PROPERTY,
+                        null,
+                        [
+                            'property' => $this->getName(),
+                            'max'      => 255
+                        ],
+                        [
+                            'property' => $this->getName(),
+                            'max'      => 255
+                        ]);
+                }
+                break;
+
+            default:
+                if (mb_strlen($this->getValue()) > 100) {
+                    cb_throw_error(
+                        E_GRN_CSV_TOO_LONG_USER_PROPERTY,
+                        null,
+                        [
+                            'property' => $this->getName(),
+                            'max'      => 100
+                        ],
+                        [
+                            'property' => $this->getName(),
+                            'max'      => 100
+                        ]);
+                }
+        }
+        if ($this->isNecessary() && strlen($this->getValue()) === 0) {
+            cb_throw_error(E_GRN_CSV_EMPTY_USER_PROPERTY,
+                null,
+                ['property' => $this->getName()],
+                ['property' => $this->getName()]);
+        }
+
+        return true;
+    }
+}

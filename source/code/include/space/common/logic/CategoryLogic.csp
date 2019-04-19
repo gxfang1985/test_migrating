@@ -1,0 +1,663 @@
+<?php
+
+namespace grn\space\common\logic;
+
+use grn\space\common\utility\ValidateUtility;
+
+use grn\space\common\data\bean\CategoryLocal;
+
+use grn\space\common\data\collection\CategoryLocalCollection;
+use grn\space\common\data\bean\Category;
+use grn\space\common\data\bean\LanguageStatus;
+use grn\space\common\data\collection\CategoryCollection;
+use grn\space\common\data\condition\CategorySearchCondition;
+use grn\space\common\db\CategoryFacade;
+use grn\space\common\exception\GrnInvalidArgumentException;
+
+/**
+ * Business Logic Layer
+ * This layer achieves the demand from the application service layer by using the DB layer.
+ *
+ * Category logic class
+ * All demands for the CATEGORY are undertaken from the application service layer.
+ *
+ **/
+class CategoryLogic
+{
+    private static $_instance = null;
+
+    /**
+     * コンストラクタ
+     */
+    public function __construct()
+    {
+    }
+
+    /**
+     * Get Instance(Singleton pattern)
+     *
+     * @return CategoryLogic $_instance
+     */
+    public static function getInstance()
+    {
+        if (is_null(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    //*****************************************************************************************************
+    //***********************************        category        ******************************************
+    //*****************************************************************************************************
+    /**
+     * Create category
+     *
+     * @param  \grn\space\common\data\bean\Category                      $category                Category
+     * @param  \grn\space\common\data\collection\CategoryLocalCollection $categoryLocalCollection CategoryLocalCollection
+     *
+     * @throws \grn\space\common\exception\GrnDatabaseException               Any error in the database.
+     * @return \grn\space\common\data\bean\Category
+     */
+    public function createCategory(
+        Category $category,
+        CategoryLocalCollection $categoryLocalCollection
+    ) {
+        //Set current time
+        $category->setCreateTimestamp(time());
+
+        if ( ! is_null($category->getModifierId())) {
+            $category->setModifyTimestamp($category->getCreateTimestamp());
+        }
+
+        //create of category
+        $categoryDBFacade = new CategoryFacade();
+        $newCategory = $categoryDBFacade->insertCategory($category);
+
+        // Setup the localized name of the category.
+        /** @var \grn\space\common\data\bean\CategoryLocal $eachCategoryLocal */
+        foreach ($categoryLocalCollection as $eachCategoryLocal) {
+            $eachCategoryLocal->setCategoryId($category->getId());
+            $this->setupCategoryLocal($eachCategoryLocal);
+        }
+
+        //create ancestor of category
+        $this->_createCategoryHierarchies($newCategory);
+
+        return $newCategory;
+    }
+
+    /**
+     * Insert a record into tab_grn_space_category_local.
+     * When the record is duplicated, this method updates col_name value of the record.
+     *
+     * The retuend value is a little tricky.
+     * 0 : There had been the same record already so that no record was changed.
+     * 1 : There had been no record whose col_category and col_language were the same with $categoryLocal so that a new record was inserted.
+     * 2 : There had been the record whose col_category and col_language were the same with $categoryLocal so that only col_category_name of the record was updated.
+     *
+     * @param \grn\space\common\data\bean\CategoryLocal $categoryLocal
+     *
+     * @return integer the number of affected rows.
+     * @throws GrnInvalidArgumentException
+     */
+    public function setupCategoryLocal(CategoryLocal $categoryLocal)
+    {
+        $categoryFacade = new CategoryFacade();
+
+        return $categoryFacade->insertOnDuplicateUpdateCategoryLocal($categoryLocal);
+    }
+
+    /**
+     *
+     * Modify category
+     *
+     * @param \grn\space\common\data\bean\Category $category Category
+     *
+     * @throws \grn\space\common\exception\GrnDataNotFoundException     When the specified category is not found.
+     * @throws \grn\space\common\exception\GrnDatabaseException         Any error in the database.
+     * @return \grn\space\common\data\bean\Category
+     */
+    public function modifyCategory(Category $category)
+    {
+        //changed is parent category id ?
+        //delete and insert of ancestor category
+        $beforeCategory = $this->getCategory($category->getId(),
+            LanguageStatus::STANDARD_LANGUAGE_CODE);
+        if ($category->getParentCategoryId()
+            !== $beforeCategory->getParentCategoryId()
+        ) {
+            //Re-creation of ancestor category
+            $this->_deleteCategoryHierarchies($category);
+            $this->_createCategoryHierarchies($category);
+        }
+
+        //update of category
+        $categoryDBFacade = new CategoryFacade();
+        $category = $categoryDBFacade->updateCategory($category);
+
+        //update of decendant categories
+        if ($category->getParentCategoryId()
+            !== $beforeCategory->getParentCategoryId()
+        ) {
+            //変更後と変更前の階層レベルの差を求める
+            $diffHierarchyLevel = $category->getHierarchyLevel()
+                                  - $beforeCategory->getHierarchyLevel();
+
+            //自身の配下カテゴリを全て取得（自身も対象に含まれる）
+            $searchCondition = new CategorySearchCondition();
+            $searchCondition->setSearchCategoryId($category->getId());
+            $searchCondition->setSearchScopeType(CategorySearchCondition::SEARCH_SCOPE_CATEGORY_DESCENDANT);
+            $searchCondition->setLanguageCode(LanguageStatus::STANDARD_LANGUAGE_CODE);
+            $descendantCategoryCollection
+                = $this->searchCategory($searchCondition);
+
+            //配下カテゴリの階層情報を更新
+            /** @var \grn\space\common\data\bean\Category $desencantCategory */
+            foreach ($descendantCategoryCollection as $desencantCategory) {
+                //検索結果に自身も含まれるので、自身の場合はスキップする
+                if ($category->getId() == $desencantCategory->getId()) {
+                    continue;
+                }
+
+                $desencantCategory->setHierarchyLevel($desencantCategory->getHierarchyLevel()
+                                                      + $diffHierarchyLevel);
+
+                //Re-creation of ancestor category
+                $this->_deleteCategoryHierarchies($desencantCategory);
+                $this->_createCategoryHierarchies($desencantCategory);
+
+                $categoryDBFacade->updateCategory($desencantCategory);
+            }
+        }
+
+        return $category;
+    }
+
+    /**
+     *
+     * Delete category
+     *
+     * @param \grn\space\common\data\bean\Category $category Category
+     *
+     * @throws \grn\space\common\exception\GrnDataNotFoundException     When the specified category is not found.
+     * @throws \grn\space\common\exception\GrnDatabaseException         Any error in the database.
+     * @return \grn\space\common\data\bean\Category
+     */
+    public function deleteCategory(Category $category)
+    {
+        //delete ancestor of category
+        $this->_deleteCategoryHierarchies($category);
+
+        //delete of category
+        $categoryDBFacade = new CategoryFacade();
+        $category = $categoryDBFacade->deleteCategory($category);
+
+        return $category;
+    }
+
+    /**
+     * Delete $categoryCollection.
+     *
+     * @param \grn\space\common\data\collection\CategoryCollection $categoryCollection
+     *
+     * @return integer number of the deleted categories.
+     */
+    public function deleteCategoryByCategoryCollection(
+        CategoryCollection $categoryCollection
+    ) {
+        if (count($categoryCollection)) {
+            //delete batch of categories
+            $categoryFacade = new CategoryFacade();
+
+            return $categoryFacade->deleteCategoryByCategoryCollection($categoryCollection);
+        }
+
+        return 0;
+    }
+
+    /**
+     * Get the category
+     *
+     * @param string $categoryId   category sequence id
+     * @param string $languageCode dispaly language code.
+     *
+     * @throws \grn\space\common\exception\GrnDataNotFoundException     When the specified category is not found.
+     * @throws \grn\space\common\exception\GrnDatabaseException         Any error in the database.
+     * @return \grn\space\common\data\bean\Category
+     */
+    public function getCategory($categoryId, $languageCode)
+    {
+        $categoryDBFacade = new CategoryFacade();
+        $resultCategory = $categoryDBFacade->getCategory($categoryId,
+            $languageCode);
+
+        $tempCategoryCollection = new CategoryCollection();
+        $tempCategoryCollection->appendBean($resultCategory);
+        $categoryCollection
+            = $categoryDBFacade->selectCountChildlenOfCategoryCollection($tempCategoryCollection);
+
+        if (count($categoryCollection) > 0) {
+            /** @var \grn\space\common\data\bean\Category $cntCldlnCtg */
+            $cntCldlnCtg = $categoryCollection->getBean(0);
+            $resultCategory->setCountChildlen($cntCldlnCtg->countChildlen());
+        }
+
+        return $resultCategory;
+    }
+
+    /**
+     * Return a Category object searched by spaceId and applicationCode
+     *
+     * @param string $spaceId
+     * @param string $applicationCode
+     * @param string $languageCode
+     *
+     * @throws \grn\space\common\exception\GrnDatabaseException
+     * @throws \grn\space\common\exception\GrnDataNotFoundException
+     * @return \grn\space\common\data\bean\Category
+     */
+    public function getCategoryBySpaceIdApplicationCode(
+        $spaceId,
+        $applicationCode,
+        $languageCode
+    ) {
+        $categoryFacade = new CategoryFacade();
+
+        return $categoryFacade->getCategoryBySpaceIdApplicationCode($spaceId,
+            $applicationCode, $languageCode);
+    }
+
+    /**
+     * Return a Category object searched by spaceId and threadCategoryId
+     *
+     * @param string $spaceId          space sequence id
+     * @param string $threadCategoryId category sequence id
+     * @param string $languageCode     dispaly language code
+     *
+     * @throws \grn\space\common\exception\GrnDataNotFoundException     category is not found
+     * @throws \grn\space\common\exception\GrnDatabaseException         Any error in the database.
+     * @return \grn\space\common\data\bean\Category
+     */
+    public function getCategoryBySpaceIdThreadCategoryId(
+        $spaceId,
+        $threadCategoryId,
+        $languageCode
+    ) {
+        $categoryFacade = new CategoryFacade();
+
+        return $categoryFacade->getCategoryBySpaceIdThreadCategoryId($spaceId,
+            $threadCategoryId, $languageCode);
+    }
+
+    /**
+     * Return a Category object searched by spaceId and threadId and todoCategoryId
+     *
+     * @param string $spaceId        space sequence id
+     * @param string $threadId       thread sequence id
+     * @param string $todoCategoryId category sequence id
+     * @param string $languageCode   dispaly language code
+     *
+     * @throws \grn\space\common\exception\GrnDataNotFoundException     category is not found
+     * @throws \grn\space\common\exception\GrnDatabaseException         Any error in the database.
+     * @return \grn\space\common\data\bean\Category
+     */
+    public function getCategoryBySpaceIdThreadIdTodoCategoryId(
+        $spaceId,
+        $threadId,
+        $todoCategoryId,
+        $languageCode
+    ) {
+        $categoryFacade = new CategoryFacade();
+
+        return $categoryFacade->getCategoryBySpaceIdThreadIdTodoCategoryId($spaceId,
+            $threadId, $todoCategoryId, $languageCode);
+    }
+
+    /**
+     * Get the category
+     *
+     * @param  string $categoryCode category code
+     * @param  string $languageCode dispaly language code
+     *
+     * @throws \grn\space\common\exception\GrnDataNotFoundException     When the specified category is not found.
+     * @throws \grn\space\common\exception\GrnDatabaseException         Any error in the database.
+     * @return \grn\space\common\data\bean\Category
+     */
+    public function getCategoryByCategoryCode($categoryCode, $languageCode)
+    {
+        $categoryDBFacade = new CategoryFacade();
+        $resultCategory
+            = $categoryDBFacade->getCategoryByCategoryCode($categoryCode,
+            $languageCode);
+
+        $tempCategoryCollection = new CategoryCollection();
+        $tempCategoryCollection->appendBean($resultCategory);
+        $categoryCollection
+            = $categoryDBFacade->selectCountChildlenOfCategoryCollection($tempCategoryCollection);
+
+        if (count($categoryCollection) > 0) {
+            /** @var \grn\space\common\data\bean\Category $cntCldlnCtg */
+            $cntCldlnCtg = $categoryCollection->getBean(0);
+            $resultCategory->setCountChildlen($cntCldlnCtg->countChildlen());
+        }
+
+        return $resultCategory;
+    }
+
+    /**
+     * Get the category
+     *
+     * @param  string $ancestorCategoryId   category sequence id
+     * @param  string $descendantCategoryId category sequence id
+     * @param  string $languageCode         dispaly language code
+     *
+     * @throws \grn\space\common\exception\GrnDataNotFoundException         When the specified category is not found.
+     * @throws \grn\space\common\exception\GrnDatabaseException             Any error in the database.
+     * @return \grn\space\common\data\bean\Category
+     */
+    public function getCategoryByAncestorCategoryIdDescendantCategoryId(
+        $ancestorCategoryId,
+        $descendantCategoryId,
+        $languageCode
+    ) {
+        $categoryDBFacade = new CategoryFacade();
+        $resultCategory
+            = $categoryDBFacade->getCategoryByAncestorCategoryIdDescendantCategoryId($ancestorCategoryId,
+            $descendantCategoryId, $languageCode);
+
+        $tempCategoryCollection = new CategoryCollection();
+        $tempCategoryCollection->appendBean($resultCategory);
+        $categoryCollection
+            = $categoryDBFacade->selectCountChildlenOfCategoryCollection($tempCategoryCollection);
+
+        if (count($categoryCollection) > 0) {
+            /** @var \grn\space\common\data\bean\Category $cntCldlnCtg */
+            $cntCldlnCtg = $categoryCollection->getBean(0);
+            $resultCategory->setCountChildlen($cntCldlnCtg->countChildlen());
+        }
+
+        return $resultCategory;
+    }
+
+    /**
+     * Get the category
+     *
+     * @param  string $ancestorCategoryId category sequence id
+     * @param  string $categoryCode       category code
+     * @param  string $languageCode       dispaly language code
+     *
+     * @throws \grn\space\common\exception\GrnDataNotFoundException         When the specified category is not found.
+     * @throws \grn\space\common\exception\GrnDatabaseException             Any error in the database.
+     * @return \grn\space\common\data\bean\Category
+     */
+    public function getCategoryByAncestorCategoryIdCategoryCode(
+        $ancestorCategoryId,
+        $categoryCode,
+        $languageCode
+    ) {
+        $categoryDBFacade = new CategoryFacade();
+        $resultCategory
+            = $categoryDBFacade->getCategoryByAncestorCategoryIdCategoryCode($ancestorCategoryId,
+            $categoryCode, $languageCode);
+
+        $tempCategoryCollection = new CategoryCollection();
+        $tempCategoryCollection->appendBean($resultCategory);
+        $categoryCollection
+            = $categoryDBFacade->selectCountChildlenOfCategoryCollection($tempCategoryCollection);
+
+        if (count($categoryCollection) > 0) {
+            /** @var \grn\space\common\data\bean\Category $cntCldlnCtg */
+            $cntCldlnCtg = $categoryCollection->getBean(0);
+            $resultCategory->setCountChildlen($cntCldlnCtg->countChildlen());
+        }
+
+        return $resultCategory;
+    }
+
+
+    /**
+     * Search category
+     *
+     * @param \grn\space\common\data\condition\CategorySearchCondition $categorySearchCondition CategorySearchCondition
+     *
+     * @throws \grn\space\common\exception\GrnDatabaseException                 Any error in the database.
+     * @return \grn\space\common\data\collection\CategoryCollection
+     */
+    public function searchCategory(
+        CategorySearchCondition $categorySearchCondition
+    ) {
+        $categoryDBFacade = new CategoryFacade();
+        $resultCategoryCollection
+            = $categoryDBFacade->selectCategoryList($categorySearchCondition);
+
+        if (count($resultCategoryCollection) > 0) {
+            $countChildlenCtgCollection
+                = $categoryDBFacade->selectCountChildlenOfCategoryCollection($resultCategoryCollection);
+
+            /** @var \grn\space\common\data\bean\Category $cntCldlnCtg */
+            foreach ($countChildlenCtgCollection as $cntCldlnCtg) {
+                /** @var \grn\space\common\data\bean\Category $category */
+                foreach ($resultCategoryCollection as $category) {
+                    if ($category->getId() == $cntCldlnCtg->getId()) {
+                        $category->setCountChildlen($cntCldlnCtg->countChildlen());
+                        break;
+                    }
+                }
+            }
+        }
+
+        return $resultCategoryCollection;
+    }
+
+
+
+    //*****************************************************************************************************
+    //***********************************        category hierarchy       *********************************
+    //*****************************************************************************************************
+    /**
+     * category hierarchies is created.
+     *
+     * @param  \grn\space\common\data\bean\Category $category
+     *
+     * @throws \grn\space\common\exception\GrnDatabaseException     Any error in the database.
+     */
+    private function _createCategoryHierarchies(Category $category)
+    {
+        //select ancestor of parent category
+        $searchCondition = new CategorySearchCondition();
+        $searchCondition->setSearchCategoryId($category->getParentCategoryId());
+        $searchCondition->setSearchScopeType(CategorySearchCondition::SEARCH_SCOPE_CATEGORY_ANCESTOR);
+        $ancestorCategoryCollection = $this->searchCategory($searchCondition);
+
+        //祖先に自分も含める
+        $ancestorCategoryCollection->appendBean($category);
+
+        //insert ancestor of category
+        $categoryDBFacade = new CategoryFacade();
+        $categoryDBFacade->insertCategoryHierarchies($category->getId(),
+            $ancestorCategoryCollection);
+    }
+
+    /**
+     * category hierarchies is deleted.
+     *
+     * @param  \grn\space\common\data\bean\Category $category
+     *
+     * @throws \grn\space\common\exception\GrnDatabaseException     Any error in the database.
+     */
+    private function _deleteCategoryHierarchies(Category $category)
+    {
+        $categoryDBFacade = new CategoryFacade();
+        $categoryDBFacade->deleteCategoryHierarchies($category);
+    }
+
+    /**
+     * Select CategoryLocal by Category ID
+     *
+     * @param string $categoryId
+     *
+     * @return \grn\space\common\data\collection\CategoryLocalCollection
+     */
+    public function getCategoryLocalCollection($categoryId)
+    {
+        $categoryFacade = new CategoryFacade();
+
+        return $categoryFacade->searchCategoryLocalByCategoryId($categoryId);
+    }
+
+    /**
+     * Select CategoryLocal by Category code
+     *
+     * @param string $categoryCode
+     *
+     * @return \grn\space\common\data\collection\CategoryLocalCollection
+     */
+    public function getCategoryLocalCollectionByCategoryCode($categoryCode)
+    {
+        $categoryFacade = new CategoryFacade();
+
+        return $categoryFacade->searchCategoryLocalByCategoryCode($categoryCode);
+    }
+
+    /**
+     * Insert/Modify CategoryLocal
+     *
+     * @param \grn\space\common\data\collection\CategoryLocalCollection $categoryLocalCollection
+     *
+     * @return bool
+     */
+    public function setupCategoryLocalCollection(
+        CategoryLocalCollection $categoryLocalCollection
+    ) {
+        foreach ($categoryLocalCollection as $eachCategoryLocal) {
+            $this->setupCategoryLocal($eachCategoryLocal);
+        }
+
+        return true;
+    }
+
+    /**
+     * Delete CategoryLocal
+     *
+     * @param \grn\space\common\data\collection\CategoryLocalCollection $categoryLocalCollection
+     *
+     * @return bool
+     */
+    public function deleteCategoryLocal(
+        CategoryLocalCollection $categoryLocalCollection
+    ) {
+        $categoryFacade = new CategoryFacade();
+        $langaugeTableArray = $categoryFacade->getLanguageTableArray();
+
+        /** @var \grn\space\common\data\bean\CategoryLocal $eachCategoryLocal */
+        foreach ($categoryLocalCollection as $eachCategoryLocal) {
+            $categoryFacade->deleteCategoryLocal($eachCategoryLocal,
+                $langaugeTableArray[$eachCategoryLocal->getLanguageCode()]);
+        }
+
+        return true;
+    }
+
+    /**
+     * Calculate the Hierarchy Level of the child Category of the given $category
+     *
+     * @param \grn\space\common\data\bean\Category $category
+     *
+     * @return integer
+     */
+    public function calcChildHierarchyLevel(Category $category)
+    {
+        if (ValidateUtility::isNull($category->getHierarchyLevel())) {
+            return 1;
+        } else {
+            return $category->getHierarchyLevel() + 1;
+        }
+    }
+
+    /**
+     * Select child categories of the category whose ID is $parentCategoryId
+     *
+     * @param string $parentCategoryId
+     * @param string $languageCode
+     *
+     * @return \grn\space\common\data\collection\CategoryCollection
+     */
+    public function getChildCategoryList($parentCategoryId, $languageCode)
+    {
+        $categoryFacade = new CategoryFacade();
+
+        return $categoryFacade->selectChildCategoryList($parentCategoryId,
+            $languageCode);
+    }
+
+    /**
+     * Select all the CategoryLocal records of the categories which are descendant of the Category whose category code is $categoryCode.
+     *
+     * @param string   $categoryCode
+     * @param string[] $languageCodeArray
+     *
+     * @return \grn\space\common\data\collection\CategoryLocalCollection
+     */
+    public function getCategoryLocalCollectionForCSV(
+        $categoryCode,
+        $languageCodeArray
+    ) {
+        $categoryFacade = new CategoryFacade();
+
+        return $categoryFacade->selectCategoryLocalCollectionForCSV($categoryCode,
+            $languageCodeArray);
+    }
+
+    /**
+     * Select Category By its Category code and Category ID of its ancestor.
+     *
+     * @param string $categoryCode
+     * @param string $ancestorCategoryId
+     * @param string $langugeCode
+     *
+     * @throws \grn\space\common\exception\GrnDataNotFoundException
+     * @return \grn\space\common\data\bean\Category
+     */
+    public function getCategoryByCategoryCodeAncestorId(
+        $categoryCode,
+        $ancestorCategoryId,
+        $langugeCode
+    ) {
+        $categoryFacade = new CategoryFacade();
+
+        return $categoryFacade->selectCategoryByCategoryCodeAncestorId($categoryCode,
+            $ancestorCategoryId, $langugeCode);
+    }
+
+    /**
+     * @param \grn\space\common\data\bean\Category $parentCategory
+     * @param \grn\space\common\data\bean\Category $childCategory
+     *
+     * @return bool
+     */
+    public function isParent($parentCategory, $childCategory)
+    {
+        $categoryDBFacade = new CategoryFacade();
+        $oid = $parentCategory->getId();
+        if ($oid == $childCategory->getId()) {
+            return true;
+        }
+        $parentOfChildCatgoryID = $childCategory->getParentCategoryId();
+
+        while ( ! is_null($parentOfChildCatgoryID)) {
+
+            if ($oid == $parentOfChildCatgoryID) {
+                return true;
+            }
+            $parentOfChildCatgory
+                = $categoryDBFacade->getCategory($parentOfChildCatgoryID,
+                LanguageStatus::STANDARD_LANGUAGE_CODE);
+            $parentOfChildCatgoryID
+                = $parentOfChildCatgory->getParentCategoryId();
+        }
+
+        return false;
+    }
+}

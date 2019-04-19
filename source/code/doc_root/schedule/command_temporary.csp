@@ -1,0 +1,272 @@
+<?php
+
+use grn\schedule\FacilityApprovalLogic;
+
+
+$event_id = array_key_exists('event', $G_INPUT) ? $G_INPUT['event'] : null;
+$group_id = array_key_exists('gid', $G_INPUT) ? $G_INPUT['gid'] : null;
+$did = array_key_exists('did', $G_INPUT) ? $G_INPUT['did'] : null;
+$str_date = array_key_exists('bdate', $G_INPUT) ? $G_INPUT['bdate'] : '';
+$date = new CB_Date();
+if ( ! $date->parse($str_date)) {
+    $date = null;
+}
+
+if (strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST') == 0) {
+    // -------- 
+    // brabrabra after success
+    // --------
+    // イベントの取得
+    require_once('schedule/application.csp');
+    $app = GRN_Schedule_Application::getInstance();
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+
+    $event = $app->getEvent($login, $event_id, $date);
+    if ( ! $event) {
+        cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+    }
+
+    // アクセス権のチェック
+    require_once('schedule/access_logic.csp');
+    $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+    $dynamic_role = $uum->listGrantedRoles();
+    $access = $acc_logic->getEventAccess($login, $event,
+        ['read', 'add', 'modify', 'delete'], $dynamic_role);
+
+    if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+    }
+
+    // アクセス権がない
+    if ($access['add'] == GRN_SCHD_ACCESS_DENY
+        && $access['modify'] == GRN_SCHD_ACCESS_DENY
+        && $access['delete'] == GRN_SCHD_ACCESS_DENY
+    ) {
+        cb_throw_error(E_GRN_SCHD_DENY_DETERMINE);
+    }
+
+    if ( ! is_a($event, 'GRN_Schedule_TemporaryEvent')) {
+        cb_throw_error(E_GRN_SCHD_ALREADY_DETERMIN_EVENT);
+    }
+
+    // エラーを出すかどうか？
+    $result = $app->determineEvent($login, $event_id, $did);
+
+    if ( ! $result) {
+        cb_throw_error(E_GRN_SCHD_NOT_FOUND_TEMPORARY_DATE);
+    } else {
+        // tuning GRB-15157
+        // param for load and cache setting
+        $param_loadAndCache = ['user', 'locale'];
+
+        require_once('grn/application.csp');
+        $app_locator = GRN_ApplicationLocator::instance();
+
+        require_once('schedule/notification.csp');
+        $util = GRN_Schedule_Notify_Logic::getInstance();
+
+        if ($date == null) {
+            $date = new CB_Date();
+        }
+
+        $date->year = $result['setdatetime']->year;
+        $date->month = $result['setdatetime']->month;
+        $date->day = $result['setdatetime']->day;
+        $timstamp = new CB_TimeStampEx();
+
+        $today = $timstamp->getDate();
+        if ($today->compare($result['setdatetime']) <= 0) {
+            // ----- GRN2-4506 -----
+            // 決定した日時をeventに反映する。
+            $event->setdatetime = $result['setdatetime'];
+            $event->enddatetime = $result['enddatetime'];
+            // イベントのタイムゾーンに変更する
+            if ($event->setdatetime instanceof CB_DateTimeEx) {
+                require_once('fw/i18n.csp');
+                $settimestamp = new CB_TimeStampEx(null, $event->timezone);
+                $settimestamp->setDateTime($event->setdatetime,
+                    CB_I18N::getInstance()->getCurrentTimezone());
+                $event->setdatetime = $settimestamp->getDateTime();
+                if (isset($event->enddatetime)) {
+                    $endtimestamp = new CB_TimeStampEx(null, $event->timezone);
+                    $endtimestamp->setDateTime($event->enddatetime,
+                        CB_I18N::getInstance()->getCurrentTimezone());
+                    $event->enddatetime = $endtimestamp->getDateTime();
+                } else {
+                    $event->enddatetime = $event->setdatetime;
+                }
+            }
+            // ----- GRN2-4506 -----
+
+            if (is_array($event->users) && count($event->users) > 0) {
+                $app_locator->loadAndCacheUsersSetting($event->users,
+                    $param_loadAndCache);
+                // 通知
+                $title
+                    = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+                $app->setNotify($event->users, $login, $event,
+                    $result['setdatetime'], $title, '', GRN_SCHEDULE_NOTIFY_FIX,
+                    $timstamp);
+                $app->forwardMail($event,
+                    [GRN_SCHEDULE_NOTIFY_FIX => $event->users], $login, $did);
+                $app->sendPushNotification(
+                    $event, [GRN_SCHEDULE_NOTIFY_FIX => $event->users], $login,
+                    true, $result['setdatetime'], $did);
+            }
+
+            // 通知先の指定がある場合
+            if ($event->private && is_array($event->notify_address)
+                && count($event->notify_address) > 0
+            ) {
+                $title
+                    = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+                $app->sendNotificationsToPublic($login, $event,
+                    $result['setdatetime'], '', $timstamp, $title, true, true,
+                    GRN_SCHEDULE_NOTIFY_FIX, $did);
+            }
+        }
+    }
+
+    // 施設の予約期間,最大時間をチェック(運用管理者は無制限)
+    require_once('schedule/facility_privilege.csp');
+    $facility_privilege = GRN_Facility_Privilege_Logic::getInstance();
+    require_once('schedule/facility_system_logic.csp');
+    $facility_logic = GRN_Facility_SystemLogic::getInstance();
+    $determined_event = $app->getEvent($login, $event_id, $date);
+    if ($obj_facilities
+        = $facility_privilege->getFacilitiesWithoutAuthority($login,
+        $determined_event->facilities)
+    ) {
+        require_once('schedule/temporary_event_logic.csp');
+        $temporary_event_logic
+            = \GRN_Schedule_TemporaryEventLogic::getInstance();
+        if (is_a($determined_event, 'GRN_Schedule_NormalEvent')) {
+            $facility_logic->checkFacilityMaxTime($obj_facilities,
+                $determined_event->enddatetime, $determined_event->setdatetime);
+            $facility_logic->checkFacilityLimit($obj_facilities,
+                $determined_event->enddatetime);
+            if (($faid
+                    = $temporary_event_logic->checkConfilictFacilites($event_id,
+                    $determined_event->setdatetime,
+                    $determined_event->enddatetime,
+                    $determined_event->facilities)) != '0'
+            ) {
+                require_once('schedule/facility_system_logic.csp');
+                $facility_logic = GRN_Facility_SystemLogic::getInstance();
+                $facility = $facility_logic->getFacility($faid);
+                cb_throw_error(E_GRN_FCLT_CONFLICT_DATETIME,
+                    ['facility' => $facility->get('name')], null,
+                    ['facility' => $facility->get('name')]);
+            }
+        } elseif (is_a($determined_event, 'GRN_Schedule_RepeatEvent')) {
+            $facility_logic->checkFacilityRepeat($obj_facilities);
+
+            // Create today's CB_DateTime for facility max time check
+            $ts = new CB_TimeStamp();
+            $ts->unix_ts = time();
+            $tsex = new CB_TimeStampEx($ts);
+
+            $setdatetime = $tsex->getDateTime();
+            $setdatetime->setTime($determined_event->settime);
+
+            $enddatetime = $tsex->getDateTime();
+            $enddatetime->setTime($determined_event->endtime);
+
+            $facility_logic->checkFacilityMaxTime($obj_facilities, $enddatetime,
+                $setdatetime);
+            $facility_logic->checkFacilityLimit($obj_facilities,
+                $determined_event->enddate);
+            if (($faid
+                    = $temporary_event_logic->checkConfilictFacilites($event_id,
+                    $setdatetime, $enddatetime, $determined_event->facilities))
+                != '0'
+            ) {
+                require_once('schedule/facility_system_logic.csp');
+                $facility_logic = GRN_Facility_SystemLogic::getInstance();
+                $facility = $facility_logic->getFacility($faid);
+                cb_throw_error(E_GRN_FCLT_CONFLICT_DATETIME,
+                    ['facility' => $facility->get('name')], null,
+                    ['facility' => $facility->get('name')]);
+            }
+        }
+    }
+
+    // リダイレクト先の情報の設定
+    $user_id = array_key_exists('uid', $G_INPUT) ? $G_INPUT['uid']
+        : $login->getOID();
+
+    if ( ! $user_id) {
+        $user_id = $login->getOID();
+    }
+
+    $b_contain = false;
+    $facility_ids = null;
+    $member_ids = null;
+    if (($fid = mb_substr($user_id, 0, 1)) === 'f') {
+        if (is_array($event->facilities) && count($event->facilities) > 0) {
+            foreach (array_keys($event->facilities) as $key) {
+                $member = $event->facilities[$key];
+                if ($member->getOID() === $fid) {
+                    $b_contain = true;
+                    break;
+                }
+            }
+        }
+    } elseif (($gid = mb_substr($user_id, 0, 1)) === 'f') {
+        if (is_array($event->groups) && count($event->groups) > 0) {
+            foreach (array_keys($event->groups) as $key) {
+                $member = $event->groups[$key];
+                if ($member->getOID() === $gid) {
+                    $b_contain = true;
+                    break;
+                }
+            }
+        }
+    } else {
+        if (is_array($event->users) && count($event->users) > 0) {
+            foreach (array_keys($event->users) as $key) {
+                $member = $event->users[$key];
+                if ($member->getOID() === $user_id) {
+                    $b_contain = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 登録した内容にいない場合
+    if ( ! $b_contain) {
+        $user_id = null;
+
+        if (is_array($event->groups) && count($event->groups) > 0) {
+            $member = reset($event->groups);
+            $user_id = 'g' . $member->getOID();
+        }
+
+        if (is_null($user_id) && is_array($event->users)
+            && count($event->users) > 0
+        ) {
+            $member = reset($event->users);
+            $user_id = $member->getOID();
+        }
+        if (is_null($user_id) && is_array($event->facilities)
+            && count($event->facilities) > 0
+        ) {
+            $member = reset($event->facilities);
+            $user_id = 'f' . $member->getOID();
+        }
+    }
+
+    $referer_key = array_key_exists('referer_key', $G_INPUT)
+        ? $G_INPUT['referer_key'] : null;
+    cb_redirect('schedule/view', [
+        'event'       => $event_id,
+        'bdate'       => $date->format(),
+        'uid'         => $user_id,
+        'referer_key' => $referer_key
+    ]);
+}
+

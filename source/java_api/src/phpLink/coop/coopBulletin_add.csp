@@ -1,0 +1,245 @@
+<?php
+/*
+* Created on 2006/09/29
+*
+* 掲示板登録機能
+* 
+* ■受信データ仕様 
+*
+*   項目名      |説明
+*   ------------+--------------------------------------------------
+*   title       |標題を指定します。
+*   c_code      |カテゴリコードを指定
+*   enable_term |期間指定 0:指定しない,2:指定する
+*   sterm_year  |掲示期間開始年 ※期間指定=1の場合のみ
+*   sterm_month |掲示期間開始月 ※期間指定=1の場合のみ
+*   sterm_day   |掲示期間開始日 ※期間指定=1の場合のみ
+*   eterm_year  |掲示期間終了年 ※期間指定=1の場合のみ
+*   eterm_month |掲示期間終了月 ※期間指定=1の場合のみ
+*   eterm_day   |掲示期間終了日 ※期間指定=1の場合のみ
+*   data        |本文
+*   editor      |本文の書式 (0:テキスト,2=書式編集)  現状は 0(テキスト)しかこないけど
+*   send        |登録コマンド (valueは空)
+*   can_follow  |フォローの許可の場合のみ (1:許可) (不許可の場合は、パラメータ自体わたらない)
+*   file[0-n]   |添付ファイルアップロード
+*   registrant  |coopLoginにて使用 差出人を指定します。(→このユーザーでLoginAs)
+*               |パラメータがなければログインユーザーで登録
+*   page        |coopLoginにて使用"_coopBulletin_add.csp" 
+*   app         |coopLoginにて使用"bulletin"
+*
+* ■機能
+*  掲示板の登録を行う 
+*  下書き保存機能は無し
+*  カテゴリは、ユーザー側で任意指定可能であるカテゴリコードを使用する
+*  →指定されたカテゴリコードよりカテゴリIDを取得できない場合は、エラーを返す
+*  本文の書式はテキスト指定のみとする(書式編集の機能はない)
+*  基本的には、↓のソースから下書き機能・画面表示部分(Smarty部分)を抜くかんじで
+*  bulletin/command_send.csp
+*  bulletin/_command_send.csp
+* ---------------------------------------------------------------------
+* 2008/01/11 Grn2.5対応
+* 下記の機能はAPIでは対応しない
+* ・差出人グループ(常に 未選択状態)
+* ・期間の時刻指定(日付指定時は常に --時--分を指す)
+*/
+
+
+global $G_INPUT;
+
+/////////////////////////////////////////////////////////////////////////////////////////
+//20061120修正
+//coopファイルが存在しないとFatal Erorrになるためファイル存在チェック
+//$nextpage = basename($G_INPUT['page']);
+$nextpage = "coopLogin.csp";
+if (is_file(cb_basedir() . '/code/doc_root/' . dirname(cb_get_pagename()) . '/'
+            . $nextpage)
+) {
+    //20061120修正
+    //require( $nextpage );
+} else {
+    //コピーライトとHTML閉じタグ出力しない
+    global $G_state_set;
+    $G_state_set->set('copyright_should_be_written', false);
+    $G_state_set->set('html_should_be_closed', false);
+
+    //   2007/03/27 coopLogin.cspがない場合のエラーメッセージ修正 不具合管理(199)
+    include_once('error_code.csp');
+    header("X-Cybozu-Error:" . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Header Data><CR><LF>");
+    print("1," . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Footer Data><CR><LF>");
+    print("ERROR<CR><LF>");
+    cb_safe_exit();
+}
+
+//ログイン認証
+require('coopLogin.csp');
+
+/////////////////////////////////////////////////////////////////////////////////////////
+unset($uum);
+
+//カテゴリコードからカテゴリIDの取得//////////////////////////////////////////
+
+require_once('bulletin/category.csp');
+$cm = GRN_Bulletin_CategoryManager::getInstance();
+$category =& $cm->getCategoryByForeignKey($G_login, $G_INPUT['c_code']);
+
+if (is_null($category)) {
+    cb_throw_error(E_GRN_BULLETIN_CATEGORY_NOT_FOUND);
+}
+$G_INPUT['cid'] = $category->getOID(); //カテゴリIDの取得
+//////////////////////////////////////////////////////////////////////////////
+
+$category = null;
+
+if ( ! isset($category_id)) {
+    if (array_key_exists('cid', $G_INPUT)) {
+        $category_id = $G_INPUT['cid'];
+    }
+}
+/** @var GRN_Bulletin $G_application */
+if (isset($category_id) && $category_id) {
+    $category =& $G_application->getCategory($G_login, $category_id);
+}
+
+$description = preg_replace('/\x0D\x0A|\x0D|\x0A/', '', @$G_INPUT['title']);
+if (mb_strlen($description) > 100) {
+    $description = mb_substr($description, 0, 200);
+}
+$G_INPUT['title'] = $description;
+
+
+$args = [
+    'subject'    => $G_INPUT['title'],
+    'can_follow' => (array_key_exists('can_follow', $G_INPUT)
+        ? $G_INPUT['can_follow'] : 0)
+];
+
+if (array_key_exists('editor', $G_INPUT) && $G_INPUT['editor']) {
+    require_once('grn/controller.csp');
+    $args['data'] = grn_strip_tags($G_INPUT['data']);
+    $args['html'] = $G_INPUT['data'];
+} else {
+    $args['data'] = $G_INPUT['data'];
+    $args['html'] = null;
+}
+
+// 掲示期間の設定
+
+if ($G_INPUT['enable_term'] == 1) {
+
+    ////////////////////////////////////////////////////////日付チェック
+    // 不具合 310 掲示板登録・変更で、日付チェックが不正
+    // 2008/01/17 許容される日付は 1970/01/01 以降  2037/12/31 以前  とする
+    $timestampex = new CB_TimeStampEx();
+    $current_date = $timestampex->getDate();
+    $date = new CB_Date();
+
+    if ($G_INPUT['sterm_year'] != "") {
+        $date->year = intval($G_INPUT['sterm_year']);
+        $date->month = intval($G_INPUT['sterm_month']);
+        $date->day = intval($G_INPUT['sterm_day']);
+        if ( ! cb_date_validate_date($date)) {
+            cb_throw_error(E_COMMON_INVALID_DATE);
+        }
+
+    }
+
+    if ($G_INPUT['eterm_year'] != "") {
+        $date->year = intval($G_INPUT['eterm_year']);
+        $date->month = intval($G_INPUT['eterm_month']);
+        $date->day = intval($G_INPUT['eterm_day']);
+        if ( ! cb_date_validate_date($date)) {
+            cb_throw_error(E_COMMON_INVALID_DATE);
+        }
+    }
+
+    //grn_bulletin_get_termで、本日 < 開始日,本日 < 終了日 のチェックをしないようになったので
+    //ここでチェックする
+    if ($G_INPUT['sterm_year'] != "") {
+        $date->year = intval($G_INPUT['sterm_year']);
+        $date->month = intval($G_INPUT['sterm_month']);
+        $date->day = intval($G_INPUT['sterm_day']);
+
+        //本日 > 開始日 の場合は エラー
+        if ($current_date->compare($date) > 0) {
+            cb_throw_error(E_GRN_BULLETIN_INVALID_TERM);
+        }
+    }
+
+    if ($G_INPUT['eterm_year'] != "") {
+        $date->year = intval($G_INPUT['eterm_year']);
+        $date->month = intval($G_INPUT['eterm_month']);
+        $date->day = intval($G_INPUT['eterm_day']);
+        //本日 > 終了日 の場合は エラー
+        if ($current_date->compare($date) > 0) {
+            cb_throw_error(E_GRN_BULLETIN_INVALID_TERM);
+        }
+    }
+
+    //start 2008/01/11 G2.5対応 (時刻の対応はしないので、ここで補填しておく）
+    $G_INPUT['sterm_hour'] = "";
+    $G_INPUT['sterm_minute'] = "";
+    $G_INPUT['eterm_hour'] = "";
+    $G_INPUT['eterm_minute'] = "";
+    //end 2008/01/11 G2.5対応
+
+    require_once('bulletin/functions.csp');
+
+    $timestamps = grn_bulletin_get_term('sterm', 'eterm');
+
+    $args['start_timestamp'] = $timestamps['start'];
+    $args['end_timestamp'] = $timestamps['end'];
+    $args['start_is_datetime'] = $timestamps['start_is_datetime'];
+    $args['end_is_datetime'] = $timestamps['end_is_datetime'];
+} else {
+    $args['start_timestamp'] = null;
+    $args['end_timestamp'] = null;
+    $args['start_is_datetime'] = null;
+    $args['end_is_datetime'] = null;
+}
+//
+
+$args['creator_group'] = null;
+
+if ( ! $category) {
+    cb_throw_error(E_GRN_BULLETIN_CATEGORY_NOT_FOUND);
+}
+
+// 掲示送信
+$article =& $G_application->sendArticle($G_login, $category, $args, null);
+
+// 添付ファイル
+foreach ($_FILES as $key => $file) {
+    if ($file['error'] != UPLOAD_ERR_OK) {
+        continue;
+    }
+
+    $article->addFile($G_login, $file);
+}
+
+//send notification
+if ($article->isPublished()) {
+    require_once('bulletin/notification.csp');
+    $bulletin_notification_listener = new GRN_Bulletin_NotificationListener();
+    $bulletin_notification_listener->registerBackgroundNotification('create',
+        $article,
+        $G_login,
+        $article->get('subject'),
+        $article->get('data'),
+        $article->get('ctime'));
+} else {
+    //scheduling service, add record
+    $scheduling_event = new grn\bulletin\NotificationSchedulingEvent();
+    $scheduling_event->registerEvent($article->getOID(),
+        $article->get('start_timestamp'));
+}
+
+//--------------------------------------------------------------------------------------------
+
+//掲示IDを返す
+$event_id = $article->getOID();
+printf("<Header Data><CR><LF>");
+printf("0,%s", $event_id);
+printf("<Footer Data><CR><LF>");
+printf("NOERROR<CR><LF>");

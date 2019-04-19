@@ -1,0 +1,219 @@
+<?php
+
+namespace grn\schedule;
+
+use grn\grn\access\service\AppAccess;
+use grn\schedule\collection\FacilityApprovalSettings;
+
+require_once('schedule/facility_system_logic.csp');
+
+class ScheduleFacilityApprovalSetting
+{
+    CONST APPROVAL_SETTING = 'approval';
+    static private $_facilitiesSettingCache = [];
+
+    /**
+     * @param array $facilityIds
+     *
+     * @return array Key: facility id, Value: TRUE if the facility approval is enabled
+     */
+    public function getSettings($facilityIds)
+    {
+        if ( ! is_array($facilityIds) || count($facilityIds) <= 0) {
+            return [];
+        }
+
+        $facilityLogic = \GRN_Facility_SystemLogic::getInstance();
+        $checkApprovalFacilitiesSettings
+            = $facilityLogic->getApprovalSettingsOfFacilities($facilityIds);
+
+        $approvalFacilities = [];
+        if ( ! is_array($checkApprovalFacilitiesSettings)) {
+            return $approvalFacilities;
+        }
+
+        foreach ($facilityIds as $facilityId) {
+            if ($facilityId[0] === 'f') {
+                $facilityId = substr($facilityId, 1);
+            }
+            if (array_key_exists($facilityId,
+                $checkApprovalFacilitiesSettings)
+            ) {
+                $approvalFacilities[$facilityId]
+                    = $checkApprovalFacilitiesSettings[$facilityId][self::APPROVAL_SETTING]
+                    ? true : false;
+                self::$_facilitiesSettingCache[$facilityId]
+                    = $approvalFacilities[$facilityId];
+            }
+        }
+
+        return $approvalFacilities;
+    }
+
+    /**
+     * @param array $facilityIds
+     *
+     * @return FacilityApprovalSettings
+     */
+    public function getSettingsObject($facilityIds)
+    {
+        return new FacilityApprovalSettings($this->getSettings($facilityIds));
+    }
+
+    public function isRequiredApproval($facilityId)
+    {
+        if (array_key_exists($facilityId, self::$_facilitiesSettingCache)) {
+            return self::$_facilitiesSettingCache[$facilityId];
+        }
+
+        $checkApprovalFacilitySetting = $this->getSettings([$facilityId]);
+        if (is_array($checkApprovalFacilitySetting)
+            && array_key_exists(
+                $facilityId, $checkApprovalFacilitySetting
+            )
+        ) {
+            return $checkApprovalFacilitySetting[$facilityId];
+        }
+
+        return false;
+    }
+
+    public function isApprover($user, $facilityObject)
+    {
+        require_once('schedule/facility_privilege.csp');
+        $privilegeLogic = \GRN_Facility_Privilege_Logic::getInstance();
+
+        return $privilegeLogic->hasPrivilegeOfFacility($user, $facilityObject);
+    }
+
+    public static function evaluateSettingForFacilityObjects(&$facilities)
+    {
+        $faids = array_keys($facilities);
+        $facilityApprovalSetting = new ScheduleFacilityApprovalSetting();
+        $approvalFacilities
+            = $facilityApprovalSetting->getSettings($faids);
+        foreach ($faids as $faid) {
+            $facilities[$faid]['approval_facility']
+                = $approvalFacilities[$faid];
+        }
+
+        return $approvalFacilities;
+    }
+
+    public function filterNeedApprovalFacilityIds($facilityIds)
+    {
+        $checkApprovalFacilities = $this->getSettings($facilityIds);
+
+        return array_keys(array_filter($checkApprovalFacilities, function ($k) {
+            return $k;
+        }));
+    }
+
+    /**
+     * @param array $facilityIds
+     *
+     * @return array
+     */
+    public function approvalFacilities(array $facilityIds)
+    {
+        $checkApprovalFacilities = $this->getSettings($facilityIds);
+
+        return array_filter($checkApprovalFacilities);
+    }
+
+    public function hasFacilityNeedApproval($facilityIds)
+    {
+        $needApprovalFacilityIds
+            = $this->filterNeedApprovalFacilityIds($facilityIds);
+        if (count($needApprovalFacilityIds) > 0) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param $facilityId
+     *
+     * @return array
+     */
+    public function getOperationalAdministrators($facilityId)
+    {
+        $facilityLogic = \GRN_Facility_SystemLogic::getInstance();
+        $facilityGroup
+            = $facilityLogic->getFacilityAffiliationGroup($facilityId);
+        if ($facilityGroup === false) {
+            return [];
+        }
+
+        $facilityGroupId = $facilityGroup->getOID();
+        $facilityGroupAncestors
+            = $facilityLogic->getAncestors([$facilityGroupId => $facilityGroupId]);
+        if ( ! is_array($facilityGroupAncestors)
+             || ! array_key_exists($facilityGroupId, $facilityGroupAncestors)
+        ) {
+            return [];
+        }
+
+        require_once('schedule/facility_privilege.csp');
+        $privilegeLogic = \GRN_Facility_Privilege_Logic::getInstance();
+
+        $operationalAdministrators = [];
+        foreach ($facilityGroupAncestors[$facilityGroupId] as $groupId) {
+            $privileges
+                = $privilegeLogic->getPrivileges($facilityLogic->getFacilityGroup($groupId));
+
+            if (is_array($privileges)) {
+                $operationalAdministrators += $this->_getPrivilegeUsers($privileges);
+            }
+        }
+        if (count($operationalAdministrators) > 0) {
+            foreach ($operationalAdministrators as $index => $operationalAdmin) {
+                if ($this->_isAvailableUser($operationalAdmin)) {
+                    continue;
+                }
+                unset($operationalAdministrators[$index]);
+            }
+        }
+
+        return $operationalAdministrators;
+    }
+
+    private function _getPrivilegeUsers(array $privileges)
+    {
+        global $G_container_base;
+        /** @var $uum \GRN_Uum */
+        $uum = $G_container_base->getInstance('uum');
+        if (count($privileges['dynamic_role']) > 0) {
+            return $uum->getUsers();
+        }
+        $privilegeUsers = [];
+        if (count($privileges['static_role']) > 0) {
+            foreach (array_keys($privileges['static_role']) as $tid) {
+                $privilegeUsers += $uum->getRoleUsers($tid);
+            }
+        }
+        if (count($privileges['group']) > 0) {
+            foreach (array_keys($privileges['group']) as $tid) {
+                $privilegeUsers += $uum->getGroupUsers($tid);
+            }
+        }
+
+        if (count($privileges['user']) > 0) {
+            $privilegeUsers += $privileges['user'];
+        }
+
+        return $privilegeUsers;
+    }
+
+    private function _isAvailableUser(\CB_User $user)
+    {
+        //user is inactivate
+        if ( ! is_null($user->get('valid'))) {
+            return false;
+        }
+
+        return AppAccess::isAppAvailableInternalAccess(GRN_SCHEDULE_APPLICATION_ID,
+            $user->getOID());
+    }
+}

@@ -1,0 +1,149 @@
+<?php
+global $G_INPUT;
+
+if ( ! isset($article_id)) {
+    if ( ! isset($G_INPUT['aid'])) {
+        require_once('bulletin/error_code.csp');
+        cb_throw_error(E_GRN_BULLETIN_ARTICLE_NOT_FOUND);
+    }
+    $article_id = $G_INPUT['aid'];
+}
+
+if ( ! ($article =& $G_bulletin->getArticle($G_bulletin_login, $article_id))) {
+    require_once('bulletin/error_code.csp');
+    cb_throw_error(E_GRN_BULLETIN_ARTICLE_NOT_FOUND);
+}
+
+$properties = [
+    'subject'    => $G_INPUT['title'],
+    'can_follow' => (array_key_exists('can_follow', $G_INPUT)
+        ? $G_INPUT['can_follow'] : 0)
+];
+
+require_once('bulletin/resources.csp');
+//sender type
+$system_config = $G_bulletin->getSystemConfig($G_bulletin_login);
+$enable_manually_enter_sender
+    = $system_config->getEnableManuallyEnterSender();
+$properties['manually_enter_sender'] = null;
+if ($enable_manually_enter_sender) {
+    $sender_type = cb_at($G_INPUT, 'sender_set',
+        GRN_BULLETIN_SENDER_TYPE_CREATOR);
+    $manually_enter_sender = cb_at($G_INPUT, 'manually_sender');
+    if ($sender_type !== GRN_BULLETIN_SENDER_TYPE_CREATOR) {
+        $properties['manually_enter_sender'] = $manually_enter_sender;
+    }
+}
+
+// maintainers
+$operator_type = cb_at($G_INPUT, 'operator_set',
+    GRN_BULLETIN_MAINTAINER_TYPE_SENDER);
+$maintainer_id_list = [];
+if ($operator_type !== GRN_BULLETIN_MAINTAINER_TYPE_SENDER) {
+    $maintainer_id_list = cb_at($G_INPUT, 'sUID', []);
+}
+$properties['maintainer_id_list'] = $maintainer_id_list;
+
+if (array_key_exists('editor', $G_INPUT) && $G_INPUT['editor']) {
+    require_once('grn/controller.csp');
+    $properties['data'] = grn_strip_tags($G_INPUT['data']);
+    $properties['html'] = $G_INPUT['data'];
+} else {
+    $properties['data'] = $G_INPUT['data'];
+    $properties['html'] = null;
+}
+
+// 掲示期間の設定
+
+if ($G_INPUT['enable_term'] == 1) {
+    require_once('bulletin/functions.csp');
+
+    $timestamps = grn_bulletin_get_term('sterm', 'eterm',
+        true);
+    $properties['start_timestamp'] = $timestamps['start'];
+    $properties['start_is_datetime'] = $timestamps['start_is_datetime'];
+    $properties['end_timestamp'] = $timestamps['end'];
+    $properties['end_is_datetime'] = $timestamps['end_is_datetime'];
+} else {
+    $properties['start_timestamp'] = null;
+    $properties['end_timestamp'] = null;
+    $properties['start_is_datetime'] = null;
+    $properties['end_is_datetime'] = null;
+}
+// add group
+$properties['creator_group'] = null;
+if (array_key_exists('select_group', $G_INPUT) && $G_INPUT['select_group']) {
+    $properties['creator_group'] = $G_INPUT['select_group'];
+}
+$article_creator = $article->get('creator');
+if ( ! is_null($article_creator)) {
+    $properties['creator_id'] = $article_creator->getOID();
+} else {
+    $properties['user_deleted'] = 1;
+    if ( ! is_null($creator_group = $article->get('creator_group'))) {
+        $properties['creator_group'] = $creator_group->getOID();
+    }
+}
+// 掲示変更
+$old_publish_status = $article->isPublished();
+
+if (array_key_exists('notifyFlag', $G_INPUT)) {
+    $properties['notifyFlag'] = $G_INPUT['notifyFlag'];
+}
+
+$article->setProperties($G_bulletin_login, $properties);
+
+require_once('grn/controller.csp');
+
+// 添付ファイル
+
+assert('isset($target_name)');
+$tmp_key = grn_get_temporary_key();
+$files = grn_get_attached_files($target_name . $tmp_key, 'bulletin');
+
+require_once('grn/upload.csp');
+$upload_files = GRN_UploadFile::getUploadedFiles(@$G_INPUT['upload_ticket'],
+    @$G_INPUT['upload_fileids'], true);
+foreach ($upload_files as $fid => $file) {
+    $files[$fid] = $file;
+}
+
+$current_files = $article->getFiles();
+
+foreach (array_keys($current_files) as $key) {
+    if ( ! array_key_exists($key, $files)) {
+        $article->deleteFile($G_bulletin_login, $key);
+    } else {
+        unset($files[$key]);
+    }
+}
+
+foreach (array_keys($files) as $key) {
+    $article->addFile($G_bulletin_login, $files[$key]);
+}
+
+if ( ! array_key_exists('notifyFlag', $G_INPUT)
+     || $G_INPUT['notifyFlag'] == 1
+) {
+    //send notification
+    $scheduling_event = new grn\bulletin\NotificationSchedulingEvent();
+    if ($article->isPublished()) {
+        //scheduling service, delete record.
+        $scheduling_event->unRegisterEvent($article->getOID());
+
+        require_once('bulletin/notification.csp');
+        $bulletin_notification_listener
+            = new GRN_Bulletin_NotificationListener();
+        $bulletin_notification_listener->registerBackgroundNotification($old_publish_status
+            ? 'update' : 'create',
+            $article,
+            $article->getSenderForNotification($G_bulletin_login),
+            $article->get('subject'),
+            $article->get('data'),
+            $article->get('mtime'));
+    } else {
+        //scheduling service, modify record.
+        $scheduling_event->registerEvent($article->getOID(),
+            $article->get('start_timestamp'));
+    }
+}

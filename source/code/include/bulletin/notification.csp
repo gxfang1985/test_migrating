@@ -1,0 +1,2708 @@
+<?php
+
+use grn\grn\background\BackgroundJobName;
+use grn\notification\background\NotificationJobRegisterService;
+use grn\bulletin\dao\BulletinUnSubscribeCategoryDAO;
+use grn\bulletin\logic\BulletinAdjustSubscribeLogic;
+
+/**
+ * 掲示板通知設定クラス
+ *
+ * @author  Tanaka, Yoshiaki        2004/11
+ * @package grn.bulletin
+ */
+
+require_once('bulletin/table.csp');
+require_once('grn/application.csp');
+require_once('grn/notification.csp');
+require_once('bulletin/resources.csp');
+
+// 購読設定をキャッシュするユーザー数
+define('GRN_BULLETIN_MAX_CACHE_USERS', 1);
+// 一度に処理する通知数の上限
+define('GRN_BULLETIN_MAX_NOTIFICATION', 1000);
+define('GRN_BULLETIN_MAX_NOTIFICATION_DAY', 30);
+
+define('GRN_BULLETIN_NOTIFY_CSV_CATEGORY_FOREIGNKEY', 0);
+define('GRN_BULLETIN_NOTIFY_CSV_SETTING_ITEM', 1);
+define('GRN_BULLETIN_NOTIFY_CSV_SETTING_VALUE', 2);
+define('GRN_BULLETIN_NOTIFY_CSV_SETTING_OBJECT', 3);
+
+// 削除された掲示への通知削除を行う間隔( common.ini の Notification セクションのキー名)
+define('GRN_BULLETIN_NOTIFY_DELETE_INTERVAL_KEY',
+    "check_deleted_bulletin_interval");
+
+// 削除された掲示への通知削除処理を最後に行った時刻( 個人用の tab_cb_profiledata の col_name の値)
+define('GRN_BULLETIN_PROFILE_LAST_CHECK_DELETE_BULLETIN',
+    "last_check_deleted_bulletin");
+
+/**
+ * @package grn.bulletin
+ */
+class GRN_Bulletin_NotifyCategory
+{
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Bulletin_NotifyCategory
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * @access private
+     */
+    var $_cache = [];
+
+
+    function __construct()
+    {
+    }
+
+    /**
+     * @access private
+     */
+    var $_db = null;
+
+    /**
+     * @access private
+     */
+    function _getDatabase()
+    {
+        if (is_null($this->_db)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->_db = $app_locator->getConnection('bulletin');
+        }
+
+        return $this->_db;
+    }
+
+    /**
+     * @access private
+     */
+    function makeQuery(& $user)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $database = $app_locator->getConnection('bulletin');
+
+        $uid = $user->getOID();
+
+        require_once('bulletin/functions.csp');
+
+        $groups = grn_bulletin_get_user_groups($uid);
+        $roles = grn_bulletin_get_user_roles($uid);
+        $dynamic_roles = grn_bulletin_get_user_dynamic_roles($uid);
+
+        //Escape All IDs
+        $escape_gids = [];
+        $escape_srids = [];
+        $escape_drids = [];
+        foreach (array_keys($groups) as $key) {
+            $gid = cb_queryf($database, "'@S'", $key);
+            $escape_gids[$gid] = $gid;
+        }
+        foreach (array_keys($roles) as $key) {
+            $srid = cb_queryf($database, "'@S'", $key);
+            $escape_srids[$srid] = $srid;
+        }
+        foreach (array_keys($dynamic_roles) as $key) {
+            $drid = cb_queryf($database, "'@S'", $key);
+            $escape_drids[$drid] = $drid;
+        }
+
+        $conditions = [];
+
+        $join = 'tab_grn_bulletin_categoryentity AS c';
+
+        $conditions[] = cb_queryf($database, "u.col_user = '@S'", $uid);
+        $join_condition
+            = ' LEFT JOIN tab_grn_bulletin_usernotification AS u ON c._id = u.col_category';
+        $join = '(' . $join . $join_condition . ')';
+
+
+        // 組織指定の通知
+        if (count($groups) > 0) {
+            $join_condition
+                = ' LEFT JOIN tab_grn_bulletin_groupnotification AS g ON c._id = g.col_category';
+            $join = '(' . $join . $join_condition . ')';
+            $conditions[] = 'g.col_group IN (' . implode(',',
+                    array_keys($escape_gids)) . ')';
+        }
+
+        // ロール指定の通知
+        if (count($roles) > 0) {
+            $join_condition
+                = ' LEFT JOIN tab_grn_bulletin_rolenotification AS r ON c._id = r.col_category';
+            $join = '(' . $join . $join_condition . ')';
+            $conditions[] = 'r.col_role IN (' . implode(',',
+                    array_keys($escape_srids)) . ')';
+        }
+
+        // 動的ロール指定の通知
+        if (count($dynamic_roles) > 0) {
+            $join_condition
+                = ' LEFT JOIN tab_grn_bulletin_dynamicrolenotification AS d ON c._id = d.col_category';
+            $join = '(' . $join . $join_condition . ')';
+            $conditions[] = 'd.col_dynamic_role IN (' . implode(',',
+                    array_keys($escape_drids)) . ')';
+        }
+
+        // WHERE句で条件を単純にORで列挙せず, UNION結合することで
+        // パフォーマンスを改善.
+        $queries = [];
+        foreach ($conditions as $condition) {
+            $queries[]
+                = "SELECT c._id,c.col_force_notify FROM $join WHERE $condition";
+        }
+
+        return implode(' UNION DISTINCT ', $queries);
+    }
+
+    function &get($user)
+    {
+        if ( ! $user) {
+            assert('FALSE');
+            $ret = [];
+
+            return $ret;
+        }
+
+        $uid = $user->getOID();
+
+        if (array_key_exists($uid, $this->_cache)) {
+            $cache = $this->_cache[$uid];
+
+            return $cache;
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+
+        $query = $this->makeQuery($user);
+        $result = $db->query($query);
+
+        $category_ids = [];
+        if (cb_is_db_result($result)) {
+            $n = $db->num_rows($result);
+            for ($i = 0; $i < $n; $i++) {
+                $row = $db->fetch_row($result);
+                $category_ids[$row[0]] = $row[1];
+            }
+            $db->free_result($result);
+        }
+
+        require_once("bulletin/include_subscribe.csp");
+        $subcategory = GRN_Bulletin_SubscribeCategories::getInstance();
+        $unsubscribe_category_ids
+            = $subcategory->getUnSubscribedCategoryIds($user);
+        $category_ids = BulletinAdjustSubscribeLogic::getInstance()
+                                                    ->evaluateSubscribeCategoryIds($uid,
+                                                        $category_ids,
+                                                        $unsubscribe_category_ids);
+
+        require_once('bulletin/access.csp');
+        $acc = GRN_Bulletin_AccessManager::getInstance();
+
+        $cache = $acc->evaluateCategories($user, $category_ids,
+            GRN_BULLETIN_ACCESS_R);
+
+        if (count($this->_cache) >= GRN_BULLETIN_MAX_CACHE_USERS) {
+            $cache_keys = array_keys($this->_cache);
+            $idx = array_shift($cache_keys);
+            unset($this->_cache[$idx]);
+        }
+
+        $this->_cache[$uid] = $cache;
+
+        return $cache;
+    }
+
+    function isNotified(& $user, & $category)
+    {
+        if ( ! $user || ! $category) {
+            assert('FALSE');
+
+            return false;
+        }
+
+        $cache = $this->get($user);
+
+        if (is_object($category)) {
+            return array_key_exists($category->getOID(), $cache);
+        }
+
+        return array_key_exists($category, $cache);
+    }
+
+    /**
+     * @access private
+     */
+    var $_tables = null;
+
+    function _initTables()
+    {
+        if ( ! is_null($this->_tables)) {
+            return;
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm =& $app_locator->getTableManager('bulletin');
+
+        $this->_tables = [];
+        $this->_tables['user']
+            =& $tm->getTableInfo('grn_bulletin_usernotification');
+        $this->_tables['group']
+            =& $tm->getTableInfo('grn_bulletin_groupnotification');
+        $this->_tables['role']
+            =& $tm->getTableInfo('grn_bulletin_rolenotification');
+        $this->_tables['dynamic_role']
+            =& $tm->getTableInfo('grn_bulletin_dynamicrolenotification');
+    }
+
+    /**
+     * @access private
+     */
+    function _target2column(& $target)
+    {
+        if (is_null($target)) {
+            return null;
+        }
+
+        if (is_string($target)) {
+            return 'dynamic_role';
+        }
+
+        return substr(strtolower(get_class($target)), 3);
+    }
+
+    /**
+     * @access private
+     */
+    function &_column2table($column)
+    {
+        $this->_initTables();
+
+        if ( ! array_key_exists($column, $this->_tables)) {
+            $ret = null;
+
+            return $ret;
+        }
+        if ($column == 'category') {
+            $ret = null;
+
+            return $ret;
+        }
+
+        return $this->_tables[$column];
+    }
+
+    /**
+     * @access private
+     */
+    function _addUserJoin(& $rowset, $target_column, $alias = '')
+    {
+        if (strcasecmp($target_column, 'user') === 0) {
+            if (is_string($alias) && strlen($alias) > 0) {
+                $table_name = $alias;
+            } else {
+                $table_name = CB_DATABASE_TABLE_PREFIX
+                              . $this->_tables['user']->getTableName();
+            }
+
+            $app_locator = GRN_ApplicationLocator::instance();
+            $tm =& $app_locator->getTableManager('bulletin');
+            $user_table_info = $tm->getTableInfo('cb_user');
+
+            $on = "${table_name}.col_user = u._id AND u.col_deleted IS NULL";
+            $rowset->addJoin($user_table_info, $on, CB_DATABASE_INNER_JOIN,
+                'u');
+        }
+    }
+
+    /**
+     * @access private
+     */
+    function _getTableRow(& $category, & $target)
+    {
+        if ( ! $category || ! $target) {
+            return false;
+        }
+
+        if ( ! ($column = $this->_target2column($target))) {
+            return false;
+        }
+
+        if ( ! ($table = $this->_column2table($column))) {
+            return false;
+        }
+
+        $target_value = null;
+
+        if (is_object($target)) {
+            $target_value = $target->getOID();
+        } else {
+            $target_value = $target;
+        }
+
+        $rowset = new CB_RowSet($table, 'a');
+        $this->_addUserJoin($rowset, $column, 'a');
+
+        $rowset->addCondition($rowset->queryf("a.col_" . $column
+                                              . " = '@S' AND  a.col_category = '@S'",
+            $target_value, $category->getOID()));
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return ['table' => &$table, 'row' => $row];
+    }
+
+    /**
+     * レコードイベント処理
+     */
+    function onAction($action, & $object, & $target)
+    {
+        require_once('inspection.csp');
+        $inspection = GRN_Bulletin_Inspection::getInstance();
+        $inspection->writeLogSystem($action, $object, $target, 'notify', null);
+    }
+
+    function setTarget(& $category, & $target, $onoff)
+    {
+        if ( ! ($tablerow = $this->_getTableRow($category, $target))) {
+            return false;
+        }
+
+        if ($onoff) {
+            if ( ! $tablerow['row']) {
+                if ( ! ($column = $this->_target2column($target))) {
+                    return false;
+                }
+
+                $row = $tablerow['table']->newRow();
+                $row->set('category', $category->_getRow());
+                $row->set($column, $target);
+                $row->registerNow();
+                $this->_cache = [];
+
+                $this->onAction('create', $category, $target);
+            }
+        } else {
+            if ($tablerow['row']) {
+                $this->onAction('delete', $category, $target);
+                $tablerow['row']->delete();
+                $this->_cache = [];
+            }
+        }
+
+        return true;
+    }
+
+    function getTargets(& $category, $target_column)
+    {
+        if ( ! $category) {
+            return [];
+        }
+
+        if ( ! ($table =& $this->_column2table($target_column))) {
+            return [];
+        }
+
+        $rowset = new CB_RowSet($table, 'a');
+        $this->_addUserJoin($rowset, $target_column, 'a');
+        $rowset->addCondition($rowset->queryf("col_category = '@S'",
+            $category->getOID()));
+
+        $targets = [];
+        while ( ! is_null(($row = $rowset->iterate()))) {
+            $target = $row->get($target_column);
+            if (is_object($target)) {
+                $targets[$target->getOID()] = $target;
+            } else {
+                $targets[$target] = 1;
+            }
+        }
+        $rowset->destroy();
+
+        return $targets;
+    }
+
+    function deleteTargets(& $category)
+    {
+        if ( ! $category) {
+            return false;
+        }
+
+        $columns = ['user', 'group', 'role', 'dynamic_role'];
+
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+        $users_list = $uum->getUsersInfo();
+
+        foreach ($columns as $column) {
+            $table =& $this->_column2table($column);
+
+            $rowset = new CB_RowSet($table);
+            $rowset->addCondition($rowset->queryf("col_category = '@S'",
+                $category->getOID()));
+            if (strcmp($column, 'user') === 0) {
+                $user_condition = 'col_user IN ('
+                                  . implode(array_keys($users_list), ',') . ')';
+                $rowset->addCondition($user_condition);
+            }
+            $rowset->deleteAllMatched();
+            $rowset->destroy();
+            $this->onAction('delete_all', $category, $column);
+        }
+        $this->_cache = [];
+
+        return true;
+    }
+
+
+    function existsTarget(& $category, & $target)
+    {
+        if ( ! ($tablerow = $this->_getTableRow($category, $target))) {
+            return false;
+        }
+
+        return ! is_null($tablerow['row']);
+    }
+
+    /**
+     * @param string $user_id
+     */
+    public function clearCache($user_id)
+    {
+        if (array_key_exists($user_id, $this->_cache)) {
+            unset($this->_cache[$user_id]);
+        }
+    }
+}
+
+/**
+ * @package grn.bulletin
+ */
+class GRN_Bulletin_NotificationManager
+{
+    /**
+     * @access private
+     */
+    var $_module_id = null;
+
+
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Bulletin_NotificationManager
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    function __construct()
+    {
+        require_once('grn/application.csp');
+        $locator = GRN_ApplicationLocator::instance();
+        $app = $locator->getInstance('bulletin');
+        $this->_module_id = ! is_null($app) ? $app->getModuleId()
+            : GRN_BULLETIN_MODULEID;
+    }
+
+    /**
+     * データベースコネクションの取得
+     *
+     * @return object $database                  //Database Connection Object
+     */
+    function _getDatabase()
+    {
+        static $database = null;
+        if (is_null($database)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $database = $app_locator->getConnection('bulletin');
+        }
+
+        return $database;
+    }
+
+    /**
+     * テーブル名の取得
+     *
+     * @params  string $class_name
+     *
+     * @return string  $table_name
+     */
+    function _getTableName($class_name)
+    {
+        $table_name = sprintf('tab_%s', strtolower($class_name));
+
+        return $table_name;
+    }
+
+    /**
+     * カラム名リストの取得
+     *
+     * @params  string $class_name
+     *
+     * @return array  $colum_list                //GRN_Portal_Portal Table Information
+     */
+    function &_getColumnList($class_name, $use_join = false)
+    {
+        //Get Column List
+        require_once('bulletin/table.csp');
+        $column_list = get_class_vars($class_name);
+
+        //Get Table Name
+        $table_name = null;
+        if ($use_join) {
+            $table_name = $this->_getTableName($class_name);
+            switch ($table_name) {
+                case 'tab_grn_bulletin_articleentity':
+                    $table_name = 'a';
+                    break;
+                case 'tab_grn_bulletin_followentity':
+                    $table_name = 'f';
+                    break;
+                case 'tab_grn_bulletin_readstatus':
+                    $table_name = 'r';
+                    break;
+                default:
+                    $table_name = null;
+                    break;
+            }
+        }
+
+        //Create Real Column Name List
+        foreach (array_keys($column_list) as $column_name) {
+            if (strpos($column_name, 'col_') === 0
+                && strpos($column_name, 'col_reserve') !== 0
+            ) {
+                if (is_null($table_name)) {
+                    $column_name_list[] = $column_name;
+                } else {
+                    $column_name_list[] = sprintf('%s.%s %s_%s', $table_name,
+                        $column_name, $table_name, $column_name);
+                }
+            }
+        }
+        if (is_null($table_name)) {
+            $column_name_list[] = '_id';
+        } else {
+            $column_name_list[] = sprintf('%s._id %s_id', $table_name,
+                $table_name);
+        }
+
+        return $column_name_list;
+    }
+
+
+    /**
+     * 購読設定
+     * この操作でカテゴリの通知設定は考慮しないので、強制通知カテゴリであっても
+     * 購読解除を設定することができる
+     *
+     * @param CB_User                                    $user  操作ユーザー
+     * @param GRN_Bulletin_Category|GRN_Bulletin_Article $object
+     * @param bool                                       $onoff 購読の場合はTRUE、解除の場合はFALSEを指定
+     *
+     * @return bool  成功の場合にTRUE、それ以外の場合にはFALSE
+     */
+    function subscribe($user, $object, $onoff)
+    {
+        if ( ! $user || ! $object) {
+            return false;
+        }
+
+        if ($object instanceof GRN_Bulletin_Category) {
+            require_once('bulletin/include_subscribe.csp');
+            $subcategory = GRN_Bulletin_SubscribeCategories::getInstance();
+
+            return $subcategory->set($user, $object, $onoff);
+        }
+        if ($object instanceof GRN_Bulletin_Article) {
+            require_once('bulletin/include_subscribe.csp');
+            $subarticle = GRN_Bulletin_SubscribeArticles::getInstance();
+
+            return $subarticle->set($user, $object, $onoff);
+        }
+
+        return false;
+    }
+
+    /**
+     * @param CB_User               $user
+     * @param GRN_Bulletin_Category $object
+     * @param boolean               $onoff
+     *
+     * @return boolean
+     */
+    function unsubscribe(CB_User $user, $object, $onoff)
+    {
+        if ( ! $user || ! $object) {
+            return false;
+        }
+
+        if ($object instanceof GRN_Bulletin_Category) {
+            require_once("bulletin/include_subscribe.csp");
+            $subcategory = GRN_Bulletin_SubscribeCategories::getInstance();
+
+            return $subcategory->setUnSubscribedCategory($user, $object,
+                $onoff);
+        }
+
+        return false;
+    }
+
+
+    /**
+     * 購読状態を取得する
+     * 通知設定は考慮せず、ユーザーの購読設定を調べるだけ
+     *
+     * @param CB_User                                    $user 操作ユーザー
+     * @param GRN_Bulletin_Category|GRN_Bulletin_Article $object
+     *
+     * @return bool  購読している場合にはTRUE、それ以外の場合にはFALSE
+     */
+    function isSubscribed(& $user, & $object)
+    {
+        if ( ! $user || ! $object) {
+            return false;
+        }
+
+        if ($object instanceof GRN_Bulletin_Category) {
+            require_once('bulletin/include_subscribe.csp');
+            $subcategory = GRN_Bulletin_SubscribeCategories::getInstance();
+
+            return $subcategory->exists($user, $object);
+        }
+        if ($object instanceof GRN_Bulletin_Article) {
+            require_once('bulletin/include_subscribe.csp');
+            $subarticle = GRN_Bulletin_SubscribeArticles::getInstance();
+
+            return $subarticle->exists($user, $object);
+        }
+
+        return false;
+    }
+
+    /**
+     * 通知設定
+     *
+     * @param object GRN_Bulletin_Category $category  設定対象カテゴリ
+     * @param mixed $target 通知対象（User,Group,Role）
+     * @param bool  $onoff  通知を受ける場合はTRUE
+     *
+     * @return bool  設定に成功した場合にはTRUE、それ以外でFALSE
+     */
+    function setNotificationTarget(& $category, & $target, $onoff)
+    {
+        $notify = GRN_Bulletin_NotifyCategory::getInstance();
+
+        return $notify->setTarget($category, $target, $onoff);
+    }
+
+    /**
+     * カテゴリの通知先を一括削除する
+     *
+     * @param object GRN_Bulletin_Category $category
+     *
+     * @return bool
+     */
+    function deleteAllNotificationTargets(& $category)
+    {
+        $notify = GRN_Bulletin_NotifyCategory::getInstance();
+
+        return $notify->deleteTargets($category);
+    }
+
+
+    /**
+     * 通知されているか調べる
+     *
+     * @param mixed $target ユーザーまたは組織またはロールオブジェクト
+     * @param object GRN_Bulletin_Category $category
+     *
+     * @return bool
+     */
+    function isNotificationTarget(& $category, & $target)
+    {
+        $notify = GRN_Bulletin_NotifyCategory::getInstance();
+
+        return $notify->existsTarget($category, $target);
+    }
+
+
+    /**
+     * 通知先を取得する
+     *
+     * @param object GRN_Bulletin_Category $category  カテゴリ
+     * @param string $target_column "user" or "group" or "role"
+     *
+     * @return array  array( $oid => & $object, ... )
+     */
+    function getNotificationTargets(& $category, $target_column)
+    {
+        $notify = GRN_Bulletin_NotifyCategory::getInstance();
+
+        return $notify->getTargets($category, $target_column);
+    }
+
+
+    /**
+     * 通知対象かどうか調べる
+     *
+     * @param CB_User                                    $user ユーザー
+     * @param GRN_Bulletin_Category|GRN_Bulletin_Article $object
+     *
+     * @return bool
+     */
+    function isNotified($user, $object)
+    {
+        if ( ! $user || ! $object) {
+            return false;
+        }
+
+        if ($object instanceof GRN_Bulletin_Category) {
+            $notify = GRN_Bulletin_NotifyCategory::getInstance();
+            if ($notify->isNotified($user, $object)) {
+                return true;
+            }
+
+            return $this->isSubscribed($user, $object);
+        }
+
+        if ($object instanceof GRN_Bulletin_Article) {
+            $category =& $object->get('category');
+
+            $notify = GRN_Bulletin_NotifyCategory::getInstance();
+
+            if ($notify->isNotified($user, $category)) {
+                if ($category->get('force_notify')) {
+                    return true;
+                }
+            } elseif ( ! $this->isSubscribed($user, $category)) {
+                return false;
+            }
+
+            return $this->isSubscribed($user, $object);
+        }
+
+        return false;
+    }
+
+    /**
+     * ユーザーの購読しているカテゴリ一覧を取得する、通知設定は考慮されない
+     *
+     * @access private
+     */
+    function getSubscribedCategoryIds(& $user)
+    {
+        if ( ! $user) {
+            return [];
+        }
+
+        require_once('bulletin/include_subscribe.csp');
+        $subcategory = GRN_Bulletin_SubscribeCategories::getInstance();
+
+        return $subcategory->get($user);
+    }
+
+    /**
+     * @param CB_User $user
+     *
+     * @return array
+     */
+    function getUnSubscribedCategoryIds(CB_User $user)
+    {
+        if ( ! $user) {
+            return [];
+        }
+
+        require_once("bulletin/include_subscribe.csp");
+        $subcategory = GRN_Bulletin_SubscribeCategories::getInstance();
+
+        return $subcategory->getUnSubscribedCategoryIds($user);
+    }
+
+    function getSubscribedCategories($inUser)
+    {
+        $ids = $this->getSubscribedCategoryIds($inUser);
+
+        if (count($ids) < 1) {
+            return [];
+        }
+
+        require_once('fw/i18n.csp');
+        require_once('bulletin/BulletinFacade.csp');
+        require_once('bulletin/category.csp');
+
+        $i18n = CB_I18N::getInstance();
+        $table_info = cb_class2table("GRN_Bulletin_CategoryEntity");
+
+        $dao = new BulletinFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+        $dataObj['offset'] = 0;
+        $dataObj['limit'] = -1;
+        $categoryIdArray = array_keys($ids);
+
+        $categoryList = $dao->getBulletinCategoryListByIds($dataObj,
+            $categoryIdArray);
+
+        $factory = GRN_Bulletin_CategoryFactory::getInstance();
+        $categories = [];
+        foreach ($categoryList as $category) {
+            $row = $table_info->getRow($category->getId(),
+                $category->convertArray());
+            $categoryId = $row->getOID();
+            $categories[$categoryId] = $factory->row2object($row);
+        }
+
+        return $categories;
+    }
+
+    /**
+     * @param CB_User $user
+     *
+     * @return array
+     */
+    function getUnSubscribedCategories(CB_User $user)
+    {
+        $category_ids = $this->getUnSubscribedCategoryIds($user);
+
+        if (count($category_ids) < 1) {
+            return [];
+        }
+
+        require_once('fw/i18n.csp');
+        require_once('bulletin/BulletinFacade.csp');
+        require_once('bulletin/category.csp');
+
+        $i18n = CB_I18N::getInstance();
+        $table_info = cb_class2table("GRN_Bulletin_CategoryEntity");
+
+        $dao = new BulletinFacade();
+        $dao_params = [];
+        $dao_params['lock'] = $table_info->_lock;
+        $dao_params['language'] = $i18n->getCurrentLanguage();
+        $dao_params['offset'] = 0;
+        $dao_params['limit'] = -1;
+
+        $category_list = $dao->getBulletinCategoryListByIds($dao_params,
+            $category_ids);
+
+        $factory = GRN_Bulletin_CategoryFactory::getInstance();
+        $categories = [];
+        foreach ($category_list as $category) {
+            $row = $table_info->getRow($category->getId(),
+                $category->convertArray());
+            $category_id = $row->getOID();
+            $categories[$category_id] = $factory->row2object($row);
+        }
+
+        return $categories;
+    }
+
+    /**
+     * @param CB_User $user
+     *
+     * @return array
+     */
+    public function getNotifiedCategoryInfo(CB_User $user)
+    {
+        $notification_manager
+            = \GRN_Bulletin_NotificationManager::getInstance();
+        $notified_categories
+            = $notification_manager->getNotifiedCategories($user);
+        $user_notified_categories
+            = $notification_manager->getSubscribedCategories($user);
+        $user_unnotified_categories
+            = $notification_manager->getUnSubscribedCategories($user);
+
+        $category_notify_ids = [];
+        $force_notify_ids = [];
+        $user_notify_ids = [];
+        $user_unnotify_ids = [];
+
+        foreach ($notified_categories as $id => $category) {
+            $category_notify_ids[$id] = $id;
+            if ($category->get('force_notify')) {
+                $force_notify_ids[$id] = $id;
+            }
+        }
+        foreach ($user_notified_categories as $id => $category) {
+            $user_notify_ids[$id] = $id;
+        }
+        foreach ($user_unnotified_categories as $id => $category) {
+            $user_unnotify_ids[$id] = $id;
+        }
+
+        $checked_ids = [];
+        foreach ($category_notify_ids as $id) {
+            $checked_ids[$id] = $id;
+        }
+        foreach ($user_notify_ids as $id) {
+            $checked_ids[$id] = $id;
+        }
+        foreach ($user_unnotify_ids as $id) {
+            if ( ! isset($force_notify_ids[$id])) {
+                unset($checked_ids[$id]);
+            }
+        }
+
+        $notified_category_info = [];
+        $notified_category_info["category_notify_ids"] = $category_notify_ids;
+        $notified_category_info["force_notify_ids"] = $force_notify_ids;
+        $notified_category_info["user_notify_ids"] = $user_notify_ids;
+        $notified_category_info["user_unnotify_ids"] = $user_unnotify_ids;
+        $notified_category_info["checked_ids"] = $checked_ids;
+
+        return $notified_category_info;
+    }
+
+    /**
+     * 通知カテゴリの取得
+     *
+     * @param object CB_User $user                 ユーザー
+     * @param bool $contains_subscribed 購読カテゴリを含む場合はTRUE
+     *
+     * @return array  array( $cid => & GRN_Bulletin_Category, ... )
+     */
+    function getNotifiedCategoryIds(& $user, $contains_subscribed = false)
+    {
+        if ( ! $user) {
+            return [];
+        }
+
+        $notify = GRN_Bulletin_NotifyCategory::getInstance();
+
+        $notified = $notify->get($user);
+
+        if ($contains_subscribed) {
+            // 購読カテゴリを含む場合
+
+            // 購読カテゴリを取得
+            $subscribed = $this->getSubscribedCategoryIds($user);
+
+            // 通知カテゴリと購読カテゴリをマージ
+            foreach (array_keys($subscribed) as $cid) {
+                if ( ! array_key_exists($cid, $notified)) {
+                    $notified[$cid] = 1;
+                }
+            }
+        }
+
+        return $notified;
+    }
+
+    function getNotifiedCategories($inUser, $inIsContainsSubscribed = false)
+    {
+        $ids = $this->getNotifiedCategoryIds($inUser, $inIsContainsSubscribed);
+
+        if (count($ids) < 1) {
+            return [];
+        }
+
+        require_once('fw/i18n.csp');
+        require_once('bulletin/BulletinFacade.csp');
+        require_once('bulletin/category.csp');
+
+        $i18n = CB_I18N::getInstance();
+        $table_info = cb_class2table("GRN_Bulletin_CategoryEntity");
+
+        $dao = new BulletinFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+        $dataObj['offset'] = 0;
+        $dataObj['limit'] = -1;
+        $categoryIdArray = array_keys($ids);
+
+        $categoryList = $dao->getBulletinCategoryListByIds($dataObj,
+            $categoryIdArray);
+
+        $factory = GRN_Bulletin_CategoryFactory::getInstance();
+        $categories = [];
+        foreach ($categoryList as $category) {
+            $row = $table_info->getRow($category->getId(),
+                $category->convertArray());
+            $categoryId = $row->getOID();
+            $categories[$categoryId] = $factory->row2object($row);
+        }
+
+        return $categories;
+    }
+
+
+    /**
+     * 既読処理
+     *
+     * @param CB_User              $user           ユーザー
+     * @param GRN_Bulletin_Article $article        記事
+     * @param CB_TimeStamp         $ts             処理時間、「null」の場合は現在時刻
+     * @param bool                 $enable_confirm 通知処理を実行する場合にTRUE
+     * @param bool                 $write_log
+     *
+     * @return bool
+     */
+    function read(
+        $user,
+        $article,
+        $ts = null,
+        $enable_confirm = true,
+        $write_log = true
+    ) {
+        if ( ! $user || ! $article) {
+            return false;
+        }
+
+        if (is_null($ts)) {
+            $ts = new CB_TimeStamp();
+            $ts->unix_ts = time();
+        }
+
+        require_once('bulletin/readstatus.csp');
+        $cacher = GRN_Bulletin_ArticleReadStatus::getInstance();
+        $status = $cacher->get($user, $article);
+
+        if ( ! $status) {
+            // 最初の閲覧
+            $status = $cacher->create($user, $article, $ts);
+        }
+
+        $status->set('last_timestamp', $ts);
+
+        // 掲示開始日を変更した場合に作成者のタイムスタンプは過去へ戻る場合がある
+        $ft = $status->get('first_timestamp');
+        if (is_null($ft) || $ft->unix_ts > $ts->unix_ts) {
+            $status->set('first_timestamp', $ts);
+        }
+
+        $status->updateNow();
+
+        if ($enable_confirm) {
+            $bulletin_notification_listener
+                = new GRN_Bulletin_NotificationListener();
+            $bulletin_notification_listener->confirmNotification($user,
+                $article, $ts);
+        }
+
+        if ($write_log) {
+            grn_bulletin_write_log("browse", "article", [
+                'cid'     => $article->getId('category'),
+                'aid'     => $article->getOID(),
+                'subject' => $article->get('subject'),
+                'uid'     => $user->getOID()
+            ], "info");
+        }
+
+        return true;
+    }
+
+    /**
+     * 記事の既読タイムスタンプを取得
+     *
+     * @param object CB_User              $user     ユーザー
+     * @param object GRN_Bulletin_Article $article  記事
+     *
+     * @return object CB_TimeStamp
+     */
+    function getReadTimeStamp(& $user, & $article)
+    {
+        if ( ! $user || ! $article) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        require_once('bulletin/readstatus.csp');
+        $cacher = GRN_Bulletin_ArticleReadStatus::getInstance();
+        $status = $cacher->get2($user, $article);
+
+        if ( ! $status || is_null($status['last_timestamp'])) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        $ts = new CB_Timestamp();
+        $ts->unix_ts = $status['last_timestamp'];
+
+        return $ts;
+    }
+
+    /**
+     * 既読状態を取得する
+     *
+     * @param object CB_User              $user     ユーザー
+     * @param object GRN_Bulletin_Article $article  記事
+     *
+     * @return integer  未読の場合「-1」更新後未読の場合「1」既読の場合「0」
+     */
+    function getReadStatus(& $user, & $article)
+    {
+        if (is_null(($rtime = $this->getReadTimeStamp($user, $article)))) {
+            return -1;
+        }
+
+        $ntime = $article->get('ntime');
+        $rtime_unix_ts = $rtime->unix_ts;
+        if (is_a($rtime_unix_ts, 'CB_Timestamp')) {
+            $rtime = new CB_Timestamp();
+            $rtime->unix_ts = $rtime_unix_ts->unix_ts;
+        }
+
+        return $ntime->unix_ts > $rtime->unix_ts ? 1 : 0;
+    }
+
+    /**
+     * 既読確認
+     *
+     * @param object CB_User              $user     ユーザー
+     * @param object GRN_Bulletin_Article $article  記事
+     *
+     * @return bool  既読の場合にはTRUE、未読の場合にはFALSE
+     */
+    function isRead(& $user, & $article)
+    {
+        return $this->getReadStatus($user, $article) == 0;
+    }
+
+    /**
+     * 購読カテゴリ内の購読解除されていない記事の検索条件
+     *
+     * @access private
+     */
+    function _makeSubscribeArticlesCondition(
+        & $user,
+        $subscribed_categories,
+        $alias = 'a'
+    ) {
+        if ( ! $subscribed_categories) {
+            return null;
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $database =& $app_locator->getConnection('bulletin');
+
+        // 購読解除した記事を取得
+        require_once('bulletin/include_subscribe.csp');
+        $subarticle = GRN_Bulletin_SubscribeArticles::getInstance();
+        $unsubscribed = $subarticle->getUnsubscribeIds($user,
+            $subscribed_categories);
+
+        if ($alias) {
+            $alias .= '.';
+        }
+
+        $conditions = [
+            cb_queryf($database, $alias . 'col_category IN (@A)',
+                array_keys($subscribed_categories))
+        ];
+        if ($unsubscribed) {
+            $conditions[] = cb_queryf($database, $alias . '_id NOT IN (@A)',
+                array_keys($unsubscribed));
+        }
+
+        return implode(' AND ', $conditions);
+    }
+
+
+    /**
+     * 通知記事検索用のCB_MultiRowSetを生成する
+     *
+     * @access private
+     * @return CB_MultiRowSet
+     */
+    function _createNotifyArticleMultiRowSet(
+        $user,
+        $last_timestamp,
+        $limit = GRN_BULLETIN_MAX_NOTIFICATION,
+        $equal_timestamp = false
+    ) {
+        // 通知カテゴリを取得
+        $notified = $this->getNotifiedCategoryIds($user);
+
+        // 購読カテゴリを取得
+        $subscribed = $this->getSubscribedCategoryIds($user);
+
+        // 通知、購読カテゴリが全くなければ何もしない
+        if ( ! $notified && ! $subscribed) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        // 強制通知カテゴリを分ける
+        $force_notified = [];
+        foreach (array_keys($notified) as $cid) {
+            if ($notified[$cid]) // check force_notify
+            {
+                $force_notified[$cid] = 1;
+                unset($notified[$cid]);
+            }
+        }
+
+        // 強制通知カテゴリは購読設定を無視する
+
+        $keys = array_intersect(array_keys($force_notified),
+            array_keys($subscribed));
+        foreach ($keys as $k) {
+            unset($subscribed[$k]);
+        }
+
+        // 非強制通知カテゴリは購読カテゴリと同じ扱いをする
+
+        $keys = array_diff(array_keys($notified), array_keys($subscribed));
+        foreach ($keys as $k) {
+            $subscribed[$k] = 1;
+        }
+
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm =& $app_locator->getTableManager('bulletin');
+        $tab_article =& $tm->getTableInfo('GRN_Bulletin_ArticleEntity');
+
+        $rowset = new CB_MultiRowSet($tab_article, 'a');
+
+        $tab_read_status =& $tm->getTableInfo('GRN_Bulletin_ReadStatus');
+
+        // 既読時刻テーブルとJOIN
+        $rowset->addJoin($tab_read_status,
+            $rowset->queryf("r.col_user = '@S' AND r.col_article = a._id",
+                $user->getOID()),
+            CB_DATABASE_LEFT_JOIN, 'r');
+
+        require_once('bulletin/article_condition.csp');
+
+        // クエリーの生成
+
+        // 強制通知設定されたカテゴリの検索条件
+        $c_force_notified = null;
+        if (count($force_notified) > 0) {
+            $c_force_notified = grn_bulletin_make_category_condition('a',
+                array_keys($force_notified), 'OR');
+        }
+
+        // 購読または通知（非強制）設定されたカテゴリで購読解除されていない記事の検索条件
+        $c_subscribed = $this->_makeSubscribeArticlesCondition($user,
+            $subscribed);
+
+        assert('! is_null($c_force_notified) || ! is_null($c_subscribed)');
+
+
+        // 記事カテゴリに関する検索条件
+        $category_condition = null;
+
+        if ($c_force_notified) {
+            if ($c_subscribed) {
+                $category_condition = '(' . $c_force_notified . ' OR '
+                                      . $c_subscribed . ')';
+            } else {
+                $category_condition = '(' . $c_force_notified . ')';
+            }
+        } else {
+            $category_condition = '(' . $c_subscribed . ')';
+        }
+
+        $conditions = [];
+
+        if ($last_timestamp) {
+            if ($equal_timestamp) {
+                // 最終通知処理時刻に更新されている記事に限定する
+                $conditions[] = '(a.col_dirty_timestamp = '
+                                . $last_timestamp->unix_ts . ')';
+            } else {
+                // 最終通知処理時刻以降に更新されている記事に限定する
+                $conditions[] = '(a.col_dirty_timestamp > '
+                                . $last_timestamp->unix_ts . ')';
+            }
+        }
+
+        // 未読記事に限定
+        $conditions[]
+            = '(r.col_user IS NULL OR r.col_last_timestamp < a.col_dirty_timestamp)';
+
+        // 公開されている記事に限定
+        $conditions[] = grn_bulletin_make_published_condition('a');
+
+        // カテゴリ条件
+        $conditions[] = $category_condition;
+
+        $rowset->addCondition(implode(' AND ', $conditions));
+
+        $rowset->addOrderColumn('a.col_ntime');
+        $rowset->addOrderColumn('a._id');
+
+        $rowset->limit(0, $limit);
+
+        return $rowset;
+    }
+
+
+    /**
+     * 通知記事検索結果を取得する
+     *
+     * @param CB_User      $user
+     * @param CB_TimeStamp $last_timestamp
+     * @param int          $limit
+     *
+     * @access private
+     * @return array
+     */
+    function _createNotifyArticleList(
+        & $user,
+        $last_timestamp,
+        $limit = GRN_BULLETIN_MAX_NOTIFICATION
+    ) {
+        // 通知カテゴリを取得
+        $notified = $this->getNotifiedCategoryIds($user);
+
+        // 購読カテゴリを取得
+        $subscribed = $this->getSubscribedCategoryIds($user);
+
+        // 通知、購読カテゴリが全くなければ何もしない
+        if ( ! $notified && ! $subscribed) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        // 強制通知カテゴリを分ける
+        $force_notified = [];
+        foreach (array_keys($notified) as $cid) {
+            if ($notified[$cid]) // check force_notify
+            {
+                $force_notified[$cid] = 1;
+                unset($notified[$cid]);
+            }
+        }
+
+        // 強制通知カテゴリは購読設定を無視する
+
+        $keys = array_intersect(array_keys($force_notified),
+            array_keys($subscribed));
+        foreach ($keys as $k) {
+            unset($subscribed[$k]);
+        }
+
+        // 非強制通知カテゴリは購読カテゴリと同じ扱いをする
+
+        $keys = array_diff(array_keys($notified), array_keys($subscribed));
+        foreach ($keys as $k) {
+            $subscribed[$k] = 1;
+        }
+
+        //Get Database
+        $database =& $this->_getDatabase();
+
+        //カラムリストの生成
+        $article_column_list
+            = $this->_getColumnList('GRN_Bulletin_ArticleEntity',
+            true);
+        $read_column_list = $this->_getColumnList('GRN_Bulletin_ReadStatus',
+            true);
+        $all_column_list = array_merge($article_column_list,
+            $read_column_list);
+        $column_list = implode(',', $all_column_list);
+
+        //テーブル名の生成
+        $table_name_article
+            = $this->_getTableName('GRN_Bulletin_ArticleEntity');
+        $table_name_read = $this->_getTableName('GRN_Bulletin_ReadStatus');
+
+        //Order Byの生成
+        $order_by = 'ORDER BY a.col_ntime DESC, a._id DESC';
+
+        //Joinの生成
+        $join_list = [];
+        $join_list[] = cb_queryf($database,
+            "@S AS r ON r.col_user = '@S' AND r.col_article = a._id",
+            $table_name_read, $user->getOID());
+        $join = implode(' LEFT JOIN ', $join_list);
+        if ($join) {
+            $join = 'LEFT JOIN ' . $join;
+        }
+
+        require_once('bulletin/article_condition.csp');
+
+        // クエリーの生成
+
+        // 強制通知設定されたカテゴリの検索条件
+        $c_force_notified = null;
+        if (count($force_notified) > 0) {
+            $c_force_notified = grn_bulletin_make_category_condition('a',
+                array_keys($force_notified), 'OR');
+        }
+
+        // 購読または通知（非強制）設定されたカテゴリで購読解除されていない記事の検索条件
+        $c_subscribed = $this->_makeSubscribeArticlesCondition($user,
+            $subscribed);
+
+        assert('! is_null($c_force_notified) || ! is_null($c_subscribed)');
+
+
+        // 記事カテゴリに関する検索条件
+        $category_condition = null;
+
+        if ($c_force_notified) {
+            if ($c_subscribed) {
+                $category_condition = '(' . $c_force_notified . ' OR '
+                                      . $c_subscribed . ')';
+            } else {
+                $category_condition = '(' . $c_force_notified . ')';
+            }
+        } else {
+            $category_condition = '(' . $c_subscribed . ')';
+        }
+
+        $conditions = [];
+
+        if ($last_timestamp) {
+            // 最終通知処理時刻以降に更新されている記事に限定する
+            $conditions[] = '(a.col_dirty_timestamp > '
+                            . $last_timestamp->unix_ts . ')';
+        }
+
+        // Only receive the notifications within 30 days
+        $conditions[] = '(a.col_dirty_timestamp > ' . (time()
+                                                       - GRN_BULLETIN_MAX_NOTIFICATION_DAY
+                                                         * 24 * 60 * 60) . ')';
+
+        // 未読記事に限定
+        $conditions[]
+            = '(r.col_user IS NULL OR r.col_last_timestamp IS NULL OR r.col_last_timestamp < a.col_dirty_timestamp)';
+
+        // 公開されている記事に限定
+        $conditions[] = grn_bulletin_make_published_condition('a');
+
+        // カテゴリ条件
+        $conditions[] = $category_condition;
+
+        // クエリ生成
+        $query = sprintf('SELECT %s FROM %s a %s WHERE %s %s', $column_list,
+            $table_name_article, $join, implode(' AND ', $conditions),
+            $order_by);
+        $query = $database->select_format($query, 0, $limit,
+            CB_DATABASE_NO_LOCK);
+
+        // クエリ実行
+        $article_read_infos = [];
+        $result = $database->query($query);
+        if ($result === false) {
+            return $article_read_infos;
+        }
+
+        // 通知記事リストの生成
+        $count = $database->num_rows($result);
+        for ($i = 0; $i < $count; $i++) {
+            if (($row = $database->fetch_assoc($result)) === false) {
+                break;
+            }
+
+            $article_infos = [];
+
+            if (array_key_exists('r_id', $row)) {
+                if ( ! is_null($row['r_id'])) {
+                    $article_infos['r'] = [];
+                    $article_infos['r']['_id'] = $row['r_id'];
+                }
+                unset($row['r_id']);
+            }
+
+            foreach (array_keys($row) as $column_name) {
+                if ($column_name == 'a_id') {
+                    if ( ! is_null($row[$column_name])) {
+                        if ( ! array_key_exists('a', $article_infos)) {
+                            $article_infos['a'] = [];
+                        }
+
+                        $article_infos['a']['_id'] = $row[$column_name];
+                    }
+                } elseif (strpos($column_name, 'a_') === 0) {
+                    if ( ! array_key_exists('a', $article_infos)) {
+                        $article_infos['a'] = [];
+                    }
+
+                    $article_infos['a'][substr($column_name, 2)]
+                        = $row[$column_name];
+                } elseif (strpos($column_name, 'r_') === 0) {
+                    if (array_key_exists('r', $article_infos)) {
+                        $article_infos['r'][substr($column_name, 2)]
+                            = $row[$column_name];
+                    }
+                }
+            }
+
+            $article_read_infos[] = $article_infos;
+        }
+        $database->free_result($result);
+
+
+        return $article_read_infos;
+    }
+
+    /**
+     * 最新の通知状態が設定された通知データを生成
+     *
+     * @param object CB_User               $user               閲覧ユーザー
+     * @param array  GRN_Bulletin_Article  $article_info       記事情報
+     * @param bool $need_confirm_data 既読の場合詳細データが必要ならTRUE
+     * @param object GRN_Notification_Data $data               通知データ
+     *
+     * @return bool
+     * @access private
+     */
+    function _createCurrentNotificationFromInfo(
+        & $user,
+        $article_info,
+        $need_confirm_data,
+        & $data
+    ) {
+        require_once('bulletin/readstatus.csp');
+        $cacher = GRN_Bulletin_ArticleReadStatus::getInstance();
+        $rstate =& $cacher->getInfo($user, $article_info);
+
+        require_once('bulletin/follow.csp');
+        $follow_manager = GRN_Bulletin_FollowManager::getInstance();
+
+        $status = null;
+        $target =& $article_info;
+        $last_follow = null;
+
+        if ( ! $rstate
+             || (is_null($rstate['col_last_timestamp'])
+                 && is_null($rstate['col_first_timestamp']))
+        ) {
+            $status = 'unread';
+        } else {
+            $ntime = $article_info['col_ntime'];
+            $rtime = $rstate['col_last_timestamp'];
+
+            $target =& $article_info;
+
+            if ($ntime > $rtime) {
+                // 更新未読
+
+                $status = 'update';
+
+                if (($last_follow
+                    = $follow_manager->getLastOtherArticleFollowInfo($article_info['_id'],
+                    $user->getOID(), CB_DATABASE_NO_LOCK))
+                ) {
+                    // フォローと記事の変更のどちらが後に行われているか
+                    if (array_key_exists('col_mtime', $article_info)
+                        && $article_info['col_mtime']
+                           > $last_follow['col_ctime']
+                    ) {
+                        // フォローなしの状態にする
+                        $last_follow = null;
+                    } else {
+                        // フォローの書き込まれた未読の掲示を閲覧して、フォローを書き込んだ場合には
+                        // 最後に受けた通知が未読であっても更新へ切り替わってしまう
+                        // 閲覧→フォロー書き込みの間に他人がフォローを書き込むことがあるため区別できない
+                        $target =& $last_follow;
+                    }
+                } elseif (($last_follow
+                    = $follow_manager->getLastArticleFollowInfo($article_info['_id'],
+                    CB_DATABASE_NO_LOCK))
+                ) {
+                    // 自分のフォロー書き込みを閲覧
+                    $status = 'confirm';
+                } else {
+                    // 掲示板本文の更新
+                    $last_follow = null;
+                }
+            } elseif ( ! ($last_follow
+                = $follow_manager->getLastOtherArticleFollowInfo($article_info['_id'],
+                $user->getOID(), CB_DATABASE_NO_LOCK))
+            ) {
+                // 既読で自分以外のフォローがない場合
+
+                if ($article_info['col_creator'] == $user->getOID()) {
+                    // 自分の書いた記事なら現在は通知なし
+                    return false;
+                }
+
+                $status = 'confirm';
+            } else {
+                // 既読で自分以外のフォローがある場合
+
+                $ftime = $rstate['col_first_timestamp'];
+                $ltime = $last_follow['col_ctime'];
+
+                if ($ftime < $ltime) {
+                    // 最初に閲覧したのがフォローより過去なら更新を確認した
+                    $target =& $last_follow;
+                } else {
+                    $last_follow = null;
+                }
+
+                $status = 'confirm';
+            }
+
+        }
+
+        $data->initData();
+
+        if ($status == 'unread') {
+            $data->setStatusToUnread();
+        } elseif ($status == 'update') {
+            $data->setStatusToUpdate();
+        } else {
+            $data->setStatusToConfirm();
+
+            if ( ! $need_confirm_data) {
+                // 詳細が必要ないならステータスをセットするだけ
+                return true;
+            }
+        }
+
+        $data->setModuleId($this->_module_id);
+        $data->setUniqueId($article_info['_id']);
+        $data->setSubjectData($article_info['col_subject']);
+
+        global $G_container_base;
+        $grn_uum =& $G_container_base->getInstance('uum');
+        $creator_id = $target['col_creator'];
+        $creator =& $grn_uum->getUser($target['col_creator']);
+
+        if ($creator) {
+            $data->setSenderData($creator->get('display_name'), $creator_id);
+        } else {
+            $data->setSenderData($target['col_creator_name'], 0);
+        }
+
+        $ts_ctime = new CB_TimeStamp();
+        if ($status == 'update' && is_null($last_follow)) {
+            $ts_ctime->unix_ts = $target['col_mtime'];
+        } elseif ($status == 'unread' && is_null($last_follow)) {
+            $ts_ctime->unix_ts = $target['col_dirty_timestamp'];
+        } else {
+            $ts_ctime->unix_ts = $target['col_ctime'];
+        }
+        $data->setTimeStampData($ts_ctime);
+
+        $data->setAbstractData($target['col_data']);
+
+        require_once('bulletin/file.csp');
+        $file_manager = GRN_Bulletin_FileManager::getInstance();
+        $org_data
+            = ['files' => $file_manager->getNumFileInfos($article_info['_id'])];
+
+        if ($last_follow) {
+            $org_data['follow'] = $last_follow['_id'];
+        }
+
+        $org_data['cid'] = $article_info['col_category'];
+
+        $data->setOrgData($org_data);
+
+        return true;
+    }
+
+
+    /**
+     * 通知の更新
+     *
+     * @param CB_User      $user           閲覧ユーザー
+     * @param CB_TimeStamp $last_timestamp 最終通知確認時刻
+     * @param CB_TimeStamp $new_timestamp  最終通知時刻を変更する場合にはこの値をセットする
+     */
+    function updateNotification($user, $last_timestamp, & $new_timestamp)
+    {
+        assert('! is_null( $last_timestamp )');
+
+        require_once('grn/notification.csp');
+        $service = GRN_Notification_Service::getInstance();
+
+        // 1回の最大通知処理件数の検索を行う
+        $article_read_infos = $this->_createNotifyArticleList($user,
+            $last_timestamp, GRN_BULLETIN_MAX_NOTIFICATION);
+
+        if ( ! is_null($new_timestamp)) {
+            unset($new_timestamp);
+        }
+        $new_timestamp = new CB_TimeStamp;
+        $new_timestamp->unix_ts = $last_timestamp->unix_ts;
+
+        if (count($article_read_infos) == 0) {
+            return;
+        }
+
+        require_once('bulletin/readstatus.csp');
+        $read_status = GRN_Bulletin_ArticleReadStatus::getInstance();
+
+        $notify_articles = [];
+        $add_notifications = [];
+
+        require_once('grn/notification.csp');
+        $data = new GRN_Notification_Data();
+
+        $user_id = $user->getOID();
+
+        while (count($article_read_infos) != 0) {
+            $article_read_info = array_pop($article_read_infos);
+
+            $article_info = $article_read_info['a'];
+            if (array_key_exists('r', $article_read_info)) {
+                $read_info = $article_read_info['r'];
+            } else {
+                $read_info = null;
+            }
+
+            $notify_articles[$article_info['_id']] = $article_info;
+
+            $read_status->cacheInfo($user_id, $article_info, $read_info);
+
+            // 現在の通知状態を確認
+            if ( ! $this->_createCurrentNotificationFromInfo($user,
+                $article_info, true, $data)
+            ) {
+                // 既存通知の削除
+                $service->deleteNotifyData($user, $this->_module_id,
+                    $article_info['_id']);
+            } else {
+                $actions
+                    = []; // Multiple actions may occur before pulling time, so we have to infer which kinds of actions have happened
+
+                if ((int)$article_info['col_ctime']
+                    <= (int)$last_timestamp->unix_ts
+                ) {
+                    $actions[] = [
+                        'time' => $article_info['col_dirty_timestamp'],
+                        'id'   => GRN_NOTIFICATION_ACTION_UPDATE_ID
+                    ];
+                } else {
+                    // $actionIds should store actions in the order same to actions' occurring order
+                    $creatorId = $article_info['col_creator'];
+                    if (is_null($read_info)) {
+                        $readerId = null;
+                    } else {
+                        $readerId = $read_info['col_user'];
+                    }
+
+                    if ($creatorId
+                        != $readerId
+                    ) { // Not send any 'create' notification to the topic creator
+                        $actions[] = [
+                            'time' => $article_info['col_ctime'],
+                            'id'   => GRN_NOTIFICATION_ACTION_CREATE_ID
+                        ];
+                    }
+
+                    if ((int)$article_info['col_ctime']
+                        < (int)$article_info['col_dirty_timestamp']
+                    ) {
+                        $actions[] = [
+                            'time' => $article_info['col_dirty_timestamp'],
+                            'id'   => GRN_NOTIFICATION_ACTION_UPDATE_ID
+                        ];
+                    }
+                }
+
+                foreach ($actions as $action) {
+                    $data->setActionId($action['id']);
+
+                    $timestamp_obj = new CB_TimeStamp();
+                    $timestamp_obj->unix_ts = $action['time'];
+                    $data->setTimeStampData($timestamp_obj);
+
+                    // 既存通知の更新
+                    if ($service->modifyNotifyData($user, $data, true, true)
+                        == null
+                    ) {
+                        // 更新できなければ新規通知としてリストに追加
+                        $add_notifications[$data->getUniqueID()]
+                            = $data->export();
+                    }
+                }
+            }
+        }
+
+        //新規通知の一括登録
+        if (count($add_notifications) != 0) {
+            $service->addNotifyDataListByUniqueId($user, $add_notifications);
+        }
+
+        $c = count($notify_articles);
+        if ($c > 0 && $c < GRN_BULLETIN_MAX_NOTIFICATION) {
+            $notify_articles_keys = array_keys($notify_articles);
+            $last = array_pop($notify_articles_keys);
+            $notify_article_info =& $notify_articles[$last];
+            if ( ! is_a($new_timestamp, 'CB_TimeStamp')) {
+                $new_timestamp = new CB_TimeStamp();
+            }
+            $new_timestamp->unix_ts
+                = $notify_article_info['col_dirty_timestamp'];
+        }
+    }
+
+    /**
+     * 記事の通知を削除
+     *
+     * @param object GRN_Bulletin_Article $article  削除する記事
+     */
+    function deleteArticleNotification(& $article)
+    {
+        if ( ! $article) {
+            return;
+        }
+
+        require_once('grn/notification.csp');
+        $service = GRN_Notification_Service::getInstance();
+        $service->deleteNotifyDataForAllUser($this->_module_id,
+            $article->getOID());
+    }
+
+    /**
+     * Export notify category setting
+     *
+     * @param object $user
+     * @param object $csv
+     * @param object $category
+     */
+    function exportNotify(& $csv, & $category)
+    {
+        if ( ! $csv || ! $category) {
+            assert('FALSE');
+            cb_throw_error();
+        }
+        //get "force_notify"  from tab_grn_bulletin_categoryentity
+        if ($category->get('force_notify') === '1') {
+            $line = [];
+            $line[GRN_BULLETIN_NOTIFY_CSV_CATEGORY_FOREIGNKEY]
+                = $category->get('foreign_key');
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_ITEM] = 'force_notify';
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_VALUE] = 1;
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_OBJECT] = '';
+            $csv->writeLine($line);
+        }
+        require_once('grn/uum_util.csp');
+        $uum_util = GRN_UumUtil::getInstance();
+        $dynamic_roles = $uum_util->listDynamicRoles();
+        //get data from tab_grn_bulletin_dynamicrolenotification
+        $targets = $category->getNotificationTargets('dynamic_role');
+        foreach (array_keys($targets) as $id) {
+            $line = [];
+            $line[GRN_BULLETIN_NOTIFY_CSV_CATEGORY_FOREIGNKEY]
+                = $category->get('foreign_key');
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_ITEM] = 'dynamic_role';
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_VALUE] = 1;
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_OBJECT] = $id;
+
+            $csv->writeLine($line);
+        }
+
+        //get data from tab_grn_bulletin_rolenotification
+        $targets = $category->getNotificationTargets('role');
+        foreach (array_keys($targets) as $id) {
+            $item =& $targets[$id];
+            $line = [];
+            $line[GRN_BULLETIN_NOTIFY_CSV_CATEGORY_FOREIGNKEY]
+                = $category->get('foreign_key');
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_ITEM] = 'role';
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_VALUE] = 1;
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_OBJECT]
+                = $item->get('foreign_key');
+
+            $csv->writeLine($line);
+        }
+
+        //get data from tab_grn_bulletin_groupnotification
+        $targets = $category->getNotificationTargets('group');
+        foreach (array_keys($targets) as $id) {
+            $item =& $targets[$id];
+            $line = [];
+            $line[GRN_BULLETIN_NOTIFY_CSV_CATEGORY_FOREIGNKEY]
+                = $category->get('foreign_key');
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_ITEM] = 'group';
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_VALUE] = 1;
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_OBJECT]
+                = $item->get('foreign_key');
+
+            $csv->writeLine($line);
+        }
+
+        //get data from tab_grn_bulletin_usernotification
+        $targets = $category->getNotificationTargets('user');
+        foreach (array_keys($targets) as $id) {
+            $item =& $targets[$id];
+            $line = [];
+            $line[GRN_BULLETIN_NOTIFY_CSV_CATEGORY_FOREIGNKEY]
+                = $category->get('foreign_key');
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_ITEM] = 'user';
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_VALUE] = 1;
+            $line[GRN_BULLETIN_NOTIFY_CSV_SETTING_OBJECT]
+                = $item->get('foreign_key');
+
+            $csv->writeLine($line);
+        }
+    }
+
+    /**
+     * Import notify category setting
+     *
+     * @param object $user
+     * @param object $line
+     * @param object $category
+     */
+    function importNotify(& $user, $line, & $category)
+    {
+        require_once('bulletin/access.csp');
+        $acc = GRN_Bulletin_AccessManager::getInstance();
+        if ( ! $acc->isSuperAdmin($user)) {
+            $ret = null;
+
+            return $ret;
+        }
+        require_once('fw/string_util.csp');
+        $foreign_key
+            = cb_trim($line[GRN_BULLETIN_NOTIFY_CSV_CATEGORY_FOREIGNKEY]);
+
+        $item = cb_trim($line[GRN_BULLETIN_NOTIFY_CSV_SETTING_ITEM]);
+        if ( ! is_numeric(cb_trim($line[GRN_BULLETIN_NOTIFY_CSV_SETTING_VALUE]))) {
+            cb_throw_error(E_GRN_BULLETIN_INVALID_CSV_VALUE);
+        } else {
+            $onoff
+                = intval(cb_trim($line[GRN_BULLETIN_NOTIFY_CSV_SETTING_VALUE]));
+            if ($onoff !== 0 && $onoff !== 1) {
+                cb_throw_error(E_GRN_BULLETIN_INVALID_CSV_VALUE);
+            }
+        }
+        $target = '';
+        if (count($line) >= 3) {
+            $target = cb_trim($line[GRN_BULLETIN_NOTIFY_CSV_SETTING_OBJECT]);
+        }
+
+        global $G_container_base;
+        require_once('grn/uum_util.csp');
+        $uum =& $G_container_base->getInstance('uum');
+        $uum_util = GRN_UumUtil::getInstance();
+        $dynamic_roles = $uum_util->listDynamicRoles();
+
+        switch ($item) {
+            case 'force_notify':
+                require_once('bulletin/category.csp');
+                $cm = GRN_Bulletin_CategoryManager::getInstance();
+                $categories = $cm->getAllCategories();
+                foreach (array_keys($categories) as $id) {
+                    $item = $categories[$id];
+                    if ($item->get('foreign_key') === $foreign_key) {
+                        $properties = ['force_notify' => $onoff];
+                        foreach (array_keys($properties) as $key) {
+                            $item->set($key, $properties[$key]);
+                        }
+                        $ret = $item->onUpdate($user);
+                    }
+                }
+                break;
+            case 'user':
+                if ($user = &$uum->getUserByForeignKey($target)) {
+                    $ret = $category->setNotificationTarget($user, $onoff);
+                } else {
+                    require_once('grn/error_code.csp');
+                    cb_throw_error(E_GRN_USER_NOT_FOUND);
+                }
+                break;
+
+            case 'group':
+                if (($group =& $uum->getGroupByForeignKey($target))) {
+                    $ret = $category->setNotificationTarget($group, $onoff);
+                } else {
+                    require_once('grn/error_code.csp');
+                    cb_throw_error(E_GRN_GROUP_NOT_FOUND);
+                }
+                break;
+
+            case 'role':
+                if (($role =& $uum->getStaticRoleByForeignKey($target))) {
+                    $ret = $category->setNotificationTarget($role, $onoff);
+                } else {
+                    require_once('grn/error_code.csp');
+                    cb_throw_error(E_GRN_ROLE_NOT_FOUND);
+                }
+                break;
+
+            case 'dynamic_role':
+                if (array_key_exists($target, $dynamic_roles)) {
+                    $ret = $category->setNotificationTarget($target, $onoff);
+                } else {
+                    require_once('grn/error_code.csp');
+                    cb_throw_error(E_GRN_ROLE_NOT_FOUND);
+                }
+                break;
+            default:
+                cb_throw_error(E_GRN_BULLETIN_NOTIFY_TARGET_CSV_NOT_FOUND, null,
+                    ['item' => $item]);
+        }
+
+        return $ret;
+    }
+
+    //Flowing fucntions it's use notification read
+
+    /**
+     * @param $category
+     * @param $userAllow
+     *
+     * @return array
+     */
+    function getUserListRequriredConfirm($category, $userAllow)
+    {
+        $userDynamicRole = $this->getUserIdByDynamicRoleNotification($category);
+        $arrayresult = [];
+        if (count($userDynamicRole) == 0) {
+            $users = $this->getUserIdByUserNotification($category);
+            $usersgroup = $this->getUserIdByGroupNotification($category);
+            $userrole = $this->getUserIdByRoleNotification($category);
+            $arraymerge = array_merge($users, $usersgroup);
+            $arrayresult = array_merge($arraymerge, $userrole);
+        } else {
+            $arrayresult = $userDynamicRole;
+        }
+        $arrayFinal = array_intersect($userAllow,
+            $arrayresult);// user exists two array
+
+        return $arrayFinal;
+    }
+
+    /**
+     * @param $category
+     *
+     * @return array
+     */
+    function getUserIdByUserNotification($category)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+        $query = cb_queryf($db,
+            "SELECT col_user FROM tab_grn_bulletin_usernotification WHERE col_category = '@S';",
+            $category);
+        $result = $db->query($query);
+        $rows = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $rows[] = $row['col_user'];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param $category
+     *
+     * @return array
+     */
+    function getUserIdByGroupNotification($category)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+        $query = cb_queryf($db,
+            "SELECT col_group FROM tab_grn_bulletin_groupnotification WHERE col_category = '@S';",
+            $category);
+        $result = $db->query($query);
+        $groups = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $groups[] = $row['col_group'];
+        }
+        $db->free_result($result);
+
+        $rows = [];
+        if (count($groups) > 0) {
+            $query = cb_queryf($db,
+                "SELECT DISTINCT col_user FROM tab_cb_usergrouprelation WHERE col_group IN (@A);",
+                $groups);
+            $result = $db->query($query);
+            while ($row = $db->fetch_assoc($result)) {
+                $rows[] = $row['col_user'];
+            }
+            $db->free_result($result);
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param $category
+     *
+     * @return array
+     */
+    function getUserIdByRoleNotification($category)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+        $query = cb_queryf($db,
+            "SELECT col_role FROM tab_grn_bulletin_rolenotification WHERE col_category = '@S';",
+            $category);
+        $result = $db->query($query);
+        $roles = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $roles[] = $row['col_role'];
+        }
+        $db->free_result($result);
+
+        $rows = [];
+        if (count($roles) > 0) {
+            $query = cb_queryf($db,
+                "SELECT DISTINCT col_user FROM tab_cb_userrolerelation WHERE col_role IN (@A);",
+                $roles);
+            $result = $db->query($query);
+            while ($row = $db->fetch_assoc($result)) {
+                $rows[] = $row['col_user'];
+            }
+            $db->free_result($result);
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Role dynamic notification
+     *
+     * @param $category
+     *
+     * @return array
+     */
+    function getUserIdByDynamicRoleNotification($category)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+        $query = cb_queryf($db,
+            "SELECT _id FROM tab_grn_bulletin_dynamicrolenotification WHERE col_category = '@S';",
+            $category);
+        $result = $db->query($query);
+        $rows = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $queryS = cb_queryf($db, 'SELECT _id FROM tab_cb_user;');
+            $resultS = $db->query($queryS);
+            while ($rowS = $db->fetch_assoc($resultS)) {
+                $rows[] = $rowS['_id'];
+            }
+            break;
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @return array
+     */
+    function getAllUserId()
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+        $rows = [];
+        $tablenamesub = 'tab_cb_user';
+        $queryS = sprintf('SELECT _id FROM %s ', $tablenamesub);
+        $resultS = $db->query($queryS);
+        while ($rowS = $db->fetch_assoc($resultS)) {
+            $rows[] = $rowS['_id'];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Group category
+     *
+     * @param $category
+     * @param $groupId
+     *
+     * @return array
+     */
+    function getUserIdByGroupCategory($category, $groupId)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+        $query = cb_queryf($db,
+            "SELECT col_target FROM tab_grn_bulletin_categoryentity_acl_cb_group WHERE col_object = '@S' AND col_target = '@S';",
+            $category, $groupId);
+        $result = $db->query($query);
+        $groups = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $groups[] = $row['col_target'];
+        }
+        $db->free_result($result);
+
+        $rows = [];
+        if (count($groups) > 0) {
+            $query = cb_queryf($db,
+                "SELECT DISTINCT col_user FROM tab_cb_usergrouprelation WHERE col_group IN (@A);",
+                $groups);
+            $result = $db->query($query);
+            while ($row = $db->fetch_assoc($result)) {
+                $rows[] = $row['col_user'];
+            }
+            $db->free_result($result);
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Role category
+     *
+     * @param $category
+     * @param $roleId
+     *
+     * @return array
+     */
+    function getUserIdByRoleCategory($category, $roleId)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+        $query = cb_queryf($db,
+            "SELECT col_target FROM tab_grn_bulletin_categoryentity_acl_cb_role WHERE col_object = '@S' AND col_target = '@S';",
+            $category, $roleId);
+        $result = $db->query($query);
+        $roles = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $roles[] = $row['col_target'];
+        }
+        $db->free_result($result);
+
+        $rows = [];
+        if (count($roles) > 0) {
+            $query = cb_queryf($db,
+                "SELECT DISTINCT col_user FROM tab_cb_userrolerelation WHERE col_role IN (@A);",
+                $roles);
+            $result = $db->query($query);
+            while ($row = $db->fetch_assoc($result)) {
+                $rows[] = $row['col_user'];
+            }
+            $db->free_result($result);
+        }
+
+        return $rows;
+    }
+
+    /**
+     * DynamicRole category, if the dynamic role is exists, all user have access right
+     *
+     * @param $category
+     * @param $roleId
+     *
+     * @return array
+     */
+    function getUserIdByDynamicRoleCategory($category, $roleId)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('bulletin');
+        $query = cb_queryf($db,
+            "SELECT col_target FROM tab_grn_bulletin_categoryentity_acl_dynamic_role WHERE col_object = '@S' AND col_target = '@S';",
+            $category, $roleId);
+        $result = $db->query($query);
+        $rows = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $queryS = cb_queryf($db,
+                'SELECT _id FROM tab_cb_user WHERE col_deleted IS NULL');
+            $resultS = $db->query($queryS);
+            while ($rowS = $db->fetch_assoc($resultS)) {
+                $rows[] = $rowS['_id'];
+            }
+            break;
+        }
+
+        return $rows;
+    }
+
+    /**
+     * カテゴリの通知設定コピー
+     *
+     * @param int   $src_id     コピー元カテゴリID
+     * @param array $target_ids コピー先カテゴリID
+     *
+     * @return bool
+     */
+    function copyNotification($src_id, $target_ids)
+    {
+        if ( ! $src_id) {
+            return false;
+        }
+        if ( ! is_array($target_ids) || 0 == count($target_ids)) {
+            return false;
+        }
+
+        require_once('grn/application.csp');
+        global $G_bulletin, $G_bulletin_login;
+        if ( ! ($src_category = $G_bulletin->getCategory($G_bulletin_login,
+            $src_id))
+        ) {
+            cb_throw_error(E_GRN_BULLETIN_CATEGORY_NOT_FOUND);
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        require_once('grn/uum_util.csp');
+        $uum_util = GRN_UumUtil::getInstance();
+        $dynamic_roles = $uum_util->listDynamicRoles();
+
+        // コピー元のカテゴリの通知設定権情報を取得
+        $force_notify = $src_category->get('force_notify');
+        $properties = ['force_notify' => $force_notify];
+
+        require_once('grn/access_resources.csp');
+        $notifyCategory = GRN_Bulletin_NotifyCategory::getInstance();
+        $notify_list = [];
+
+        $targets = $notifyCategory->getTargets($src_category, 'dynamic_role');
+        foreach (array_keys($targets) as $id) {
+            $mixed = null;
+            if (array_key_exists($id, $dynamic_roles)) {
+                $mixed = $id;
+            }
+            $notify_list[] = [
+                'type'  => GRN_ACCESS_TARGET_TYPE_DYNAMIC_ROLE,
+                'tid'   => $id,
+                'mixed' => $mixed
+            ];
+        }
+
+        $targets = $notifyCategory->getTargets($src_category, 'role');
+        foreach (array_keys($targets) as $id) {
+            $mixed = null;
+            if (($role = $uum->getStaticRole($id))) {
+                $mixed = $role;
+            }
+            $notify_list[] = [
+                'type'  => GRN_ACCESS_TARGET_TYPE_STATIC_ROLE,
+                'tid'   => $id,
+                'mixed' => $mixed
+            ];
+        }
+
+        $targets = $notifyCategory->getTargets($src_category, 'group');
+        foreach (array_keys($targets) as $id) {
+            $mixed = null;
+            if (($role = $uum->getGroup($id))) {
+                $mixed = $role;
+            }
+            $notify_list[] = [
+                'type'  => GRN_ACCESS_TARGET_TYPE_GROUP,
+                'tid'   => $id,
+                'mixed' => $mixed
+            ];
+        }
+
+        $targets = $notifyCategory->getTargets($src_category, 'user');
+        foreach (array_keys($targets) as $id) {
+            $mixed = null;
+            if (($role = $uum->getUser($id))) {
+                $mixed = $role;
+            }
+            $notify_list[] = [
+                'type'  => GRN_ACCESS_TARGET_TYPE_USER,
+                'tid'   => $id,
+                'mixed' => $mixed
+            ];
+        }
+
+        // 対象カテゴリへコピー
+        foreach ($target_ids as $id) {
+            $category = $G_bulletin->getCategory($G_bulletin_login, $id);
+            if ( ! $category) {
+                cb_throw_error(E_GRN_BULLETIN_CATEGORY_NOT_FOUND);
+            }
+
+            // ルートは適用先として設定できないが念のためチェックしておく
+            if ($id == GRN_BULLETIN_ROOT_CATEGORY_ID) {
+                continue;
+            }
+
+            // 登録されている通知一覧をすべて削除
+            $notifyCategory->deleteTargets($category);
+            // 強制通知設定をセット
+            $force_notify = $category->get('force_notify');
+            if ($force_notify != $properties['force_notify']) {
+                $category->setProperties($G_bulletin_login, $properties);
+            }
+            // 通知設定をセット
+            foreach ($notify_list as $notify) {
+                if ( ! is_null($notify['mixed'])) {
+                    $notifyCategory->setTarget($category, $notify['mixed'],
+                        true);
+                }
+            }
+        }
+
+        return true;
+    }
+}
+
+/**
+ *
+ * @package grn.bulletin
+ */
+class GRN_Bulletin_NotificationListener
+{
+    const KEY_SENDER_ID = 'id';
+    const KEY_SENDER_NAME = 'name';
+    const DELETED_SENDER_ID = -1;
+    const MANUALLY_ENTER_SENDER_ID = -2;
+
+    /**
+     * @var $_notify_service GRN_Notification_Service
+     */
+    private $_notify_service;
+
+    /**
+     * @var $_notification_job_register_service \grn\notification\background\NotificationJobRegisterService
+     */
+    private $_notification_job_register_service;
+
+    /**
+     * @var $_manager GRN_TableManager
+     */
+    private $_manager;
+
+    /**
+     * @var CB_DatabaseConnection
+     */
+    private $_db;
+
+    /**
+     * GRN_Bulletin_NotificationListener constructor.
+     */
+    public function __construct()
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $manager
+            = $app_locator->getTableManager('bulletin');
+        $this->_db
+            = $app_locator->getConnection('bulletin');
+        $this->_notify_service
+            = GRN_Notification_Service::getInstance();
+        $this->_notification_job_register_service
+            = NotificationJobRegisterService::create();
+        $this->_manager = $manager;
+    }
+
+    /**
+     * @param string               $action
+     * @param GRN_Bulletin_Article $article
+     *
+     * @return array
+     */
+    private function _getNotificationTargets(
+        $action,
+        GRN_Bulletin_Article $article
+    ) {
+        $category = $article->get('category');
+        $category_id = $category->getOID();
+
+        $notify_user_list = [];
+        $query = cb_queryf($this->_db,
+            "SELECT _id FROM tab_grn_bulletin_dynamicrolenotification WHERE col_category = '@S' AND col_dynamic_role IN ( 'LoginUser', 'Everyone' );",
+            $category_id);
+        $result_dynamic_role = $this->_db->query($query);
+        if ($row = $this->_db->fetch_assoc($result_dynamic_role)) {
+            $uum = cb_lwc_uum();
+            $notify_user_list = $uum->getUsersId();
+        } else {
+            $query = cb_queryf(
+                $this->_db,
+                "SELECT col_user AS id FROM tab_grn_bulletin_subscribecategory AS bs, tab_cb_user AS u"
+                .
+                " WHERE bs.col_user = u._id AND u.col_deleted IS NULL AND bs.col_category = '@S'"
+                .
+                " UNION " .
+                "SELECT col_user AS id FROM tab_grn_bulletin_usernotification AS bun, tab_cb_user AS u"
+                .
+                " WHERE bun.col_user = u._id AND u.col_deleted IS NULL AND bun.col_category = '@S'"
+                .
+                " UNION " .
+                "SELECT u._id AS id FROM tab_grn_bulletin_groupnotification AS bgn, tab_cb_usergrouprelation AS ug, tab_cb_user AS u"
+                .
+                " WHERE bgn.col_group = ug.col_group AND ug.col_user = u._id AND u.col_deleted IS NULL AND bgn.col_category = '@S'"
+                .
+                " UNION " .
+                "SELECT u._id AS id FROM tab_grn_bulletin_rolenotification AS brn, tab_cb_userrolerelation AS ur, tab_cb_user AS u"
+                .
+                " WHERE brn.col_role = ur.col_role AND ur.col_user = u._id AND u.col_deleted IS NULL AND brn.col_category = '@S';",
+                $category_id, $category_id, $category_id, $category_id
+            );
+            $result = $this->_db->query($query);
+            while ($row = $this->_db->fetch_assoc($result)) {
+                $notify_user_list[] = $row['id'];
+            }
+            $this->_db->free_result($result);
+        }
+        $this->_db->free_result($result_dynamic_role);
+
+        if ( ! $category->get('force_notify')) {
+            $dao = new BulletinFacade();
+            $unsubscribe_user_ids
+                = $dao->selectUnSubscribeCategoryUserByCategoryId($category->getOID());
+            $notify_user_list = array_diff($notify_user_list,
+                $unsubscribe_user_ids);
+        }
+
+        if ($action != 'create' && ! $category->get('force_notify')) {
+            require_once('bulletin/include_subscribe.csp');
+            $subscribe_article = GRN_Bulletin_SubscribeArticles::getInstance();
+            $users_unsubscribe
+                = $subscribe_article->getUnsubscribeUsers($article);
+            $notify_user_list = array_diff($notify_user_list,
+                $users_unsubscribe);
+        }
+
+        if (count($notify_user_list) > 0) {
+            // check access permission
+            $hierarchy = [];
+            require_once('bulletin/category.csp');
+            $category_factory = GRN_Bulletin_CategoryFactory::getInstance();
+            $current = $category_factory->get($category_id);
+            while ($current) {
+                $hierarchy[] = $current;
+                $current = $current->get('parent');
+            }
+
+            foreach ($hierarchy as $category) {
+                /* @var GRN_Bulletin_Category $category */
+                $obj = $category->getOID();
+                $temp_user = [];
+                $query = cb_queryf($this->_db,
+                    "SELECT col_target FROM tab_grn_bulletin_categoryentity_acl_dynamic_role WHERE col_authority_read = 1 AND col_target IN ( 'LoginUser', 'Everyone' ) AND col_object = '@S';",
+                    $obj);
+                $result = $this->_db->query($query);
+                if ($row = $this->_db->fetch_assoc($result)) {
+                    $uum = cb_lwc_uum();
+                    $temp_user = $uum->getUsersId();
+                } else {
+                    $query = cb_queryf(
+                        $this->_db,
+                        "SELECT col_target AS id FROM tab_grn_bulletin_categoryentity_acl_cb_user AS bua"
+                        .
+                        " WHERE bua.col_authority_read = 1 AND bua.col_object = '@S'"
+                        .
+                        " UNION " .
+                        "SELECT ug.col_user AS id FROM tab_grn_bulletin_categoryentity_acl_cb_group AS bga, tab_cb_usergrouprelation AS ug"
+                        .
+                        " WHERE bga.col_target = ug.col_group AND bga.col_authority_read = 1 AND bga.col_object = '@S'"
+                        .
+                        " UNION " .
+                        "SELECT ur.col_user AS id FROM tab_grn_bulletin_categoryentity_acl_cb_role AS bra, tab_cb_userrolerelation AS ur"
+                        .
+                        " WHERE bra.col_target = ur.col_role AND bra.col_authority_read = 1 AND bra.col_object = '@S';",
+                        $obj, $obj, $obj
+                    );
+                    $result_temp = $this->_db->query($query);
+                    while ($row = $this->_db->fetch_assoc($result_temp)) {
+                        $temp_user[] = $row['id'];
+                    }
+                    $this->_db->free_result($result_temp);
+                }
+                $this->_db->free_result($result);
+
+                $security_model = $category->get('security_model');
+                if ($security_model == 1)//REVOKE
+                {
+                    $notify_user_list = array_diff($notify_user_list,
+                        $temp_user);// user exists array A, not exits array B
+                } else {
+                    $notify_user_list = array_intersect($temp_user,
+                        $notify_user_list);// user exists two array
+                }
+
+                if (count($notify_user_list) == 0) {
+                    break;
+                }
+            }
+        }
+
+        return $notify_user_list;
+    }
+
+    /**
+     * 通知の確認処理
+     *
+     * @param CB_User              $user      閲覧ユーザー
+     * @param GRN_Bulletin_Article $article   記事
+     * @param CB_TimeStamp         $timestamp 確認時刻
+     */
+    public function confirmNotification(
+        $user,
+        GRN_Bulletin_Article $article,
+        CB_TimeStamp $timestamp
+    ) {
+        $notify_service = GRN_Notification_Service::getInstance();
+        $current_notify = $notify_service->getNotifyDataProperties($user,
+            GRN_BULLETIN_MODULEID, $article->getOID());
+        if ($current_notify && ! $current_notify->isStatusConfirmed()) {
+            $notify_service->confirmNotifyData($user, GRN_BULLETIN_MODULEID,
+                $article->getOID(), $timestamp);
+        }
+    }
+
+    /**
+     * @param                                     $action
+     * @param GRN_Bulletin_Article                $article
+     * @param CB_User|array('id'=>xx, 'name'=>xx) $sender
+     *        if $sender is an array, id=0: sender is a manually input sender, id=-1: sender is a deleted user.
+     * @param string                              $subject
+     * @param string                              $abstract
+     * @param CB_TimeStamp                        $timestamp
+     * @param int                                 $follow_id
+     */
+    public function registerBackgroundNotification(
+        $action,
+        GRN_Bulletin_Article $article,
+        $sender,
+        $subject,
+        $abstract,
+        CB_TimeStamp $timestamp,
+        $follow_id = null
+    ) {
+        $addresses = $this->_getNotificationTargets($action, $article);
+        if (count($addresses) == 0) {
+            return;
+        }
+
+        $org_data = [
+            'cid'   => $article->getId('category'),
+            'files' => $article->getNumFiles()
+        ];
+        if ( ! is_null($follow_id)) {
+            $org_data['follow'] = $follow_id;
+        }
+
+        $notification = new GRN_Notification_Data();
+        $notification->setUniqueId($article->getOID());
+        $notification->setModuleId(GRN_BULLETIN_MODULEID);
+        $notification->setSubjectData($subject);
+
+        if ($sender instanceof CB_User) {
+            $notification->setSenderData($sender->get('display_name'),
+                $sender->getOID());
+        } else {
+            $notification->setSenderData($sender[self::KEY_SENDER_NAME],
+                $sender[self::KEY_SENDER_ID]);
+            global $G_container_base;
+            $uum = $G_container_base->getInstance('uum');
+            $sender = $uum->getUser(1);
+        }
+
+        $notification->setAbstractData($abstract);
+        $notification->setTimeStampData($timestamp);
+        $notification->setOrgData($org_data);
+        $notification->setActionId($action);
+        $notification->setStatusToUpdate();
+        $this->_notification_job_register_service->register(BackgroundJobName::SEND_NOTIFICATION,
+            $notification, $sender, $addresses);
+    }
+}

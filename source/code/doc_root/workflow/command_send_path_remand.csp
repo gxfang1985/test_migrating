@@ -1,0 +1,217 @@
+<?php
+
+use grn\grn\JSONResponse;
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    global $G_INPUT;
+    $json = JSONResponse::create();
+
+    //Instantiate Smarty Object
+    require_once("grn/smarty.csp");
+    $t = new GRN_Smarty;
+
+    //Get Parameter
+    $folder_id = @ $G_INPUT['fid'];    //Folder ID
+    $petition_id = @ $G_INPUT['pid'];    //Petition ID
+    $command = @ $G_INPUT['cmd'];    //Command
+    $mode = @ $G_INPUT['mode'];   //Mode Parameter
+    $simple = @ $G_INPUT['simple'];
+    $cpsf = @ $G_INPUT['cpsf'];
+    $handle = @ $G_INPUT['handle'];
+
+    //Get Session Key
+    require_once('workflow/controller_util.csp');
+    require_once('grn/controller.csp');
+    $tmp_key = grn_get_temporary_key();
+
+    //Create Parameter Translation Map for Petition
+    $translation_map_petition = [
+        'ptid' => '_id',  //Petition ID
+        'user' => 'user', //User
+    ];
+
+    $petition_util = GRN_Workflow_Petition_Controller_Utility::getInstance();
+    $petition = $petition_util->getView($petition_id,
+        $translation_map_petition);
+
+    //Check Petition Owner
+    global $G_workflow_login_user;
+    if ($petition['user'] != $G_workflow_login_user->getOID()) {
+        //Petition Not Found
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_PETITION_NOT_FOUND);
+    }
+
+    //Check Command Parameter
+    switch ($command) {
+        case 'back':
+            //Redirect Back Page
+            if (defined('AJAX_REQUEST')) {
+                $json->response([
+                    'link' => cb_get_full_url('workflow/send_form_remand', [
+                        'fid'     => $folder_id,
+                        'pid'     => $petition_id,
+                        'mode'    => $mode,
+                        'sf'      => 1,
+                        'simple'  => $simple,
+                        'cpsf'    => $cpsf,
+                        'tmp_key' => $tmp_key
+                    ])
+                ]);
+                cb_safe_exit();
+            }
+            cb_redirect('workflow/send_form_remand', [
+                'fid'     => $folder_id,
+                'pid'     => $petition_id,
+                'mode'    => $mode,
+                'sf'      => 1,
+                'simple'  => $simple,
+                'cpsf'    => $cpsf,
+                'tmp_key' => $tmp_key
+            ]);
+        case 'cancel':
+            grn_workflow_cleanup_session($t, 'remand', $tmp_key);
+            //Redirect Cancel Page
+            if ($cpsf) {
+                $params = ['cpsf' => $cpsf, 'tmp_key' => $tmp_key];
+            } else {
+                $params = ['fid' => $folder_id, 'pid' => $petition_id];
+            }
+            if (defined('AJAX_REQUEST')) {
+                $json->response([
+                    'link' => cb_get_full_url('workflow/handle', $params)
+                ]);
+                cb_safe_exit();
+            }
+            cb_redirect('workflow/handle', $params);
+            break;
+        default:
+            break;
+    }
+
+    //Validation Check
+    require_once('SmartyValidate.class.php');
+    SmartyValidate::connect($t);
+    $target_name = 'workflow/send_path_remand';
+    $session_target = $target_name . $tmp_key;
+    SmartyValidate::register_form($session_target);
+
+    //Prepare Path Step Validation
+    $send_path_data_list = [];
+    foreach (array_keys($G_INPUT) as $key) {
+        if (strpos($key, 'all_path_step_') === 0) {
+            $keys = explode('_', $key);
+            $values = $G_INPUT[$key];
+            if (is_array($values) && count($values) > 0) {
+                $send_path_data_list[$keys[3]] = $values;
+                $G_INPUT["path_step_{$keys[3]}_sUID"] = count($values);
+            } else {
+                $G_INPUT["path_step_{$keys[3]}_sUID"] = null;
+            }
+        }
+    }
+
+    //Get Session
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session = $session_manager->getSession($session_target);
+    //Add Path Step Data To Session
+    $session->set('send_path_data_list', $send_path_data_list);
+
+    //Validate After POST
+    if (SmartyValidate::is_valid($G_INPUT, $session_target)) {
+        // 最終承認の処理者の（省略）を禁止
+        $session = $session_manager->getSession('workflow/send_form_remand'
+                                                . $tmp_key);
+        $path_steps = $session->get('path_step_data_list');
+        if ( ! is_array($path_steps) || 0 == count($path_steps)) {
+            // フォームがない
+            require_once('workflow/error_code.csp');
+            cb_throw_error(E_GRN_WRKF_DENY_REQUEST_DATA);
+        }
+        foreach (array_keys($path_steps) as $path_step_id) {
+            $path_step =& $path_steps[$path_step_id];
+            if (array_key_exists($path_step_id, $send_path_data_list)) {
+                $path_step['col_activate'] = true;
+            } else {
+                $path_step['col_activate'] = false;
+            }
+        }
+        $controller_util = new GRN_Workflow_ControllerUtil($target_name);
+        $controller_util->connectPathStepLink($path_steps);
+
+        $top_path_step = current($path_steps);
+        if ($controller_util->isOnlyCircularPathSteps($top_path_step)) {
+            $is_skip = true;
+            foreach ($send_path_data_list as $send_path_data) {
+                $is_skip &= false !== array_search(0, $send_path_data);
+            }
+
+            if ($is_skip) {
+                // すべての回覧経路ステップを省略できない
+                require_once('workflow/error_code.csp');
+                cb_throw_error(E_GRN_WRKF_DENY_ALL_SKIP_PATH_STEP_DATA);
+            }
+        } else {
+            if ($path_step
+                =& $controller_util->getLastAcceptancePathStep($top_path_step)
+            ) {
+                $send_path_data = $send_path_data_list[$path_step['_id']];
+                if (false !== array_search(0, $send_path_data)) {
+                    // 最終承認の経路ステップは省略できない
+                    require_once('workflow/error_code.csp');
+                    cb_throw_error(E_GRN_WRKF_DENY_SKIP_PATH_STEP_DATA);
+                }
+            }
+        }
+
+        //Create Parameter Translation Map
+        $translation_map = [
+            'fid'  => '_fid',
+            'pid'  => '_pid',
+            'mode' => 'mode',
+        ];
+
+        //Do Parameter Translation
+        $properties = [];
+        foreach ($translation_map as $view_name => $model_name) {
+            $properties[$model_name] = @ $G_INPUT[$view_name];
+        }
+
+        //Validation Session Finished
+        SmartyValidate::unregister_form($session_target);
+
+        //Redirect Next Page
+        $json->response([
+            'link' => cb_get_full_url('workflow/send_confirm_remand', [
+                'fid'     => $properties['_fid'],
+                'pid'     => $properties['_pid'],
+                'mode'    => $properties['mode'],
+                'sf'      => 1,
+                'simple'  => $simple,
+                'cpsf'    => $cpsf,
+                'handle'  => $handle,
+                'tmp_key' => $tmp_key
+            ])
+        ]);
+        cb_safe_exit();
+    } else {
+        $session = $session_manager->getSession('workflow/send_form_remand'
+                                                . $tmp_key);
+        $petition_for_view = $session->get('petition');
+        if ( ! is_array($petition_for_view) || 0 == count($petition_for_view)) {
+            // フォームがない
+            require_once('workflow/error_code.csp');
+            cb_throw_error(E_GRN_WRKF_DENY_REQUEST_DATA);
+        }
+
+        header(CB_ERROR_HEADER . 'error_validation');
+        $json->response([
+            'validation'    => false,
+            'error_message' => $t->fetch('grn/show_validation_errors.tpl')
+        ]);
+        cb_safe_exit();
+    }
+}
+
+

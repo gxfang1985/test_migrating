@@ -1,0 +1,405 @@
+<?php
+
+cb_require_role('CommandLine');
+
+/*
+ * Forcibly reset the administration password (the database password)
+ * from command-line.
+ *
+ */
+
+// disable output buffering for command-line
+while (ob_get_level() > 0) {
+    ob_end_clean();
+}
+
+// enable automatic flushing upon every 'echo'.
+ob_implicit_flush();
+
+//////////////////////////////////////////////////////////////////////////
+$util = GRN_UpgradeMysql_Util::getInstance();
+$need_versionup = 1;
+if (array_key_exists('need_versionup', $G_INPUT)) {
+    $need_versionup = $G_INPUT['need_versionup'];
+}
+
+if (array_key_exists('use_installed_mysql', $G_INPUT)) {
+    define('USE_INSTALLED_MYSQL', 1);
+}
+
+if ($need_versionup == 1) {
+    $console = false;
+    $password = false;
+
+    if (array_key_exists('password', $G_INPUT)) {
+        $password = $G_INPUT['password'];
+    }
+
+    if ($password === false) {
+        if ($console === false) {
+            $console = fopen('php://stdin', 'r');
+            if ($console === false) {
+                exit(1);
+            }
+        }
+        echo "\n";
+        echo "DB Root Password: ";
+        $password = trim(fgets($console), "\r\n");
+    }
+
+    if ( ! $util->initialize($password)) {
+        $util->logging("Invalid Password!\n");
+        exit(1);
+    }
+
+    if ( ! defined('USE_INSTALLED_MYSQL')) {
+        //run mysql_upgrade command
+        if ( ! $util->upgradeMySQLDB($password)) {
+            $util->logging("Run the mysql_upgrade command fail!\n");
+            exit(1);
+        }
+    }
+}
+
+global $G_config_common;
+$cgi_dir = $G_config_common->get('Global', 'cgi_dir');
+if (is_file($cgi_dir . '/garoon.ini.old')) {
+    $grn_old_config = new CB_ConfigManager($cgi_dir . '/garoon.ini.old');
+    $old_version = $grn_old_config->get('System', 'version');
+    if (is_file($cgi_dir . '/garoon.ini')) {
+        global $G_config_grn;
+        $G_config_grn->set('System', 'version', $old_version);
+        $G_config_grn->save();
+    }
+}
+
+// execute versionup script
+$util->execute();
+
+// re-connect DB ( avoiding the connection timeout caused by mysql long sleep )
+$db = cb_get_master_db();
+$db->reconnect();
+
+class GRN_UpgradeMysql_Util
+{
+    var $log_on = true;
+    var $echo_on = true;
+    var $log_format = "versionup_%03d.log";
+    var $log_lines = 0;
+    var $log_max_lines = 10000;
+    var $log_idx = 0;
+
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_UpgradeMysql_Util();
+        }
+
+        return $_instance;
+    }
+
+    function initialize($password)
+    {
+        //password check
+        global $G_container_base;
+        $dbconn =& $G_container_base->getInstance('dbconn');
+        $conn = @mysqli_connect($dbconn->_host, 'cbroot', $password);
+        if ($conn) {
+            @mysqli_close($conn);
+        } else {
+            return false;
+        }
+        $this->logging("DB root password corrected! ");
+
+        return true;
+    }
+
+    function execute()
+    {
+        // check existing versionup_scripts directory in tmp
+        $versionup_script_dir = cb_tmpdir() . '/versionup_scripts';
+        if ( ! $this->_isExistsVersionupScripts($versionup_script_dir)) {
+            return false;
+        }
+
+        // run versionup script update.csp
+        if ( ! $this->_invokeVersionupScript($versionup_script_dir)) {
+            $this->logging('!!! Versionup1 is failed !!!');
+            exit(1);
+        }
+
+        // run versionup after script update_after.csp
+        if ( ! $this->_invokeVersionupScript_2($versionup_script_dir)) {
+            $this->logging('!!! Versionup2 is failed !!!');
+            exit(2);
+        }
+
+        if ( ! $this->_isNeedConvertDatabaseScheme()) {
+            $this->logging("Need not Forest Converter");
+
+            return true;
+        }
+
+        // remove versionup script in tmp
+
+        $this->logging("start removing versionup scripts");
+
+        $this->_removeVersionupScripts($versionup_script_dir);
+        if (is_dir(cb_tmpdir() . '/update')) {
+            $this->_removeVersionupScripts(cb_tmpdir() . '/update');
+        }
+
+        $this->logging("end removing versionup scripts");
+    }
+
+    function upgradeMySQLDB($password)
+    {
+        $this->logging("start upgrading mysqldb");
+        $mysqli_default_socket = ini_get("mysqli.default_socket");
+        $mysql_dir = dirname(dirname($mysqli_default_socket));
+        $mysql_bin_dir = $mysql_dir . '/bin';
+        if ( ! chdir($mysql_bin_dir)) {
+            $this->logging("!!! can not chdir:${mysql_bin_dir}");
+
+            return false;
+        }
+
+        $mysql_default_port = ini_get("mysqli.default_port");
+
+        global $G_container_base;
+        $dbconn =& $G_container_base->getInstance('dbconn');
+        $host = explode(":", $dbconn->_host);
+        if (is_string($host)) {
+            $host = trim($host);
+            $port = $mysql_default_port;
+        } else {
+            if (array_key_exists(1, $host)) {
+                $port = trim($host[1]);
+            } else {
+                $port = $mysql_default_port;
+            }
+            $host = trim($host[0]);
+        }
+
+        if ($host == 'localhost') {
+            $host = '127.0.0.1';
+        }
+
+        $command_upgrade = null;
+        $is_win = (strncasecmp(php_uname('s'), 'WIN', 3) == 0);
+        if ($is_win) {
+            $command_upgrade
+                = "mysql_upgrade.exe -f -u cbroot -P ${port} -h ${host} -p${password}";
+        } else {
+            $command_upgrade
+                = "./mysql_upgrade -f -u cbroot -P ${port} -h ${host} -p${password}";
+        }
+
+        exec("${command_upgrade}", $output, $return_var);
+
+        if (is_array($output)) {
+            foreach ($output as $line) {
+                $this->logging($line);
+            }
+        }
+
+        if ( ! is_numeric($return_var) || $return_var != 0) {
+            $this->logging("!!! can not execute mysql_upgrade command");
+
+            return false;
+        }
+
+        $this->logging("execute mysql_upgrade command finished.");
+
+        $this->logging("end upgrading mysqldb");
+
+        return true;
+    }
+
+    function _isExistsVersionupScripts($versionup_script_dir)
+    {
+        if ( ! is_dir($versionup_script_dir)) {
+            $this->logging('skip running versionup script...');
+
+            return false;
+        }
+
+        return true;
+    }
+
+    private function getExeName()
+    {
+        $appfile = "";
+        // GTM-1483
+        $is_win = (strncasecmp(php_uname('s'), 'WIN', 3) == 0);
+        if ($is_win) {
+            $appfile = 'grn.exe';
+        } else {
+            $appfile = './grn.cgi';
+        }
+
+        return $appfile;
+    }
+
+    function _invokeVersionupScript($versionup_script_dir)
+    {
+        $basedir = cb_basedir();
+
+        $appfile = $this->getExeName();
+
+        $use_installed_mysql = "";
+        if (defined('USE_INSTALLED_MYSQL')) {
+            $use_installed_mysql = "use_installed_mysql";
+        }
+
+        chdir($basedir);
+        $update_script = $versionup_script_dir . '/update.csp';
+        $archive_tar_gz = $versionup_script_dir . '/archive.tar.gz';
+        $phandle = popen("${appfile} -C -q -d output_buffering=false -f "
+                         .
+                         '"' . $update_script . '" ' .
+                         '"' . $archive_tar_gz . '" ' .
+                         $use_installed_mysql,
+            'r');
+        if ($phandle === false) {
+            $this->logging('!!! failed running update.csp.');
+
+            return false;
+        }
+
+        $out = '';
+        while ( ! feof($phandle)) {
+            $out .= fread($phandle, 1024);
+        }
+        $this->logging($out);
+
+        $exit_code = pclose($phandle);
+        if ($exit_code != 0) {
+            // スクリプトが異常終了
+            $this->logging('!!! failed running update.csp.');
+
+            return false;
+        }
+
+        return true;
+    }
+
+    function _invokeVersionupScript_2($versionup_script_dir)
+    {
+        $basedir = cb_basedir();
+        chdir($basedir);
+        global $G_INPUT;
+        $build_date = array_key_exists('build_date', $G_INPUT)
+            ? $G_INPUT['build_date'] : '';
+        if ($build_date === '') {
+            $this->logging('!!! build_date is missing.');
+
+            return false;
+        }
+
+        $update_script = $versionup_script_dir . '/update_after.csp';
+
+        if ( ! file_exists($update_script)) {
+            $this->logging('update_after.csp does not exist. Skipped the execution of the script.');
+
+            return true;
+        }
+
+        $appfile = $this->getExeName();
+
+        $phandle = popen("${appfile} -C -q -d output_buffering=false -f " .
+                         '"' . $update_script . '" ' .
+                         '"' . $build_date . '" ',
+            'r');
+
+        if ($phandle === false) {
+            $this->logging('!!! failed running update_after.csp.');
+
+            return false;
+        }
+
+        $out = '';
+        while ( ! feof($phandle)) {
+            $out .= fread($phandle, 1024);
+        }
+        $this->logging($out);
+
+        $exit_code = pclose($phandle);
+        if ($exit_code != 0) {
+            // スクリプトが異常終了
+            $this->logging('!!! failed running update_after.csp.');
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     *  フォレストコンバータを走らせる必要があるかどうかをチェックする
+     */
+    function _isNeedConvertDatabaseScheme()
+    {
+        $lwc = new CB_ConfigManager(cb_basedir() . '/lwc.ini');
+        $host = $lwc->get('dbconn', 'prop:_host');
+        preg_match("/val:([^:]*)(:([0-9]+))?/", $host, $matched);
+        $host = $matched[1];
+
+        return $host == 'localhost' || $host == '127.0.0.1';
+    }
+
+    function _removeVersionupScripts($src, $empty_only = false)
+    {
+        $dh = @opendir($src);
+        if ( ! $dh) {
+            return;
+        }
+
+        while (($r = @readdir($dh)) !== false) {
+            if (($r != '.') && ($r != '..')) {
+                $src_child = "$src/$r";
+
+                if (is_dir($src_child)) {
+                    $this->_removeVersionupScripts($src_child, $empty_only);
+                } else {
+                    if ($empty_only === false) {
+                        @unlink($src_child);
+                    }
+                }
+            }
+        }
+
+        @closedir($dh);
+        @rmdir($src);
+
+        return;
+    }
+
+    function logging($message)
+    {
+        $date = date("r");
+        if ($this->log_on) {
+            if ($this->log_lines >= $this->log_max_lines) {
+                $this->log_idx++;
+                $this->log_lines = 0;
+            }
+
+            $log_file = cb_basedir() . '/' . sprintf($this->log_format,
+                    $this->log_idx);
+
+            if ($this->log_lines === 0) {
+                $log = fopen($log_file, 'w');
+            } else {
+                $log = fopen($log_file, 'a');
+            }
+            fwrite($log, "[${date}] ${message}\n");
+            fclose($log);
+            $this->log_lines++;
+        }
+        if ($this->echo_on) {
+            echo "[${date}] ${message}\n";
+        }
+    }
+}
+

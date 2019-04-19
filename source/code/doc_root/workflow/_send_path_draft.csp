@@ -1,0 +1,348 @@
+<?php
+require_once('grn/uum.csp');
+
+use grn\grn\access\service\AppAccess;
+
+global $G_container_base;
+$grn_uum = $G_container_base->getInstance('uum');
+$login = $grn_uum->getLoginUser();
+
+//Get Parameter
+$folder_id = @ $G_INPUT['fid'];    //Folder ID
+$petition_id = @ $G_INPUT['pid'];    //Petition ID
+$sf = @ $G_INPUT['sf'];     //Session Hold Flag
+$mode = @ $G_INPUT['mode'];   //Mode Parameter
+$simple = @ $G_INPUT['simple'];
+
+//Get Session Key
+require_once('workflow/controller_util.csp');
+require_once('grn/controller.csp');
+$tmp_key = grn_get_temporary_key();
+$t->assign('tmp_key', $tmp_key);
+$t->assign('session_suffix', 'draft');
+
+//Get Session
+require_once('fw/session_manager.csp');
+$session_manager = CB_SessionManager::getInstance();
+$session_send_form =& $session_manager->getSession('workflow/send_form_draft'
+                                                   . $tmp_key);
+$session_send_path =& $session_manager->getSession('workflow/send_path_draft'
+                                                   . $tmp_key);
+
+//Load Send Form Session (for Design)
+$form_for_view = $session_send_form->get('form');
+if ( ! is_array($form_for_view) || 0 == count($form_for_view)) {
+    // フォームがない
+    require_once('workflow/error_code.csp');
+    cb_throw_error(E_GRN_WRKF_DENY_REQUEST_DATA);
+}
+$item_list_for_view = $session_send_form->get('item_list');
+$path_for_view = $session_send_form->get('path');
+$path_step_list_for_view = $session_send_form->get('path_step_list');
+$path_step_data_list_for_view
+    = $session_send_form->get('path_step_data_list');
+$default_path_step_list_for_view
+    = $session_send_form->get('default_path_step_list');
+$path_skip_for_view = $session_send_form->get('path_skip');
+$path_skip_data_for_view = $session_send_form->get('path_skip_data');
+
+//Load Send Form Session (for Data)
+$send_form_data_list = $session_send_form->get('send_form_data_list');
+
+// 未分類でないカテゴリのアクセス権をチェック
+$category_id = $form_for_view['category'];
+if (0 == strlen($category_id)) {
+    $category_id = GRN_WORKFLOW_CATEGORY_NONPARTY_ID;
+}
+if (GRN_WORKFLOW_CATEGORY_NONPARTY_ID != $category_id) {
+    $category_util = GRN_Workflow_Category_Controller_Utility::getInstance();
+    $category_util->checkAccess($category_id, true, CB_DATABASE_NO_LOCK);
+}
+
+//Create Parameter Translation Map for Petition
+$translation_map_petition = [
+    'ptid'   => '_id',  //Petition ID
+    'user'   => 'user', //User
+    'status' => 'status', //Status
+];
+
+$petition_util = GRN_Workflow_Petition_Controller_Utility::getInstance();
+$petition = $petition_util->getView($petition_id,
+    $translation_map_petition);
+
+if ($petition['status'] == GRN_WORKFLOW_STATUS_UNPROCESSING_CANCEL) {
+    $default_path_step_list_for_view = $path_step_data_list_for_view;
+}
+
+//Check Session Hold Flag
+if ($sf != 1) {
+//-------------- Clear Session Section --------------//
+
+    //Clear Send Path Session (for Data)
+    $session_send_path->unset_by('send_path_data_list');
+} else {
+    //Load Send Path Session (for Data)
+    $send_path_data_list = $session_send_path->get('send_path_data_list');
+    if ($send_path_data_list) {
+        //Replace Default Path Step User by Path Step Data List
+        $uids = [];
+        foreach (array_keys($send_path_data_list) as $path_step_id) {
+            $default_path_step_list_for_view[$path_step_id]['users'] = [];
+            $default_path_step_list_for_view[$path_step_id]['uids'] = [];
+
+            foreach ($send_path_data_list[$path_step_id] as $user_id) {
+                $path_step_user = [];
+                if ($user_id == 0) {
+                    $path_step_user['_id'] = $user_id;
+                    $path_step_user[GRN_WORKFLOW_COLUMN_DISPLAY_NAME]
+                        = cb_plain_msg(GRN_WORKFLOW_MODULE_ID,
+                        'skip');
+                    $path_step_user[GRN_WORKFLOW_COLUMN_FOREIGN_KEY]
+                        = cb_plain_msg(GRN_WORKFLOW_MODULE_ID,
+                        'skip');
+                    $default_path_step_list_for_view[$path_step_id]['users'][]
+                        = $path_step_user;
+                    $default_path_step_list_for_view[$path_step_id]['uids'][]
+                        = $user_id;
+                } else {
+                    $uids[] = $user_id;
+                }
+            }
+        }
+
+        $columns = ['col_display_name', 'col_foreign_key', 'col_position'];
+        $users = $grn_uum->getUsersInfo($uids, $columns);
+
+        foreach (array_keys($send_path_data_list) as $path_step_id) {
+            foreach ($send_path_data_list[$path_step_id] as $user_id) {
+                if (0 != $user_id) {
+                    $path_step_user = [];
+                    $path_step_user['_id'] = $user_id;
+                    if (array_key_exists($user_id, $users)) {
+                        $path_step_user[GRN_WORKFLOW_COLUMN_DISPLAY_NAME]
+                            = GRN_ControllerUtil::getUserNameText($login->getOID(),
+                            $user_id);
+                        $path_step_user[GRN_WORKFLOW_COLUMN_FOREIGN_KEY]
+                            = $users[$user_id]['col_foreign_key'];
+                        $path_step_user['col_position']
+                            = $users[$user_id]['col_position'];
+                    }
+                    $default_path_step_list_for_view[$path_step_id]['users'][]
+                        = $path_step_user;
+                    $default_path_step_list_for_view[$path_step_id]['uids'][]
+                        = $user_id;
+                }
+            }
+        }
+    }
+}
+
+//Evaluate Path Condition
+$current_path_step_list = null;
+if ($petition['status'] == GRN_WORKFLOW_STATUS_UNPROCESSING_CANCEL
+    && count($path_skip_data_for_view) !== 0
+) {
+    require_once('workflow/path_condition_data_logic.csp');
+    $path_condition_data_logic
+        = GRN_Workflow_Path_Condition_Data_Logic::getInstance();
+    $condition_path_step_data_list
+        = $path_condition_data_logic->getEvaluatedPathStepDatas($default_path_step_list_for_view,
+        $path_skip_data_for_view, $send_form_data_list);
+
+    //Unset Path Step Condition
+    foreach (array_keys($default_path_step_list_for_view) as $path_step_data_id) {
+        if ( ! array_key_exists($path_step_data_id,
+            $condition_path_step_data_list)
+        ) {
+            unset($default_path_step_list_for_view[$path_step_data_id]);
+        }
+    }
+} elseif ($petition['status'] != GRN_WORKFLOW_STATUS_UNPROCESSING_CANCEL
+          && count($path_skip_for_view) !== 0
+) {
+    require_once('workflow/path_condition_logic.csp');
+    $path_condition_logic = GRN_Workflow_Path_Condition_Logic::getInstance();
+    $condition_path_step_list
+        = $path_condition_logic->getEvaluatedPathSteps($path_step_list_for_view,
+        $path_skip_for_view, $send_form_data_list, $item_list_for_view);
+
+    //Unset Path Step Condition
+    foreach (array_keys($default_path_step_list_for_view) as $path_step_id) {
+        if ( ! array_key_exists($path_step_id, $condition_path_step_list)) {
+            unset($default_path_step_list_for_view[$path_step_id]);
+        }
+    }
+}
+
+$default_path_for_view = [];
+$users_id_init_default = [];
+
+foreach ($default_path_step_list_for_view as $key => $value) {
+    if (count($value['uids']) > 0) {
+        $users_id_init_default = array_merge($users_id_init_default,
+            $value['uids']);
+    }
+}
+$users_id_init_default = array_unique($users_id_init_default);
+if (($index = array_search(0, $users_id_init_default)) !== false) {
+    unset($users_id_init_default[$index]);
+}
+if (count($users_id_init_default) > 0) {
+    $uids_allow
+        = AppAccess::filterUserIdsInternalAccessByAppId($users_id_init_default,
+        'workflow');
+    $uids_unset = array_diff($users_id_init_default, $uids_allow);
+}
+foreach ($default_path_step_list_for_view as $key => $value) {
+    if (isset($uids_unset) && count($uids_unset) > 0
+        && count($value['users']) > 0
+    ) {
+        foreach ($uids_unset as $uid_unset) {
+            if (($poss = array_search($uid_unset, $value['uids'])) !== false) {
+                unset($value['uids'][$poss]);
+                foreach ($value['users'] as $key2 => $user) {
+                    if ($user['_id'] == $uid_unset) {
+                        unset($value['users'][$key2]);
+                    }
+
+                }
+            }
+        }
+    }
+    $default_path_for_view[$key] = $value;
+}
+
+$controller_util = new GRN_Workflow_ControllerUtil();
+$controller_util->connectPathStepLink($default_path_for_view);
+$default_path_step = current($default_path_for_view);
+$path_step_id
+    = $controller_util->getLastAcceptancePathStepId($default_path_step);
+if ($path_step_id) {
+    $default_path_step =& $default_path_for_view[$path_step_id];
+    if ($default_path_step['col_skip']
+        || false !== array_search(0, $default_path_step['uids'])
+    ) {
+        $default_path_step['users'] = [];
+        $default_path_step['uids'] = [];
+        $default_path_step['user_count'] = 0;
+        $default_path_step['col_skip'] = false;
+    }
+}
+
+//Remove deleted users from path steps for view
+foreach (array_keys($default_path_for_view) as $path_key) {
+    $path =& $default_path_for_view[$path_key];
+
+    foreach (array_keys($path['uids']) as $uid_key) {
+        if (is_null($path['uids'][$uid_key])) {
+            unset($path['uids'][$uid_key]);
+        }
+    }
+
+    $columns = ['col_display_name', 'col_foreign_key', 'col_position'];
+    $users = $grn_uum->getUsersInfo($path['uids'], $columns);
+    foreach (array_keys($path['users']) as $user_key) {
+        if (array_key_exists('col_user', $path['users'][$user_key])) {
+            //Rename username if username is changed.
+            if (array_key_exists($path['users'][$user_key]['_id'], $users)) {
+                $path['users'][$user_key][GRN_WORKFLOW_COLUMN_DISPLAY_NAME]
+                    = GRN_ControllerUtil::getUserNameText($login->getOID(),
+                    $path['users'][$user_key]['_id']);
+                $path['users'][$user_key][GRN_WORKFLOW_COLUMN_FOREIGN_KEY]
+                    = $users[$path['users'][$user_key]['_id']]['col_foreign_key'];
+            }
+            if (is_null($path['users'][$user_key]['col_user'])) {
+                unset($path['users'][$user_key]);
+            }
+        }
+    }
+    $path['user_count'] = count($path['users']);
+}
+
+// copy path step data id for template
+if ($petition['status'] == GRN_WORKFLOW_STATUS_UNPROCESSING_CANCEL) {
+    foreach (array_keys($default_path_for_view) as $key) {
+        $default_path_for_view[$key]['col_path_step']
+            = $default_path_for_view[$key]['col_path_step_data'];
+    }
+}
+
+//Check Petition Owner
+global $G_workflow_login_user;
+if ($petition['user'] != $G_workflow_login_user->getOID()) {
+    //Petition Not Found
+    require_once('workflow/error_code.csp');
+    cb_throw_error(E_GRN_WRKF_PETITION_NOT_FOUND);
+}
+
+$petition_util = GRN_Workflow_Petition_Controller_Utility::getInstance();
+foreach ($item_list_for_view as $key => $item) {
+    if ($item['type'] == 1) {
+        $subject = $petition_util->getSubjectView($item);
+        if (strlen($subject) > 0) {
+            $form_for_view['subject'] = $subject;
+        }
+    }
+}
+
+//Assign Display Infomation
+//Assign Folder ID
+$t->assign('folder_id', $folder_id);
+//Assign Petition ID
+$t->assign('petition_id', $petition_id);
+
+//Assign Form
+$t->assign('form', $form_for_view);
+//Assign path
+$t->assign('path', $path_for_view);
+//Assign Path Step List
+$t->assign('path_step_list', $default_path_for_view);
+//Assign Path Step Count
+$t->assign('path_step_count', count($default_path_for_view));
+
+//Assign Mode
+$t->assign('mode', $mode);
+$t->assign('simple', $simple);
+
+$t->assign('plugin', [
+    'name'   => 'common',
+    'params' => [
+        'action'       => null,
+        'session_name' => cb_get_pagename(),
+        'app_id'       => 'workflow'
+    ]
+]);
+
+//-- set page title and site position
+
+//page title
+$page_title = grn_get_current_page_display_name();
+$t->assign('page_title', $page_title);
+
+//site position
+$t->assign('site_position', [
+        [
+            'page' => 'workflow/index',
+            'name' => grn_get_page_display_name('workflow/index'),
+            'fid'  => $folder_id
+        ],
+        [
+            'page' => 'workflow/view',
+            'name' => grn_get_page_display_name('workflow/view'),
+            'fid'  => $folder_id,
+            'pid'  => $petition_id
+        ],
+        [
+            'page'    => 'workflow/send_form_draft',
+            'name'    => grn_get_page_display_name('workflow/send_form_draft'),
+            'fid'     => $folder_id,
+            'pid'     => $petition_id,
+            'mode'    => $mode,
+            'sf'      => 1,
+            'tmp_key' => $tmp_key
+        ],
+        ['page' => '', 'name' => $page_title]
+    ]
+);
+
+

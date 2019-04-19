@@ -1,0 +1,712 @@
+<?php
+
+/**
+ * RSS Reader Personal Logic
+ *
+ * @author  Eiji TAEN    2005/03
+ * @version 1.0
+ * @package grn.rss
+ */
+
+require_once('rss/resources.csp');
+require_once('rss/config.csp');
+
+/**
+ * RSS Reader personal logic class
+ *
+ * @author  Eiji TAEN    2005/03
+ * @version 1.0
+ * @package grn.rss
+ */
+class GRN_RSS_PersonalLogic extends GRN_RSS_ConfigBase
+{
+    var $_profile = null;
+
+    // database connection instance
+    var $_db;
+
+    /**
+     * constructor
+     */
+    function __construct()
+    {
+        parent::__construct('Personal');
+
+        require_once('rss/tables.csp');
+        $manager = GRN_RSS_TableManager::getInstance();
+        $table = $manager->getTableInfo('GRN_RSS_PersonalFolder');
+        $this->_db = $table->getDBConnection();
+    }
+
+    private static $_instance = null;
+
+    /**
+     * get instance
+     *
+     * @return GRN_RSS_PersonalLogic
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * initialize personal config
+     */
+    function initialize(& $user)
+    {
+        require_once('rss/folder.csp');
+        $folder = GRN_RSS_FolderManager::getInstance();
+        $row = $folder->getPersonalFolder($user, GRN_RSS_PERSONALROOTFOLDER, CB_DATABASE_SHARED_LOCK);
+
+        if ($row) {
+            return false;
+        }
+
+        if ( ! $row) {
+            require_once('rss/tables.csp');
+            $manager = GRN_RSS_TableManager::getInstance();
+            $table = $manager->getTableInfo('GRN_RSS_PersonalFolder');
+            $row = $table->newRow();
+            $row->set('user', $user);
+            $row->set('title', 'personal_root');
+            $row->set('type', strval(GRN_RSS_FOLDER_ROOT));
+            $row->registerNow();
+        }
+
+        return true;
+    }
+
+    /**
+     * get personal channel
+     *
+     * @param    object $user CB_User
+     * @param    string $id   folder relation OID
+     *
+     * @return   object   GRN_RSS_PersonalChannelInfo
+     *                    if specified channel doesn't exist, return FALSE.
+     */
+    function getPersonalChannelInfo(& $user, $id)
+    {
+        $strquery = cb_queryf($this->_db, "col_user = '@S' AND ",
+            $user->getOID());
+        $ret = $this->_getChannelInfo($id, $strquery);
+
+        return $ret;
+    }
+
+    function getPersonalChannelInfoByURL(& $user, $url)
+    {
+        $strquery = cb_queryf($this->_db, "col_user = '@S' AND ",
+            $user->getOID());
+        $ret = $this->_getChannelInfoByURL($url, $strquery);
+
+        return $ret;
+    }
+
+    /**
+     * add personal channel list
+     *
+     * @param    object $user       CB_User
+     * @param    string $channel_id channel id (channel url)
+     * @param    array  $channel    channel data
+     *
+     * @option   string   $folder_id    folder id (default: GRN_RSS_PERSONALROOTFOLDER)
+     * @return   mixed    GRN_RSS_PersonalFolderRelation
+     *                    if specified channel already exist, return TRUE.
+     *                    if specified folder doesn't exist, return FALSE.
+     *
+     * $channel['title']       => string   channel title
+     *         ['memo']        => string   channel memo
+     */
+    function addPersonalChannelInfo(
+        $user,
+        $channel_id,
+        $channel,
+        $folder_id = GRN_RSS_PERSONALROOTFOLDER
+    ) {
+        require_once('rss/folder.csp');
+        $folder_manager = GRN_RSS_FolderManager::getInstance();
+        $folder_row = $folder_manager->getPersonalFolder($user, $folder_id);
+        if ( ! $folder_row) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $channel_info_row = $this->getPersonalChannelInfoByURL($user,
+            $channel_id);
+        if ($channel_info_row !== false) {
+            $ret = true;
+
+            return $ret;
+        }
+
+        // add/update channel row and get it
+        require_once('rss/logic.csp');
+        $rss_logic = new GRN_RSS_ReaderLogic();
+        $channel_row = $rss_logic->onDemandSyncDataByURL($channel_id, true,
+            true);
+        $channel_row->set('user_num', $channel_row->get('user_num') + 1);
+
+
+        // add personal channel
+        $channel['channel'] =& $channel_row;
+        $personal_row = $this->_addPersonalChannelInfo($user, $channel_id,
+            $channel);
+        if ( ! $personal_row) {
+            $ret = true;
+
+            return $ret;
+        }
+
+        //write log notice create personal site
+        $cid = $channel_row->getOID();//channel ID
+        $url = $channel_row->get('id');// URL
+        $memo = '';
+        if (array_key_exists('memo', $channel)) {
+            $memo = $channel['memo'];//memo 
+        }
+        $user_id = $user->getOID();//user ID 
+        require_once('rss/inspection.csp');
+        $inspection = GRN_Rss_Inspection::getInstance();
+        if ($inspection->isEnabled()) {
+            $inspection->writeInspectionLogNotice('create', 'personal_rss', [
+                'cid'  => $cid,
+                'url'  => $url,
+                'memo' => $memo,
+                'uid'  => $user_id
+            ]);
+        }
+        // add personal folder relation
+        $ret = $this->_addPersonalFolderRelation($user, $folder_row,
+            GRN_RSS_RELATION_TYPE_CHANNEL,
+            $personal_row);
+
+        return $ret;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param    object $user    CB_User
+     * @param    string $id      channel id (channel url)
+     * @param    array  $channel channel data
+     *
+     * @return   mixed    GRN_RSS_PersonalChannelInfo
+     *                    if specified channel already exist, return FALSE.
+     *
+     * $channel['title']   => string   channel title
+     *         ['memo']    => string   channel memo
+     *         ['channel'] => object   GRN_RSS_Channel
+     */
+    function _addPersonalChannelInfo(& $user, $id, $channel)
+    {
+        require_once('rss/tables.csp');
+
+        $row = $this->getPersonalChannelInfoByURL($user, $id);
+        if ($row) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $row = $this->_addChannelInfo($channel);
+        $row->set('user', $user);
+
+        return $row;
+    }
+
+    /**
+     * @access   private
+     */
+    function _addPersonalFolderRelation(& $user, & $parent, $type, & $data)
+    {
+        $row = $this->_addFolderRelation($parent, $type, $data);
+        $row->set('user', $user);
+
+        return $row;
+    }
+
+    /**
+     * modify personal channel information
+     *
+     * @param    object $user        CB_User
+     * @param    string $relation_id personal relation ID
+     * @param    array  $channel     personal channel data
+     * @param    string $memo        personal channel memo
+     * @param    string $new_url     RSS data url
+     *
+     * @option   string   $parent_id     parent folder id (default: GRN_RSS_PERSONALROOTFOLDER)
+     * @return   mixed    GRN_RSS_PersonalChannelInfo
+     *                    return FALSE if specified $relation_id or $parent_id doesn't exist.
+     *
+     * $channel['title'] => string   channel title
+     *         ['memo']  => string   channel memo
+     */
+    function modifyPersonalChannelInfo(
+        $user,
+        $relation_id,
+        $channel,
+        $new_url,
+        $parent_id = GRN_RSS_PERSONALROOTFOLDER
+    ) {
+        require_once('rss/tables.csp');
+        $table_manager = GRN_RSS_TableManager::getInstance();
+        $table
+            = $table_manager->getTableInfo('GRN_RSS_PersonalFolderRelation');
+
+        // relation
+        $db = $table->getDBConnection();
+        $rowset = new CB_RowSet($table, 'p');
+        $rowset->addJoin($table_manager->getTableInfo('CB_User'),
+            "p.col_user = u._id AND u.col_deleted IS NULL",
+            CB_DATABASE_INNER_JOIN,
+            'u');
+        $rowset->addCondition(cb_queryf($db,
+            'p._id = \'@S\' AND p.col_user = \'@S\'', $relation_id,
+            $user->getOID()));
+        $rowset->setLock(CB_DATABASE_NO_LOCK);
+        $relation_row = $rowset->iterate();
+        $rowset->destroy();
+
+        if ( ! $relation_row) {
+            require_once('rss/error_code.csp');
+            cb_throw_error(E_GRN_RSS_NO_SITE_INFO);
+        }
+
+        // folder
+        $folder_row = $relation_row->get('parent');
+        if ($folder_row->getOID() !== $parent_id
+            && (strcmp($parent_id, GRN_RSS_PERSONALROOTFOLDER) !== 0
+                || intval($folder_row->get('type') !== GRN_RSS_FOLDER_ROOT))
+        ) {
+            require_once('rss/folder.csp');
+            $folder_manager = GRN_RSS_FolderManager::getInstance();
+            $folder_row = $folder_manager->getPersonalFolder($user,
+                $parent_id);
+            if ( ! $folder_row) {
+                $ret = false;
+
+                return $ret;
+            }
+            $channel['parent'] = $folder_row;
+        }
+
+        // personal channel
+        $channel_info_row = $relation_row->get('channel');
+
+        // channel
+        require_once('grn/rss.csp');
+        $channel_row = $channel_info_row->get('channel');
+        $old_url = $channel_row->get('id');
+        $url = '';
+        $cid = $channel_row->getOID();//channel ID
+        $url = $old_url; // URL
+        if (strcmp($old_url, $new_url) !== 0) // url was modified
+        {
+            // $new_url already exists?
+            if ($this->getPersonalChannelInfoByURL($user, $new_url) !== false) {
+                $ret = false;
+
+                return $ret;
+            }
+
+            // update new channel data
+            require_once('rss/logic.csp');
+            $rss_logic = new GRN_RSS_ReaderLogic();
+            $new_channel_row = $rss_logic->onDemandSyncDataByURL($new_url, true,
+                true);
+            $new_channel_row->set('user_num',
+                $new_channel_row->get('user_num') + 1);
+            $channel['channel'] = $new_channel_row;
+
+            // modify personal channel info
+            $channel_info_row->setData($channel);
+            $channel_info_row->updateNow();
+
+            // delete channel and cache file
+            $this->_deletePersonalChannel($channel_row);
+
+            //write log notice modify personal site
+            $url = $new_channel_row->get('id');// URL
+        } else {
+            // modify personal channel
+            $channel_info_row->setData($channel);
+        }
+        $memo = '';
+        if (array_key_exists('memo', $channel)) {
+            $memo = $channel['memo'];//memo
+        }
+        require_once('rss/inspection.csp');
+        $inspection = GRN_Rss_Inspection::getInstance();
+        if ($inspection->isEnabled()) {
+            $inspection->writeInspectionLogNotice('modify', 'personal_rss', [
+                'cid'  => $cid,
+                'url'  => $url,
+                'memo' => $memo,
+                'uid'  => $user->getOID()
+            ]);
+        }
+
+        return $channel_info_row;
+    }
+
+    /**
+     * delete personal channel
+     *
+     * @param    object $user        CB_User
+     * @param    string $relation_id relation ID
+     *
+     * @return   mixed    object    GRN_RSS_PersonalChannelInfo
+     *                    boolean   return FALSE if specified channel doesn't exist
+     */
+    function deletePersonalChannelInfo(& $user, $relation_id)
+    {
+        require_once('rss/tables.csp');
+        $manager = GRN_RSS_TableManager::getInstance();
+        $table = $manager->getTableInfo('GRN_RSS_PersonalFolderRelation');
+        $db = $table->getDBConnection();
+        $rowset = new CB_RowSet($table, 'p');
+        $rowset->addJoin($manager->getTableInfo('CB_User'),
+            "p.col_user = u._id AND u.col_deleted IS NULL",
+            CB_DATABASE_INNER_JOIN,
+            'u');
+        $rowset->addCondition(cb_queryf($db,
+            'p._id = \'@S\' AND p.col_user = \'@S\'', $relation_id,
+            $user->getOID()));
+        $rowset->limit(0, 1);
+        $rowset->setLock(CB_DATABASE_NO_LOCK);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        if ( ! $row) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        // get personal channel
+        $row = $row->get('channel');
+
+        // channel
+        require_once('grn/rss.csp');
+        $channel_row = $row->get('channel');
+
+        //write log notice delete  personal site
+        $cid = $channel_row->getOID();//channel ID
+        $url = $channel_row->get('id');// URL
+        $user_id = $user->getOID();
+        require_once('rss/inspection.csp');
+        $inspection = GRN_Rss_Inspection::getInstance();
+        if ($inspection->isEnabled()) {
+            $inspection->writeInspectionLogNotice('delete', 'personal_rss',
+                ['cid' => $cid, 'url' => $url, 'uid' => $user_id]);
+        }
+
+        // delete channel and cache file
+        $channel = $row->get('channel');
+        $this->_deletePersonalChannel($channel);
+
+        $row->delete();
+
+        return $row;
+    }
+
+    /**
+     * @access   private
+     *
+     * @param    object $channel_row GRN_RSS_Channel
+     */
+    function _deletePersonalChannel(& $channel_row)
+    {
+        $user_num = $channel_row->get('user_num');
+
+        if ($user_num == 1) // no one share specified channel
+        {
+            require_once('rss/system.csp');
+            $system = GRN_RSS_SystemLogic::getInstance();
+            if ( ! $system->getSharedChannelInfoByURL($channel_row->get('id'))) {
+                // specified channel is not shared channel
+                $this->_deleteChannel($channel_row);
+            }
+        }
+        $channel_row->set('user_num', $user_num - 1);
+    }
+
+    /**
+     * change personal relation order
+     *
+     * @param    object $user          CB_User
+     * @param    array  $relation_list relation list
+     *
+     * @option   string   $folder_id   personal folder id (default: GRN_RSS_PERSONALROOTFOLDER)
+     *
+     * $relation_list[personal relation OID] => display order
+     */
+    function changePersonalRelationOrder(
+        & $user,
+        $relation_list,
+        $folder_id = GRN_RSS_PERSONALROOTFOLDER
+    ) {
+        require_once('rss/folder.csp');
+        $folder_manager = GRN_RSS_FolderManager::getInstance();
+        $folder_row =& $folder_manager->getPersonalFolder($user,
+            $folder_id);
+        if ( ! $folder_row) {
+            return false;
+        }
+        $folder_id = $folder_row->getOID();
+
+        $strquery = cb_queryf($this->_db, "col_user = '@S' AND ",
+            $user->getOID());
+
+        //$this->_changeRelationOrder( $relation_list, $folder_id,
+        //                             'col_user = ' . $user->getOID() . ' AND ' );
+
+        $this->_changeRelationOrder($relation_list, $folder_id, $strquery);
+    }
+
+    /**
+     * get personal delimiter
+     *
+     * @param    object $user CB_User
+     * @param    string $id   folder relation OID
+     *
+     * @return   object   GRN_RSS_PersonalChannelInfo
+     *                    if specified channel doesn't exist, return FALSE.
+     */
+    function getPersonalDelimiter($user, $id)
+    {
+        $ret = $this->_getDelimiter($id,
+            'col_user = ' . $user->getOID() . ' AND ');
+
+        return $ret;
+    }
+
+    /**
+     * add delimiter
+     *
+     * @param    object $user CB_User
+     *
+     * @option   string   $folder_id   personal folder id (default: GRN_RSS_PERSONALROOTFOLDER)
+     * @return   mixed    GRN_RSS_PersonalFolderRelation
+     *                    if specified folder doesn't exist, return FALSE.
+     */
+    function addDelimiter(& $user, $folder_id = GRN_RSS_PERSONALROOTFOLDER)
+    {
+        require_once('rss/folder.csp');
+        $folder_manager = GRN_RSS_FolderManager::getInstance();
+        $folder_row =& $folder_manager->getPersonalFolder($user,
+            $folder_id);
+        if ( ! $folder_row) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $row =& $this->_addDelimiter($folder_row);
+        $row->set('user', $user);
+
+        return $row;
+    }
+
+    /**
+     * delete delimiter
+     *
+     * @param    object   CB_User
+     * @param    string $relation id   relation ID
+     *
+     * @return   mixed    GRN_RSS_PersonalFolderRelation
+     *                    if specified relation doesn't exist, return FALSE.
+     */
+    function deleteDelimiter($user, $relation_id)
+    {
+        $row = $this->_getDelimiter($relation_id);
+        if ( ! $row) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $owner = $row->get('user');
+        if ( ! $owner || $owner->getOID() !== $user->getOID()) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $row->delete();
+
+        return $row;
+    }
+
+    /**
+     * get personal relation list
+     *
+     * @param    object $user CB_User
+     *
+     * @option   string   $folder_id   personal folder id (default: GRN_RSS_PERSONALROOTFOLDER)
+     * @return   mixed    array
+     *                    if specified folder doesn't exist, return FALSE.
+     *
+     * return[relation id]          => array   (key: relation id)
+     *                    ['title']       => string   relation data title
+     *                    ['type']        => int      relation type (see resources.csp)
+     *                    ['has_error']   => boolean
+     *                    ['channel_oid'] => string   channel OID
+     */
+    function getPersonalRelationList(
+        & $user,
+        $folder_id = GRN_RSS_PERSONALROOTFOLDER
+    ) {
+        require_once('rss/folder.csp');
+        $folder_manager = GRN_RSS_FolderManager::getInstance();
+        $folder_row = $folder_manager->getPersonalFolder($user, $folder_id);
+        if ( ! $folder_row) {
+            return false;
+        }
+
+        $strquery = cb_queryf($this->_db, "r.col_user = '@S' AND ",
+            $user->getOID());
+
+        //return $this->_getRelationList( $folder_row,
+        //                                'r.col_user = ' . $user->getOID() . ' AND ' );
+
+        return $this->_getRelationList($folder_row, $strquery);
+
+    }
+
+    /**
+     * get message application user profile
+     *
+     * @access   private
+     *
+     * @param    object $user CB_User
+     *
+     * @return   object   CB_Profile
+     */
+    function _getUserProfile(& $user)
+    {
+        if (is_null($this->_profile)) {
+            require_once('rss/application.csp');
+            $reader = new GRN_RSS_Reader();
+            $this->_profile = $reader->getUserProfile($user);
+        }
+
+        return $this->_profile;
+    }
+
+    /**
+     * get specified attribute
+     *
+     * @access   private
+     *
+     * @param    object $user    CB_User
+     * @param    string $name    attribute name
+     * @param    string $default default value
+     *
+     * @return   string              specified attribute. if it doesn't exist, return $default
+     */
+    function _getAttribute(& $user, $name, $default)
+    {
+        $profile = $this->_getUserProfile($user);
+
+        if ( ! $profile->getAttribute($name, $value)) {
+            return $default;
+        }
+
+        return $value;
+    }
+
+    /**
+     * set specified attribute
+     *
+     * @access   private
+     *
+     * @param    object $user  CB_User
+     * @param    string $name  attribute name
+     * @param    string $value attribute value
+     *
+     * @return   boolean           TRUE: success setting attribute, FALSE: fail
+     */
+    function _setAttribute(& $user, $name, $value)
+    {
+        $profile =& $this->_getUserProfile($user);
+
+        if ( ! $profile->getAttribute($name, $dummy)) {
+            if ( ! $profile->createAttribute($name, $value)) {
+                return false;
+            }
+        } else {
+            if ( ! $profile->updateAttribute($name, $value)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * get 'open other window' attribute
+     *
+     * @param    object $user CB_User
+     *
+     * @return   string   'open other window' attribute
+     */
+    function getOpenOtherWindowAttribute(& $user)
+    {
+        return $this->_getAttribute($user, 'personal_open_other_window', '1');
+    }
+
+    /**
+     * set 'open other window' attribute
+     *
+     * @param    object $user              CB_User
+     * @param    string $open_other_window '1': open other window, '0': use same window
+     *
+     * @return   boolean   TRUE: success setting attribute
+     *                     FALSE: fail to set attribute
+     */
+    function setOpenOtherWindowAttribute(& $user, $open_other_window)
+    {
+        return $this->_setAttribute($user, 'personal_open_other_window',
+            $open_other_window);
+    }
+
+    /**
+     * get 'use shared' attribute
+     *
+     * @param    object $user CB_User
+     *
+     * @return   string   'use shared' attribute
+     */
+    function getUseSharedAttribute(& $user)
+    {
+        return $this->_getAttribute($user, 'personal_use_shared', '1');
+    }
+
+    /**
+     * set 'use shared' attribute
+     *
+     * @param    object $user       CB_User
+     * @param    string $use_shared '1': use shared channel, '0': do not use
+     *
+     * @return   boolean   TRUE: success setting attribute
+     *                     FALSE: fail to set attribute
+     */
+    function &setUseSharedAttribute($user, $use_shared)
+    {
+        $ret = $this->_setAttribute($user, 'personal_use_shared', $use_shared);
+
+        return $ret;
+    }
+
+}
+
+

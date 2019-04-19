@@ -1,0 +1,1040 @@
+<?php
+
+/**
+ * メール受信ロジック
+ *
+ * @package grn.mail
+ * @author  Ikeda, ATSUSHI 2004/12
+ * @version 1.0
+ */
+
+require_once('fw/i18n.csp');
+require_once('fw/mail_message.csp');
+require_once('mail/utility.csp');
+require_once('mail/table.csp');
+require_once('grn/application.csp');
+
+use grn\grn\access\service\AppAccess;
+
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+ * メール受信ロジック
+ *
+ * @author  IKEDA, Atsushi 2004/12
+ * @version 1.0
+ * @package grn.mail
+ */
+class GRN_Mail_ReceiveLogic
+{
+    /**
+     * Return singleton.
+     *
+     * @return GRN_Mail_ReceiveLogic
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_Mail_ReceiveLogic();
+        }
+
+        return $_instance;
+    }
+
+    function __construct()
+    {
+        $this->_utility = GRN_Mail_Utility::getInstance();
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    // メンバ変数
+    /**
+     * @access private
+     */
+    var $_utility = null;
+
+    //////////////////////////////////////////////////////////////////////////
+    // private method
+
+    /**
+     * エラーメールデータ追加
+     *
+     * @access  private
+     *
+     * @param   string $uid         メールUID
+     * @param   object $user        受信するユーザー
+     * @param   object $server_info サーバー情報
+     * @param   object $account     受信に使用したアカウント
+     * @param          $subject
+     * @param          $from
+     * @param          $send_ts
+     * @param   int    $size        メールサイズ
+     * @param          $attached
+     *
+     * @return void
+     */
+    function _addPop3ErrorMail(
+        $uid,
+        & $user,
+        & $server_info,
+        & $account,
+        $subject,
+        $from,
+        & $send_ts,
+        $size,
+        $attached
+    ) {
+        assert('! is_null( $uid )');
+        assert('is_object( $user )');
+        assert('! is_null( $server_info )');
+        assert('is_object( $account )');
+
+        $retrieve_account = is_object($account)
+            ? $account->get('retrieve_account') : null;
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db =& $app_locator->getConnection('mail');
+
+        // 同じメールがある場合のみ削除（デッドロック対応）
+        $rowset
+            = new CB_RowSet($this->_utility->getTableInfo(GRN_MAIL_POP3ERRORUIDS_TABLE));
+        $query = cb_queryf($db,
+            "col_host = '@S' AND col_port = '@S' AND col_user = '@S' AND col_uid = '@S'",
+            $server_info->getRetrieve(), $server_info->getRetrievePort(),
+            $retrieve_account, $uid);
+        $rowset->addCondition($query);
+        if ( ! is_null($row = $rowset->iterate())) {
+            $row->delete();
+        }
+
+        // エラーメールデータテーブルにデータを追加
+        $table = $this->_utility->getTableInfo(GRN_MAIL_POP3ERRORUIDS_TABLE);
+        $row = $table->newRow();
+        if ( ! is_object($row)) {
+            // データ追加失敗
+            $error = E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA;
+        }
+
+        $timestamp = new CB_TimeStamp;
+        $timestamp->unix_ts = time();
+        $row->set('ogre_user', $user);
+        $row->set('account', $account);
+        $row->set('subject', $subject);
+        $row->set('from', $from);
+        $row->set('send_ts', $send_ts);
+        $row->set('size', $size);
+        $row->set('attached', $attached);
+        $row->set('timestamp', $timestamp);
+
+        $row->set('host', $server_info->getRetrieve());
+        $row->set('port', $server_info->getRetrievePort());
+        $row->set('user', $retrieve_account);
+        $row->set('uid', $uid);
+    }
+
+    /**
+     * エラーメールをメールサーバーから削除
+     *
+     * @access  private
+     *
+     * @param   string $account_id アカウントID
+     * @param   array  $uids       削除するエラーメールUID
+     *
+     * @return  mixed   メールサーバー上の残り数 or FALSE
+     */
+    function deletePop3ErrorMails($account_id, & $uids)
+    {
+        assert('! is_null( $account_id )');
+        assert('is_array( $uids )');
+
+        // メールアカウントデータを取得
+        $system_config =& $this->_utility->getSystemConfig();
+        $account =& $system_config->_getAccountRow($account_id);
+        if ( ! is_object($account)) {
+            // アカウントが見つからない
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+
+        if ( ! is_array($uids) || (count($uids) == 0)) {
+            return 0;
+        }
+
+        // メールサーバーと接続
+        $connection_logic =& $this->_utility->getConnectionLogic($account);
+        $server_info =& $connection_logic->getServerInfo();
+        $account_info =& $connection_logic->getAccountInfo();
+
+        // メールサーバーにログイン
+        $server_folder =& $connection_logic->loginRetrieveServer();
+        if ( ! is_object($server_folder)) {
+            // 接続失敗
+            cb_throw_error(E_GRN_MAIL_FAILED_TO_CONNECT_RETRIEVE_SERVER, null,
+                ['cause' => $connection_logic->formatErrors()]);
+        }
+
+        // UIDがサポートされていない
+        if ( ! $server_folder->isUIDCapable()) {
+            cb_throw_error(E_GRN_MAIL_FAILED_TO_CONNECT_RETRIEVE_SERVER, null,
+                ['cause' => $connection_logic->formatErrors()]);
+        }
+
+        // 一旦全てのエラーをクリア
+        $connection_logic->clearErrors();
+
+        // 未読メールの数を取得
+        $unseen_num = $server_folder->getUnseenMessageNumbers();
+        if ( ! is_array($unseen_num)) {
+            cb_throw_error(E_GRN_MAIL_FAILED_TO_DELETE_FROM_RETRIEVE_SERVER,
+                null, ['cause' => $connection_logic->formatErrors()]);
+        }
+
+        $new_mails = count($unseen_num);
+
+        $count = 0;
+        foreach ($uids as $id) {
+            $_msgnum = $server_folder->getMessageNumber($id);
+
+            // 該当するUIDがサーバに存在
+            if ( ! is_numeric($_msgnum)) {
+                continue;
+            }
+
+            // サーバーからメールを削除する
+            if ($server_folder->deleteMessage($_msgnum) === false) {
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_DELETE_FROM_RETRIEVE_SERVER,
+                    null, ['cause' => $connection_logic->formatErrors()]);
+            }
+
+            $count++;
+        }
+
+        // escape uids
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db =& $app_locator->getConnection('mail');
+        $escaped_uids = [];
+        foreach ($uids as $uid) {
+            $escaped_uids[] = $db->escape($uid);
+        }
+
+        // エラーメールデータテーブルから指定されたアカウントのデータを削除
+        $rowset
+            = new CB_RowSet($this->_utility->getTableInfo(GRN_MAIL_POP3ERRORUIDS_TABLE));
+        $query = 'col_account=' . $account->getOID() . ' AND col_uid IN(\''
+                 . implode('\',\'', $escaped_uids) . '\')';
+        $rowset->addCondition($query);
+        if ($rowset->deleteAllMatched() === false) {
+            cb_throw_error(E_GRN_MAIL_FAILED_TO_DELETE_FILE_DATA);
+        }
+
+        // 件数保存
+        $new_mails -= $count;
+        if ($new_mails < 0) {
+            $new_mails = 0;
+        }
+
+        $account->set('new_mails', $new_mails);
+        $account->updateNow();
+
+        return $new_mails;
+    }
+
+    /**
+     * エラーメールデータクリア
+     *
+     * @access  private
+     *
+     * @param   object $account 受信に使用したアカウント
+     *
+     * @return void
+     */
+    function _clearPop3ErrorMails(& $account)
+    {
+        assert('is_object( $account )');
+
+        // エラーメールデータテーブルから指定されたアカウントのデータを削除
+        // データが存在する場合のみ削除する。（デッドロック対応）
+        $rowset
+            = new CB_RowSet($this->_utility->getTableInfo(GRN_MAIL_POP3ERRORUIDS_TABLE));
+        $rowset->addCondition($rowset->queryf("col_account = '@S'",
+            $account->getOID()));
+        while ( ! is_null($row = $rowset->iterate())) {
+            $row->delete();
+        }
+
+    }
+
+    /**
+     * 指定されたアカウントのメールを受信
+     *
+     * @access  private
+     *
+     * @param CB_User          $user                受信するユーザー
+     * @param GRN_Mail_Account $account             受信に使用するアカウント
+     * @param string           $name_format         表示する形式（'name'/'email'/'full'）
+     * @param string           $retrieve_save
+     * @param boolean          $use_notify_mail     外部通知を使用するフラグ
+     * @param boolean          $use_address_history 送受信記録を使用するフラグ
+     * @param int              $mail_size           アカウントの総メールサイズ(Byte)
+     * @param int              $max_receive_count   最大受信件数（-1は無制限）
+     * @param int              $user_limit          受信可能総メールサイズ(Byte)（-1は無制限）
+     * @param int              $receive_limit       受信可能最大メールサイズ(Byte)（-1は無制限）
+     * @param int              $remaining           受信していないメール数を受け取る
+     * @param int              $received_size       受信したメールサイズ合計を受け取る
+     * @param int              $notify_received_num 受信した外部通知メール数を受け取る
+     * @param int              $max_receive_size    受信するメールサイズの制限値
+     *
+     * @return  array   オブジェクトIDリスト
+     */
+    function _recvMails(
+        & $user,
+        & $account,
+        $name_format,
+        $retrieve_save,
+        $use_notify_mail,
+        $use_address_history,
+        $mail_size,
+        $max_receive_count,
+        $user_limit,
+        $receive_limit,
+        & $remaining,
+        & $received_size,
+        & $notify_received_num,
+        $max_receive_size = GRN_MAIL_RECEIVE_TOTAL_SIZE_MAX
+    ) {
+        assert('is_object( $user )');
+        assert('is_object( $account )');
+
+        $max_trial_count = $this->_utility->getMailApp()
+                                          ->getMaxReceiveTrialCount();
+
+        ////////////////////////////////////////////////////////////////////////
+        // メール受信
+        $mail_ids = [];
+        $receive_counter = 0;           // 受信数
+        $received_size = 0;             // 受信メールサイズ
+        $notify_received_num = 0;       // 外部通知受信数
+        $remaining = 0;
+
+        // メールサーバーと接続
+        $connection_logic = $this->_utility->getConnectionLogic($account);
+        $server_info = $connection_logic->getServerInfo();
+        $account_info = $connection_logic->getAccountInfo();
+
+        // アカウント名
+        $account_name = $account->getTitle();
+
+        // メールサーバーにログイン
+        $server_folder = $connection_logic->loginRetrieveServer();
+        if ( ! is_object($server_folder)) {
+            // 接続失敗
+            cb_throw_error(E_GRN_MAIL_FAILED_TO_CONNECT_RETRIEVE_SERVER, null,
+                ['cause' => $connection_logic->formatErrors()]);
+        }
+
+        // 一旦全てのエラーをクリア
+        $connection_logic->clearErrors();
+
+        $error = 0;
+
+        // 未読メールの数を取得
+        $unseen_num = $server_folder->getUnseenMessageNumbers();
+        if ( ! is_array($unseen_num)) {
+            cb_throw_error(E_GRN_MAIL_FAILED_TO_DELETE_FROM_RETRIEVE_SERVER,
+                null, ['cause' => $connection_logic->formatErrors()]);
+        }
+
+        $count = count($unseen_num);
+
+        $mail_logic = $this->_utility->getMailLogic();
+        if ($use_address_history) {
+            $address_history_logic = $this->_utility->getAddressHistoryLogic();
+        } else {
+            $address_history_logic = null;
+        }
+
+        if ($count > 0) {
+            // メールデータテーブル
+            $table_name = grn_mail_get_personal_tablename($user->getOID(),
+                GRN_MAIL_MESSAGE_TABLE);
+            $table = $this->_utility->getTableInfo($table_name);
+            $ts = new CB_TimeStamp();
+            $now = time();
+
+            global $G_container_base;
+            $tzfactory = $G_container_base->getInstance('timezoneinfo_factory');
+            $i18n = CB_I18N::getInstance();
+            $timezone
+                = $tzfactory->getTimezoneInfo($i18n->getCurrentTimezone());
+
+            $set_unseen_messages = [];     // エラー等で受信できなかったメールリスト
+
+            // 名前を表示する形式
+            $name_key = 'abstract_from';
+            if ($name_format == 'name') {
+                $name_key .= '_name';
+            } elseif ($name_format == 'email') {
+                $name_key .= '_email';
+            }
+
+            $account_title = $account->get('name');
+            $account_email = $account->get('email');
+            if (is_null($account_title) || (mb_strlen($account_title) == 0)) {
+                if ( ! is_null($account_email)
+                     && (strlen($account_email) > 0)
+                ) {
+                    require_once('mail/utility.csp');
+                    $account_title
+                        = GRN_Mail_Utility::static_addEmailBracket($account_email,
+                        'add');
+                }
+            }
+            $notify_mail_logic = $this->_utility->getNotificationMailLogic();
+            require_once('grn/notification.csp');
+            $inside_notify_data = new GRN_Notification_Data;
+            $inside_notify_data->setModuleId(GRN_MAIL_MODULE_ID);
+            $inside_notify_data->setStatusToUnread();
+            // Always treat a mail notification as a fresh new notification
+            $inside_notify_data->setActionId(GRN_NOTIFICATION_ACTION_CREATE_ID);
+
+            $outside_notify_data = new GRN_Notification_Data;
+
+            $notify_data_list = [];
+            $traial = 0;
+            $send_ts = new CB_TimeStamp;
+
+            // 未読メールを取得
+            // 受信だけして、ループしないケースが存在するため、試行回数を先に比較する
+            while ($traial < $max_trial_count
+                   && ($retval
+                    = $server_folder->getNextUnseenMessage())) {
+                if ( ! is_array($retval)) {
+                    break;
+                }
+
+                /** @var CB_MailIMAPMessage|CB_MailPOP3Message $msg */
+                $msg =& $retval['message'];
+                $msgnum = $retval['msgnum'];
+                $send_ts->unix_ts = $now;
+
+                if (is_null($msg)) {
+                    assert('FALSE');
+                    continue;
+                }
+
+                $size = $msg->getSize();
+                /*** GREQ-265 start ***/
+                if (defined('ON_FOREST')) {
+                    if (0 < $receive_limit && $receive_limit < $size
+                        && $server_folder->isUIDCapable()
+                    ) {
+                        // ヘッダーデータを取得
+                        $raw_headers = $msg->getAllRawHeaders();
+
+                        // メールの表題をデコード
+                        if ($raw_headers && isset($raw_headers['subject'])) {
+                            $subject = $raw_headers['subject']->value;
+                        } else {
+                            $subject = '';
+                        }
+                        // メールの送信者をデコード
+                        if ($raw_headers && isset($raw_headers['from'])) {
+                            $from = $raw_headers['from']->value;
+                        } else {
+                            $from = '';
+                        }
+                        // メールの送信日時を変換
+                        if ($raw_headers && isset($raw_headers['date'])
+                            && is_string($raw_headers['date']->value)
+                        ) {
+                            if (false !== ($parse_timestamp
+                                    = $this->_parseDate($raw_headers['date']->value))
+                            ) {
+                                $send_ts->unix_ts = $parse_timestamp;
+                            }
+                        }
+
+                        // エラーデータ追加
+                        $_uid = $server_folder->getMessageUID($msgnum);
+                        $this->_addPop3ErrorMail($_uid, $user, $server_info,
+                            $account, $subject, $from, $send_ts, $size, false);
+
+                        // メールを未読に戻す
+                        $set_unseen_messages[] = $msgnum;
+                        $msg->unsetMailContents();
+                        $traial++;
+                        continue;
+                    }
+                }
+                /*** GREQ-265 end ***/
+
+                // Subject, From, Date
+                $subject = $msg->getSubject();
+
+                //require_once( 'fw/string_util.csp' );
+                $from = '';
+                $from_list = $msg->getHeaderValues('from');
+
+                if (is_array($from_list)) {
+                    foreach ($from_list as $temp) {
+                        if (strlen($from) > 0) {
+                            $from .= ', ';
+                        }
+                        $from .= $temp;
+                    }
+                }
+
+                if (strlen($from) == 0) {
+                    // メールのチェック
+                    $msg->_fetchSource();
+                    $mail_source =& $msg->_source_data;
+                    if (is_null($mail_source)) {
+                        // メールを未読に戻す
+                        $set_unseen_messages[] = $msgnum;
+                        $msg->unsetMailContents();
+                        $traial++;
+                        continue;
+                    }
+                }
+
+                // 送信日時
+                $date = $msg->getDate();
+
+                if (is_null($date)) {
+                    // メールのチェック
+                    $msg->_fetchSource();
+                    $mail_source =& $msg->_source_data;
+                    if (is_null($mail_source)) {
+                        // メールを未読に戻す
+                        $set_unseen_messages[] = $msgnum;
+                        $msg->unsetMailContents();
+                        $traial++;
+                        continue;
+                    }
+                }
+
+                if (is_string($date)) {
+                    if (false !== ($tmp_ts = $this->_parseDate($date))) {
+                        $send_ts->unix_ts = $tmp_ts;
+                    }
+                }
+
+                if ( ! defined('ON_FOREST')) {
+                    // サイズチェック
+                    if (($receive_limit >= 0) && ($size > $receive_limit)
+                        && $server_folder->isUIDCapable()
+                    ) {
+                        // 添付ファイル有無
+                        //$file_count = count( $files );
+                        $fileAttached
+                            = $mail_logic->_isFileAttachedMailMessage($msg);
+
+                        // メールソースがある場合にはエラー追加
+                        $msg->_fetchSource();
+                        $mail_source =& $msg->_source_data;
+                        //$mail_source = $msg->getSourceData();                    
+                        if (is_null($mail_source)) {
+                            // メールを未読に戻す
+                            $set_unseen_messages[] = $msgnum;
+                            $msg->unsetMailContents();
+                            $traial++;
+                            continue;
+                        }
+
+                        // エラーデータ追加
+                        $_uid = $server_folder->getMessageUID($msgnum);
+                        $this->_addPop3ErrorMail($_uid, $user, $server_info,
+                            $account, $subject, $from, $send_ts, $size,
+                            $fileAttached);
+
+                        // メールを未読に戻す
+                        $set_unseen_messages[] = $msgnum;
+                        $msg->unsetMailContents();
+                        $traial++;
+                        continue;
+                    }
+                }
+
+                ///////////////////////
+                // 外部通知処理
+                if ($use_notify_mail) {
+                    if ($notify_mail_logic->processNotifyMail($user, $msg,
+                        $outside_notify_data)
+                    ) {
+                        // 外部通知だったら次へ
+                        $notify_received_num++;
+                        $receive_counter++;
+                        $msg->unsetMailContents();
+                        $traial++;
+                        continue;
+                    }
+                }
+
+                // メールをDBに保存
+                $folder = null;
+                $row = $mail_logic->_addMailRow($user, $account, $folder,
+                    $table, $msg, $subject, $from, $ts, $date, $send_ts,
+                    $error, $address_history_logic);
+                if ( ! is_object($row)) {
+                    if ($error !== 0) {
+                        // メールを未読に戻す
+                        $set_unseen_messages[] = $msgnum;
+                        break;
+                    } else {
+                        // メールを未読に戻す
+                        $set_unseen_messages[] = $msgnum;
+                        $msg->unsetMailContents();
+                        $traial++;
+                        continue;
+                    }
+                }
+
+                $mail_id = $row->getOID();
+                $mail_ids[] = $mail_id;
+                $receive_counter++;
+
+                // 通知
+                $dest_folder = $row->get('folder');
+                if ( ! is_null($dest_folder)
+                     && $dest_folder->get('subscribed') == 1
+                ) {
+                    $notify_mail_logic->createNotificationData($inside_notify_data,
+                        $row,
+                        $account_title, $name_key,
+                        $name_format,
+                        $notify_data_array);
+                    $notify_data_list[$notify_data_array['col_unique_id']]
+                        = $notify_data_array;
+                }
+
+                // サイズ更新
+                $size = $row->get('size');
+                if (isset($size) && ! is_null($size)) {
+                    $received_size += $size;
+                }
+
+                if (($receive_counter >= $max_receive_count
+                     && 0 <= $max_receive_count)
+                    || ($received_size >= $max_receive_size
+                        && 0 <= $max_receive_size)
+                ) {
+                    // 最大受信件数または最大受信サイズに到達
+                    break;
+                }
+
+
+                // 総サイズ制限チェック
+                if (($user_limit >= 0)
+                    && ($received_size + $mail_size >= $user_limit)
+                ) {
+                    // これ以上受信しない
+                    break;
+                }
+                $msg->unsetMailContents();
+                $traial++;
+
+                if ($receive_counter % 100 === 0) {
+                    gc_collect_cycles();
+                }
+            }
+
+            // メールを未読に戻す
+            if (count($set_unseen_messages) > 0) {
+                // メールサーバーの削除リストから除外
+                $server_folder->setUnseen($set_unseen_messages);
+            }
+
+            if ($error === 0) {
+                if ($retrieve_save != GRN_MAIL_RETRIEVE_SAVE_LEAVE) {
+                    //既読メールを削除する
+                    $server_folder->deleteSeenMessages();
+                }
+            }
+
+            // 通知登録
+            if (count($notify_data_list) > 0) {
+                require_once('grn/notification.csp');
+                $notify_service = GRN_Notification_Service::getInstance();
+                $notify_service->addNotifyDataListByUniqueId($user,
+                    $notify_data_list);
+            }
+
+        }
+
+        // エラー発生
+        if ($error !== 0) {
+            // サーバーから切断
+            $connection_logic->abortRetrieveServer();
+            cb_throw_error($error);
+        }
+
+        $remaining = ($count > $receive_counter) ? ($count - $receive_counter)
+            : 0;
+
+        // 件数保存
+        $account->set('new_mails', $remaining);
+        $account->updateNow();
+
+        return $mail_ids;
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    // public method
+
+    /**
+     * 指定されたアカウントの新着メール数を取得
+     *
+     * @param   object  $user          受信するユーザー
+     * @param   string  $account_id    受信に使用するアカウントID
+     * @param   int     $check_span    前回チェック時から必要な間隔（秒）。0以下の場合は無視される
+     * @param   boolean $b_disconnect  処理後に切断するフラグ
+     * @param   boolean $b_throw_error エラー発生時に例外をスローするか(default:TRUE)
+     *
+     * @return  int     新着メール数
+     */
+    function getNewMailCount(
+        & $user,
+        $account_id,
+        $check_span,
+        $b_disconnect = false,
+        $b_throw_error = true
+    ) {
+        // 現在日時
+        $now = time();
+
+        assert('is_object( $user )');
+        assert('! is_null( $account_id )');
+
+        // メールアカウントデータを取得
+        $system_config = $this->_utility->getSystemConfig();
+        $account = $system_config->_getAccountRow($account_id);
+        if ( ! is_object($account)) {
+            if ($b_throw_error) {
+                // アカウントが見つからない
+                cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+            } else {
+                return 0;
+            }
+        }
+
+        // メール使用停止設定チェック
+        if ( ! $system_config->canUseMail()) {
+            // エラーメールデータクリア
+            $this->_clearPop3ErrorMails($account);
+
+            return 0;
+        }
+
+        // 受信可能かチェック
+        $no_account = $no_server = false;
+        if ( ! $account->canReceive($no_account, $no_server)) {
+            // エラーメールデータクリア
+            $this->_clearPop3ErrorMails($account);
+
+            return 0;
+        }
+
+        if ( ! is_null($check_span) && ($check_span > 0)) {
+            $check_mail_ts = $account->get('check_mail_ts');
+            if (is_object($check_mail_ts)
+                && ($check_mail_ts->unix_ts + $check_span >= $now)
+            ) {
+                // 一定間隔経過していないとチェックしない
+                $new_mails = $account->get('new_mails');
+                if (is_null($new_mails)) {
+                    return 0;
+                } else {
+                    return (int)$new_mails;
+                }
+            }
+        }
+
+        // エラーメールデータクリア
+        $this->_clearPop3ErrorMails($account);
+
+        // メールサーバーにログイン
+        $connection_logic = $this->_utility->getConnectionLogic($account);
+        $server_folder = $connection_logic->loginRetrieveServer();
+        if ( ! is_object($server_folder)) {
+            if ($b_throw_error) {
+                // 接続失敗
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_CONNECT_RETRIEVE_SERVER,
+                    null, ['cause' => $connection_logic->formatErrors()]);
+            } else {
+                return 0;
+            }
+        }
+        // メールサーバー上の新着メールの数を取得
+        $unseen_num = $server_folder->getUnseenMessageNumbers();
+        $count = count($unseen_num);
+
+        if ($b_disconnect) {
+            // 切断
+            $connection_logic->disconnectFromRetrieveServer();
+        }
+
+        // チェック日時保存
+        $ts = new CB_TimeStamp;
+        $ts->unix_ts = time();
+        $account->set('check_mail_ts', $ts);
+
+        // 件数保存
+        $account->set('new_mails', $count);
+        $account->updateNow();
+
+        return $count;
+    }
+
+    /**
+     * 全アカウントの新着メール数を取得
+     *
+     * @param   object  $user          受信するユーザー
+     * @param   int     $check_span    前回チェック時から必要な間隔（秒）。0以下の場合は無視される
+     * @param   boolean $b_disconnect  処理後に切断するフラグ
+     * @param   boolean $b_throw_error エラー発生時に例外をスローするか(default:TRUE)
+     *
+     * @return  int     新着メール数
+     */
+    function getNewMailCountForAllAccount(
+        & $user,
+        $check_span,
+        $b_disconnect = false,
+        $b_throw_error = true
+    ) {
+        assert('is_object( $user )');
+
+        // メールアカウントデータ一覧を取得
+        $rowset
+            = new CB_RowSet($this->_utility->getTableInfo(GRN_MAIL_ACCOUNT_TABLE),
+            'a');
+        $rowset->addCondition($rowset->queryf("a.col_user = '@S'",
+            $user->getOID()));
+        $rowset->addCondition("a.col_disabled = 0");
+        $rowset->addCondition("a.col_deleted = 0");
+        $user_table_info =& $this->_utility->getTableInfo('cb_user');
+        $on = 'a.col_user = u._id AND u.col_deleted IS NULL';
+        $rowset->addJoin($user_table_info, $on, CB_DATABASE_INNER_JOIN, 'u');
+        $rowset->addOrderColumn('a.col_list_index', false);      // ソート
+        $rowset->addOrderColumn(null, false);                  // OID順
+        $rowset->setOidOnly();
+
+        $count = 0;
+        while ( ! is_null($account_id = $rowset->iterate())) {
+            $count += $this->getNewMailCount($user, $account_id, $check_span,
+                $b_disconnect, $b_throw_error);
+        }
+
+        return $count;
+    }
+
+    /**
+     * 指定されたアカウントのメールを受信
+     *
+     * @param CB_User $user                受信するユーザー
+     * @param string  $account_id          受信に使用するアカウントID
+     * @param bool    $use_notify_mail     外部通知を使用するフラグ
+     * @param int     $max_receive_count   最大受信件数（-1は無制限）
+     * @param int     $remaining           受信していないメール数を受け取る
+     * @param int     $notify_received_num 受信した外部通知メール数を受け取る
+     * @param int     $max_receive_size    受信するメールサイズの制限値
+     *
+     * @return string[] オブジェクトIDリスト
+     */
+    function recvMails(
+        & $user,
+        $account_id,
+        $use_notify_mail,
+        $max_receive_count,
+        & $remaining,
+        & $notify_received_num,
+        $max_receive_size = GRN_MAIL_RECEIVE_TOTAL_SIZE_MAX
+    ) {
+        assert('! is_null( $account_id )');
+
+        $user_id = $user->getOID();
+        if ( ! AppAccess::isAppAvailableInternalAccess(GRN_MAIL_APP_ID,
+            $user_id)
+        ) {
+            return [];
+        }
+
+        // メール使用停止設定チェック
+        $system_config = $this->_utility->getSystemConfig();
+        if ( ! $system_config->canUseMail()) {
+            cb_throw_error(E_GRN_MAIL_CANNOT_USE);
+        }
+
+        // メールアカウントデータを取得
+        $account = $system_config->_getAccountRow($account_id);
+        if ( ! is_object($account)) {
+            // アカウントが見つからない
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+
+        // サーバーに残す設定
+        $account_info = $account->getAccountInfo();
+        $retrieve_save = $account_info->getRetrieveSave();      // 個人設定
+
+        // 受信可能かチェック
+        $no_account = $no_server = false;
+        if ( ! $account->canReceive($no_account, $no_server)) {
+            return [];
+        }
+
+        // サイズの上限設定取得
+        $system_config->getSizeUserLimitSetting($size_settings, $user_id);
+
+        $user_limit = $size_settings['user_limit_' . $user_id];
+        if ($user_limit != -1) {
+            $user_limit *= 1024 * 1024;
+        }     // MB -> Byte
+
+        $receive_limit = $size_settings['receive_limit_' . $user_id];
+        if ($receive_limit != -1) {
+            $receive_limit *= 1024;
+        }         // KB -> Byte
+
+        $send_limit = $size_settings['send_limit_' . $user_id];
+        if ($send_limit != -1) {
+            $send_limit *= 1024;
+        }            // KB -> Byte
+
+        // 最大受信件数
+        // エラーメールデータクリア
+        $this->_clearPop3ErrorMails($account);
+
+        $received_size = 0;                                         // 受信メールサイズ
+        $personal_config = $this->_utility->getPersonalConfig($user);
+        $mail_size
+            = $personal_config->getMailSize($account_id);  // アカウントの総メールサイズ
+
+        // 表示する形式
+        $name_format = $personal_config->getListNameFormatSetting();
+
+        // 送受信記録を使用する設定
+        $use_address_history = $system_config->canUserUseHistory();
+
+        // メール受信
+        $mail_ids = $this->_recvMails($user, $account, $name_format,
+            $retrieve_save, $use_notify_mail, $use_address_history, $mail_size,
+            $max_receive_count, $user_limit, $receive_limit, $remaining,
+            $received_size, $notify_received_num, $max_receive_size);
+        $mailAutomation
+            = \grn\mail\background\service\MailAutomationJobRegisterService::create();
+        $mailAutomation->register($user, $account, $mail_ids);
+        //count( $mail_ids );
+
+        // アカウントのメールサイズ更新
+        if ($received_size > 0) {
+            $mail_size = bcadd($mail_size, $received_size);
+            $personal_config->setAccountMailSize($account_id, $mail_size);
+        }
+
+        return $mail_ids;
+    }
+
+    /**
+     * エラーメールデータ数の取得
+     *
+     * @access  private
+     *
+     * @param   string $account_id アカウントID
+     *
+     * @return int
+     */
+    function getPop3ErrorMailDataCount($account_id)
+    {
+        assert('! is_null( $account_id )');
+
+        $rowset
+            = new CB_RowSet($this->_utility->getTableInfo(GRN_MAIL_POP3ERRORUIDS_TABLE),
+            'e');
+        $rowset->setLock(CB_DATABASE_NO_LOCK);
+        $rowset->addCondition($rowset->queryf("e.col_account = '@S'",
+            $account_id));
+        $user_table_info = $this->_utility->getTableInfo('cb_user');
+        $on = 'e.col_ogre_user = u._id AND u.col_deleted IS NULL';
+        $rowset->addJoin($user_table_info, $on, CB_DATABASE_INNER_JOIN, 'u');
+        $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+        $result = $rowset->iterate();
+        $rowset->destroy();
+
+        return $result['count'];
+    }
+
+    /**
+     * エラーメールデータ一覧の取得
+     *
+     * @access  private
+     *
+     * @param   string $account_id アカウントID
+     * @param bool     $reverse
+     * @param null     $offset
+     * @param null     $limit
+     *
+     * @return  array
+     */
+    function getPop3ErrorMailDataList(
+        $account_id,
+        $reverse = true,
+        $offset = null,
+        $limit = null
+    ) {
+        assert('! is_null( $account_id )');
+
+        $rowset
+            = new CB_RowSet($this->_utility->getTableInfo(GRN_MAIL_POP3ERRORUIDS_TABLE),
+            'e');
+        $rowset->addCondition($rowset->queryf("e.col_account = '@S'",
+            $account_id));
+        $user_table_info =& $this->_utility->getTableInfo('cb_user');
+        $on = 'e.col_ogre_user = u._id AND u.col_deleted IS NULL';
+        $rowset->addJoin($user_table_info, $on, CB_DATABASE_INNER_JOIN, 'u');
+        $rowset->addOrderColumn('e.col_send_ts', $reverse);
+        $rowset->addOrderColumn(null, $reverse);
+
+        // 取得範囲の設定
+        if ( ! is_null($offset) && ($offset >= 0) && ! is_null($limit)
+             && ($limit >= 0)
+        ) {
+            $rowset->limit($offset, $limit);
+        }
+
+        // データ一覧ループ
+        $result = [];
+        /** @var GRN_Mail_Pop3ErrorUIDs $row */
+        while ( ! is_null($row = $rowset->iterate())) {
+            $result[] = $row->getDataProperties();
+        }
+
+        return $result;
+    }
+
+    private function _parseDate($date)
+    {
+        $pos = strpos($date, '(');
+        if ($pos) {
+            $date = substr($date, 0, $pos);
+        }
+        $arrDate = explode(' ', $date);
+        foreach ($arrDate as $key => $item_date) {
+            if (strcasecmp($item_date, 'UT') === 0) {
+                $arrDate[$key] = 'UTC';
+            }
+        }
+        $date = implode(' ', $arrDate);
+        // タイムスタンプに変換
+        $temp_ts = strtotime($date);
+        if ($temp_ts >= 0) {
+            $datetime = cb_timestamp_to_datetime($temp_ts);
+            if (cb_date_validate_datetime($datetime)) {
+                return $temp_ts;
+            }
+        }
+
+        return false;
+    }
+
+}
+
+

@@ -1,0 +1,3 @@
+{capture name='grn_link_operation_GRN_LNK_OP_44'}{cb_msg module='grn.link.operation' key='GRN_LNK_OP-44' replace='true'}{/capture}{grn_button_cancel class='margin' caption=$smarty.capture.grn_link_operation_GRN_LNK_OP_44 page='link/operation/import1' charset=$charset skip=$skip cid=$category_id}
+{capture name='grn_link_operation_GRN_LNK_OP_45'}{cb_msg module='grn.link.operation' key='GRN_LNK_OP-45' replace='true'}{/capture}{grn_button_submit class='margin' caption=$smarty.capture.grn_link_operation_GRN_LNK_OP_45}
+{grn_button_cancel class='margin' page='link/index' cid=$category_id type='share'}

@@ -1,0 +1,1519 @@
+<?php
+
+use grn\grn\JSONResponse;
+use grn\workflow\customization\DataConverterForJsPetitionData;
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    global $G_INPUT;
+    $json = JSONResponse::create();
+
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty;
+
+    //Get Session Key
+    require_once('workflow/controller_util.csp');
+    require_once('grn/controller.csp');
+    $tmp_key = grn_get_temporary_key();
+
+    require_once('SmartyValidate.class.php');
+    SmartyValidate::connect($t);
+    $page_name = 'workflow/handle';
+    $session_target = $page_name . $tmp_key;
+    SmartyValidate::register_form($session_target);
+
+    $folder_id = null;
+    if (array_key_exists('fid', $G_INPUT)) {
+        $folder_id = $G_INPUT['fid'];
+    }
+    $petition_id = null;
+    if (array_key_exists('pid', $G_INPUT)) {
+        $petition_id = $G_INPUT['pid'];
+    }
+    $simple = false;
+    if (array_key_exists('simple', $G_INPUT)) {
+        $simple = $G_INPUT['simple'];
+    }
+    $command = null;
+    if (array_key_exists('cmd', $G_INPUT)) {
+        $command = $G_INPUT['cmd'];
+    }
+    $in_process = cb_at($G_INPUT, 'in_process', null);
+    $destination = null;
+    if ('remand' == $command) {
+        require_once('workflow/config.csp');
+        $configs = GRN_Workflow_Configs::getInstance();
+        $config = $configs->getSystemConfig();
+        if ( ! $config->getRemand()) {
+            require_once('workflow/error_code.csp');
+            cb_throw_error(E_GRN_WRKF_PETITION_SYSTEM_DENY_REMAND);
+        }
+
+        if (array_key_exists('destination', $G_INPUT)) {
+            $destination = $G_INPUT['destination'];
+        }
+        if ( ! is_numeric($destination) && 'applicant' != $destination) {
+            $G_INPUT['destination'] = null;
+        }
+    } else {
+        $G_INPUT['destination'] = $command;
+    }
+    $session_flag = false;
+    if (array_key_exists('cpsf', $G_INPUT)) {
+        $session_flag = $G_INPUT['cpsf'];
+    }
+
+    $finally_approved = false;
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    $user_id = $login->getOID();
+
+    $agent_id = '';
+    require_once('workflow/folder_logic.csp');
+    $logic = GRN_Workflow_Folder_Logic::getInstance();
+
+    $folder_org = $logic->getFolder($folder_id);
+    $folder_user_id = $folder_org['col_user'];
+    if ($user_id != $folder_user_id) {
+        //代理承認の検証
+        require_once('workflow/config.csp');
+        $configs = GRN_Workflow_Configs::getInstance();
+        $config =& $configs->getSystemConfig();
+        if ($config->isProxyApproval($user_id, $folder_user_id)) {
+            // 代理承認
+            $agent_id = $user_id;
+            $user_id = $folder_user_id;
+        }
+    }
+
+    //Update Form and Item List
+    require_once('workflow/controller_util.csp');
+    require_once('workflow/item_resources.csp');
+    $item_data_util = GRN_Workflow_ItemData_Controller_Utility::getInstance();
+
+    //Create Parameter Translation Map
+    $translation_map_item_data_tmp = [
+        //Item Data Information
+        'petition'    => 'itemdata_petition',
+        'settings'    => 'itemdata_settings',
+        'iid'         => 'itemdata_id',                  //Item Data ID
+        'foreign_key' => 'itemdata_foreign_key',         //Item Data foreign_key
+        'number'      => 'itemdata_number',
+    ];
+
+    $item_data_list
+        = $item_data_util->getListViewEx($translation_map_item_data_tmp,
+        $petition_id);
+    unset($item_data_util);
+
+    require_once('workflow/change_access_data.csp');
+    $change_access_data_logic = GRN_Workflow_ChangeAccessData::getInstance();
+    require_once('workflow/controller_util.csp');
+    $controller_util = new GRN_Workflow_ControllerUtil($page_name);
+    $path_steps = $controller_util->getPathInfo($petition_id);
+
+    //Huy add @ 2008/07/18
+    if ( ! is_null($agent_id) && strlen($agent_id) > 0) {
+        $path_steps_current = current($path_steps);
+        $path_step
+            = $controller_util->getInProcessPathStep($path_steps_current);
+        if ( ! $path_step || $path_step['col_type'] == GRN_WORKFLOW_CIRCULAR) {
+            cb_throw_error(E_GRN_WRKF_PETITION_DENY_ACCESS);
+        }
+    }
+    //End: Huy add @ 2008/07/18
+
+    // 処理中の経路ステップを取得
+    $path_steps_current = current($path_steps);
+    $path_step_id
+        = $controller_util->getInProcessPathStepId($path_steps_current);
+
+    foreach ($item_data_list as $item_id => $item_data) {
+        if ($item_data['foreign_key'] == 'grn.workflow.numeric'
+            || $item_data['foreign_key'] == 'grn.workflow.route_search'
+        ) {
+            $G_INPUT['item_' . $item_id] = cb_at($G_INPUT, 'item_' . $item_id,
+                $item_data['number']);
+        }
+    }
+
+    $parsed_input_data = [];
+    if ($path_step_id) {
+        if ($path_step_id != $in_process) {
+            cb_throw_error(E_GRN_WRKF_INVALID_PATH_STEP_ID);
+        }
+        foreach (array_keys($item_data_list) as $item_id) {
+            $change_access
+                = $change_access_data_logic->evaluateEx($item_data_list[$item_id]['iid'],
+                $path_step_id);
+            if ($change_access['col_edit'] == 1
+                || $item_data_list[$item_id]['foreign_key']
+                   == 'grn.workflow.calc_numeric'
+            ) {
+                $item_util
+                    =& grn_workflow_get_item_util($item_data_list[$item_id]['foreign_key']);
+                if ($item_util) {
+                    //Parse Item Data
+                    $item_util->parseItemData($G_INPUT, 'item',
+                        $item_data_list[$item_id]);
+                    unset($item_util);
+                }
+            }
+        }
+    }
+
+    /**
+     * 制限事項
+     * ・フォルダにフォルダリレーションがない（通常のみ）
+     * ・フォルダは未処理一覧でない（通常のみ）
+     */
+
+    if ($command == 'remand'
+        && ($destination == 'none'
+            || $destination == 'separator')
+    ) {
+        if (is_array($_SESSION['SmartyValidate'][$session_target]['validators'])) {
+            $validation_number
+                = array_keys($_SESSION['SmartyValidate'][$session_target]['validators']);
+
+            for ($i = 0; $i < count($validation_number); $i++) {
+                if (isset($_SESSION['SmartyValidate'][$session_target]['validators'][$validation_number[$i]])
+                    && $_SESSION['SmartyValidate'][$session_target]['validators'][$validation_number[$i]]['field']
+                       != 'destination'
+                ) {
+                    unset($_SESSION['SmartyValidate'][$session_target]['validators'][$validation_number[$i]]);
+                }
+            }
+            unset($validation_number);
+        }
+    } elseif ($command == 'acceptance') {
+        /**
+         * 承認経路で編集可能である「必須項目」となっている「ファイル添付」への対応
+         */
+
+        // fids が空であれば、その申請には「ファイル添付」が「必須」となっている項目がない、
+        // もしくは、既にあったファイルが今回の承認時にすべて削除されている ==> validation をかけるべき
+        $unchanged_fids = null;
+        if (array_key_exists('fids', $G_INPUT)) {
+            $unchanged_fids = $G_INPUT['fids'];
+        }
+
+        if ( ! is_null($unchanged_fids)) {
+            $columns = [
+                //Item Data Information
+                'iid'         => 'itemdata_id',
+                //Item Data ID
+                'foreign_key' => 'itemdata_foreign_key',
+                //Item Data foreign_key
+                'required'    => 'itemdata_required',
+                //Item Data Reuired Flag
+                //Item Data File Information
+                'fid'         => 'itemdatafile_id',
+                //Item Data File ID
+                'file'        => 'itemdatafile_file',
+                //Item Data File ID
+                'files'       => 'itemdata_files',
+                //Item Data File ID
+            ];
+
+            require_once('workflow/controller_util.csp');
+            $item_data_util
+                = GRN_Workflow_ItemData_Controller_Utility::getInstance();
+            $item_data_list = $item_data_util->getListViewEx($columns,
+                $petition_id);
+
+            foreach (array_keys($item_data_list) as $item_data_id) {
+                if ($item_data_list[$item_data_id]['foreign_key']
+                    == GRN_WORKFLOW_CONDITION_ITEM_FILE
+                    && $item_data_list[$item_data_id]['required'] == 1
+                ) {
+                    $skip_validation_flag = false;
+                    $existing_fids
+                        = array_keys($item_data_list[$item_data_id]['files']);
+                    $item_form_name = 'item_' . $item_data_id . '_file';
+
+                    for ($i = 0; $i < count($existing_fids); $i++) {
+                        for ($j = 0; $j < count($unchanged_fids); $j++) {
+                            if ($existing_fids[$i] == $unchanged_fids[$j]) {
+                                $skip_validation_flag = true;
+                                break 2;
+                            }
+                        }
+                    }
+
+                    if ($skip_validation_flag
+                        && is_array($_SESSION['SmartyValidate'][$session_target]['validators'])
+                    ) {
+                        $validation_number
+                            = array_keys($_SESSION['SmartyValidate'][$session_target]['validators']);
+
+                        for ($i = 0; $i < count($validation_number); $i++) {
+                            if (isset($_SESSION['SmartyValidate'][$session_target]['validators'][$validation_number[$i]])
+                                && $_SESSION['SmartyValidate'][$session_target]['validators'][$validation_number[$i]]['field']
+                                   == $item_form_name
+                                && $_SESSION['SmartyValidate'][$session_target]['validators'][$validation_number[$i]]['criteria']
+                                   == 'notEmpty'
+                            ) {
+                                unset($_SESSION['SmartyValidate'][$session_target]['validators'][$validation_number[$i]]);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            unset($columns, $item_data_util, $item_data_list);
+        }
+    }
+
+    if ($command == 'acceptance'
+        || ($command == 'remand'
+            && ($destination == 'none'
+                || $destination == 'separator'))
+    ) {
+        if ( ! SmartyValidate::is_valid($G_INPUT, $session_target)) {
+            if ($session_flag) {
+                require_once('fw/session_manager.csp');
+                $session_manager = CB_SessionManager::getInstance();
+                $session
+                    =& $session_manager->getSession($session_target);
+                $params = $session->get('batch');
+                if ( ! is_array($params) || 0 == count($params)) {
+                    // 連続処理のパラメータが空
+                    cb_throw_error(E_GRN_WRKF_EMPTY_BATCH_PARAMS);
+                }
+                $folder_id = $params['fid'];
+                $simple = $params['simple'];
+                $folder_relations = $params['folder_relations'];
+                if ( ! is_array($folder_relations)
+                     || 0 == count($folder_relations)
+                ) {
+                    // 既にない申請
+                    // 申請を取得
+                    require_once('workflow/petition_logic.csp');
+                    $logic = GRN_Workflow_Petition_Logic::getInstance();
+                    $petition = $logic->get($petition_id);
+                    $status = $petition['col_status'];
+                    switch ($command) {
+                        case 'remand':      // 差し戻し
+                            if (GRN_WORKFLOW_STATUS_IN_PROCESS
+                                <= $petition['col_status']
+                                && GRN_WORKFLOW_STATUS_REMAND
+                                   != $petition['col_status']
+                            ) {
+                                // 進行中、差し戻しでない申請は差し戻しできない
+                                cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_REMAND);
+                            }
+                            break;
+                    }
+                    unset($logic);
+                } else {
+                    require_once('workflow/folderrelation_logic.csp');
+                    $logic = GRN_Workflow_FolderRelation_Logic::getInstance();
+
+                    if ( ! is_null($agent_id) && strlen($agent_id) > 0) {
+                        $tmp
+                            = $logic->getSpecificListByOID(array_keys($folder_relations));
+                    } else {
+                        $tmp
+                            = $logic->getSpecificListByOID(array_keys($folder_relations),
+                            $folder_id);
+                    }
+                    if ( ! is_array($tmp) || 0 == count($tmp)) {
+                        // 既にない申請
+                        // 申請を取得
+                        require_once('workflow/petition_logic.csp');
+                        $logic = GRN_Workflow_Petition_Logic::getInstance();
+                        $petition = $logic->get($petition_id);
+                        $status = $petition['col_status'];
+                        switch ($command) {
+                            case 'remand':      // 差し戻し
+                                if (GRN_WORKFLOW_STATUS_IN_PROCESS
+                                    <= $petition['col_status']
+                                    && GRN_WORKFLOW_STATUS_REMAND
+                                       != $petition['col_status']
+                                ) {
+                                    // 進行中、差し戻しでない申請は差し戻しできない
+                                    cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_REMAND);
+                                }
+                                break;
+                        }
+                        unset($logic);
+                    } else {
+                        $exists_flag = false;
+                        foreach ($tmp as $tmp_value) {
+                            if ($tmp_value['col_petition'] == $petition_id) {
+                                $exists_flag = true;
+                                break;
+                            }
+                        }
+                        if ($exists_flag == false) {
+                            // 既にない申請
+                            // 申請を取得
+                            require_once('workflow/petition_logic.csp');
+                            $logic = GRN_Workflow_Petition_Logic::getInstance();
+                            $petition = $logic->get($petition_id);
+                            $status = $petition['col_status'];
+                            switch ($command) {
+                                case 'remand':      // 差し戻し
+                                    if (GRN_WORKFLOW_STATUS_IN_PROCESS
+                                        <= $petition['col_status']
+                                        && GRN_WORKFLOW_STATUS_REMAND
+                                           != $petition['col_status']
+                                    ) {
+                                        // 進行中、差し戻しでない申請は差し戻しできない
+                                        cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_REMAND);
+                                    }
+                                    break;
+                                default:
+                                    break;
+                            }
+
+                            unset($logic, $session, $session_manager);
+                        }
+                    }
+                    unset($logic);
+                }
+            }
+
+            $t->setPageInfo($page_name);
+            $page_title = grn_get_page_display_name($page_name);
+            $t->assign('page_title', $page_title);
+
+            include('_handle.csp');
+
+            //Update item list before display//
+            require_once('workflow/item_resources.csp');
+            foreach (array_keys($item_data_list) as $item_id) {
+                if ($item_data_list[$item_id]['view_mode'] == "view") {
+                    continue;
+                }
+                $item_util
+                    =& grn_workflow_get_item_util($item_data_list[$item_id]['foreign_key']);
+                if ($item_util) {
+                    if ($item_data_list[$item_id]['foreign_key']
+                        == "grn.workflow.file"
+                    ) {
+                        //get old files and modify them according to user input
+                        $files = $item_data_list[$item_id]['files'];
+                        if ( ! array_key_exists('fids', $G_INPUT)
+                             || ! count($G_INPUT['fids'])
+                        ) {
+                            $files = [];
+                        } elseif (count($files) > 0) {
+                            foreach ($files as $index => &$file_info) {
+                                if ( ! in_array($index, $G_INPUT['fids'])) {
+                                    unset($files[$index]);
+                                }
+                            }
+                        }
+                        //parse new added files
+                        $parsed_data = $item_util->parseItemData($G_INPUT,
+                            'item', $item_data_list[$item_id]);
+                        //merge all data to construct final attacked files view
+                        $attached_files_for_view = [];
+                        if ( ! is_null($files)) {
+                            $attached_files_for_view = $attached_files_for_view
+                                                       + $files;
+                        }
+                        if ( ! is_null($parsed_data)) {
+                            //add info about attachement field from which the attached file was chosen from
+                            $attached_files_for_view = $attached_files_for_view
+                                                       + $parsed_data;
+                        }
+                        $item_data_list[$item_id]['files']
+                            = $attached_files_for_view;
+                    } else {
+                        $item_util->parseItemData($G_INPUT, 'item',
+                            $item_data_list[$item_id]);
+                    }
+                }
+            }
+            //End Update item list//
+            //Assign data for design
+            $t->assign('item_data_list', $item_data_list);
+
+            $content
+                = $t->fetch("{$page_name}.tpl"); // create HTML and register SmartyValidate
+
+            if (defined('AJAX_REQUEST')) {
+                header(CB_ERROR_HEADER . 'error_validation');
+                $json->response([
+                    'validation'    => false,
+                    'error_message' => $t->fetch('grn/show_validation_errors.tpl')
+                ]);
+            } else {
+                echo $content;
+            }
+            cb_safe_exit();
+        }
+    }
+
+//    if(SmartyValidate::is_valid($G_INPUT, $page_name))
+//    {
+    if ($session_flag) {
+        require_once('fw/session_manager.csp');
+        $session_manager = CB_SessionManager::getInstance();
+        $session =& $session_manager->getSession($session_target);
+        $params = $session->get('batch');
+        if ( ! is_array($params) || 0 == count($params)) {
+            // 連続処理のパラメータが空
+            cb_throw_error(E_GRN_WRKF_EMPTY_BATCH_PARAMS);
+        }
+        $folder_id = $params['fid'];
+        $simple = $params['simple'];
+        $folder_relations = $params['folder_relations'];
+        if ( ! is_array($folder_relations) || 0 == count($folder_relations)) {
+            $session->unset_by('batch');
+            SmartyValidate::unregister_form($session_target);
+            if (defined('AJAX_REQUEST')) {
+                $json->response([
+                    'link' => cb_get_full_url('workflow/index',
+                        ['fid' => $folder_id])
+                ]);
+                cb_safe_exit();
+            }
+            cb_redirect('workflow/index', ['fid' => $folder_id]);
+        }
+
+        require_once('workflow/folderrelation_logic.csp');
+        $logic = GRN_Workflow_FolderRelation_Logic::getInstance();
+
+
+        if ( ! is_null($agent_id) && strlen($agent_id) > 0) {
+            $tmp = $logic->getSpecificListByOID(array_keys($folder_relations));
+        } else {
+            $tmp = $logic->getSpecificListByOID(array_keys($folder_relations),
+                $folder_id);
+        }
+        if ( ! is_array($tmp) || 0 == count($tmp)) {
+            // 既にない申請
+            // 申請を取得
+            require_once('workflow/petition_logic.csp');
+            $logic = GRN_Workflow_Petition_Logic::getInstance();
+            $petition = $logic->get($petition_id);
+            $status = $petition['col_status'];
+            switch ($command) {
+                case 'acceptance':  // 承認
+                    if (GRN_WORKFLOW_STATUS_IN_PROCESS
+                        <= $petition['col_status']
+                        && GRN_WORKFLOW_STATUS_REMAND != $petition['col_status']
+                    ) {
+                        // 進行中、差し戻しでない申請は承認できない
+                        cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_ACCEPT);
+                    }
+                    break;
+                case 'reject':   // 却下
+                    if (GRN_WORKFLOW_STATUS_IN_PROCESS
+                        <= $petition['col_status']
+                        && GRN_WORKFLOW_STATUS_REMAND != $petition['col_status']
+                    ) {
+                        // 進行中、差し戻しでない申請は却下できない
+                        cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_REJECT);
+                    }
+                    break;
+                case 'remand':      // 差し戻し
+                    if (GRN_WORKFLOW_STATUS_IN_PROCESS
+                        <= $petition['col_status']
+                    ) {
+                        // 進行中、差し戻しでない申請は差し戻しできない
+                        cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_REMAND);
+                    }
+                    break;
+                default:
+                    break;
+            }
+
+            $session->unset_by('batch');
+            SmartyValidate::unregister_form($session_target);
+            if (defined('AJAX_REQUEST')) {
+                $json->response([
+                    'link' => cb_get_full_url('workflow/index',
+                        ['fid' => $folder_id])
+                ]);
+                cb_safe_exit();
+            }
+            cb_redirect('workflow/index', ['fid' => $folder_id]);
+        }
+
+        foreach (array_keys($folder_relations) as $folder_relation_id) {
+            if ( ! array_key_exists($folder_relation_id, $tmp)) {
+                unset($folder_relations[$folder_relation_id]);
+            }
+        }
+
+        $folder_relation = current($folder_relations);
+        if ('reapply' != $command && 'cancel' != $command) {
+            unset($folder_relations[$folder_relation['r__id']]);
+            $params['folder_relations'] = $folder_relations;
+
+            if ( ! is_null($agent_id) && strlen($agent_id) > 0) {
+                $folder_relation_tmp = current($folder_relations);
+                $params['fid'] = $folder_relation_tmp['f__id'];
+            }
+
+            $session->set('batch', $params);
+        }
+
+        if ($petition_id != $folder_relation['p__id']) {
+            // 既にない申請
+            // 申請を取得
+            require_once('workflow/petition_logic.csp');
+            $logic = GRN_Workflow_Petition_Logic::getInstance();
+            $petition = $logic->get($petition_id);
+            $status = $petition['col_status'];
+            switch ($command) {
+                case 'acceptance':  // 承認
+                    if (GRN_WORKFLOW_STATUS_IN_PROCESS
+                        <= $petition['col_status']
+                        && GRN_WORKFLOW_STATUS_REMAND != $petition['col_status']
+                    ) {
+                        // 進行中、差し戻しでない申請は承認できない
+                        cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_ACCEPT);
+                    }
+                    break;
+                case 'reject':   // 却下
+                    if (GRN_WORKFLOW_STATUS_IN_PROCESS
+                        <= $petition['col_status']
+                        && GRN_WORKFLOW_STATUS_REMAND != $petition['col_status']
+                    ) {
+                        // 進行中、差し戻しでない申請は却下できない
+                        cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_REJECT);
+                    }
+                    break;
+                case 'remand':      // 差し戻し
+                    if (GRN_WORKFLOW_STATUS_IN_PROCESS
+                        <= $petition['col_status']
+                    ) {
+                        // 進行中、差し戻しでない申請は差し戻しできない
+                        cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_REMAND);
+                    }
+                    break;
+                default:
+                    break;
+            }
+
+            SmartyValidate::unregister_form($session_target);
+            if (defined('AJAX_REQUEST')) {
+                $json->response([
+                    'link' => cb_get_full_url('workflow/handle',
+                        ['cpsf' => true, 'tmp_key' => $tmp_key])
+                ]);
+                cb_safe_exit();
+            }
+            cb_redirect('workflow/handle',
+                ['cpsf' => true, 'tmp_key' => $tmp_key]);
+        }
+    } else {
+        require_once('workflow/controller_util.csp');
+        $controller_util = new GRN_Workflow_ControllerUtil($page_name);
+        $folder = $controller_util->getSimilarFolder($user_id,
+            $folder_id);
+        /*
+                    if(GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID != @ $folder['col_folder_type'])
+                    {
+                        // 申請がフォルダにない
+                        cb_throw_error(E_GRN_WRKF_FOLDER_INVALID_FOLDER_ID);
+                    }
+        */
+        if (is_array($folder) && 0 < count($folder)) {
+            $folder_id = $folder['_id'];
+        }
+    }
+
+    // 申請を取得
+    require_once('workflow/petition_logic.csp');
+    $logic = GRN_Workflow_Petition_Logic::getInstance();
+    $petition = $logic->get($petition_id);
+    $status = $petition['col_status'];
+
+    // 経路を取得
+    require_once('workflow/controller_util.csp');
+    $controller_util = new GRN_Workflow_ControllerUtil($page_name);
+    $path_steps = $controller_util->getPathInfo($petition_id);
+
+    // 処理中の経路ステップを取得
+    $path_steps_current = current($path_steps);
+    $path_step_id
+        = $controller_util->getInProcessPathStepId($path_steps_current);
+
+    $comment = null;
+    if (array_key_exists('col_comment', $G_INPUT)) {
+        $comment = $G_INPUT['col_comment'];
+    }
+    $ptime = time();
+
+    $uids = [];
+    $forced_remove = false;
+    $message_type = null;
+    $message_args = ['pid' => $petition_id, 'comment' => $comment];
+    switch ($command) {
+        case 'acceptance':  // 承認
+            if (GRN_WORKFLOW_STATUS_IN_PROCESS < $petition['col_status']
+                && GRN_WORKFLOW_STATUS_REMAND != $petition['col_status']
+            ) {
+                // 進行中、差し戻しでない申請は承認できない
+                cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_ACCEPT);
+            }
+
+            // 経路種別が承認か確認
+            $path_step =& $path_steps[$path_step_id];
+            if (GRN_WORKFLOW_ACCEPTANCE != $path_step['col_type']) {
+                // 承認でない経路ステップは承認できない
+                cb_throw_error(E_GRN_WRKF_DENY_ACCEPT_PATH_STEP_DATA);
+            }
+
+            // 処理者の結果を変更
+            $result = GRN_WORKFLOW_RESULT_ACCEPT;
+            $path_steps = $controller_util->modifyUserResult($path_step_id,
+                $user_id,
+                $result,
+                $comment,
+                $ptime,
+                true,
+                true,
+                $agent_id);
+
+            // 添付ファイルを更新
+            $controller_util->updateFile($petition_id, $G_INPUT, $path_step_id);
+
+            // 項目の更新
+            $controller_util->modifyItemData($petition_id, $G_INPUT,
+                $path_step_id);
+
+            // 次以降の経路ステップを未処理に変更
+            $path_step =& $path_steps[$path_step_id];
+            $controller_util->modifyPathStepsStatus($path_step,
+                GRN_WORKFLOW_FINISHED_NONE);
+            $message_type = 'petition_accept';
+            // 承認経路ステップを評価
+            if ($controller_util->evalAcceptancePathStep($path_step)) {
+                // 経路ステップを処理済に変更
+                $logic = GRN_Workflow_PathStepDatas::getInstance();
+                $properties
+                    = ['col_finished' => GRN_WORKFLOW_FINISHED_COMPLETE];
+                $path_step['col_finished'] = GRN_WORKFLOW_FINISHED_COMPLETE;
+                $logic->modify($path_step_id, $properties);
+
+                // 次に処理を回す経路ステップIDを取得
+                $path_steps_current = current($path_steps);
+                $path_step_id
+                    = $controller_util->getInProcessPathStepId($path_steps_current);
+                if (false === $path_step_id) {
+                    // 完了
+                    $status = GRN_WORKFLOW_STATUS_FINISHED;
+
+                    $uids[] = $petition['col_user'];
+                    if ( ! is_null($petition['col_agent_user'])) {
+                        $uids[] = $petition['col_agent_user'];
+                    }
+
+                    $foreign_keys = [
+                        'FINISH_FOLDER_FOREIGN_KEY',
+                        'IN_FOLDER_FOREIGN_KEY'
+                    ];
+
+                    $forced_remove = true;
+                    $finally_approved = true;
+
+                    $message_type = "petition_accept_with_approved_number";
+                    $controller_util->updateSerialNumberAfterFinallyApproved($petition,
+                        $message_args);
+
+                    // 自動書き出し
+                    if ($petition['col_auto_export']) {
+                        $petition_controller_util
+                            = GRN_Workflow_Petition_Controller_Utility::getInstance();
+                        $petition_controller_util->exportSinglePetition($petition_id,
+                            $status);
+                    }
+                } else {
+                    $path_step =& $path_steps[$path_step_id];
+
+                    if (GRN_WORKFLOW_CIRCULAR == $path_step['col_type']) {
+                        // 申請者にフォルダリレーションを追加
+                        //$uids[] = $petition['col_creator'];
+                        $uids[] = $petition['col_user'];
+                        if ( ! is_null($petition['col_agent_user'])) {
+                            $uids[] = $petition['col_agent_user'];
+                        }
+
+                        $foreign_keys = [
+                            'FINISH_FOLDER_FOREIGN_KEY',
+                            'IN_FOLDER_FOREIGN_KEY'
+                        ];
+
+                        // 最終承認
+                        $status = GRN_WORKFLOW_RESULT_ACCEPT;
+                        $finally_approved = true;
+
+                        $message_type = "petition_accept_with_approved_number";
+                        $controller_util->updateSerialNumberAfterFinallyApproved($petition,
+                            $message_args);
+
+                        $logic = GRN_Workflow_Petition_Logic::getInstance();
+                        $logic->modifyStatus($petition_id, $status);
+                        $b_status_modified = true;
+
+                        $controller_util->sendPetition($petition_id, $uids,
+                            $foreign_keys,
+                            GRN_WORKFLOW_MAILNOTIFICATION_ACTION_ACCEPTED);
+
+                        // 自動書き出し
+                        if ($petition['col_auto_export']) {
+                            $petition_controller_util
+                                = GRN_Workflow_Petition_Controller_Utility::getInstance();
+                            $petition_controller_util->exportSinglePetition($petition_id,
+                                $status);
+                        }
+                    } else {
+                        // 進行中
+                        $status = GRN_WORKFLOW_STATUS_IN_PROCESS;
+                    }
+
+                    if ( ! array_key_exists('uids', $path_step)) {
+                        assert('FALSE');
+                    }
+                    $uids = $path_step['uids'];
+
+                    $foreign_keys = [
+                        'UNPROCESSED_FOLDER_FOREIGN_KEY',
+                        'IN_FOLDER_FOREIGN_KEY'
+                    ];
+                }
+
+                // 申請の状況を変更
+                if ( ! (isset($b_status_modified) && $b_status_modified)) {
+                    $logic = GRN_Workflow_Petition_Logic::getInstance();
+                    $logic->modifyStatus($petition_id, $status);
+                }
+
+                // 次の処理者に申請を送信
+                $controller_util->sendPetition($petition_id, $uids,
+                    $foreign_keys,
+                    GRN_WORKFLOW_MAILNOTIFICATION_ACTION_TO_NEXT);
+            } else {
+                // 申請の状況を進行中に変更
+                if (GRN_WORKFLOW_STATUS_UNPROCESSING
+                    == $petition['col_status']
+                ) {
+                    $status = GRN_WORKFLOW_STATUS_IN_PROCESS;
+                    $logic->modifyStatus($petition_id, $status);
+                } else {
+                    if (0 == strlen($ptime)) {
+                        $ptime = time();
+                    }
+                    $properties = [];
+                    $properties['col_ptime'] = $ptime;
+                    require_once('workflow/petition_manager.csp');
+                    $petition_manager
+                        = GRN_Workflow_Petition_Manager::getInstance();
+                    $petition_manager->update($petition_id, $properties);
+                }
+            }
+            break;
+        case 'confirmation':    // 確認
+            // 進行中、承認
+            switch ($petition['col_status']) {
+                case GRN_WORKFLOW_STATUS_UNPROCESSING:
+                case GRN_WORKFLOW_STATUS_IN_PROCESS:
+                    /**
+                     * In the following case, the `confirmation` by the login user doesn't change the status of the petition nor the relation between the petition and folders.
+                     *
+                     * * The login user is in the current step of the path of the petition,
+                     * * AND the status of the petition is whether UNPROCESSING or INPROCESS.
+                     * http://issues.dev.cybozu.co.jp/browse/GRN2-1064
+                     */
+                    $path_step =& $path_steps[$path_step_id];
+                    $top_path_step
+                        = $controller_util->getTopPathStep($path_step);
+                    if (false !== array_search($user_id, $path_step['uids'])
+                        && ! $controller_util->isOnlyCircularPathSteps($top_path_step)
+                    ) {
+                        $uids[] = $user_id;
+                        break;
+                    }
+                case GRN_WORKFLOW_STATUS_TEMPORARY:
+                case GRN_WORKFLOW_STATUS_ACCEPTANCE:
+                    // 経路種別（回覧）を確認
+                    $path_step =& $path_steps[$path_step_id];
+                    if (GRN_WORKFLOW_CIRCULAR == $path_step['col_type']) {
+                        if (false === array_search($user_id,
+                                $path_step['uids'])
+                        ) {
+                            // 経路ステップの処理が移ってしまった
+                            require_once('workflow/controller_util.csp');
+                            $controller_util
+                                = new GRN_Workflow_ControllerUtil($page_name);
+                            $path_steps
+                                = $controller_util->getLockedPathInfo($path_step_id);
+
+                            // Huy add @ 2008/07/23
+                            $path_step = current($path_steps);
+                            $path_step_id_to_confirm = null;
+                            while ($path_step) {
+                                if ($path_step['col_activate']) {
+                                    $path_step_id = $path_step['_id'];
+
+                                    if (false !== ($key = array_search($user_id,
+                                            $path_step['uids']))
+                                        && $path_step['col_finished']
+                                           == GRN_WORKFLOW_FINISHED_COMPLETE
+                                    ) {
+                                        if ( ! $path_step['users'][$key]['col_ptime']) {
+                                            if ( ! isPathStepAfterRemand($path_step)) {
+                                                $path_step_id_to_confirm
+                                                    = $path_step_id;
+                                            }
+                                        }
+                                    }
+                                }
+                                $path_step =& $path_step['next'];
+                            }
+                            if ($path_step_id_to_confirm) {
+                                $result = GRN_WORKFLOW_RESULT_CONFIRM;
+                                $controller_util->modifyUserResult($path_step_id_to_confirm,
+                                    $user_id, $result, $comment, $ptime, true,
+                                    false);
+                            }
+                            // End: Huy add @ 2008/07/23
+                        } else {
+                            // 処理者の結果を変更
+                            $result = GRN_WORKFLOW_RESULT_CONFIRM;
+                            $path_steps
+                                = $controller_util->modifyUserResult($path_step_id,
+                                $user_id, $result, $comment, $ptime);
+
+                            // 回覧経路ステップを評価
+                            $path_step =& $path_steps[$path_step_id];
+                            if ($controller_util->evalCircularPathStep($path_step)) {
+                                // 経路ステップを処理済に変更
+                                $logic
+                                    = GRN_Workflow_PathStepDatas::getInstance();
+                                $properties
+                                    = ['col_finished' => GRN_WORKFLOW_FINISHED_COMPLETE];
+                                $path_step['col_finished']
+                                    = GRN_WORKFLOW_FINISHED_COMPLETE;
+                                $logic->modify($path_step_id, $properties);
+
+                                // 次に処理を回す経路ステップIDを取得
+                                $path_steps_current = current($path_steps);
+                                $path_step_id
+                                    = $controller_util->getInProcessPathStepId($path_steps_current);
+                                if (false === $path_step_id) {
+                                    // 完了
+                                    $status = GRN_WORKFLOW_STATUS_FINISHED;
+
+                                    //$uids[] = $petition['col_creator'];
+                                    $uids[] = $petition['col_user'];
+                                    if ( ! is_null($petition['col_agent_user'])) {
+                                        $uids[] = $petition['col_agent_user'];
+                                    }
+
+
+                                    $foreign_keys = [
+                                        'FINISH_FOLDER_FOREIGN_KEY',
+                                        'IN_FOLDER_FOREIGN_KEY'
+                                    ];
+
+                                    $forced_remove = true;
+                                    $action_type
+                                        = GRN_WORKFLOW_MAILNOTIFICATION_ACTION_FINISHED;
+                                } else {
+                                    if (GRN_WORKFLOW_STATUS_ACCEPTANCE
+                                        != $petition['col_status']
+                                    ) {
+                                        // 進行中
+                                        $status
+                                            = GRN_WORKFLOW_STATUS_IN_PROCESS;
+                                    }
+
+                                    $path_step =& $path_steps[$path_step_id];
+                                    if ( ! array_key_exists('uids',
+                                        $path_step)
+                                    ) {
+                                        assert('FALSE');
+                                    }
+                                    $uids = $path_step['uids'];
+
+                                    $foreign_keys = [
+                                        'UNPROCESSED_FOLDER_FOREIGN_KEY',
+                                        'IN_FOLDER_FOREIGN_KEY'
+                                    ];
+                                    $action_type
+                                        = GRN_WORKFLOW_MAILNOTIFICATION_ACTION_TO_NEXT;
+                                }
+
+                                // 申請のステータスを変更
+                                $logic
+                                    = GRN_Workflow_Petition_Logic::getInstance();
+                                $logic->modifyStatus($petition_id, $status);
+
+                                // 次の処理者に申請を送信
+                                $controller_util->sendPetition($petition_id,
+                                    $uids, $foreign_keys, $action_type);
+                            } else {
+                                if (GRN_WORKFLOW_STATUS_ACCEPTANCE
+                                    != $petition['col_status']
+                                ) {
+                                    // 進行中
+                                    $status = GRN_WORKFLOW_STATUS_IN_PROCESS;
+                                }
+
+                                // 申請のステータスを変更
+                                $logic
+                                    = GRN_Workflow_Petition_Logic::getInstance();
+                                $logic->modifyStatus($petition_id, $status);
+                            }
+                        }
+                    } // Huy add @ 2008/07/23
+                    else {
+                        while ($path_step) {
+                            if ($path_step['col_activate']) {
+                                $path_step_id = $path_step['_id'];
+
+                                if (false !== ($key = array_search($user_id,
+                                        $path_step['uids']))
+                                    && $path_step['col_finished']
+                                       == GRN_WORKFLOW_FINISHED_COMPLETE
+                                ) {
+                                    if ( ! $path_step['users'][$key]['col_ptime']) {
+                                        if ( ! isPathStepAfterRemand($path_step)) {
+                                            $result
+                                                = GRN_WORKFLOW_RESULT_CONFIRM;
+                                            $controller_util->modifyUserResult($path_step_id,
+                                                $user_id, $result, $comment,
+                                                $ptime, true, false);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            $path_step =& $path_step['previous'];
+                        }
+                    }
+                    // End: Huy add @ 2008/07/23
+                    break;
+                case GRN_WORKFLOW_STATUS_IN_PROCESS_CANCEL:
+                    // 差し戻しからの取り消しは除外
+                    if ($path_step_id) {
+                        $path_step =& $path_steps[$path_step_id];
+
+                        // 処理者の所属を確認
+                        if ( ! array_key_exists('uids', $path_step)) {
+                            assert('FALSE');
+                        }
+
+                        if (false !== array_search($user_id,
+                                $path_step['uids'])
+                        ) {
+                            // 処理者の結果を変更
+                            $result = GRN_WORKFLOW_RESULT_CONFIRM;
+                            $path_steps
+                                = $controller_util->modifyUserResult($path_step_id,
+                                $user_id, $result, $comment, $ptime);
+
+                            // すべての経路ステップを処理済に変更
+                            if ($controller_util->evalPathStep($path_step)) {
+                                $logic
+                                    = GRN_Workflow_PathStepDatas::getInstance();
+                                $properties
+                                    = ['col_finished' => GRN_WORKFLOW_FINISHED_COMPLETE];
+                                $logic->modifyList(array_keys($path_steps),
+                                    $properties);
+                            }
+                        } else {
+                            // 過去の承認(誰か1人)の経路を確認する
+                            while ($path_step) {
+                                if ($path_step['col_activate']) {
+                                    $path_step_id = $path_step['_id'];
+                                    if (false !== ($key = array_search($user_id,
+                                            $path_step['uids']))
+                                        && $path_step['col_finished']
+                                           == GRN_WORKFLOW_FINISHED_COMPLETE
+                                        && $path_step['col_acceptance_type']
+                                           == GRN_WORKFLOW_OPERATOR_OR
+                                    ) {
+                                        if ( ! $path_step['users'][$key]['col_ptime']) {
+                                            if ( ! isPathStepAfterRemand($path_step)) {
+                                                $result
+                                                    = GRN_WORKFLOW_RESULT_CONFIRM;
+                                                $controller_util->modifyUserResult($path_step_id,
+                                                    $user_id, $result, $comment,
+                                                    $ptime, true, false);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                                $path_step =& $path_step['previous'];
+                            }
+                        }
+                    }
+                    break;
+                case GRN_WORKFLOW_STATUS_REJECTION:
+                    $path_steps_current = current($path_steps);
+                    $path_step_id
+                        = $controller_util->getRejectionPathStepId($path_steps_current);
+                    $path_step =& $path_steps[$path_step_id];
+
+                    // 処理者の所属を確認
+                    if ( ! array_key_exists('uids', $path_step)) {
+                        assert('FALSE');
+                    }
+
+                    if (false !== ($result = array_search($user_id,
+                            $path_step['uids']))
+                    ) {
+                        if (GRN_WORKFLOW_RESULT_UNPROCESSING
+                            == $path_step['users'][$result]['col_result']
+                        ) {
+                            // 処理者の結果を変更
+                            $result = GRN_WORKFLOW_RESULT_CONFIRM;
+                            $path_steps
+                                = $controller_util->modifyUserResult($path_step_id,
+                                $user_id, $result, $comment, $ptime, true,
+                                false);
+                        }
+                    } else {
+                        // 過去の承認(誰か1人)の経路を確認する
+                        while ($path_step) {
+                            if ($path_step['col_activate']) {
+                                $path_step_id = $path_step['_id'];
+                                if (false !== ($key = array_search($user_id,
+                                        $path_step['uids']))
+                                    && $path_step['col_finished']
+                                       == GRN_WORKFLOW_FINISHED_COMPLETE
+                                    && $path_step['col_acceptance_type']
+                                       == GRN_WORKFLOW_OPERATOR_OR
+                                ) {
+                                    if ( ! $path_step['users'][$key]['col_ptime']) {
+                                        if ( ! isPathStepAfterRemand($path_step)) {
+                                            $result
+                                                = GRN_WORKFLOW_RESULT_CONFIRM;
+                                            $controller_util->modifyUserResult($path_step_id,
+                                                $user_id, $result, $comment,
+                                                $ptime, true, false);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            $path_step =& $path_step['previous'];
+                        }
+                    }
+                    break;
+                case GRN_WORKFLOW_STATUS_FINISHED:
+                    // Huy add @ 2008/07/23
+                    $path_step = current($path_steps);
+                    $path_step_id_to_confirm = null;
+                    while ($path_step) {
+                        if ($path_step['col_activate']) {
+                            $path_step_id = $path_step['_id'];
+
+                            if (false !== ($key = array_search($user_id,
+                                    $path_step['uids']))
+                                && $path_step['col_finished']
+                                   == GRN_WORKFLOW_FINISHED_COMPLETE
+                            ) {
+                                if ( ! $path_step['users'][$key]['col_ptime']) {
+                                    if ( ! isPathStepAfterRemand($path_step)) {
+                                        $path_step_id_to_confirm
+                                            = $path_step_id;
+                                    }
+                                }
+                            }
+                        }
+                        $path_step =& $path_step['next'];
+                    }
+                    if ($path_step_id_to_confirm) {
+                        $result = GRN_WORKFLOW_RESULT_CONFIRM;
+                        $controller_util->modifyUserResult($path_step_id_to_confirm,
+                            $user_id, $result, $comment, $ptime, true, false);
+                    }
+                    // End: Huy add @ 2008/07/23
+                    $forced_remove = true;
+                    break;
+                case GRN_WORKFLOW_STATUS_REMAND:
+                    foreach (array_keys($path_steps) as $path_step_id) {
+                        $path_step =& $path_steps[$path_step_id];
+                        $path_step_data_id = $path_step['_id'];
+                        if ($path_step['col_activate']) {
+                            if ( ! $path_step['col_skip']) {
+                                if ( ! $path_step['col_finished']) {
+                                    $path_step['in_process'] = true;
+                                    if (false !== array_search($user_id,
+                                            $path_step['uids'])
+                                    ) {
+                                        if (defined('AJAX_REQUEST')) {
+                                            $json->response([
+                                                'link' => cb_get_full_url('workflow/index',
+                                                    ['fid' => $folder_id])
+                                            ]);
+                                            cb_safe_exit();
+                                        }
+                                        cb_redirect('workflow/index',
+                                            ['fid' => $folder_id]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break;
+                case GRN_WORKFLOW_STATUS_UNPROCESSING_CANCEL:
+                default:
+                    $forced_remove = true;
+                    break;
+            }
+            $message_type = 'petition_confirm';
+            break;
+        case 'reject':   // 却下
+            if (GRN_WORKFLOW_STATUS_IN_PROCESS < $petition['col_status']
+                && GRN_WORKFLOW_STATUS_REMAND != $petition['col_status']
+            ) {
+                // 進行中、差し戻しでない申請は却下できない
+                cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_REJECT);
+            }
+
+            // 経路種別が承認か確認
+            $path_step =& $path_steps[$path_step_id];
+            if (GRN_WORKFLOW_ACCEPTANCE != $path_step['col_type']) {
+                // 承認でない経路ステップは却下できない
+                cb_throw_error(E_GRN_WRKF_DENY_REJECT_PATH_STEP_DATA);
+            }
+
+            // 処理者の結果を変更
+            $result = GRN_WORKFLOW_RESULT_REJECT;
+            $path_steps = $controller_util->modifyUserResult($path_step_id,
+                $user_id,
+                $result,
+                $comment,
+                $ptime,
+                true,
+                true,
+                $agent_id
+            );
+
+            // すべての経路ステップを処理済に変更
+            $logic = GRN_Workflow_PathStepDatas::getInstance();
+            $properties = ['col_finished' => GRN_WORKFLOW_FINISHED_COMPLETE];
+            $logic->modifyList(array_keys($path_steps), $properties);
+            $properties = ['col_finished' => GRN_WORKFLOW_FINISHED_REJECTION];
+            $logic->modify($path_step_id, $properties);
+
+            // 申請の状況を却下に変更
+            require_once('workflow/petition_logic.csp');
+            $logic = GRN_Workflow_Petition_Logic::getInstance();
+            $logic->modifyStatus($petition_id, GRN_WORKFLOW_STATUS_REJECTION,
+                $user_id, $comment, $ptime);
+
+            // 申請者に申請を送信
+            $uids[] = $petition['col_user'];
+            if ( ! is_null($petition['col_agent_user'])) {
+                $uids[] = $petition['col_agent_user'];
+            }
+            $foreign_keys = [
+                'FINISH_FOLDER_FOREIGN_KEY',
+                'IN_FOLDER_FOREIGN_KEY'
+            ];
+            $controller_util->sendPetition($petition_id, $uids, $foreign_keys,
+                GRN_WORKFLOW_MAILNOTIFICATION_ACTION_REJECTED);
+            $forced_remove = true;
+            $message_type = 'petition_reject';
+
+            require('workflow/auto_schedule_register_logic.csp');
+            $wf_register_logic
+                = GRN_Workflow_Auto_Schedule_Register_Logic::getInstance();
+            $wf_register_logic->delete($petition_id);
+
+            break;
+        case 'remand':      // 差し戻し
+            if (GRN_WORKFLOW_STATUS_IN_PROCESS < $petition['col_status']
+                && GRN_WORKFLOW_STATUS_REMAND != $petition['col_status']
+            ) {
+                // 進行中、差し戻しでない申請は差し戻しできない
+                cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_REMAND);
+            }
+
+            // 経路種別（承認）を確認
+            $path_step =& $path_steps[$path_step_id];
+            if (GRN_WORKFLOW_ACCEPTANCE != $path_step['col_type']) {
+                // 承認でない経路ステップは差し戻しできない
+                cb_throw_error(E_GRN_WRKF_DENY_REMAND_PATH_STEP_DATA);
+            }
+
+            // 差し戻し先のユーザーが削除されていないか確認 
+            if ($destination == 'applicant') {
+                if (strlen($petition['col_user']) == 0) {
+                    // 差し戻し先が申請者で、申請者が削除済みのユーザー 
+                    cb_throw_error(E_GRN_WRKF_INVALID_USER_ID);
+                }
+            } elseif (array_key_exists($destination, $path_steps)) {
+                $all_transactor_deleted = true;
+                foreach ($path_steps[$destination]['uids'] as $uid) {
+                    if (strlen($uid) > 0) {
+                        $all_transactor_deleted = false;
+                        break;
+                    }
+                }
+                if ($all_transactor_deleted) {
+                    // 差し戻し先の経路ステップの全てユーザーが削除済み 
+                    cb_throw_error(E_GRN_WRKF_INVALID_USER_ID);
+                }
+            } else {
+                // 差し戻し先が不正 
+                assert('$destination == "applicant" || array_key_exists( $destination, $path_steps )');
+            }
+
+            // 処理者の結果を変更（ここではデータベースに反映しない）
+            $result = GRN_WORKFLOW_RESULT_REMAND;
+            $path_steps = $controller_util->modifyUserResult($path_step_id,
+                $user_id,
+                $result,
+                $comment,
+                $ptime,
+                false,
+                true,
+                $agent_id
+            );
+
+            // 結果、コメント、日時をコメントにまとめ、データベースに反映
+            $path_steps = $controller_util->finalizeUserComment($path_steps,
+                $destination, $agent_id, $path_step_id, $user_id);
+
+            // 申請の状況を差し戻しに変更
+            require_once('workflow/petition_logic.csp');
+            $logic = GRN_Workflow_Petition_Logic::getInstance();
+            $logic->modifyStatus($petition_id, GRN_WORKFLOW_STATUS_REMAND,
+                $user_id, $comment, $ptime, $agent_id);
+
+            // すべての経路ステップを処理済に変更
+            $logic = GRN_Workflow_PathStepDatas::getInstance();
+            $properties = ['col_finished' => GRN_WORKFLOW_FINISHED_COMPLETE];
+            $logic->modifyList(array_keys($path_steps), $properties);
+
+            // 差し戻し元を差し戻し完了に変更
+            $properties = ['col_finished' => GRN_WORKFLOW_FINISHED_REMAND];
+            $logic->modify($path_step_id, $properties);
+
+            if ('applicant' == $destination) {
+                // 差し戻し先は申請者
+                $uids[] = $petition['col_user'];
+                if ( ! is_null($petition['col_agent_user'])) {
+                    $uids[] = $petition['col_agent_user'];
+                }
+            } else {
+                // 差し戻し先を未完了に変更
+                $path_step = $path_steps[$destination];
+                $properties = ['col_finished' => null];
+                $logic->modify($path_step['_id'], $properties);
+
+                // 差し戻し先は（差し戻し先の）処理者全員
+                $uids = $path_step['uids'];
+            }
+
+            // 申請を送信
+            $foreign_keys = [
+                'UNPROCESSED_FOLDER_FOREIGN_KEY',
+                'IN_FOLDER_FOREIGN_KEY'
+            ];
+            $controller_util->sendPetition($petition_id, $uids, $foreign_keys,
+                GRN_WORKFLOW_MAILNOTIFICATION_ACTION_REMANDED);
+            $message_type = 'petition_remand';
+            break;
+        case 'next':    // 次へ
+            // 申請は削除しない
+            $uids[] = $user_id;
+            break;
+        case 'reapply': // （差し戻しの）再申請
+            if (GRN_WORKFLOW_STATUS_REMAND != $petition['col_status']) {
+                // 差し戻しでない申請は再申請できない
+                cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_REAPPLY);
+            }
+
+            SmartyValidate::unregister_form($session_target);
+            if ( ! is_null($petition['col_agent_user'])) {
+                if (defined('AJAX_REQUEST')) {
+                    $json->response([
+                        'link' => cb_get_full_url('workflow/send_form_remand_proxy',
+                            [
+                                'fid'     => $folder_id,
+                                'pid'     => $petition_id,
+                                'simple'  => $simple,
+                                'mode'    => 'remand',
+                                'handle'  => true,
+                                'cpsf'    => $session_flag,
+                                'tmp_key' => $tmp_key
+                            ])
+                    ]);
+                    cb_safe_exit();
+                }
+                cb_redirect('workflow/send_form_remand_proxy', [
+                    'fid'     => $folder_id,
+                    'pid'     => $petition_id,
+                    'simple'  => $simple,
+                    'mode'    => 'remand',
+                    'handle'  => true,
+                    'cpsf'    => $session_flag,
+                    'tmp_key' => $tmp_key
+                ]);
+            } else {
+                if (defined('AJAX_REQUEST')) {
+                    $json->response([
+                        'link' => cb_get_full_url('workflow/send_form_remand', [
+                            'fid'     => $folder_id,
+                            'pid'     => $petition_id,
+                            'simple'  => $simple,
+                            'mode'    => 'remand',
+                            'handle'  => true,
+                            'cpsf'    => $session_flag,
+                            'tmp_key' => $tmp_key
+                        ])
+                    ]);
+                    cb_safe_exit();
+                }
+                cb_redirect('workflow/send_form_remand', [
+                    'fid'     => $folder_id,
+                    'pid'     => $petition_id,
+                    'simple'  => $simple,
+                    'mode'    => 'remand',
+                    'handle'  => true,
+                    'cpsf'    => $session_flag,
+                    'tmp_key' => $tmp_key
+                ]);
+            }
+            break;
+        case 'cancel':  // （差し戻しの）取り消し
+            if (GRN_WORKFLOW_STATUS_REMAND != $petition['col_status']) {
+                // 差し戻しでない申請は取り消しできない
+                cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_CANCEL);
+            }
+            SmartyValidate::unregister_form($session_target);
+            if (defined('AJAX_REQUEST')) {
+                $json->response([
+                    'link' => cb_get_full_url('workflow/cancel', [
+                        'fid'     => $folder_id,
+                        'pid'     => $petition_id,
+                        'simple'  => $simple,
+                        'handle'  => true,
+                        'cpsf'    => $session_flag,
+                        'tmp_key' => $tmp_key
+                    ])
+                ]);
+                cb_safe_exit();
+            }
+            cb_redirect('workflow/cancel', [
+                'fid'     => $folder_id,
+                'pid'     => $petition_id,
+                'simple'  => $simple,
+                'handle'  => true,
+                'cpsf'    => $session_flag,
+                'tmp_key' => $tmp_key
+            ]);
+            break;
+        default:
+            // 不正なコマンド
+            cb_throw_error(E_GRN_WRKF_INVALID_COMMAND);
+            break;
+    }
+
+    // 監査
+    require_once('workflow/inspection.csp');
+    $inspection = GRN_Workflow_Petition_Inspection::getInstance();
+    if ($inspection->isEnabled()) {
+        if (0 < strlen($message_type)) {
+            $inspection->record($message_type, $message_args);
+        }
+    }
+
+    if (false === array_search($user_id, $uids) || $forced_remove) {
+        // 処理者の申請を削除
+        $controller_util->removePetition($petition_id, $user_id,
+            'UNPROCESSED_FOLDER_FOREIGN_KEY');
+    }
+
+    // 連続処理
+    if ($session_flag) {
+        if (is_array($folder_relations) && 0 < count($folder_relations)) {
+            SmartyValidate::unregister_form($session_target);
+            if (defined('AJAX_REQUEST')) {
+                $response = [
+                    'link' => cb_get_full_url('workflow/handle',
+                        ['cpsf' => true, 'tmp_key' => $tmp_key])
+                ];
+                if (isset($status)) {
+                    $response['petition_status']
+                        = DataConverterForJsPetitionData::convertStatus($status);
+                }
+
+                if ($finally_approved) {
+                    $response['success_do'] = 'auto_schedule';
+                    $response['petition_id'] = $petition_id;
+                }
+                $json->response($response);
+                cb_safe_exit();
+            }
+            cb_redirect('workflow/handle',
+                ['cpsf' => true, 'tmp_key' => $tmp_key]);
+        }
+        $session->unset_by('batch');
+    }
+    SmartyValidate::unregister_form($session_target);
+    if ( ! is_null($agent_id) && strlen($agent_id) > 0) {
+        $folder_id = GRN_WORKFLOW_FOLDER_PROXY_APPROVAL_ID;
+    }
+    if (defined('AJAX_REQUEST')) {
+        $response = [
+            'link' => cb_get_full_url('workflow/index', ['fid' => $folder_id])
+        ];
+        if (isset($status)) {
+            $response['petition_status']
+                = DataConverterForJsPetitionData::convertStatus($status);
+        }
+
+        if ($finally_approved) {
+            $response['success_do'] = 'auto_schedule';
+            $response['petition_id'] = $petition_id;
+        }
+        $json->response($response);
+        cb_safe_exit();
+    }
+    cb_redirect('workflow/index', ['fid' => $folder_id]);
+//    }
+//    else
+//    {
+//        $t->assign($G_INPUT);
+//        $t->setPageInfo($page_name);
+//        $page_title = grn_get_page_display_name($page_name);
+//        $t->assign('page_title', $page_title);
+//
+//        include('_handle.csp');
+//
+//        $t->display("{$page_name}.tpl");
+//    }
+}
+
+/**
+ * 過去に差し戻しが行われたことがあり
+ * 差し戻し先の経路が $path_step より後ろだったため
+ * 以前の承認が現在も有効である場合 TRUE を返す
+ */
+function isPathStepAfterRemand(& $path_step)
+{
+    if ( ! $path_step['col_finished'] == GRN_WORKFLOW_FINISHED_COMPLETE) {
+        return false;
+    }
+
+    $is_after_remand = true;
+    foreach (array_keys($path_step['users']) as $path_step_user_key) {
+        if ($path_step['users'][$path_step_user_key]['col_ptime']) {
+            $is_after_remand = false;
+        }
+    }
+
+    return $is_after_remand;
+}
+
+
+
+

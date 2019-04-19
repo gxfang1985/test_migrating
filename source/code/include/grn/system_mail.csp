@@ -1,0 +1,550 @@
+<?php
+
+/**
+ * システムメールアカウント管理クラス
+ *
+ * @version     1.0
+ * @package     grn.common
+ */
+class GRN_SystemMailConfigManager extends CB_ModuleBase
+{
+    const BUILTIN_FROM_LOCALPART = 'no-reply';
+    const BUILTIN_MAILSERVER_PORT = 25;
+    const BUILTIN_MAILSERVER_TIMEOUT = 10;
+    const BUILT_IN_SYSTEM_MAIL_ADDRESS = 'no-reply@cybozu.com';
+    const BUILT_IN_SYSTEM_MAIL_ADDRESS_CN = 'no-reply@cybozu.cn';
+
+    private static $POP_BEFORE_SMTP_ATTRIBUTES
+        = [
+            "is_pop_before_smtp",
+            "pop_before_smtp_wait",
+            "pop3_auth",
+            "pop3_server",
+            "pop3_port",
+            "pop3_ssl",
+            "pop3_user",
+            "pop3_pass",
+            "pop3_timeout"
+        ];
+    var $_profile = null;
+    var $_cache = [];
+    var $_logger = null;
+    var $_listener = null;
+
+    /**
+     * シングルトンインスタンスを取得する
+     *
+     * @return GRN_SystemMailConfigManager
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new static();
+        }
+
+        return $_instance;
+    }
+
+    function __construct()
+    {
+        parent::__construct('grn.common.systemmail');
+        $this->_profile = $this->getSystemProfile();
+    }
+
+    /**
+     * @access private
+     */
+    private function _getSmtpProperties()
+    {
+        $properties = [];
+
+        if ($this->useBuiltinMailServer()) {
+            require_once('fw/mailserver_config.csp');
+            $config = CB_MailServerConfig::getInstance();
+            $properties['hostname'] = $config->getBuiltinHost();
+            $properties['port'] = self::BUILTIN_MAILSERVER_PORT;
+            $properties['smtp_ssl'] = false;
+            $properties['smtp_tls'] = false;
+            $properties['smtp_auth'] = 'NONE';
+            $properties['smtp_timeout'] = self::BUILTIN_MAILSERVER_TIMEOUT;
+
+            return $properties;
+        }
+
+        $this->getProperty('smtp_server', $properties['hostname']);
+        $this->getProperty('smtp_port', $properties['port']);
+        $this->getProperty('smtp_ssl', $properties['smtp_ssl']);
+        $this->getProperty('smtp_tls', $properties['smtp_tls']);
+        $this->getProperty('smtp_user', $properties['uid']);
+        $this->getProperty('smtp_pass', $properties['password']);
+        $this->getProperty('smtp_auth', $properties['auth']);
+        $this->getProperty('smtp_timeout', $properties['timeout']);
+
+        return $properties;
+    }
+
+    /**
+     * @access private
+     */
+    private function _getPop3Properties()
+    {
+        $properties = [];
+        $this->getProperty('pop3_server', $properties['hostname']);
+        $this->getProperty('pop3_port', $properties['port']);
+        $this->getProperty('pop3_ssl', $properties['pop3_ssl']);
+        $this->getProperty('pop3_user', $properties['uid']);
+        $this->getProperty('pop3_pass', $properties['password']);
+        $this->getProperty('pop3_auth', $properties['auth']);
+        $this->getProperty('pop3_timeout', $properties['timeout']);
+
+        return $properties;
+    }
+
+    /**
+     * @param $keyName
+     *
+     * @return bool
+     */
+    private function isPopBeforeSMTPAttribute($keyName)
+    {
+        return in_array($keyName, self::$POP_BEFORE_SMTP_ATTRIBUTES);
+    }
+
+    /**
+     * @access private
+     */
+    private function _isPop3BeforeSmtp()
+    {
+        if ($this->useBuiltinMailServer()) {
+            return false;
+        }
+        // always don't use pop before smtp
+        if (defined("ON_FOREST")) {
+            return false;
+        }
+
+        if ($this->getProperty('is_pop_before_smtp', $value)) {
+            return (bool)$value;
+        }
+
+        return false;
+    }
+
+    /**
+     * @access private
+     */
+    private function _getPop3BeforeSmtpWaittime()
+    {
+        // always 0 sec.
+        if (defined("ON_FOREST")) {
+            return 0;
+        }
+
+        if ($this->getProperty('pop_before_smtp_wait', $value)) {
+            return (int)$value;
+        }
+
+        return false;
+    }
+
+    /**
+     * システムメールアカウントが利用可能かどうか？
+     *
+     * @return bool
+     */
+    function isAvailable()
+    {
+        if ($this->getProperty('available', $value)) {
+            return (bool)$value;
+        }
+
+        return false;
+    }
+
+    /**
+     * システムメールアカウントのメールアドレスを取得する
+     *
+     * @return mixed FALSE or メールアドレス
+     */
+    public function getMailAddress()
+    {
+        if (defined('ON_FOREST') && $this->useBuiltinMailServer()) {
+            require_once('fw/slash_util.csp');
+            $region = CB_SlashUtil::getRegion();
+            if ($region === "CN") {
+                return self::BUILT_IN_SYSTEM_MAIL_ADDRESS_CN;
+            }
+
+            return self::BUILT_IN_SYSTEM_MAIL_ADDRESS;
+        } elseif ($this->getProperty('mailaddress', $value)) {
+            return $value;
+        }
+
+        return false;
+    }
+
+    /**
+     * システムメールアカウントのプロパティを削除する
+     *
+     * @param string $key プロパティ名
+     *
+     * @return bool
+     */
+    function removeProperty($key)
+    {
+        unset($this->_cache[$key]);
+
+        return $this->_profile->removeAttribute($key);
+    }
+
+    /**
+     * システムメールアカウントのプロパティを取得する
+     *
+     * @param string $key   プロパティ名
+     * @param string $value プロパティ値
+     *
+     * @return bool
+     */
+    function getProperty($key, &$value)
+    {
+        if (array_key_exists($key, $this->_cache)) {
+            $value = $this->_cache[$key];
+
+            return true;
+        }
+
+        return $this->_profile->getAttribute($key, $value);
+    }
+
+    /**
+     * システムメールアカウントのプロパティを設定する
+     *
+     * @param string $key   プロパティ名
+     * @param string $value プロパティ値
+     *
+     * @return bool
+     */
+    function setProperty($key, $value)
+    {
+        // don't set properties
+        // on garoon.com pop before smtp is obsolete
+        if (defined("ON_FOREST") && $this->isPopBeforeSMTPAttribute($key)) {
+            return;
+        }
+
+        if ($this->_profile->getAttribute($key, $dummy)) {
+            $this->_profile->updateAttribute($key, $value);
+        } else {
+            $this->_profile->createAttribute($key, $value);
+        }
+        $this->_cache[$key] = $value;
+    }
+
+    /**
+     * リスナーを取得する
+     *
+     * @return GRN_SystemMailErrorListener
+     */
+    function getListener()
+    {
+        if (is_null($this->_listener)) {
+            $this->_listener = new GRN_SystemMailErrorListener;
+        }
+
+        return $this->_listener;
+    }
+
+    /**
+     * 有効設定か接続確認を行う
+     *
+     * @return bool
+     */
+    function testConnect()
+    {
+        global $G_container_base;
+
+        /** @var CB_MailSMTPSenderBase $sender */
+        $sender = $G_container_base->getInstance('mail_smtp');
+        $sender->setLogger($this->getLogger());
+        $listener = $this->getListener();
+        $sender->setErrorListener($listener);
+
+        require_once('fw/mailserver_config.csp');
+        $mailserver_config = CB_MailServerConfig::getInstance();
+
+        if ($this->_isPop3BeforeSmtp()) {
+            /** @var CB_MailPOP3Store $reciever */
+            $reciever = $G_container_base->getInstance('mail_pop3');
+            $reciever->setErrorListener($listener);
+
+            $pop3_properties = $this->_getPop3Properties();
+            $pop3_hostname = cb_at($pop3_properties, 'hostname');
+            if ( ! $mailserver_config->isValidHost($pop3_hostname)) {
+                cb_throw_error(E_GRN_EXTSERVER_INVALID_POP3_MAILSERVER_NAME);
+            }
+            if ( ! $reciever->isAvailable($pop3_properties)) {
+                cb_throw_error(E_GRN_EXTSERVE_FAILED_TO_CONNECT_POP3_SERVER, null,
+                    ['cause' => $listener->formatErrors()]);
+            }
+        }
+
+        $smtp_properties = $this->_getSmtpProperties();
+        $smtp_hostname = cb_at($smtp_properties, 'hostname');
+        if ( ! $mailserver_config->isValidHost($smtp_hostname)) {
+            cb_throw_error(E_GRN_EXTSERVER_INVALID_SMTP_MAILSERVER_NAME);
+        }
+        if ( ! $sender->isAvailable($smtp_properties)) {
+            cb_throw_error(E_GRN_EXTSERVE_FAILED_TO_CONNECT_SMTP_SERVER, null,
+                ['cause' => $listener->formatErrors()]);
+        }
+
+        return true;
+    }
+
+    /**
+     * システムメールアカウントの送信オブジェクトを取得する。
+     *
+     * @return bool|CB_MailSMTPSenderBase
+     */
+    function getSystemMailSender(&$errMessage = null)
+    {
+        if ( ! $this->isAvailable()) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        global $G_container_base;
+        /** @var CB_MailSMTPSenderBase $sender */
+        $sender = $G_container_base->getInstance('mail_smtp');
+        require_once('fw/mailserver_config.csp');
+        $mailserver_config = CB_MailServerConfig::getInstance();
+        $listener = $this->getListener();
+        $sender->setErrorListener($listener);
+        if ($this->_isPop3BeforeSmtp()) {
+            $pop3_properties = $this->_getPop3Properties();
+            $pop3_hostname = cb_at($pop3_properties, 'hostname');
+            if ( ! $mailserver_config->isValidHost($pop3_hostname)) {
+                $ret = false;
+                $errMessage = 'The incoming mail server name is invalid';
+
+                return $ret;
+            }
+            /** @var CB_MailPOP3Store $reciever */
+            $reciever = $G_container_base->getInstance('mail_pop3');
+            $reciever->setErrorListener($listener);
+            if ($reciever->connect($pop3_properties) === false) {
+                $ret = false;
+                $errMessage = 'Failed to connect to POP3 server "' . $listener->formatErrors() . '"';
+
+                return $ret;
+            }
+
+            $wait = (int)$this->_getPop3BeforeSmtpWaittime();
+            if ($wait > 0) {
+                sleep($wait);
+            }
+        }
+
+        $smtp_properties = $this->_getSmtpProperties();
+
+        if ( ! $this->useBuiltinMailServer()) {
+            $smtp_hostname = cb_at($smtp_properties, 'hostname');
+            if ( ! $mailserver_config->isValidHost($smtp_hostname)) {
+                $ret = false;
+                $errMessage = 'The outgoing mail server name (SMTP) is invalid';
+
+                return $ret;
+            }
+        } else {
+            $smtp_properties['is_need_connect_to_socks'] = FALSE;
+        }
+        if ($sender->connect($smtp_properties) === false) {
+            $ret = false;
+            $errMessage = 'Failed to connect to SMTP server "' . $listener->formatErrors() . '"';
+
+            return $ret;
+        }
+
+        return $sender;
+    }
+
+    /**
+     * @return bool
+     */
+    public function isAvailableBuiltinMailServer()
+    {
+        if ( ! defined('ON_FOREST')) {
+            return false;
+        }
+
+        require_once('fw/mailserver_config.csp');
+        $config = CB_MailServerConfig::getInstance();
+        if ( ! $config->isEnableBuiltin()) {
+            return false;
+        }
+        $builtin_host = $config->getBuiltinHost();
+        if ($builtin_host !== false && strlen($builtin_host) > 0) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @return bool
+     */
+    public function useBuiltinMailServer()
+    {
+        if ( ! $this->isAvailableBuiltinMailServer()) {
+            return false;
+        }
+
+        $use_builtin = false;
+        $this->getProperty('use_builtin', $use_builtin);
+        if ($use_builtin) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Output a log about sending mail unsuccessfully.
+     *
+     * @param String $errMessage    (Information of Error.)
+     * @param String $applicationId (Application Id)
+     * @param String $moduleId      (Module Id)
+     *
+     * @return null
+     **/
+    function logForwardMailFail($errMessage, $applicationId, $moduleId)
+    {
+        require_once('fw/logger.csp');
+        $logger_manager = CB_LoggerManager::getInstance();
+        $logger = $logger_manager->getLogger($moduleId);
+
+        $message = 'Could not forward the ' . $applicationId . ' notification (' . $errMessage . ')';
+        $params = null;
+
+        $logger->warningEx($message, $params);
+
+        unset($logger_manager);
+        unset($logger);
+    }
+
+    /**
+     * Check the address
+     *
+     * @param string $address
+     *
+     * @return bool
+     * True: it is a local mail address
+     * False: it is not a local mail address
+     */
+    private function matchLocalMailAddress($address)
+    {
+        $ret = preg_match("/(^[^@]*|@localhost|@localdomain|@.*[.]localdomain)$/", $address);
+        if ($ret) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param array $mail_addresses
+     * @param array $invalid_addresses
+     *
+     * @return array
+     */
+    public function separateLocalMailAddress(& $mail_addresses, & $invalid_addresses)
+    {
+        foreach ($mail_addresses as $key => $address) {
+            if ($this->matchLocalMailAddress($address)) {
+                $invalid_addresses[] = $address;
+                unset($mail_addresses[$key]);
+            }
+        }
+    }
+
+    /**
+     * Create the log message of invalid address
+     *
+     * @param $addresses
+     *
+     * @return string   invalid_address_1:'xxx', invalid_address_2: 'xxx'
+     */
+    public function createInvalidAddressLogMessage($addresses)
+    {
+        $message = '';
+        $index = 1;
+        foreach ($addresses as $address) {
+            $message .= ($index === 1 ? '' : ', ') . 'invalid_address_' . $index . ':\'' . $address . '\'';
+            $index++;
+        }
+
+        return $message;
+    }
+}
+
+/**
+ * システムメールエラーリスナークラス
+ *
+ * @package grn.common
+ */
+class GRN_SystemMailErrorListener
+{
+    var $_errors = [];
+
+    /**
+     * エラーを登録
+     *
+     * @param   string $errno エラーコード
+     * @param   string $msg   サーバーからの応答文字列
+     */
+    function error($errno, $msg)
+    {
+        $this->_errors[] = ['errno' => $errno, 'msg' => $msg];
+    }
+
+    /**
+     * 全てのエラーを削除
+     *
+     */
+    function clearErrors()
+    {
+        $this->_errors = [];
+    }
+
+    /**
+     * エラー文字列を取得
+     *
+     * @return string
+     */
+    function formatError($errno, $msg)
+    {
+        $ret = "$errno - [$msg]";
+
+        return $ret;
+    }
+
+    /**
+     * 全てのエラー文字列を取得
+     *
+     * @return string
+     */
+    function formatErrors()
+    {
+        $str = '';
+        foreach ($this->_errors as $error) {
+            $str .= $this->formatError($error['errno'], $error['msg']);
+            $str .= "\r\n";
+        }
+
+        return $str;
+    }
+}
+
+

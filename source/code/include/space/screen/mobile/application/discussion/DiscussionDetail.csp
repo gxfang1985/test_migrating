@@ -1,0 +1,385 @@
+<?php
+
+namespace grn\space\screen\mobile\application\discussion;
+
+use grn\favour\service\FavourService;
+use grn\space\common\data\bean\Application;
+use grn\space\common\data\bean\Authority;
+use grn\space\common\data\bean\Comment;
+use grn\space\common\data\bean\LanguageStatus;
+use grn\space\common\data\condition\CommentSearchCondition;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\exception\GrnDataNotFoundException;
+use grn\space\common\exception\GrnInvalidPermissionException;
+use grn\space\common\utility\SpaceDatetimeUtility;
+use grn\space\common\utility\SpaceFileUtility;
+use grn\space\common\utility\ValidateUtility;
+use grn\space\logic\SpaceLogic;
+use grn\space\screen\mobile\MobileGenericScreenBase;
+use grn\space\service\DiscussionService;
+use grn\space\service\SpaceService;
+use grn\space\service\TodoService;
+use grn\grn\mention\MentionController;
+use grn\grn\MemberLogic;
+
+/**
+ * Class DiscussionDetail
+ */
+class DiscussionDetail extends MobileGenericScreenBase
+{
+    private $_todo_add_auth;
+    private $is_favour_active;
+
+    /**
+     * @param $input
+     */
+    public function __construct($input)
+    {
+        parent::__construct($input);
+
+        $input = $this->getInput();
+        $parameter = [self::ARG_SPACE_ID, self::ARG_THREAD_ID];
+        $this->checkArgFromInput($parameter, $input);
+        $this->verifySpaceIsNotExpired();
+
+        $space_id = $this->getSpaceId();
+        $discussion_id = $this->getThreadId();
+        $login_id = $this->getLoginUserId();
+
+        $todo_service = TodoService::getInstance();
+        $todo_root_category
+            = $todo_service->getApplicationRootCategory($space_id,
+            Application::APPLICATION_CODE_TODO, $this->getLanguageCode());
+        $this->_todo_add_auth
+            = $todo_service->hasTodoCategoryAccessControl(Authority::AUTHORITY_CODE_WRITE,
+            $space_id, $discussion_id, $todo_root_category->getId(), $login_id);
+
+        $this->setMobileOperateMenu([
+            [
+                'page'   => 'space/mobile/member_list',
+                'name'   => cb_msg('grn.space.mobile', 'member'),
+                'params' => [
+                    self::ARG_SPACE_ID  => $space_id,
+                    self::ARG_THREAD_ID => $discussion_id,
+                    self::ARG_FROM      => self::FROM_DISCUSSION_DETAIL
+                ]
+            ]
+        ]);
+        if ($this->_todo_add_auth) {
+            $this->setMobileFooterBar([
+                'add_spacetodo' => [
+                    'page'   => 'space/mobile/application/todo/add',
+                    'params' => [
+                        self::ARG_SPACE_ID  => $space_id,
+                        self::ARG_THREAD_ID => $discussion_id,
+                        self::ARG_FROM      => self::FROM_DISCUSSION_DETAIL
+                    ]
+                ]
+                ,
+                'comment'       => []
+            ]);
+        } else {
+            $this->setMobileFooterBar();
+        }
+
+        $favour_service = new FavourService();
+        $this->is_favour_active = $favour_service->isFavourAppActive();
+    }
+
+    /**
+     * @return mixed|string|void
+     * @throws GrnDataNotFoundException
+     * @throws GrnInvalidPermissionException
+     */
+    public function fetch()
+    {
+        $space_id = $this->getSpaceId();
+        $discussion_id = $this->getThreadId();
+        $login_id = $this->getLoginUserId();
+
+        $space_service = SpaceService::getInstance();
+        $space = $space_service->getSpace($space_id, $login_id,
+            $this->getLanguageCode());
+
+        $discussion_service = DiscussionService::getInstance();
+        $read_auth
+            = $discussion_service->hasThreadAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $space_id, $discussion_id, $login_id);
+        if ($read_auth) {
+            $discussion = $discussion_service->getThread($discussion_id,
+                $login_id, false);
+            $discussion_service->registerReadThread($discussion_id, $login_id);
+            if ($discussion_service->isNotConfirmedDiscussionNotification($login_id,
+                $discussion_id)
+            ) {
+                $discussion_service->confirmDiscussionNotification($login_id,
+                    $discussion);
+            }
+        } else {
+            throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_ACCESS_PERMISSION);
+        }
+
+        $space_file_collection = $discussion->getSpaceFileCollection();
+
+        require_once('grn/smarty.csp');
+        $t = new \GRN_Smarty();
+
+        require_once('star/logic.csp');
+        $star_logic = \GRN_Star_StarLogic::getInstance();
+        $use_star = $star_logic->isActive();
+        $t->assign('use_star', $use_star);
+        if ($use_star) {
+            $t->assign('star_infos',
+                $star_logic->getStatusByIDs($this->getLoginUser(),
+                    self::GRN_SPACE_MODULE_ID, [$discussion->getId()]));
+            $t->assign('sub_module', self::GRN_DISCUSSION_SUB_MODULE_ID);
+            $t->assign('module', self::GRN_SPACE_MODULE_ID);
+        }
+
+        $t->assign('is_favour_active', $this->is_favour_active);
+        $t->assign('space_id', $space_id);
+        $t->assign('space', $space);
+        $t->assign('discussion', $discussion);
+        $t->assign('has_attached_file',
+            $space_file_collection->getCountNoLimit() > 0 ? true : false);
+        $t->assign('comments', $this->_getComments());
+        $t->assign('offset', $this->getNewOffset());
+        $t->assign('more_view_args', [
+            self::ARG_SPACE_ID  => $space_id,
+            self::ARG_THREAD_ID => $discussion->getId()
+        ]);
+        $t->assign('todo_add_auth', $this->_todo_add_auth);
+
+        require_once('fw/plugin.csp');
+        $mention_access_plugin_encoded = \CB_PluginLoader::encodeParam(
+            [
+                'name'   => 'space',
+                'params' => [
+                    'app_id'   => 'space',
+                    'space_id' => $space_id,
+                    'target'   => [MemberLogic::TYPE_USER]
+                ]
+            ]);
+        $t->assign('mention_access_plugin_encoded',
+            $mention_access_plugin_encoded);
+
+        //assign breadcrumb.
+        $current_page = cb_msg('grn.mobile', 'detail_title');
+        $upper_page = cb_msg('grn.space.discussion', 'index');
+        $this->assignBreadcrumbCurrentPage($t, $current_page);
+        $input = $this->getInput();
+        if (array_key_exists('nid', $input)
+            || array_key_exists('nhid', $input)
+        ) {
+            $this->assignBreadcrumbUpperPage($t, '', '', [], true);
+        } else {
+            $this->assignBreadcrumbUpperPage($t, $upper_page,
+                self::URL_DISCUSSION_LIST,
+                $params = [self::ARG_SPACE_ID => $space_id]);
+        }
+
+        //generate upload ticket
+        include('grn/_upload_prepend.csp');
+
+        $spaceLogic = SpaceLogic::getInstance();
+        $space_obj = $spaceLogic->getSpace($space_id,
+            LanguageStatus::STANDARD_LANGUAGE_CODE);
+        $browse_log = [
+            "space_id"    => $space_id,
+            "category_id" => $space_obj->getCategoryId(),
+            "space_name"  => $space_obj->getSpaceName(),
+            "thread_id"   => $discussion_id,
+            "thread_name" => $discussion->getTitle()
+        ];
+        if ($discussion->getFolderId() > 0) {
+            $browse_log['directory_id'] = $discussion->getFolderId();
+        }
+        $discussion_service->addBrowseThreadLog($browse_log);
+
+        return $t->fetch('space/mobile/application/discussion/discussion_detail.tpl');
+    }
+
+    /**
+     * @return mixed|string|void
+     * @throws GrnDataNotFoundException
+     * @throws GrnInvalidPermissionException
+     */
+    public function fetchCommentsForAjax()
+    {
+        $space_id = $this->getSpaceId();
+        $discussion_id = $this->getThreadId();
+        $login_id = $this->getLoginUserId();
+
+        $discussion_service = DiscussionService::getInstance();
+        $read_auth
+            = $discussion_service->hasThreadAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $space_id, $discussion_id, $login_id);
+        if ($read_auth) {
+            if ($discussion_service->isNotConfirmedDiscussionNotification($login_id,
+                $discussion_id)
+            ) {
+                $discussion = $discussion_service->getThread($discussion_id,
+                    $login_id);
+                if ( ! $discussion->isUnread()) {
+                    $discussion_service->confirmDiscussionNotification($login_id,
+                        $discussion);
+                }
+            }
+            $comments = $this->_getComments();
+        } else {
+            throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_ACCESS_PERMISSION);
+        }
+
+        require_once('grn/smarty.csp');
+        $smarty = new \GRN_Smarty();
+        $smarty->assign('is_favour_active', $this->is_favour_active);
+        $smarty->assign('space_id', $space_id);
+        $smarty->assign('discussion_id', $discussion_id);
+        $smarty->assign('comments', $comments);
+
+        return $smarty->fetch('space/mobile/application/discussion/comment_list.tpl');
+    }
+
+    /**
+     * @return array
+     * @throws GrnDataNotFoundException
+     * @throws \grn\space\common\exception\GrnInvalidArgumentException
+     */
+    private function _getComments()
+    {
+        $discussion_id = $this->getThreadId();
+        $login_id = $this->getLoginUserId();
+        $space_id = $this->getSpaceId();
+
+        $offset = $this->getArrayValue(self::ARG_NAVI_TAG, $this->getInput());
+        if ( ! ValidateUtility::isNumber($offset,
+            ValidateUtility::DISABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            $offset = 0;
+        }
+
+        $search_condition = new CommentSearchCondition();
+        $search_condition->setSearchScopeType(CommentSearchCondition::SEARCH_SCOPE_TYPE_THREAD_AND_TODO);
+        $search_condition->setSearchScopeValue($discussion_id);
+        $search_condition->setSearchUserId($login_id);
+        $search_condition->setOrderSortArray([CommentSearchCondition::SORT_COMMENT_NO_DESC]);
+        $search_condition->setLimit(self::MORE_VIEW_COUNT + $offset);
+        $search_condition->setOffset(0);
+
+        $discussion_service = DiscussionService::getInstance();
+        try {
+            $comment_collection
+                = $discussion_service->searchCommentBySearchConditionWithAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+                $search_condition, $login_id,
+                DiscussionService::MARK_THREAD_COMMENTS_READ);
+            $discussion_service->addInspectionCollectionUserInfo($comment_collection,
+                $login_id, $this->isSystemUseEnglish(),
+                $this->isEnglishDisplayAfterName(),
+                $this->isOrganizationDisplayAfterName(),
+                $this->getLanguageCode());
+            SpaceDatetimeUtility::constructionInspectionDisplayDatetime($comment_collection,
+                $this->getDatetimeFormat(),
+                SpaceDatetimeUtility::DISPLAY_TYPE_LONGDATE_AND_TIME,
+                $this->getLanguageCode(), $this->getTimezoneName());
+            //add mention info
+            $comment_collection
+                = $discussion_service->addMentionInfo($comment_collection);
+            $this->setNewOffset($offset, self::MORE_VIEW_COUNT,
+                $comment_collection->getCountNoLimit());
+        } catch (GrnDataNotFoundException $e) {
+            $e->setErrorCode(ErrorCode::GRN_THREAD_INVALID_COMMENT_ID);
+            throw $e;
+        }
+
+        $discussion_comments = [];
+
+        $favour_service = new FavourService();
+        foreach ($comment_collection as $comment) {
+            /** @var \grn\space\common\data\bean\Comment $comment */
+            $comment_file_collection = $comment->getSpaceFileCollection();
+            $attachment = [];
+            foreach ($comment_file_collection as $file) {
+                /** @var \grn\space\common\data\bean\SpaceFile $file */
+                $attachment[$file->getId()]
+                    = SpaceFileUtility::getSpaceFileLinkView($file);
+            }
+            $is_todo_comment = $comment->getParentApplicationType()
+                               == Comment::PARENT_APPLICATION_TYPE_TODO ? true
+                : false;
+            $todo_id = null;
+            $todo_title = null;
+            if ($is_todo_comment) {
+                $parent_app = $comment->getParentApplicationObject();
+                $todo_title = $parent_app->getTitle();
+                $todo_id = $comment->getParentApplicationId();
+            }
+            $creator = $comment->getCreator();
+
+            $favour_info = [];
+            if ($this->is_favour_active) {
+                if ($is_todo_comment) {
+                    $params = [
+                        self::ARG_SPACE_ID  => $space_id,
+                        self::ARG_THREAD_ID => $discussion_id,
+                        self::ARG_TODO_ID   => $todo_id
+                    ];
+                    $favour_info
+                        = $favour_service->constructFavourInfo(\GrnSpaceApplication::GRN_SPACE_MODULE_ID,
+                        \GrnSpaceApplication::FAVOUR_TODO_COMMENT,
+                        $comment->getId(),
+                        $login_id,
+                        $params,
+                        \GrnSpaceApplication::GRN_TODO_SUB_MODULE_ID);
+                } else {
+                    $params = [
+                        self::ARG_SPACE_ID  => $space_id,
+                        self::ARG_THREAD_ID => $discussion_id
+                    ];
+                    $favour_info
+                        = $favour_service->constructFavourInfo(\GrnSpaceApplication::GRN_SPACE_MODULE_ID,
+                        \GrnSpaceApplication::FAVOUR_DISCUSSION_COMMENT,
+                        $comment->getId(),
+                        $login_id,
+                        $params,
+                        \GrnSpaceApplication::GRN_DISCUSSION_SUB_MODULE_ID);
+                }
+            }
+
+            if ($comment->getCreatorId() == $login_id) {
+                $cmt_deletable = true;
+            } else {
+                $cmt_deletable = false;
+            }
+            $mention = $comment->getMention();
+            $offset_member
+                = MobileGenericScreenBase::DEFAULT_OFFSET_DISPLAY_MEMBER;
+            $max_member
+                = MobileGenericScreenBase::MAX_NUM_DISPLAY_MEMBER;
+            $mention_list
+                = MentionController::createMemberListsForView([$mention],
+                $offset_member, $max_member);
+            $discussion_comments[$comment->getId()] = [
+                'id'              => $comment->getId(),
+                'number'          => $comment->getCommentNo(),
+                'is_todo_comment' => $is_todo_comment,
+                'todo_id'         => $todo_id,
+                'todo_title'      => $todo_title,
+                'content'         => $comment->getContent(),
+                'is_rich_text'    => $comment->isRichText(),
+                'parent_no'       => $comment->getParentCommentNo(),
+                'unread'          => ($comment->isUnread() ? true : false),
+                'attachment'      => $attachment,
+                'ctime'           => $comment->getCreateDisplayDatetime(),
+                'creator_type'    => $this->getUserType($creator),
+                'creator_name'    => $creator->getDisplayName(),
+                'deletable'       => $cmt_deletable,
+                'favour_info'     => $favour_info,
+                'mention'         => $mention_list[0] ?? [],
+                'mention_count'   => $comment->getMention()->count()
+            ];
+        }
+
+        return $discussion_comments;
+    }
+}

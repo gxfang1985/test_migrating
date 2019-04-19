@@ -1,0 +1,123 @@
+<?php
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    global $G_INPUT;
+
+    $folder_id = null;
+    if (array_key_exists('fid', $G_INPUT)) {
+        $folder_id = $G_INPUT['fid'];
+    }
+    $petition_id = null;
+    if (array_key_exists('pid', $G_INPUT)) {
+        $petition_id = $G_INPUT['pid'];
+    }
+
+    /**
+     * 制限事項
+     * ・ログインユーザーはフォルダの所有者でない
+     * ・フォルダにフォルダリレーションがない
+     */
+
+    global $G_container_base;
+    $uum =& $G_container_base->getInstance('uum');
+    $login =& $uum->getLoginUser();
+    $user_id = $login->getOID();
+
+    require_once('workflow/folder_logic.csp');
+    $logic = GRN_Workflow_Folder_Logic::getInstance();
+    $folder = $logic->get($user_id, $folder_id);
+    if ( ! is_array($folder) || 0 == count($folder)) {
+        // ログインユーザーはフォルダの所有者でない
+        cb_throw_error(E_GRN_WRKF_FOLDER_INVALID_FOLDER_ID);
+    }
+
+    require_once('workflow/folderrelation_logic.csp');
+    $logic = GRN_Workflow_FolderRelation_Logic::getInstance();
+    $folder_relation = $logic->getSpecific($folder_id, $petition_id);
+    if ( ! is_array($folder_relation) || 0 == count($folder_relation)) {
+        // フォルダにフォルダリレーションがない
+        cb_throw_error(E_GRN_WRKF_FOLDER_FOLDERRELATION_NOT_FOUND);
+    }
+
+    //Get Petition and Item Data Controller Utility
+    require_once('workflow/controller_util.csp');
+    $petition_util = GRN_Workflow_Petition_Controller_Utility::getInstance();
+
+    //Create Parameter Translation Map
+    $translation_map_petition = [
+        'pid'    => '_id',                  //Petition ID
+        'status' => 'status'
+    ];
+
+    //Get Petition for view
+    $petition = $petition_util->getView($petition_id,
+        $translation_map_petition);
+
+    $controller_util = new GRN_Workflow_ControllerUtil(cb_get_pagename());
+    // 申請IDリストの経路情報を取得
+    $path_steps = $controller_util->getPathInfo($petition['pid'], false,
+        CB_DATABASE_NO_LOCK);
+    $cancel_confirm = false;
+
+    if (GRN_WORKFLOW_STATUS_IN_PROCESS_CANCEL == $petition['status']) {
+        // 処理中の経路ステップを取得
+        $path_steps_current = current($path_steps);
+        $path_step
+            =& $controller_util->getInProcessPathStep($path_steps_current);
+        $transactor = [];
+        if (false !== $path_step) {
+            $transactor = $path_step['users'];
+        }
+
+        foreach ($transactor as $path_step_user) {
+            if (GRN_WORKFLOW_RESULT_CONFIRM == $path_step_user['col_result']) {
+                $cancel_confirm = true;
+                break;
+            }
+        }
+    }
+
+    if (($folder['col_folder_type'] == GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID)
+        || ($folder['col_folder_type'] == GRN_WORKFLOW_FOLDER_TYPE_OUT_ID
+            && ( ! ((GRN_WORKFLOW_STATUS_IN_PROCESS_CANCEL
+                     == $petition['status']
+                     && $cancel_confirm)
+                    || GRN_WORKFLOW_STATUS_IN_PROCESS_CANCEL
+                       == $petition['status']
+                    || GRN_WORKFLOW_STATUS_FINISHED == $petition['status']
+                    || GRN_WORKFLOW_STATUS_REJECTION == $petition['status'])))
+    ) {
+        cb_redirect('workflow/index', ['fid' => $folder_id]);
+    }
+
+    // ベースサービスの通知を削除
+    require_once('workflow/notification.csp');
+    $notification_logic = GRN_Workflow_Notification::getInstance();
+    $notification_logic->confirm($user_id, $petition_id);
+
+    $logic->remove($folder_id, $petition_id);
+
+    if ($folder['col_folder_type'] == GRN_WORKFLOW_FOLDER_TYPE_TEMP_ID) {
+        require('workflow/auto_schedule_register_logic.csp');
+        $wf_register_logic
+            = GRN_Workflow_Auto_Schedule_Register_Logic::getInstance();
+        $wf_register_logic->delete($petition_id);
+    }
+
+    //監査する
+    require_once('workflow/inspection.csp');
+    $inspection = GRN_Workflow_Folder_Relation_Inspection::getInstance();
+    if ($inspection->isEnabled()) {
+        $message_type = 'folder_relation_delete';
+
+        $message_args['foid'] = $folder_id;
+        $message_args['pid'] = $petition_id;
+
+        //Record Inspection
+        $inspection->record($message_type, $message_args);
+    }
+
+    cb_redirect('workflow/index', ['fid' => $folder_id]);
+}
+
+

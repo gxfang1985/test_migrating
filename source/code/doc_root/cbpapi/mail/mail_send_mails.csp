@@ -1,0 +1,277 @@
+<?php
+if (isset($cbpapi_service)) {
+    $action = $cbpapi_service->getAction();
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    require_once('mail/utility.csp');
+    $utility = GRN_Mail_Utility::getInstance();
+    // メールの使用が許可されているか
+    $system_config = $utility->getSystemConfig();
+    $personal_config = $utility->getPersonalConfig($login);
+    $mail_logic = $utility->getMailLogic();
+
+    // get parameters of SOAP message
+    $node_parameters = $cbpapi_service->getRequestParameters();
+    $node_send_mail = $cbpapi_service->selectNodes($node_parameters,
+        'send_mail');
+    if ( ! $node_send_mail) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'send_mail']);
+    }
+    $mails_for_view = [];
+    $sent_mail_ids = [];
+    require_once('cbpapi/mail_logic.csp');
+    $cbpapi_mail_logic = GRN_CBPApi_Mail_Logic::getInstance();
+    foreach (array_keys($node_send_mail) as $send_mail_key) {
+        $mail_params = [];
+        $mail_params
+            = $cbpapi_mail_logic->getInputParamerters($node_send_mail[$send_mail_key]);
+        $account_id = '';
+        $to = '';
+        $cc = '';
+        $bcc = '';
+        $from = '';
+        $reply_to = '';
+        $draft_id = null;
+        $mail_data = null;
+        if (array_key_exists('attributes', $node_send_mail[$send_mail_key])) {
+            $attributes = $node_send_mail[$send_mail_key]['attributes'];
+            if ( ! array_key_exists('account_id', $attributes)) {
+                require_once('cbpapi/error_code.csp');
+                cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                    ['param' => 'account_id']);
+            }
+            $account_id = $attributes['account_id'];
+            // check account id
+            if (strlen($account_id) > 0 && is_numeric($account_id)) {
+                $account = $personal_config->getAccountData($account_id);
+                if (is_null($account)) {
+                    require_once('mail/error_code.csp');
+                    cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+                }
+                if ( ! array_key_exists('user_id', $account)
+                     || $account['user_id'] != $login->getOID()
+                ) {
+                    require_once('mail/error_code.csp');
+                    cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+                }
+                if ($account['disabled']) {
+                    // アカウント停止中
+                    cb_throw_error(E_GRN_MAIL_DISABLED_ACCOUNT);
+                }
+                $folder = $utility->getFolderLogic();
+                // initialize special folders
+                $folder->initSpecialFolders($login, $account_id);
+            } else {
+                require_once('mail/error_code.csp');
+                cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+            }
+            if (array_key_exists('from_string', $attributes)) {
+                $from = $attributes['from_string'];
+            }
+            if (array_key_exists('to_string', $attributes)) {
+                $to
+                    = $cbpapi_mail_logic->escapeDisplayName($attributes['to_string']);
+            }
+            if (array_key_exists('cc_string', $attributes)) {
+                $cc
+                    = $cbpapi_mail_logic->escapeDisplayName($attributes['cc_string']);
+            }
+            if (array_key_exists('bcc_string', $attributes)) {
+                $bcc
+                    = $cbpapi_mail_logic->escapeDisplayName($attributes['bcc_string']);
+            }
+            if (array_key_exists('reply_to_string', $attributes)) {
+                $reply_to_string
+                    = $cbpapi_mail_logic->escapeDisplayName($attributes['reply_to_string']);
+            }
+            if (array_key_exists('draft_id', $attributes)) {
+                $draft_id = $attributes['draft_id'];
+                // check draft id
+                if (strlen($draft_id) > 0 && is_numeric($draft_id)) {
+                    $mail_data = $mail_logic->getMailData($draft_id, false);
+                    $draft_flag = array_key_exists('draft', $mail_data)
+                        ? $mail_data['draft'] : null;
+                    if (is_null($mail_data) || is_null($draft_flag)) {
+                        require_once('mail/error_code.csp');
+                        cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+                    }
+                    if ( ! array_key_exists('user_id', $mail_data)
+                         || $mail_data['user_id'] != $login->getOID()
+                    ) {
+                        require_once('mail/error_code.csp');
+                        cb_throw_error(E_GRN_MAIL_MAIL_ACCESS_DENIED);
+                    }
+                } else {
+                    require_once('mail/error_code.csp');
+                    cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+                }
+            }
+        }
+        if (strlen($to) > 0 || strlen($cc) > 0 || strlen($bcc) > 0) {
+            $mail_params['recipient'] = 'dummy';
+        }
+
+        $system_config->getGeneralSetting($general_settings);
+        $disable_mail = $general_settings['disable_mail'];
+        $check_mail_on_login = $general_settings['check_mail_on_login'];
+        if ($disable_mail) {
+            // メール使用停止中
+            cb_throw_error(E_GRN_MAIL_CANNOT_USE);
+        }
+        // 総メールサイズをチェック
+        $user_id = $login->getOID();
+        $system_config->getSizeUserLimitSetting($size_settings, $user_id);
+        $mail_size = $personal_config->getMailSize(null);
+        if ((0 <= $size_settings['user_limit_' . $user_id])
+            && ($mail_size >= $size_settings['user_limit_' . $user_id] * 1024
+                              * 1024)
+        ) {
+            cb_throw_error(E_GRN_MAIL_LIMIT, null,
+                ['limit' => $size_settings['user_limit_' . $user_id] . 'MB']);
+        }
+
+        $properties = [];
+        $properties['subject'] = @ $mail_params['subject'];
+        $properties['to'] = $to;
+        $properties['cc'] = $cc;
+        $properties['bcc'] = $bcc;
+        $properties['data'] = $mail_params['data'];
+
+        //GRN2-1380
+        if (array_key_exists('children', $node_send_mail[$send_mail_key])) {
+            $childrent = $node_send_mail[$send_mail_key]['children'][0];
+            if (array_key_exists('children', $childrent)) {
+                foreach ($childrent['children'] as $child) {
+                    if ($child['node_name'] === "disposition_notification_to") {
+                        $attribute_reply = $child['attributes'];
+                        if (isset($attribute_reply['address'])
+                            && ! is_null($attribute_reply['address'])
+                            && $attribute_reply['address']
+                        ) {
+                            $properties['confirmation_request'] = 1;
+                            $properties['in_reply_to']
+                                = $attribute_reply['address'];
+
+                            if ( ! isset($attribute_reply['name'])) {
+                                $attribute_reply['name'] = "";
+                            }
+                            $properties['name_to'] = $attribute_reply['name'];
+                        }
+                    }
+                }
+            }
+        }
+        //GRN2-1380
+        require_once('mail/include_send.csp');
+        $send_logic = $utility->getSendLogic();
+        // attached files
+        $attached_files = [];
+        if (strlen($draft_id) > 0) {
+            // old attached files
+            $old_attached_files = $send_logic->makeReuseFiles($mail_data);
+            $remove_file_ids = [];
+            if (array_key_exists('remove_file_ids', $mail_params)) {
+                $remove_file_ids = $mail_params['remove_file_ids'];
+                if (count($remove_file_ids) > 0) {
+                    foreach (array_keys($remove_file_ids) as $remove_key) {
+                        if (array_key_exists($remove_key,
+                            $old_attached_files)
+                        ) {
+                            unset($old_attached_files[$remove_key]);
+                        }
+                    }
+                }
+            }
+            // 再送信用ファイル情報取得
+            require_once('grn/controller.csp');
+            $reuse_files = grn_init_attached_file('mail/draft_modify',
+                $old_attached_files);
+            global $G_container_base;
+            /** @var CB_ServerFileManager|CB_BlobFileManager $fm */
+            $fm = $G_container_base->getInstance('file_manager');
+            $fm->commit();
+            if (is_array($reuse_files) && count($reuse_files) > 0) {
+                global $G_INPUT;
+                $G_INPUT['fids'] = array_keys($reuse_files);
+            }
+
+            // get old attached files from session file
+            $files = grn_get_attached_files('mail/draft_modify');
+
+            // append old attached files to new attached files
+            foreach (array_keys($files) as $fid) {
+                $attached_files[$fid] = $files[$fid];
+            }
+        }
+        // get new attach files
+        if (array_key_exists('files', $mail_params)) {
+            $new_files = $mail_params['files'];
+            foreach ($new_files as $file_key => $value) {
+                $attached_files['file' . $file_key]
+                    = cbpapi_upload_file($value);
+            }
+        }
+
+        if (array_key_exists('files', $mail_params)) {
+            $new_files = $mail_params['files'];
+            foreach ($new_files as $file_key => $value) {
+                $attached_files['file' . $file_key]
+                    = cbpapi_upload_file($value);
+            }
+        }
+        // メールの送信
+        $personal_config->getGeneralSetting($general_settings);
+        $mail_id = $send_logic->sendMail($login, $account_id, $properties,
+            $attached_files, $draft_id, null, null, null, true,
+            $general_settings['save_sentfile']);
+        $utility->addIncrementalSearch($to, $cc, $bcc);
+        //GRN2-1380
+        if (isset($properties['confirmation_request'])
+            && ! is_null($properties['confirmation_request'])
+            && $properties['confirmation_request']
+        ) {
+            $temp[$mail_id]['confirmation_request'] = 1;
+            $temp[$mail_id]
+                = [
+                'confirmation_request' => 1,
+                'name_to'              => $attribute_reply['name'],
+                'address'              => $attribute_reply['address']
+            ];
+        }
+        //GRN2-1380
+
+        if (strlen($draft_id) > 0) {
+            // delete a draft mail
+            $mail_ids = [$draft_id];
+            $mail_logic->deleteMailDatas($mail_ids, true);
+        }
+        $sent_mail_ids[] = $mail_id;
+    }
+
+    $mail_for_view = $cbpapi_mail_logic->getMailForViewByIds($login,
+        $sent_mail_ids);
+    //GRN2-1380
+    if (isset($temp)) {
+        foreach ($sent_mail_ids as $sent_mail_id) {
+            if (array_key_exists($sent_mail_id, $temp)) {
+                $mail_for_view[$sent_mail_id]['confirmation_to'] = [
+                    [
+                        'name'    => $temp[$sent_mail_id]['name_to'],
+                        'address' => $temp[$sent_mail_id]['address']
+                    ]
+                ];
+            }
+        }
+    }
+    //GRN2-1380
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty;
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('mail')]);
+    $t->assign('mails', $mail_for_view);
+    $t->assign('action', $action);
+    grn_cbpapi_response($t, __FILE__);
+}
+

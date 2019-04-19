@@ -1,0 +1,776 @@
+<?php
+
+/**
+ * Service Provider Interface (SPI) for Unified User Management API.
+ * This file also implements the default SPI that provides built-in
+ * user, group, role managers as well as an authentication service.
+ *
+ * To implement your own SP, inherit and override the deafult SP
+ * (class CB_UumDefaultServiceProvider).
+ *
+ * Things to do in Service Prodidrs (example):
+ * 1) Validate/Modify parameters
+ *    For example, a service provider may require 'sort_key' column
+ *    as a mandatory input.  The default service provider normalizes
+ *    'sort_key' and set the normalized string to 'normalized_sort_key'.
+ * 2) Redirect password authentication
+ *    can be achieved by overriding authenticate() method.  For example,
+ *    you may redirect password authentication to an LDAP server.
+ * 3) Override entire authentication
+ *    can even be achieved by overriding requireRole() and/or
+ *    getLoginUser() methods.
+ * 4) Prohibit modification
+ *    can simply be achieved by overriding isServiceAvailable() method.
+ *
+ * @package fw.uum.spi
+ */
+
+require_once('fw/uum_core.csp');
+require_once('fw/module.csp');
+
+define('CB_UUMSPI_SYSTEMPARAM', '_system');
+define('CB_UUMSPI_LOGIN_ID', 'login_id');
+define('CB_UUMSPI_DYNAMIC_ROLES', 'dynamic_roles');
+
+/**
+ * The default service provider implements SPI for UUM.
+ *
+ * @package fw.uum.spi
+ */
+class CB_UumDefaultServiceProvider extends CB_ModuleBase
+{
+    /**
+     * @access private
+     */
+    var $_core;
+
+    /**
+     * @access private
+     */
+    var $_login_triggers = [];
+
+    /**
+     * @access private
+     */
+    var $_logout_triggers = [];
+
+    /**
+     * @access protected
+     */
+    function _loadHook($func, $prefix = null)
+    {
+        $loader = null;
+
+        if (strcmp($func, 'addTriggerOnLogin') === 0) {
+            $loader = new CB_PluginLoader('fw.uum.login');
+        } elseif (strcmp($func, 'addTriggerOnLogout') === 0) {
+            $loader = new CB_PluginLoader('fw.uum.logout');
+        } else {
+            assert('FALSE');
+
+            return;
+        }
+
+        foreach ($loader->loadHooks($prefix) as $hook) {
+            call_user_func([$this, $func], $hook);
+        }
+    }
+
+    /**
+     * @access protected
+     */
+    function _runHook($triggers, $user)
+    {
+        foreach (array_keys($triggers) as $trigger) {
+            call_user_func($trigger, $user);
+        }
+    }
+
+    function __construct($id = 'fw.uum.service_provider')
+    {
+        parent::__construct($id);
+
+        $this->_core = CB_UumCoreAPI::getInstance();
+    }
+
+    function addTriggerOnLogin($func)
+    {
+        // to uniquify triggers, we use array KEYS instead of
+        // VALUES to store trigger function names.
+        $this->_login_triggers[$func] = 1;
+    }
+
+    function addTriggerOnLogout($func)
+    {
+        // to uniquify triggers, we use array KEYS instead of
+        // VALUES to store trigger function names.
+        $this->_logout_triggers[$func] = 1;
+    }
+
+    /**
+     * Reply whether named service is provided by this SP.
+     * Read-only services should always be available.
+     *
+     * Modification services include:
+     *<ul>
+     * <li>'change_password':
+     * <li>'edit_user':
+     * <li>'edit_group':
+     * <li>'edit_user_group_relation':
+     * <li>'edit_role':
+     * <li>'edit_user_role_relation':
+     *</ul>
+     *
+     * @param $service_name
+     *
+     * @return bool TRUE if the required service is available; otherwise
+     *              returns FALSE.
+     */
+    function isServiceAvailable($service_name)
+    {
+        switch ($service_name) {
+            case 'change_password':
+            case 'edit_user':
+            case 'edit_group':
+            case 'edit_user_group_relation':
+            case 'edit_role':
+            case 'edit_user_role_relation':
+                return true;
+        }
+
+        return false;
+    }
+
+    //// Default Implementation of Read-Only Services ////
+
+    /**
+     * @param string $role_key
+     *
+     * @return bool TRUE if the session holds the required role; otherwise
+     *              returns FALSE.
+     */
+    function requireRole($role_key)
+    {
+        // check dynamic roles saved in the session
+        $session = $this->getSession();
+        $roles = $session->get(CB_UUMSPI_DYNAMIC_ROLES);
+        if (is_null($roles)) {
+            $roles = [];
+        }
+        $login_user = $this->getLoginUser();
+        if ( ! $login_user) {
+            unset($roles['LoginUser']);
+        }
+        if (array_key_exists($role_key, $roles)) {
+            return true;
+        }
+
+        // check static roles if logging-in
+        if ($login_user !== false) {
+            $role = $this->_core->getStaticRoleByForeignKey($role_key);
+            if ($role) {
+                $rowset = new CB_RowSet($this->_core->_getUserRoleTable());
+                $rowset->addCondition('col_user=' . $login_user->getOID() .
+                                      ' AND col_role=' . $role->getOID());
+                $rowset->setLock(CB_DATABASE_NO_LOCK);
+                if ( ! is_null($rowset->iterate())) {
+                    $rowset->destroy();
+
+                    return true;
+                }
+            }
+        }
+
+        // check embedded roles
+        if ($role_key == 'LoginUser') {
+            $this->_requireLoginUser();
+            $roles[$role_key] = 1;
+            $session->set(CB_UUMSPI_DYNAMIC_ROLES, $roles);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Return an array of roles that have been granted to the current session.
+     * Roles are keys of the array.  For example, a returning array may look
+     * like: array('LoginUser'=>1, 'Everyone'=>1, ...) .
+     *
+     * @return array
+     */
+    function listGrantedRoles()
+    {
+        static $static_roles = null;
+
+        $login_user = $this->getLoginUser();
+
+        if (is_null($static_roles)) {
+            $static_roles = [];
+
+            if ($login_user !== false) {
+                $db = cb_get_master_db();
+                $query
+                    = "SELECT r.col_foreign_key FROM tab_cb_role AS r INNER JOIN tab_cb_userrolerelation AS ur ON r._id = ur.col_role WHERE ur.col_user = '@S'";
+                $query = cb_queryf($db, $query, $login_user->getOID());
+                $result = $db->query($query);
+                while ($row = $db->fetch_assoc($result)) {
+                    $static_roles[$row['col_foreign_key']] = 1;
+                }
+                $db->free_result($result);
+            }
+        }
+
+        // merge roles saved in the session
+        $session = $this->getSession();
+        $roles = (array)$session->get(CB_UUMSPI_DYNAMIC_ROLES);
+        if ($login_user === false) {
+            unset($roles['LoginUser']);
+        } else {
+            $roles['LoginUser'] = 1;
+        }
+        $session->set(CB_UUMSPI_DYNAMIC_ROLES, $roles);
+
+        return $static_roles + $roles;
+    }
+
+    /**
+     * @access protected
+     */
+    function _requireLoginUser()
+    {
+        $user = $this->getLoginUser();
+        if ( ! $user) {
+            // display login page, then exit.
+            cb_switch_page('login.csp', CB_EXIT_REQUIRE_ROLE);
+        }
+    }
+
+    /**
+     * @access private
+     */
+    var $_login_user = false;
+
+    /**
+     * @return mixed FALSE if the session has not been logged in; otherwise
+     *               {@link CB_User} object for the login user.
+     */
+    function getLoginUser()
+    {
+        $fail = false;
+        if ($this->_login_user !== false) {
+            return $this->_login_user;
+        }
+
+        global $G_INPUT, $G_config_common, $G_state_set;
+
+        if ($G_state_set->get('command_line')) {
+            return $fail;
+        }
+        static $_recur = false;
+        if ($_recur) {
+            return $fail;
+        }
+        $_recur = true;
+
+        $session = $this->getSession();
+        $table = $this->_core->getUserTable();
+        $table->setLock(CB_DATABASE_NO_LOCK);
+
+        $is_system = @$G_INPUT[CB_UUMSPI_SYSTEMPARAM];
+        $user = null;
+        $uid = null;
+        if (array_key_exists('_uid', $G_INPUT)) {
+            $uid = $G_INPUT['_uid'];
+        }
+        $account = null;
+        if (array_key_exists('_account', $G_INPUT)) {
+            $account = $G_INPUT['_account'];
+        }
+
+        // The request comes from pages other than the login page.
+        if ( ! $is_system) {
+            // check session variable
+            if ( ! is_null($session->get(CB_UUMSPI_LOGIN_ID))) {
+                $uid = $session->get(CB_UUMSPI_LOGIN_ID);
+                $user = $table->getRow($uid);
+                if ( ! $user) {
+                    $_recur = false;
+
+                    return $fail;
+                }
+                $this->_login_user = $user;
+
+                return $user;
+
+            } else {
+                // need to login
+                $_recur = false;
+
+                return $fail;
+            }
+        }
+
+        // Process a login request.
+        if (is_null($account)) {
+            $user = $table->getRow($uid);
+        } else {
+            $rowset = new CB_RowSet($table);
+            $db = $table->getDBConnection();
+            $escaped_account = $db->escape($account);
+            $rowset->addCondition("col_foreign_key='${escaped_account}'");
+            $rowset->setLock(CB_DATABASE_NO_LOCK);
+            $user = $rowset->iterate();
+        }
+
+        if ( ! $user) {
+            cb_throw_error(E_COMMON_AUTHENTICATION_FAILED);
+        }
+
+        // check if the account is valid or not
+        $valid = $user->get('valid');
+        if ( ! is_null($valid)) {
+            $today = getdate();
+            if (($valid->year < $today['year'])
+                || ($valid->year == $today['year']
+                    && $valid->month < $today['mon'])
+                || ($valid->year == $today['year']
+                    && $valid->month == $today['mon']
+                    && $valid->day < $today['mday'])
+            ) {
+                cb_throw_error(E_COMMON_ACCOUNT_INVALIDATED);
+            }
+        }
+
+        $password = null;
+        if (array_key_exists('_password', $G_INPUT)) {
+            $password = $G_INPUT['_password'];
+        }
+
+        if (is_null($password) || ( ! $this->authenticate($user, $password))) {
+            cb_throw_error(E_COMMON_AUTHENTICATION_FAILED);
+        }
+
+        // keep login user in memory and session.
+        $this->_login_user = $user;
+        $session->set(CB_UUMSPI_LOGIN_ID, $user->getOID());
+
+        // run login triggers.
+        $this->_loadHook('addTriggerOnLogin');
+        $this->_runHook($this->_login_triggers, $user);
+
+        // G_INPUTに_account,_password,_system,_uidが入ったままだと受け取ったパラメータを
+        // そのまま引き継ぐようなロジックで問題が出るのでunsetしておく。
+        // login triggersの後に実行しているのは、grn_set_cookieで_accountを使うため。
+        unset($G_INPUT['_system']);
+        unset($G_INPUT['_uid']);
+        unset($G_INPUT['_account']);
+        unset($G_INPUT['_password']);
+        // パスワードの有効期限切れの時にはこっちも問題が出るので念のため毎回外す
+        unset($G_INPUT['_exec']);
+        unset($G_INPUT['_retype']);
+        unset($G_INPUT['_pwd_ticket']);
+
+        // return login user.
+        $_recur = false;
+
+        return $user;
+    }
+
+    /**
+     * Login as the specified user.
+     *
+     * @param CB_User $user
+     */
+    function loginAs($user)
+    {
+        assert('$user');
+
+        // keep login user in memory
+        $this->_login_user = $user;
+
+        global $G_state_set;
+
+        if ($G_state_set->get('command_line')) {
+            return;
+        }
+
+        // keep login user in session.
+        $session = $this->getSession();
+        $session->set(CB_UUMSPI_LOGIN_ID, $user->getOID());
+
+        // run login triggers.
+        $this->_loadHook('addTriggerOnLogin');
+        $this->_runHook($this->_login_triggers, $user);
+
+        // G_INPUTに_account,_password,_system,_uidが入ったままだと受け取ったパラメータを
+        // そのまま引き継ぐようなロジックで問題が出るのでunsetしておく。
+        // login triggersの後に実行しているのは、grn_set_cookieで_accountを使うため。
+        global $G_INPUT;
+        unset($G_INPUT['_system']);
+        unset($G_INPUT['_uid']);
+        unset($G_INPUT['_account']);
+        unset($G_INPUT['_password']);
+        // パスワードの有効期限切れの時にはこっちも問題が出るので念のため毎回外す
+        unset($G_INPUT['_exec']);
+        unset($G_INPUT['_retype']);
+        unset($G_INPUT['_pwd_ticket']);
+    }
+
+    /**
+     * Logout.
+     */
+    function logout()
+    {
+        // get login user for triggers.
+        $login = $this->getLoginUser();
+        $tmp_user = $this->_core->getUser($login->getOID());
+
+        $this->_login_user = false;
+        $session = $this->getSession();
+        $uid = $session->unset_by(CB_UUMSPI_LOGIN_ID);
+        $uid = $session->unset_by(CB_UUMSPI_DYNAMIC_ROLES);
+
+        // run logout triggers.
+        $this->_loadHook('addTriggerOnLogout');
+        $this->_runHook($this->_logout_triggers, $tmp_user);
+    }
+
+    /**
+     * Logout as the specified user.
+     *
+     * @param object CB_User $user
+     */
+    function logoutAs($user)
+    {
+        $this->_login_user = false;
+        $session = $this->getSession();
+        $uid = $session->unset_by(CB_UUMSPI_LOGIN_ID);
+        $uid = $session->unset_by(CB_UUMSPI_DYNAMIC_ROLES);
+
+        // run logout triggers.
+        $this->_loadHook('addTriggerOnLogout');
+        $this->_runHook($this->_logout_triggers, $user);
+    }
+
+    /**
+     * @param CB_User $user
+     * @param string  $credential
+     *  The credential (password, etc) used to authenticate the user.
+     *  The oid of the authenticating user, or of a row in CB_User table.
+     *
+     * @return bool
+     *           <var>TRUE</var> iff authentication succeeds; otherwise <var>FALSE</var>.
+     */
+    function authenticate($user, $credential)
+    {
+        require_once('fw/passwd_util.csp');
+
+        return CB_PasswordUtil::validatePassword($credential,
+            $user->get('salt'),
+            $user->get('password'));
+    }
+
+
+    /**
+     * Optional Modification Services
+     *
+     * @param $uid
+     * @param $oldPassword
+     * @param $newPassword
+     * @param $force
+     *
+     * @return bool
+     */
+    function changePassword($uid, $oldPassword, $newPassword, $force)
+    {
+        $user = $this->_core->getUser($uid);
+        if ($user === false) {
+            return false;
+        }
+
+        if (( ! $force) && ( ! $this->authenticate($user, $oldPassword))) {
+            cb_throw_error(E_COMMON_AUTHENTICATION_FAILED);
+        }
+
+        return $this->_core->changeUserPassword($uid, $newPassword);
+    }
+
+    function setHashedPassword($uid, $password_salt, $password_hashed)
+    {
+        $user = $this->_core->getUser($uid);
+        if ($user === false) {
+            return false;
+        }
+
+        return $this->_core->setUserHashedPassword($uid, $password_salt,
+            $password_hashed);
+    }
+
+    /**
+     * The default provider handles $properties['password'] specially.
+     * It will NOT directly be set to CB_User's password column.
+     * Instead, CB_User's salt & password columns are set by
+     * {@link CB_UumCoreAPI::changeUserPassword()} method with
+     * $properties['password'].  As a result, the default provider
+     * ignores given $properties['salt'].
+     *
+     * @param array $properties
+     *                          An associative array of column names and values of the newly
+     *                          creating CB_User instance.
+     *
+     * @param mixed $id         NULL to generate new ID for the new user;
+     *                          or $id may become the new user's id.
+     *
+     * @return \CB_Row
+     */
+    function addUser($properties, $id = null)
+    {
+        $core = $this->_core;
+
+        if (array_key_exists('sort_key', $properties)) {
+            require_once('fw/string_util.csp');
+            $properties['normalized_sort_key']
+                = cb_normalize_sort_key($properties['sort_key']);
+        }
+
+        // set modification timestamps
+        $ctime = new CB_TimeStamp();
+        $ctime->unix_ts = time();
+        $properties['ctime'] = $ctime;
+        $properties['mtime'] = $ctime;
+
+        // The default provider does not allow that these properties are
+        // set directly.  Instead, it uses underlying
+        // CB_UumCoreAPI::changeUserPassword() to set user password.
+        unset($properties['salt']);
+        $password = '';
+        if (array_key_exists('password', $properties)) {
+            $password = $properties['password'];
+            unset($properties['password']);
+        }
+
+        $user = $core->addUser($properties, $id);
+        if ($user) {
+            $core->changeUserPassword($user->getOID(), $password);
+        }
+
+        return $user;
+    }
+
+    function setUserProperties($uid, $properties)
+    {
+        // The default provider does not allow that these properties are
+        // set directly.  Changing password is left to changePassword().
+        unset($properties['salt']);
+        unset($properties['password']);
+
+        if (array_key_exists('sort_key', $properties)) {
+            require_once('fw/string_util.csp');
+            $properties['normalized_sort_key']
+                = cb_normalize_sort_key($properties['sort_key']);
+        }
+
+        // set modification timestamp
+        $mtime = new CB_TimeStamp();
+        $mtime->unix_ts = time();
+        $properties['mtime'] = $mtime;
+
+        return $this->_core->setUserProperties($uid, $properties);
+    }
+
+    function deleteActualUserData($uid)
+    {
+        return $this->_core->deleteActualUserData($uid);
+    }
+
+    function removeUser($uid)
+    {
+        return $this->_core->removeUser($uid);
+    }
+
+    function restoreUser($uid)
+    {
+        return $this->_core->restoreUser($uid);
+    }
+
+    function orderUsers($uids)
+    {
+        return $this->_core->orderUsers($uids);
+    }
+
+    /**
+     *
+     * @param array $properties
+     *                          An associative array of column names and values of the newly
+     *                          creating CB_Group instance.
+     * @param mixed $id         NULL to generate new ID for the new user;
+     *                          or $id may become the new user's id.
+     *
+     * @return \CB_Row
+     */
+    function addGroup($properties, $id = null)
+    {
+        // set modification timestamps
+        $ctime = new CB_TimeStamp();
+        $ctime->unix_ts = time();
+        $properties['ctime'] = $ctime;
+        $properties['mtime'] = $ctime;
+
+        $group = $this->_core->addGroup($properties, $id);
+
+        return $group;
+    }
+
+    /**
+     * @param      $inOrgId
+     * @param      $inLocalNameArray
+     * @param bool $sync
+     *
+     * @return bool
+     */
+    public function addGroupLocals($inOrgId, $inLocalNameArray, $sync = false)
+    {
+        return $this->_core->addGroupLocals($inOrgId, $inLocalNameArray, $sync);
+    }
+
+    /**
+     * @param      $inOrgId
+     * @param      $inLocalNameArray
+     * @param bool $sync
+     *
+     * @return bool
+     */
+    public function modifyGroupLocals(
+        $inOrgId,
+        $inLocalNameArray,
+        $sync = false
+    ) {
+        return $this->_core->modifyGroupLocals($inOrgId, $inLocalNameArray,
+            $sync);
+    }
+
+    /**
+     * @param      $child_group
+     * @param      $parentId
+     *
+     * @param bool $sync
+     *
+     * @return bool
+     */
+    function setParentGroup($child_group, $parentId, $sync = false)
+    {
+        return $this->_core->setParentGroup($child_group, $parentId, $sync);
+    }
+
+    /**
+     * @param $gid
+     * @param $properties
+     *
+     * @return bool
+     */
+    function setGroupProperties($gid, $properties)
+    {
+        // set modification timestamp
+        $mtime = new CB_TimeStamp();
+        $mtime->unix_ts = time();
+        $properties['mtime'] = $mtime;
+
+        return $this->_core->setGroupProperties($gid, $properties);
+    }
+
+    /**
+     * @param $gid
+     *
+     * @return bool
+     */
+    function removeGroup($gid)
+    {
+        return $this->_core->removeGroup($gid);
+    }
+
+    public function importGroupNameWithCSV(
+        $inFilePath,
+        $inCharset,
+        $inSkipLineCount = 0
+    ) {
+        return $this->_core->importGroupNameWithCSV($this->getLoginUser(),
+            $inFilePath, $inCharset, $inSkipLineCount);
+    }
+
+    public function createGroupNameCSV(
+        $inCharset,
+        $inIsExportHeader,
+        $inExportLanguageCodeArray = null
+    ) {
+        return $this->_core->createGroupNameCSV($this->getLoginUser(),
+            $inCharset, $inIsExportHeader, $inExportLanguageCodeArray);
+    }
+
+    /**
+     *
+     * @param array $properties
+     *                          An associative array of column names and values of the newly
+     *                          creating CB_Group instance.
+     *
+     * @param mixed $id         NULL to generate new ID for the new user;
+     *                          or $id may become the new user's id.
+     *
+     * @return \CB_Row
+     */
+    function addStaticRole($properties, $id = null)
+    {
+        // set modification timestamps
+        $ctime = new CB_TimeStamp();
+        $ctime->unix_ts = time();
+        $properties['ctime'] = $ctime;
+        $properties['mtime'] = $ctime;
+
+        $role = $this->_core->addStaticRole($properties, $id);
+
+        return $role;
+    }
+
+    function setStaticRoleProperties($id, $properties)
+    {
+        // set modification timestamp
+        $mtime = new CB_TimeStamp();
+        $mtime->unix_ts = time();
+        $properties['mtime'] = $mtime;
+
+        return $this->_core->setStaticRoleProperties($id, $properties);
+    }
+
+    function removeStaticRole($id)
+    {
+        return $this->_core->removeStaticRole($id);
+    }
+
+    function orderStaticRoles($role_ids)
+    {
+        return $this->_core->orderStaticRoles($role_ids);
+    }
+
+    function setUserGroups($uid, $gids)
+    {
+        return $this->_core->setUserGroups($uid, $gids);
+    }
+
+    function setGroupUsers($gid, $uids)
+    {
+        return $this->_core->setGroupUsers($gid, $uids);
+    }
+
+    function setUserRoles($uid, $role_ids)
+    {
+        return $this->_core->setUserRoles($uid, $role_ids);
+    }
+
+    public function setRoleUsers($role_id, $uids)
+    {
+        return $this->_core->setRoleUsers($role_id, $uids);
+    }
+}
+
+

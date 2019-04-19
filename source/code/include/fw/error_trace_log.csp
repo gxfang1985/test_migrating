@@ -1,0 +1,295 @@
+<?php
+
+define('ERROR_TRACE_LOG_FLAG_DEBUG_MODE', 1);
+define('ERROR_TRACE_LOG_FLAG_SUPPRESS_WARNNING', 1 << 1);
+define('ERROR_TRACE_LOG_FLAG_PRINT_LOG', 1 << 2);
+
+define('ERROR_TRACE_LOG_FLAG_213', ERROR_TRACE_LOG_FLAG_DEBUG_MODE);
+define('ERROR_TRACE_LOG_FLAG_250',
+    ERROR_TRACE_LOG_FLAG_DEBUG_MODE | ERROR_TRACE_LOG_FLAG_SUPPRESS_WARNNING);
+
+define('ERROR_TRACE_LOG_ERROR_MESSAGE_PREFIX', 'Gr2 ErrorTrace Failure: ');
+define('ERROR_TRACE_LOG_ERROR_LOCK_FILE', 'error_trace.lock');
+
+define('ERROR_TRACE_LOG_DEFAULT_SIZE_LIMIT', 100000);
+define('ERROR_TRACE_LOG_DEFAULT_SIZE_BASE', 1000);
+define('ERROR_TRACE_LOG_DEFAULT_LOG_COUNT', 10);
+define('ERROR_TRACE_LOG_DEFAULT_LOG_DIR', 'log');
+define('ERROR_TRACE_LOG_DEFAULT_ERROR_CODE', 'DB*');
+
+function cb_log_error_trace($error_code, $backtrace, $to_stdout = false)
+{
+    static $already_printed = null;
+    if ( ! $already_printed) {
+        $already_printed = true;
+    } else {
+        return;
+    }
+
+    if ( ! cb_is_print_error_trace_log_mode()) {
+        return;
+    }
+
+    //  common.ini から設定を読み込む
+    global $G_config_common;
+
+    $filesize = $G_config_common->get('ErrorTrace', 'log_size');
+    if (( ! is_numeric($filesize)) || ($filesize < 1)) {
+        $filesize = ERROR_TRACE_LOG_DEFAULT_SIZE_LIMIT;
+    }
+
+    $filecount = $G_config_common->get('ErrorTrace', 'log_count');
+    if (( ! is_numeric($filecount)) || ($filecount < 1)) {
+        $filecount = ERROR_TRACE_LOG_DEFAULT_LOG_COUNT;
+    }
+
+    $error_filters = $G_config_common->get('ErrorTrace', 'error_code');
+    if (strlen($error_filters) <= 0) {
+        $error_filters = ERROR_TRACE_LOG_DEFAULT_ERROR_CODE;
+    }
+
+    //  エラーコードが出力対象か確認する
+    $is_matched = false;
+    foreach (explode(',', $error_filters) as $error_filter) {
+        $error_filter = '/^' . str_replace('*', '.*', $error_filter) . '$/';
+        if (preg_match($error_filter, $error_code)) {
+            $is_matched = true;
+        }
+    }
+    if ( ! $is_matched) {
+        return;
+    }
+
+    //  出力するメッセージを組み立てる
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $user = $uum->_sp->_login_user;
+
+    $tokens = [
+        date('Y-m-d H:i:s'),
+        @$_SERVER['SERVER_ADDR'],
+        $error_code,
+        getmypid()
+    ];
+    if ($user) {
+        $tokens[] = $user->getOID();
+    } else {
+        $tokens[] = '-';
+    }
+    $tokens[] = @$_SERVER['REMOTE_ADDR'];
+    $tokens[] = @$_SERVER['REQUEST_METHOD'];
+    $tokens[] = @$_SERVER['REQUEST_URI'];
+    $msg = implode("\t", $tokens) . "\n";
+
+    ob_start();
+    foreach ($backtrace as $element) {
+        $args = [];
+        if (array_key_exists('args', $element)) {
+            foreach ($element['args'] as $arg) {
+                $args[] = "'$arg'";
+            }
+        }
+        echo "\t";
+        $class = (array_key_exists('class', $element)) ? $element['class']
+            : '';
+        $type = (array_key_exists('type', $element)) ? $element['type']
+            : '';
+        $function = '';
+        if (array_key_exists('function', $element)) {
+            $function = $element['function'] . '(' . (count($args) > 0 ? ' '
+                                                                         . implode(',',
+                        $args) . ' ' : '') . ') ';
+        }
+        echo $class . $type . $function . 'at ' . $element['file'] . ':'
+             . $element['line'] . "\n";
+    }
+    $msg .= ob_get_contents();
+    ob_end_clean();
+
+    if ( ! ($lock_fp = cb_lock_error_trace_log($to_stdout))) {
+        return;
+    }
+
+    //  必要ならばローテーションする
+    $logfile = cb_get_error_trace_log_name();
+    if ((file_exists($logfile))
+        && ($filesize * ERROR_TRACE_LOG_DEFAULT_SIZE_BASE < sprintf("%u",
+                filesize($logfile)))
+    ) {
+        cb_rotate_error_trace_log(0, $filecount, $to_stdout);
+    }
+
+    if ( ! ($fp = @fopen($logfile, 'a'))) {
+        cb_warn_error_trace_failure(ERROR_TRACE_LOG_ERROR_MESSAGE_PREFIX
+                                    . "Cannot open $logfile", $to_stdout);
+        fclose($lock_fp);
+
+        return;
+    }
+    if ( ! ($ret = @fwrite($fp, $msg))) {
+        cb_warn_error_trace_failure(ERROR_TRACE_LOG_ERROR_MESSAGE_PREFIX
+                                    . "Cannot write $logfile", $to_stdout);
+    }
+    fclose($fp);
+    fclose($lock_fp);
+
+    @unlink(cb_get_error_trace_log_dir() . DIRECTORY_SEPARATOR
+            . ERROR_TRACE_LOG_ERROR_LOCK_FILE);
+
+    return;
+}
+
+/**
+ *  ローテーションでは複数ファイルを操作すること、
+ *  Windows では flock (正確には fopen )したファイルは rename できないことから、
+ *  ロック用ファイルをつかって同期をはかる。
+ */
+function cb_lock_error_trace_log($to_stdout)
+{
+    $fp = false;
+    $lockfile = cb_get_error_trace_log_dir() . DIRECTORY_SEPARATOR
+                . ERROR_TRACE_LOG_ERROR_LOCK_FILE;
+    if ( ! ($fp = @fopen($lockfile, 'a'))) {
+        cb_warn_error_trace_failure(ERROR_TRACE_LOG_ERROR_MESSAGE_PREFIX
+                                    . "Cannot open $lockfile", $to_stdout);
+
+        return false;
+    }
+
+    global $G_config_common;
+    $nonblock = $G_config_common->get('ErrorTrace', 'nonblock');
+    $block_mode = LOCK_EX;
+    if ($nonblock) {
+        $block_mode = ($block_mode | LOCK_NB);
+    }
+    $ret = @flock($fp, $block_mode, $block);
+
+    // windowsではブロックされても、$blockはFALSEで、flockの返り値がfalseとなる
+    if ($block == true || $ret == false) {
+        cb_warn_error_trace_failure(ERROR_TRACE_LOG_ERROR_MESSAGE_PREFIX
+                                    . "Cannot flock $lockfile", $to_stdout);
+        fclose($fp);
+
+        return false;
+    }
+
+    return $fp;
+}
+
+function cb_rotate_error_trace_log($num, $file_count, $to_stdout)
+{
+    $current_file = cb_get_error_trace_log_name($num);
+    $next_file = cb_get_error_trace_log_name($num + 1);
+
+    if ($num < $file_count - 1) {
+        cb_rotate_error_trace_log($num + 1, $file_count, $to_stdout);
+    } elseif ($num == $file_count - 1) {
+        // Windows 環境では 既存ファイルを上書きするように rename() できないので、先にrename 先を消しておく
+        if (file_exists($next_file)) {
+            $ret = @unlink($next_file);
+            if ( ! $ret) {
+                cb_warn_error_trace_failure(ERROR_TRACE_LOG_ERROR_MESSAGE_PREFIX
+                                            . "Cannot unlink $next_file",
+                    $to_stdout);
+            }
+        }
+    }
+
+    if (( ! is_null($current_file)) && (is_writable($current_file))) {
+        rename($current_file, $next_file);
+    }
+
+    return;
+}
+
+function cb_warn_error_trace_failure($message, $to_stdout)
+{
+    $message .= "\n";
+    if ($to_stdout) {
+        echo $message;
+    } else {
+        syslog(LOG_CRIT, $message);
+    }
+}
+
+function cb_get_error_trace_log_dir()
+{
+    static $log_dir = null;
+    if ( ! $log_dir) {
+        global $G_config_common;
+
+        $log_dir = $G_config_common->get('ErrorTrace', 'log_dir');
+        if (strlen($log_dir) <= 0) {
+            $log_dir = cb_basedir() . DIRECTORY_SEPARATOR
+                       . ERROR_TRACE_LOG_DEFAULT_LOG_DIR;
+        } elseif ($log_dir[0] != '/') {
+            //  絶対パスで指定されていなければ、ベースディレクトリ以下からの相対パスとして扱う
+            $log_dir = cb_basedir() . DIRECTORY_SEPARATOR . $log_dir;
+        }
+        cb_mkdir($log_dir);
+    }
+
+    return $log_dir;
+}
+
+function cb_get_error_trace_log_name($num = 0)
+{
+    $log_dir = cb_get_error_trace_log_dir();
+    $filename = $log_dir . DIRECTORY_SEPARATOR . 'error_trace.log';
+    if (0 < $num) {
+        $filename .= ".$num";
+    }
+
+    return $filename;
+}
+
+/**
+ * @return bool
+ */
+function cb_is_debug_mode()
+{
+    global $G_config_common;
+
+    return ($G_config_common->get('Global', 'debug') & ERROR_TRACE_LOG_FLAG_213)
+           !== 0;
+}
+
+
+/**
+ * @return bool
+ */
+function cb_is_display_error_details_mode()
+{
+    if (cb_is_cybozu()) {
+        return true;
+    }
+
+    if (cb_is_debug_mode()) {
+        return true;
+    }
+
+    // These pages are internal API on forest.
+    $white_list_pages = [
+        'batch/versionup/before',
+        'batch/versionup/middle',
+        'batch/versionup/after'
+    ];
+    if (cb_is_forest() && in_array(cb_get_pagename(), $white_list_pages)) {
+        return true;
+    }
+
+    return false;
+}
+
+
+/**
+ * @return bool
+ */
+function cb_is_print_error_trace_log_mode()
+{
+    global $G_config_common;
+    $debug_mode = $G_config_common->get('Global', 'debug');
+
+    return ($debug_mode & ERROR_TRACE_LOG_FLAG_PRINT_LOG) !== 0;
+}
+

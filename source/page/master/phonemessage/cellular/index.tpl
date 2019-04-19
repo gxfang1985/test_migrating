@@ -1,0 +1,1 @@
+{capture name='grn_phonemessage_cellular_GRN_PHM_CE_1'}{cb_msg module='grn.phonemessage.cellular' key='GRN_PHM_CE-1' replace='true'}{/capture}{grn_link page='phonemessage/cellular/index' caption=$smarty.capture.grn_phonemessage_cellular_GRN_PHM_CE_1 params=$vars}<br>

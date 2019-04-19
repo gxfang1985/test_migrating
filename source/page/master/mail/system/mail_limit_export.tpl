@@ -1,0 +1,2 @@
+{include file='mail/system/_mail_limit_csv_columns.tpl'}
+{include file='grn/std_export.tpl' config_id='system' form_name=$page_info.all post_page='mail/system/command_mail_limit_export' postfix='mail_limit.csv' column_explanation=$smarty.capture.explanation }

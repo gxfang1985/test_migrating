@@ -1,0 +1,654 @@
+<?php
+/**
+ *
+ * @author      KADOYA Ryo
+ * @package     grn.common
+ */
+
+abstract class GRN_NestedSetModel extends CB_ModuleBase
+{
+    const MIN_LEFT = 1;
+
+    /**
+     * @param string $module_name
+     */
+    function __construct($module_name)
+    {
+        parent::__construct($module_name);
+    }
+
+    var $_persistent_name = null;
+    var $_table_name = null;
+    var $_relative_col_name = null;
+
+    var $_table = null;
+    /** @var CB_DatabaseConnection|null */
+    var $_db = null;
+    private $_locked = false;
+
+    /**
+     * @access private
+     * @return CB_DatabaseConnection
+     */
+    protected function _getDBConnection()
+    {
+        // 初期化されていなければ初期化
+        if (is_null($this->_db)) {
+            global $G_container_base;
+            $this->_db = $G_container_base->getInstance('dbconn');
+        }
+
+        return $this->_db;
+    }
+
+    /**
+     * @access private
+     * @return CB_TableInfo
+     */
+    protected function _getTable()
+    {
+        if (is_null($this->_table)) {
+            global $G_container_base;
+            /** @var CB_TableManager $tm */
+            $tm = $G_container_base->getInstance('table_manager');
+
+            $this->_table = $tm->getTableInfo($this->_persistent_name);
+        }
+
+        return $this->_table;
+    }
+
+    /**
+     * すべてのレコードを排他ロックする
+     */
+    private function _lockTable()
+    {
+        if ($this->_locked) {
+            return;
+        }
+        $db = $this->_getDBConnection();
+        $query = sprintf('SELECT _id FROM %s', $this->_table_name);
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_EXCLUSIVE_LOCK);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        $db->free_result($result);
+        $this->_locked = true;
+    }
+
+    /**
+     * オブジェクトを共有ロックして取得する
+     *
+     * @param int $oid object id
+     *
+     * @return array
+     */
+    private function &_getObject($oid)
+    {
+
+        $db = $this->_getDBConnection();
+        $oid = "'" . $db->escape($oid) . "'";
+
+        // cacheされている可能性があるのでCB_Rowsetは使用しない
+        $query = sprintf("SELECT * FROM %s WHERE %s=%s",
+            $this->_table_name, $this->_relative_col_name, $oid);
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_SHARED_LOCK);
+        $result = $db->query($query);
+
+        if ($result === false) {
+            $db->throwError(['query' => 'query failed: ' . $query]);
+        }
+        $row = $db->fetch_assoc($result);
+        $db->free_result($result);
+
+        return $row;
+    }
+
+    /**
+     * ツリー情報が構築されているかの判定
+     *
+     * @param array $obj
+     *
+     * @return array
+     */
+    protected function &_checkBuild(& $obj)
+    {
+        if (is_null($obj['col_right']) && is_null($obj['col_left'])) {
+            $this->rebuildTree();
+            $oid = $obj['_id'];
+
+            $obj =& $this->_getObject($oid);
+        }
+
+        return $obj;
+    }
+
+    /**
+     * ツリーを再構築する
+     */
+    public function rebuildTree()
+    {
+        $this->_lockTable();
+
+        $root = null;
+        $this->_rebuildTree($root, 0);
+
+    }
+
+    private function _rebuildTree($parent_id, $left)
+    {
+
+        $right = $left + 1;
+
+        $children = $this->_getChildren($parent_id);
+
+        foreach ($children as $key => $value) {
+            $right = $this->_rebuildTree($key, $right);
+        }
+
+        $db = $this->_getDBConnection();
+
+        if ( ! is_null($parent_id)) {
+            $query = sprintf('UPDATE %s SET col_left=%u, col_right=%u WHERE %s=%s', $this->_table_name, $left, $right,
+                $this->_relative_col_name, $parent_id);
+            $result = $db->query($query);
+
+            if ($result === false) {
+                $db->throwError(['query' => 'query failed: ' . $query]);
+            }
+
+        }
+
+        return $right + 1;
+
+    }
+
+    protected abstract function &_getChildren($parent_id);
+
+    private function _isValidID($oid)
+    {
+        return ( ! is_null($oid) && ($oid !== false) && strlen($oid) !== 0);
+    }
+
+    /**
+     * ノードを追加する
+     *
+     * @param int $parent_id parent oid
+     * @param int $oid       object id
+     *
+     * @return bool
+     */
+    public function add($parent_id, $oid)
+    {
+        $this->_lockTable();
+
+        $parent = null;
+        if ($this->_isValidID($parent_id)) {
+            $parent =& $this->_getObject($parent_id);
+        }
+
+        $obj = null;
+        if ($this->_isValidID($oid)) {
+            $obj =& $this->_getObject($oid);
+        }
+
+        return $this->_add($parent, $obj);
+    }
+
+    /**
+     * ノードを追加する
+     *
+     * @param  array $parent 親オブジェクト
+     * @param  array $obj    追加するオブジェクト
+     *
+     * @return bool
+     */
+    private function _add(& $parent, &  $obj)
+    {
+        if ( ! is_array($obj)) {
+            return false;
+        }
+
+        $db = $this->_getDBConnection();
+
+
+        $old_left = $obj['col_left'];
+        $old_right = $obj['col_right'];
+        $offset = 2;
+        if ( ! is_null($old_right) && ! is_null($old_left)) {
+            // offset will be the length between the node and its children.
+            $offset = $old_right - $old_left + 1;
+        }
+
+        if (is_null($parent)) {
+            // adding or moving to the root node.
+
+            // the new col_left will be MAX(col_right)+1 in the table.
+            $query = sprintf('SELECT MAX(col_right) max_right FROM %s', $this->_table_name);
+            $result = $db->query($query);
+
+            if ($result === false) {
+                $db->throwError(['query' => 'query failed: ' . $query]);
+            }
+            $r = $db->fetch_assoc($result);
+            $db->free_result($result);
+            if ($r === false) {
+                return false;
+            }
+
+            $max_right = $r['max_right'];
+
+            // when there are no nodes or there is the only one node, the new col_left must be 1.
+            if (is_null($max_right) || $max_right < self::MIN_LEFT - 1) {
+                $max_right = self::MIN_LEFT - 1;
+            }
+
+            $new_left = $max_right + 1;
+        } else {
+            $parent_right =& $parent['col_right'];
+
+            // make space for moving nodes.
+            $query = sprintf('UPDATE %s SET col_left=col_left+%u WHERE col_left >= %u', $this->_table_name, $offset,
+                $parent_right);
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError(['query' => 'query failed: ' . $query]);
+            }
+
+            $query = sprintf('UPDATE %s SET col_right=col_right+%u WHERE col_right >= %u', $this->_table_name, $offset,
+                $parent_right);
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError(['query' => 'query failed: ' . $query]);
+            }
+
+            $new_left = $parent_right;
+        }
+
+        if ( ! is_null($old_right) && ! is_null($old_left)) {
+            // for move, get back the node and its children and slide for offset.
+            $offset = $new_left - $old_left;
+            $query
+                = sprintf('UPDATE %s SET col_left=(-1*col_left)+(%d), col_right=(-1*col_right)+(%d) WHERE col_left < 0 AND col_right < 0',
+                $this->_table_name, $offset, $offset, $old_left, $old_right);
+
+        } else {
+            // for add, set col_left and col_right to the node.
+            $new_right = $new_left + 1;
+            $query = sprintf('UPDATE %s SET col_left=%u, col_right=%u WHERE _id=%u',
+                $this->_table_name, $new_left, $new_right, $obj['_id']);
+        }
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        return true;
+    }
+
+    /*
+     * ノードを追加削除する
+     * @param int    $oid          object id
+     */
+    public function remove($oid)
+    {
+        $this->_lockTable();
+
+        $obj = null;
+        if ($this->_isValidID($oid)) {
+            $obj =& $this->_getObject($oid);
+        }
+
+        return $this->_remove($obj);
+    }
+
+    /**
+     * ノードを削除する
+     *
+     * @param array $obj object
+     *
+     * @return bool
+     */
+    private function _remove(& $obj)
+    {
+        if ( ! is_array($obj)) {
+            return false;
+        }
+
+        $old_left = $obj['col_left'];
+        $old_right = $obj['col_right'];
+        if ( ! is_null($old_right) && ! is_null($old_left)) {
+            $offset = $old_right - $old_left + 1;
+        } else {
+            return false;
+        }
+
+        $db = $this->_getDBConnection();
+
+        // move nodes to the removed nodes' space.
+        $query = sprintf('UPDATE %s SET col_left=col_left-%u WHERE col_left > %u', $this->_table_name, $offset,
+            $old_right);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        $query = sprintf('UPDATE %s SET col_right=col_right-%u WHERE col_right > %u', $this->_table_name, $offset,
+            $old_right);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        return true;
+    }
+
+    /**
+     * ノードを移動する
+     *
+     * @param int $parent_id parent oid
+     * @param int $oid       object id
+     *
+     * @return bool
+     */
+    public function move(& $parent_id, & $oid)
+    {
+        $this->_lockTable();
+
+        $obj = null;
+        if ($this->_isValidID($oid)) {
+            $obj =& $this->_getObject($oid);
+        } else {
+            return false;
+        }
+
+        $db = $this->_getDBConnection();
+
+        $old_left = $obj['col_left'];
+        $old_right = $obj['col_right'];
+        if ( ! is_null($old_right) && ! is_null($old_left)) {
+            // temporarily move the node and its children to negative space.
+            $query
+                = sprintf('UPDATE %s SET col_left=-1*(col_left), col_right=-1*(col_right) WHERE col_left >= %u AND col_right <= %u',
+                $this->_table_name, $old_left, $old_right);
+            $result = $db->query($query);
+
+            if ($result === false) {
+                $db->throwError(['query' => 'query failed: ' . $query]);
+            }
+        }
+
+        if ($this->_remove($obj)) {
+            $parent = null;
+            if ($this->_isValidID($parent_id)) {
+                $parent =& $this->_getObject($parent_id);
+            }
+
+            return $this->_add($parent, $obj);
+        }
+
+        $db->throwError(['query' => 'query failed']);
+
+        return false;
+    }
+
+    /**
+     * 先祖を取得
+     *
+     * @param int  $oid object id
+     * @param bool $isMyself
+     *
+     * @return array
+     */
+    public function &getAncestorsByID($oid, $isMyself = true)
+    {
+        $obj = null;
+        if ($this->_isValidID($oid)) {
+            $obj = $this->_getObject($oid);
+        }
+
+        $__ret =& $this->_getAncestors($obj, $isMyself);
+
+        return $__ret;
+    }
+
+    /**
+     * 先祖を取得
+     *
+     * @param array $obj object
+     * @param bool  $isMyself
+     *
+     * @return array
+     */
+    protected abstract function &_getAncestors(& $obj, $isMyself);
+
+    /**
+     * 子孫一覧を取得
+     *
+     * @param int  $oid object id
+     * @param bool $isMyself
+     *
+     * @return array|bool
+     */
+    public function &getDescendantsByID(& $oid, $isMyself = true)
+    {
+        $obj = null;
+        if ($this->_isValidID($oid)) {
+            $obj = $this->_getObject($oid);
+        }
+
+        $__ret =& $this->_getDescendants($obj, $isMyself);
+
+        return $__ret;
+    }
+
+    /**
+     * 子孫一覧を取得
+     *
+     * @param array $obj object
+     * @param bool  $isMyself
+     *
+     * @return array|bool
+     */
+    protected abstract function &_getDescendants($obj, $isMyself);
+}
+
+class GRN_NestedGroup extends GRN_NestedSetModel
+{
+    function __construct()
+    {
+        $this->_persistent_name = 'GRN_GroupInfo';
+        $this->_table_name = 'tab_grn_groupinfo';
+        $this->_relative_col_name = 'col_group';
+
+        parent::__construct('grn.common.nested_group');
+    }
+
+    /**
+     * @return GRN_NestedGroup
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_NestedGroup();
+        }
+
+        return $_instance;
+    }
+
+    var $_group_table_name = 'tab_cb_group';
+    var $_group_table;
+
+    /**
+     * @return CB_TableInfo
+     */
+    private function _getGroupTable()
+    {
+        if (is_null($this->_group_table)) {
+            global $G_container_base;
+            /** @var CB_TableManager $tm */
+            $tm = $G_container_base->getInstance('table_manager');
+
+            $this->_group_table = $tm->getTableInfo('CB_Group');
+        }
+
+        return $this->_group_table;
+    }
+
+    /**
+     * すべてのレコードを排他ロックする
+     */
+    private function _lockGroupTable()
+    {
+        $db = $this->_getDBConnection();
+        $query = sprintf('SELECT _id FROM %s', $this->_group_table_name);
+
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_EXCLUSIVE_LOCK);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        $db->free_result($result);
+    }
+
+    /*
+     * ツリーを再構築する
+     */
+    public function rebuildTree()
+    {
+        $this->_lockGroupTable();
+
+        parent::rebuildTree();
+    }
+
+    /**
+     * @param string $parent_id
+     *
+     * @return \CB_Group[]
+     */
+    protected function &_getChildren($parent_id)
+    {
+        require_once('fw/FwFacade.csp');
+        require_once('fw/i18n.csp');
+
+        $i18n = CB_I18N::getInstance();
+        $groupTableInfo = $this->_getGroupTable();
+
+        $dataObj = [];
+        $dataObj['lock'] = CB_DATABASE_NO_LOCK;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+
+        $dao = new FwFacade();
+        $groupObjList = $dao->getGroupListByParentId($dataObj, $parent_id);
+
+        $results = [];
+        foreach ($groupObjList as $groupObj) {
+            $row = $groupTableInfo->getRow($groupObj->getId(), $groupObj->convertArray());
+            $groupId = $row->getOID();
+
+            $results[$groupId] = $row;
+        }
+
+        return $results;
+    }
+
+    /**
+     * 先祖を取得
+     *
+     * @param array $groupinfoArray A row data of tab_grn_groupinfo table
+     * @param bool  $isMyself
+     *
+     * @return \CB_Group[]
+     */
+    protected function &_getAncestors(& $groupinfoArray, $isMyself)
+    {
+        $ret = [];
+
+        if ( ! is_array($groupinfoArray)) {
+            return $ret;
+        }
+
+        $groupinfoArray = $this->_checkBuild($groupinfoArray);
+
+        require_once('fw/FwFacade.csp');
+        require_once('fw/i18n.csp');
+
+        $i18n = CB_I18N::getInstance();
+        $groupTableInfo = $this->_getGroupTable();
+
+        $dataObj = [];
+        $dataObj['lock'] = CB_DATABASE_SHARED_LOCK;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+        $dataObj['isMyself'] = $isMyself;
+        $dataObj['isDescendants'] = false;
+
+        $dao = new FwFacade();
+        $groupObjList = $dao->getNestedGroupListByLeftRight($dataObj, $groupinfoArray['col_left'],
+            $groupinfoArray['col_right']);
+
+        $results = [];
+        foreach ($groupObjList as $groupObj) {
+            $row = $groupTableInfo->getRow($groupObj->getId(), $groupObj->convertArray());
+            $groupId = $row->getOID();
+
+            $results[$groupId] = $row;
+        }
+
+        return $results;
+    }
+
+    /**
+     * 子孫一覧を取得
+     *
+     * @param array $groupinfoArray A row data of tab_grn_groupinfo table
+     * @param bool  $isMyself
+     *
+     * @return \CB_Group[] | bool
+     */
+    protected function &_getDescendants($groupinfoArray, $isMyself)
+    {
+        if ( ! is_null($groupinfoArray) && ! is_array($groupinfoArray)) {
+            $__ret = false;
+
+            return $__ret;
+        }
+
+        $groupinfoArray = $this->_checkBuild($groupinfoArray);
+
+        require_once('fw/FwFacade.csp');
+        require_once('fw/i18n.csp');
+
+        $i18n = CB_I18N::getInstance();
+        $groupTableInfo = $this->_getGroupTable();
+
+        $dataObj = [];
+        $dataObj['lock'] = CB_DATABASE_SHARED_LOCK;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+        $dataObj['isDescendants'] = true;
+        $dao = new FwFacade();
+
+        if (is_null($groupinfoArray)) {
+            $groupObjList = $dao->getNestedGroupList($dataObj);
+        } else {
+            $dataObj['isMyself'] = $isMyself;
+            $groupObjList = $dao->getNestedGroupListByLeftRight($dataObj, $groupinfoArray['col_left'],
+                $groupinfoArray['col_right']);
+        }
+
+        $results = [];
+        foreach ($groupObjList as $groupObj) {
+            $row = $groupTableInfo->getRow($groupObj->getId(), $groupObj->convertArray());
+            $groupId = $row->getOID();
+
+            $results[$groupId] = $row;
+        }
+
+        return $results;
+    }
+}

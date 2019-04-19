@@ -1,0 +1,149 @@
+<?php
+if (isset($cbpapi_service)) {
+    $action = $cbpapi_service->getAction();
+    $node_parameter =& $cbpapi_service->getRequestParameters();
+
+    $require_param = ['text', 'book_id', 'case_sensitive'];
+    foreach ($require_param as $param) {
+        if ( ! isset($node_parameter['attributes'][$param])) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => $param]);
+        }
+    }
+
+    $text = $node_parameter['attributes']['text'];
+    $book_id = $node_parameter['attributes']['book_id'];
+    $case_sensitive
+        = strcasecmp($node_parameter['attributes']['case_sensitive'],
+        'true') == 0 ? true : false;
+
+    require_once('fw/string_util.csp');
+    $text = cb_trim($text);
+    $old_text = $text;
+    if (0 < strlen($text)) {
+        $text = cb_parse_search_text($text);
+    }
+
+    // Get user login infomation
+    global $G_container_base;
+    $uum =& $G_container_base->getInstance('uum');
+    $login =& $uum->getLoginUser();
+    $login_id = $login->getOID();
+
+    // Get Book manager
+    require_once('address/application.csp');
+    $app_locator = GRN_ApplicationLocator::instance();
+    /** @var GRN_Address_Application $app */
+    $app =& $app_locator->getInstance(GRN_ADDRESS_APPLICATION_ID);
+    if ( ! is_object($app) || ! is_a($app, 'GRN_Address_Application')) {
+        cb_throw_error(E_GRN_APPLICATION_NOT_AVAILABLE);
+    }
+    $book_manager =& $app->getBookManager();
+
+    // Get access
+    require_once('address/access.csp');
+    $access_manager = GRN_Address_AccessManager::getInstance();
+    if ( ! ($row =& $access_manager->getAbstractData(GRN_ADDRESS_AVAILABLE))) {
+        assert('FALSE');
+    }
+
+    // List dynamic roles
+    $dynamic_roles = $uum->listGrantedRoles();
+
+    // Evaluate use permission
+    $authorities = ['private_address', 'shared_address'];
+    $security_model = $access_manager->getSecurityModel($row);
+    $access = $access_manager->evaluateAccess($row, $login,
+        $dynamic_roles, $authorities, $security_model);
+
+    // Evaluate permission on private address book
+    $authorities = ['private_address'];
+    $access_private_address = $access_manager->isAllowedAccess($access,
+        $authorities, $security_model);
+
+    // Evaluate permission on shared address book
+    $authorities = ['shared_address'];
+    $access_shared_address = $access_manager->isAllowedAccess($access,
+        $authorities, $security_model);
+
+    $books = [];
+    $allowed_books = [];
+    if ($access_shared_address) {
+        // List of shared book
+        $books = $book_manager->listSharedAddressBooks();
+
+        if (0 < count($books)) {
+            // Evaluate view permission
+            $rows = [];
+            foreach (array_keys($books) as $bid) {
+                $book =& $books[$bid];
+                $rows[$bid] =& $book->getRow();
+            }
+
+            $authorities = ['browse'];
+            $allowed_books = $access_manager->pickAllowedObjects($rows, $login,
+                $dynamic_roles, $authorities);
+        }
+    }
+
+    // Book is shared book
+    if ($book_id > 0) {
+        if ( ! $access_shared_address) {
+            cb_throw_error(E_GRN_ADDRESS_ACCESS_DENY_SHARED_ADDRESS);
+        }
+
+        if ( ! array_key_exists($book_id, $allowed_books)) {
+            cb_throw_error(E_GRN_ADDRESS_ACCESS_DENY_BROWSE);
+        }
+
+        // get shared address book
+        $book =& $books[$book_id];
+    }
+    // Book is personal book
+    if (0 > $book_id) {
+        if ( ! $access_private_address) {
+            cb_throw_error(E_GRN_ADDRESS_ACCESS_DENY_PRIVATE_ADDRESS);
+        }
+
+        if ( ! ($book
+            =& $book_manager->getPrivateAddressBookByUserId($login_id))
+        ) {
+            if ( ! ($book =& $book_manager->addPrivateAddressBook('cyde',
+                $login_id, []))
+            ) {
+                cb_throw_error(E_GRN_ADDRESS_PRIVATE_ADDRESS_BOOK_NOT_FOUND);
+            }
+        }
+    }
+
+    // get builtin items
+    require_once('address/view_util.csp');
+    $view_util = GRN_Address_ViewUtil::getInstance();
+    $builtin_items = $view_util->listBuiltinItems($book);
+
+    $datas_for_view = [];
+    if (0 < strlen($old_text)) {
+        $order_by = 'd.col_subject, d._id';
+        $datas = $book->listFullTextSearchDatas(0, -1, $order_by,
+            $text, $case_sensitive, $builtin_items);
+        $datas_for_view = $view_util->listDatas($datas, $book_id);
+    }
+
+    require_once('cbpapi/address_logic.csp');
+    $address = GRN_CBPApi_Address_Logic::getInstance();
+    $cards_for_view = $address->getCardsForViewByIds($book,
+        array_keys($datas_for_view));
+
+    // SOAP response
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty();
+
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('address')]);
+    $t->assign('action', $action);
+    $t->assign('cards', $cards_for_view);
+    $t->assign('address_namespace',
+        'xmlns="http://schemas.cybozu.co.jp/address/2008"');
+
+    grn_cbpapi_response($t, __FILE__);
+}

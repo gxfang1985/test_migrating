@@ -1,0 +1,224 @@
+<?php
+
+use grn\grn\JSONResponse;
+
+global $G_INPUT;
+$aid = @ $G_INPUT['baid'];
+$account_id = @ $G_INPUT['user_account'];
+$category_id = @ $G_INPUT['bcid'];
+$command = @ $G_INPUT['cmd'];
+$temp_mail_id = @ $G_INPUT['tmpid'];
+$draft_id = array_key_exists('draft_id', $G_INPUT) ? $G_INPUT['draft_id']
+    : '';
+$action = @ $G_INPUT['action'];
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $user = $uum->getLoginUser();
+    $user_id = $user->getOID();
+    if ( ! is_object($user)) {
+        cb_throw_error(E_COMMON_AUTHENTICATION_FAILED);
+    }
+
+    // STM-402
+    $_personal = $_utility->getPersonalConfig($user);
+    $_account = $_personal->getAccountData($account_id);
+    if ( ! array_key_exists('user_id', $_account)
+         || $_account['user_id'] != $user->getOID()
+    ) {
+        require_once('mail/error_code.csp');
+        cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+    }
+    // END STM-402
+
+    // instantiate an Smarty object
+    require_once("grn/smarty.csp");
+    $t = new GRN_Smarty;
+
+    require_once('mail/utility.csp');
+    $utility = GRN_Mail_Utility::getInstance();
+    $send_logic = $utility->getSendLogic();
+
+    // メールの使用が許可されているか
+    $system_config = $utility->getSystemConfig();
+    $personal_config = $utility->getPersonalConfig($user);
+    $system_config->getGeneralSetting($general_settings);
+    $disable_mail = $general_settings['disable_mail'];
+    $check_mail_on_login = $general_settings['check_mail_on_login'];
+    if ($disable_mail) {
+        // メール使用停止中
+        cb_throw_error(E_GRN_MAIL_CANNOT_USE);
+    }
+
+    // 総メールサイズをチェック
+    $system_config->getSizeUserLimitSetting($size_settings, $user_id);
+    $mail_size = $personal_config->getMailSize(null);
+    if ((0 <= $size_settings['user_limit_' . $user_id])
+        && ($mail_size >= $size_settings['user_limit_' . $user_id] * 1024
+                          * 1024)
+    ) {
+        cb_throw_error(E_GRN_MAIL_LIMIT, null,
+            ['limit' => $size_settings['user_limit_' . $user_id] . 'MB']);
+    }
+
+    $to = '';
+    $cc = '';
+    $bcc = '';
+    if (array_key_exists('to', $G_INPUT)) {
+        $to = $G_INPUT['to'];
+    }
+    if (array_key_exists('cc', $G_INPUT)) {
+        $cc = $G_INPUT['cc'];
+    }
+    if (array_key_exists('bcc', $G_INPUT)) {
+        $bcc = $G_INPUT['bcc'];
+    }
+
+    if (strlen($to) > 0 || strlen($cc) > 0 || strlen($bcc) > 0
+        || strcmp($command, 'draft') === 0
+    ) {
+        $G_INPUT['recipient'] = 'dummy';
+    }
+
+    // selected signature OID
+    $sign_id = '';
+    if (array_key_exists('user_sign' . $account_id, $G_INPUT)) {
+        $sign_id = $G_INPUT['user_sign' . $account_id];
+    }
+
+    // Validation check
+    require_once('SmartyValidate.class.php');
+    SmartyValidate::connect($t);
+    $target_name = 'mail/preview_modify';
+    if (isset($is_popup) && $is_popup) {
+        $target_name = 'mail/preview_modify_popup';
+    }
+
+    $json = JSONResponse::create();
+
+    // validate after a POST
+    if (SmartyValidate::is_valid($G_INPUT, $target_name)) {
+        require_once('mail/include_send.csp');
+
+        $properties = [];
+        $properties['subject'] = @ $G_INPUT['subject'];
+        $properties['to'] = @ $G_INPUT['to'];
+        $properties['cc'] = @ $G_INPUT['cc'];
+        $properties['bcc'] = @ $G_INPUT['bcc'];
+        $properties['sign_data'] = @ $G_INPUT['sign_value'];
+        $properties['sign_position'] = @ $G_INPUT['position'];
+        $properties['confirmation_request'] = @ $G_INPUT['give_open_check'];
+
+        // for rich editor
+        // for rich editor
+        if (array_key_exists('editor', $G_INPUT) && $G_INPUT['editor']) {
+            require_once('grn/controller.csp');
+            $washed_data = grn_wash_script_without_style_attribute($G_INPUT['data']);
+            $properties['data'] = grn_strip_tags($washed_data);
+            $properties['html_data'] = $washed_data;
+        } else {
+            $properties['data'] = $G_INPUT['data'];
+        }
+
+        // 署名ID
+        $properties['sign_id'] = $sign_id;
+
+        // attached files
+        require_once('grn/controller.csp');
+        $tmp_key = grn_get_temporary_key();
+        $files = grn_get_attached_files($target_name . $tmp_key);
+
+        require_once('grn/upload.csp');
+        $upload_files
+            = GRN_UploadFile::getUploadedFiles(@$G_INPUT['upload_ticket'],
+            @$G_INPUT['upload_fileids'], true);
+        foreach ($upload_files as $fid => $file) {
+            $files[$fid] = $file;
+        }
+
+        if ($command == 'preview') {
+            $redirect_page = (isset($is_popup) && $is_popup)
+                ? 'mail/preview_popup' : 'mail/preview';
+            // メールのプレビュー
+            $temp_mail_id = $send_logic->savePreviewMail($user, $account_id,
+                $properties, $files, $temp_mail_id, null, $action);
+            if (strlen($properties['sign_position']) > 0) {
+                if (defined('AJAX_REQUEST')) {
+                    $json->response([
+                        'link' => cb_get_full_url($redirect_page,
+                            [
+                                'baid'          => $aid,
+                                'bcid'          => $category_id,
+                                'mid'           => @ $G_INPUT['mid'],
+                                'tmpid'         => $temp_mail_id,
+                                'draft_id'      => $draft_id,
+                                'sign_position' => $properties['sign_position'],
+                                'action'        => $action
+                            ])
+                    ]);
+                    cb_safe_exit();
+                }
+                cb_redirect($redirect_page,
+                    [
+                        'baid'          => $aid,
+                        'bcid'          => $category_id,
+                        'mid'           => @ $G_INPUT['mid'],
+                        'tmpid'         => $temp_mail_id,
+                        'draft_id'      => $draft_id,
+                        'sign_position' => $properties['sign_position'],
+                        'action'        => $action
+                    ]);
+            } else {
+                if (defined('AJAX_REQUEST')) {
+                    $json->response([
+                        'link' => cb_get_full_url($redirect_page,
+                            [
+                                'baid'     => $aid,
+                                'bcid'     => $category_id,
+                                'mid'      => @ $G_INPUT['mid'],
+                                'tmpid'    => $temp_mail_id,
+                                'draft_id' => $draft_id,
+                                'action'   => $action
+                            ])
+                    ]);
+                    cb_safe_exit();
+                }
+                cb_redirect($redirect_page,
+                    [
+                        'baid'     => $aid,
+                        'bcid'     => $category_id,
+                        'mid'      => @ $G_INPUT['mid'],
+                        'tmpid'    => $temp_mail_id,
+                        'draft_id' => $draft_id,
+                        'action'   => $action
+                    ]);
+            }
+        } elseif ($command == 'draft') {
+            // メールの保存
+            $mail_id = $send_logic->saveMail($user, $account_id, $properties,
+                $files, $temp_mail_id);
+
+            // the validation session is finished
+            $redirect_page = (isset($is_popup) && $is_popup)
+                ? 'mail/close_popup' : 'mail/index';
+            if (defined('AJAX_REQUEST')) {
+                $json->response([
+                    'link' => cb_get_full_url($redirect_page,
+                        ['aid' => $aid, 'cid' => $category_id])
+                ]);
+                cb_safe_exit();
+            }
+            cb_redirect($redirect_page, ['aid' => $aid, 'cid' => $category_id]);
+        }
+    } elseif (defined('AJAX_REQUEST')) {
+        header(CB_ERROR_HEADER . 'error_validation');
+        $json->response([
+            'validation'    => false,
+            'error_message' => $t->fetch('grn/show_validation_errors.tpl')
+        ]);
+        cb_safe_exit();
+    }
+}
+
+

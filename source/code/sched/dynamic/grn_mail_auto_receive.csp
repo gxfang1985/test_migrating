@@ -1,0 +1,223 @@
+<?php
+
+use grn\grn\access\service\AppAccess;
+
+// get mysql lock
+$db = cb_get_master_db();
+$lockName = $db->getDatabaseName() . '-grn_mail_auto_receive';
+$ret = $db->query($db->format("SELECT GET_LOCK('@S',0) AS getlock",
+    [$lockName]));
+$row = $db->fetch_assoc($ret);
+$lock = $row['getlock'];
+$db->free_result($ret);
+if ($lock != "1") {
+    return;
+}
+
+require_once('fw/logger.csp');
+
+while (ob_get_level() > 0) {
+    ob_end_clean();
+}
+
+/**
+ * メールの自動受信イベント（親プロセス）
+ */
+
+// メールを取得する
+require_once('grn/application.csp');
+require_once('mail/application.csp');
+require_once('mail/connection.csp');
+$app_locator = GRN_ApplicationLocator::instance();
+/** @var GRN_Mail_App $mail_app */
+$mail_app = $app_locator->getInstance('mail');
+if ($mail_app instanceof GRN_Mail_App) {
+    $utility = $mail_app->getUtility();
+
+    $server_infos = [];
+    $available_servers = [];
+    $account_infos = [];
+
+    $manager = GRN_Mail_ConnectionLogicManager::getInstance();
+    $listener = $manager->getErrorListener();
+
+    // 全ユーザーのデフォルトメールアカウント情報を取得する
+    $account_info_list = $mail_app->getDefaultMailAccountInfoOfAllUsers();
+    if ( ! is_null($account_info_list)) {
+        $user_ids = [];
+        foreach ($account_info_list as $account_info) {
+            $user_ids[] = $account_info["user_id"];
+        }
+        // メールアプリの利用権限を取得
+        $users_id_allow
+            = AppAccess::getAvailabilityAppIdsInternalByUserIds($user_ids,
+            'mail');
+
+        foreach ($account_info_list as $account_info) {
+            $user_id = $account_info["user_id"];
+            if ( ! $users_id_allow[$user_id]['mail']) {
+                continue;
+            }
+            // メールアカウントIDを取得する
+            $account_id = $account_info['id'];
+
+            // サーバーIDを取得する
+            $server_id = $account_info['account_info']->server_id;
+            if ( ! is_null($server_id)
+                 && ! array_key_exists($server_id, $available_servers)
+            ) {
+                $system_config = $utility->getSystemConfig();
+                $server_data = $system_config->getServerData($server_id);
+                /** @var GRN_Mail_ServerInfo $server_info */
+                $server_info =& $server_data['server_info'];
+                $server_infos[$server_id] =& $server_info;
+
+                // 受信サーバーに接続テストする
+                if (GRN_Mail_ConnectionLogic::static_testRetrieveConnection($server_info,
+                    $listener, null)
+                ) {
+                    $available_servers[$server_id] = true;
+                } else {
+                    $available_servers[$server_id] = false;
+
+                    $cause = $listener->formatErrors();
+                    // 接続テストが失敗した場合はログに出力する
+                    $lm = CB_LoggerManager::getInstance();
+                    $l =& $lm->getLogger(GRN_MAIL_MODULE_ID);
+                    $msg = sprintf('[%ld] %s, Cause: %s, [hostname: %s]',
+                        getmypid(),
+                        E_GRN_MAIL_FAILED_TO_CONNECT_RETRIEVE_SERVER, $cause,
+                        $server_info->getRetrieve());
+                    $l->error($msg);
+                }
+            }
+
+            // 利用できるサーバーのユーザーのアカウント情報を保存する
+            if ( ! is_null($server_id) && $available_servers[$server_id]) {
+                $account_infos[$user_id] = $account_info;
+            }
+        }
+    }
+
+    // メール受信プロセスの起動を準備する
+    $basedir = cb_basedir();
+    $appfile = cb_get_cli_path();
+
+
+    $max_auto_receive_connect
+        = $mail_app->getConfig('max_auto_receive_connect');
+    if ($max_auto_receive_connect === false
+        || ! is_numeric($max_auto_receive_connect)
+    ) {
+        $max_auto_receive_connect = 1;
+    }
+    $max_receive_size = $mail_app->getConfig('max_auto_receive_size');
+    if ($max_receive_size === false || ! is_numeric($max_receive_size)) {
+        $max_receive_size = -1;
+    }
+    $process_list = [];
+    $process_count = 0;
+
+    $auto_receive_log = $mail_app->getConfig('auto_receive_log');
+    $logger = null;
+    if ($auto_receive_log) {
+        $date = gmdate("M d Y H:i:s ", time());
+        $logger = new \grn\grn\TextLogger("mail_auto_receive",
+            $auto_receive_log);
+        $logger->log("[{$date} (GMT)]start mail auto receive");
+        $logger->log('max_auto_receive_connect = ' . $max_auto_receive_connect);
+        $logger->log('max_auto_receive_size = ' . $max_receive_size);
+        $logger->log('command_file = ' . $appfile);
+    }
+
+    foreach (array_keys($account_infos) as $user_id) {
+        if (cb_get_backupmode() !== false) {
+            $logger->log("stop mail_auto_receive because of backup mode.");
+            break;
+        }
+        // アカウント情報を取得する
+        $account_info = $account_infos[$user_id];
+
+        // サーバーIDを取得する
+        $server_id = $account_info['account_info']->server_id;
+
+        if ($available_servers[$server_id]) {
+            $server_info =& $server_infos[$server_id];
+
+            $is_success
+                = GRN_Mail_ConnectionLogic::static_testRetrieveConnectionWithAccount($server_info,
+                $account_info['account_info'], $listener, null);
+
+            if ($is_success) {
+                if (array_key_exists($process_count, $process_list)) {
+                    $phandle_info =& $process_list[$process_count];
+                    $out = '';
+                    while ( ! feof($phandle_info['handle'])) {
+                        $out .= fread($phandle_info['handle'], 1024);
+                    }
+                    pclose($phandle_info['handle']);
+                    if ($logger instanceof \grn\grn\TextLogger) {
+                        $logger->log($out);
+                        $logger->log("Received data for user "
+                                     . $phandle_info['uid']);
+                    }
+                    unset($process_list[$process_count]);
+                }
+                // メールを受信する子プロセスを起動する
+                $phandle_uid = $user_id;
+                chdir($basedir);
+                $phandle_handle = popen(cb_get_fopen_execute_path($appfile,
+                        "code/command/grn_mail_auto_receive.csp")
+                                        . " user_id=${user_id}", "r");
+                if ($phandle_handle === false) {
+                    //popenが失敗した時のログ
+                    $cause = $listener->formatErrors();
+                    $lm = CB_LoggerManager::getInstance();
+                    $l =& $lm->getLogger(GRN_MAIL_MODULE_ID);
+                    $msg = sprintf('[%ld] %s for user %s, Cause: %s',
+                        getmypid(),
+                        E_GRN_MAIL_FAILED_TO_CONNECT_RETRIEVE_SERVER, $user_id,
+                        $cause);
+                    $l->error($msg);
+                } else {
+                    $process_list[$process_count]
+                        = ['handle' => $phandle_handle, 'uid' => $phandle_uid];
+                }
+                if (++$process_count >= $max_auto_receive_connect) {
+                    $process_count = 0;
+                }
+            } else {
+                //サーバーにアクセスできなかった場合はログに残す
+                $cause = $listener->formatErrors();
+                $lm = CB_LoggerManager::getInstance();
+                $l =& $lm->getLogger(GRN_MAIL_MODULE_ID);
+                $msg = sprintf('[%ld] %s for user %s, Cause: %s', getmypid(),
+                    E_GRN_MAIL_FAILED_TO_CONNECT_RETRIEVE_SERVER, $user_id,
+                    $cause);
+                $l->error($msg);
+            }
+        }
+    }
+
+    foreach ($process_list as $phandle_info) {
+        $out = '';
+        while ( ! feof($phandle_info['handle'])) {
+            $out .= fread($phandle_info['handle'], 1024);
+        }
+        pclose($phandle_info['handle']);
+        if ($logger instanceof \grn\grn\TextLogger) {
+            $logger->log($out);
+            $logger->log("Received data for user " . $phandle_info['uid']);
+        }
+    }
+
+    if ($logger instanceof \grn\grn\TextLogger) {
+        $date = gmdate("M d Y H:i:s ", time());
+        $logger->log("[{$date} (GMT)]end mail auto receive");
+
+    }
+}
+
+// release mysql lock
+$query = $db->format("SELECT RELEASE_LOCK('@S')", [$lockName]);
+$db->query($query);

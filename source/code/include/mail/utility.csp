@@ -1,0 +1,1751 @@
+<?php
+
+use grn\mail\dao\GrnMailIncrementalSearchDAO;
+
+//require_once( 'fw/i18n.csp' );
+require_once('mail/table.csp');
+require_once('grn/application.csp');
+
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+ * メールユーティリティクラス
+ *
+ * @author  IKEDA, Atsushi 2004/12
+ * @version 1.0
+ * @package grn.mail
+ */
+class GRN_Mail_Utility
+{
+    /**
+     * Return singleton.
+     *
+     * @return GRN_Mail_Utility
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_Mail_Utility();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * コンストラクタ
+     */
+    function __construct()
+    {
+        global $G_container_base;
+        $app_locator = GRN_ApplicationLocator::instance();
+        $this->_table_manager = $app_locator->getTableManager('mail');
+        $this->_uum = $G_container_base->getInstance('uum');
+    }
+
+    /**
+     * @access private
+     */
+    /** @var CB_TableInfo[] */
+    var $_table_infos = [];
+    var $_table_manager = null;
+    var $_uum = null;
+    var $_mail_app = null;                          // メールアプリオブジェクト
+    var $_system_config = null;                     // メールシステム設定ロジックオブジェクト
+    var $_personal_config = [];                // メール個人設定設定ロジックオブジェクト
+    /** @var GRN_Mail_ConnectionLogicManager|null */
+    var $_connection_logic_manager = null;          // メール通信ロジック管理オブジェクト
+    /** @var GRN_Mail_MailLogic|null */
+    var $_mail_logic = null;                        // メールロジックオブジェクト
+    var $_send_logic = null;                        // メール送信ロジックオブジェクト
+    var $_recv_logic = null;                        // メール受信ロジックオブジェクト
+    var $_folder_logic = null;                      // フォルダロジックオブジェクト
+    var $_search_logic = null;                      // 検索ロジックオブジェクト
+    var $_notification_mail_logic = null;           // 外部通知メールロジックオブジェクト
+    var $_address_history = null;                   // 送受信記録ロジックオブジェクト
+
+    //////////////////////////////////////////////////////////////////////////
+    // private method
+
+    //////////////////////////////////////////////////////////////////////////
+    // public method
+
+    /**
+     * テーブル情報を取得する
+     *
+     * @param   string $class_name 取得するテーブル情報のクラス名
+     *
+     * @return  CB_TableInfo
+     */
+
+    function getTableInfo($class_name)
+    {
+        $no_lock_tables = [GRN_MAIL_ACCOUNT_TABLE];
+
+        if ( ! array_key_exists($class_name, $this->_table_infos)) {
+            $this->_table_infos[$class_name]
+                = $this->_table_manager->getTableInfo($class_name);
+
+            // no lock で select 文を発行
+            if (in_array($class_name, $no_lock_tables)) {
+                $this->_table_infos[$class_name]->setLock(CB_DATABASE_NO_LOCK);
+            }
+        }
+
+        return $this->_table_infos[$class_name];
+    }
+
+    /**
+     * ログインユーザーオブジェクトを取得する
+     * ログインしていなければ例外をスローまたはnullを返す
+     *
+     * @param   boolean $throw_error 例外スローフラグ
+     *
+     * @return  mixed       ユーザーオブジェクト（CB_User） or null
+     */
+    function getLoginUser($throw_error = true)
+    {
+        $login = $this->_uum->getLoginUser();
+        if ( ! is_object($login)) {
+            if ($throw_error) {
+                cb_throw_error(E_COMMON_AUTHENTICATION_FAILED);
+            } else {
+                {
+                    $___ret = null;
+
+                    return $___ret;
+                }
+            }
+        }
+
+        return $login;
+    }
+
+    /**
+     * プロファイルデータを更新
+     *
+     * @param   object $profile プロファイルデータ（CB_Profile）
+     * @param   string $name    プロファイルデータ名
+     * @param   mixed  $value   プロファイルデータ
+     *
+     * @return  boolean
+     */
+    function updateProfile(& $profile, $name, $value)
+    {
+        if (is_null($profile)) {
+            // 更新できない
+            cb_throw_error(E_GRN_MAIL_FAILED_TO_UPDATE_PROFILE_DATA);
+        }
+
+        $old_value = null;
+        if ( ! $profile->getAttribute($name, $old_value)) {
+            // 見つからない場合は追加
+            if ( ! $profile->createAttribute($name, $value)) {
+                // プロファイルデータ更新失敗
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_UPDATE_PROFILE_DATA);
+            }
+        } else {
+            // 見つかった場合は更新
+            if ( ! $profile->updateAttribute($name, $value)) {
+                // プロファイルデータ更新失敗
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_UPDATE_PROFILE_DATA);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * プロファイルに設定を保存
+     *
+     * @param   object $profile プロファイルデータ（CB_Profile）
+     * @param   array  $setting プロファイルに保存するシステム設定の配列
+     *
+     * @return  boolean 成否
+     */
+    function setProfileSetting(& $profile, & $setting)
+    {
+        if ( ! is_array($setting) || (count($setting) == 0)) {
+            return false;
+        }
+
+        foreach ($setting as $key => $value) {
+            // 設定の保存
+            if ( ! $this->updateProfile($profile, $key, $value)) {
+                // プロファイルデータ更新失敗
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_UPDATE_PROFILE_DATA);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * プロファイルの設定を取得
+     *
+     * @param   CB_Profile $profile プロファイルデータ（CB_Profile）
+     * @param   string     $name    設定データ名
+     * @param   mixed      $value   設定データを受け取る
+     *
+     * @return  boolean 成否
+     */
+    function getProfileSetting(& $profile, $name, & $value)
+    {
+        if (is_null($profile)) {
+            return false;
+        }
+
+        // システム設定の取得
+        $temp = null;
+        if ($profile->getAttribute($name, $temp)) {
+            /** GRN2-8372 start **/
+            if ('charset' === $name && 'JIS' === $temp) {
+                $temp = 'JIS-MS';
+            }
+            /** GRN2-8372 end **/
+            $value = $temp;
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * メールアプリオブジェクトを取得
+     *
+     * @return GRN_Mail_App
+     */
+    function getMailApp()
+    {
+        if (is_null($this->_mail_app)) {
+            require_once('mail/application.csp');
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->_mail_app = $app_locator->getInstance(GRN_MAIL_APP_ID);
+        }
+
+        return $this->_mail_app;
+    }
+
+    /**
+     * メールシステム設定ロジックオブジェクトを取得
+     *
+     * @return GRN_Mail_SystemConfig
+     */
+    function getSystemConfig()
+    {
+        if (is_null($this->_system_config)) {
+            require_once('mail/system_config.csp');
+            $this->_system_config = GRN_Mail_SystemConfig::getInstance();
+        }
+
+        return $this->_system_config;
+    }
+
+    /**
+     * メール個人設定ロジックオブジェクトを取得
+     *
+     * @param  CB_User $user ユーザーオブジェクト
+     *
+     * @return GRN_Mail_PersonalConfig|null
+     */
+    function getPersonalConfig(& $user)
+    {
+        if ( ! is_object($user)) {
+            assert('FALSE');
+            $ret = null;
+
+            return $ret;
+        }
+
+        $uid = $user->getOID();
+        if ( ! array_key_exists($uid, $this->_personal_config)) {
+            require_once('mail/personal_config.csp');
+            $this->_personal_config[$uid] = new GRN_Mail_PersonalConfig($user);
+        }
+
+        return $this->_personal_config[$uid];
+    }
+
+    /**
+     * メール通信ロジック管理オブジェクトを取得
+     *
+     * @return GRN_Mail_ConnectionLogicManager
+     */
+    function getConnectionLogicManager()
+    {
+        // メール通信ロジック管理クラスのオブジェクトを生成
+        if (is_null($this->_connection_logic_manager)) {
+            require_once('mail/connection.csp');
+            $this->_connection_logic_manager
+                = GRN_Mail_ConnectionLogicManager::getInstance();
+        }
+
+        return $this->_connection_logic_manager;
+    }
+
+    /**
+     * メール通信ロジックオブジェクトを取得
+     *
+     * @param  object $account アカウント
+     *
+     * @return GRN_Mail_ConnectionLogic
+     */
+    function getConnectionLogic(& $account)
+    {
+        // メール通信ロジッククラスのオブジェクトを生成
+        $this->getConnectionLogicManager();
+        $ret = $this->_connection_logic_manager->getConnectionLogic($account);
+
+        return $ret;
+    }
+
+    /**
+     * メールロジックオブジェクトを取得
+     *
+     * @return GRN_Mail_MailLogic
+     */
+    function getMailLogic()
+    {
+        if (is_null($this->_mail_logic)) {
+            require_once('mail/mail.csp');
+            $this->_mail_logic = GRN_Mail_MailLogic::getInstance();
+        }
+
+        return $this->_mail_logic;
+    }
+
+    /**
+     * メール送信ロジックオブジェクトを取得
+     *
+     * @return GRN_Mail_SendLogic
+     */
+    function getSendLogic()
+    {
+        if (is_null($this->_send_logic)) {
+            require_once('mail/include_send.csp');
+            $this->_send_logic = GRN_Mail_SendLogic::getInstance();
+        }
+
+        return $this->_send_logic;
+    }
+
+    /**
+     * メール受信ロジックオブジェクトを取得
+     *
+     * @return GRN_Mail_ReceiveLogic
+     */
+    function getRecvLogic()
+    {
+        if (is_null($this->_recv_logic)) {
+            require_once('mail/recv.csp');
+            $this->_recv_logic = GRN_Mail_ReceiveLogic::getInstance();
+        }
+
+        return $this->_recv_logic;
+    }
+
+    /**
+     * フォルダロジックオブジェクトを取得
+     *
+     * @return GRN_Mail_FolderLogic
+     */
+    function getFolderLogic()
+    {
+        if (is_null($this->_folder_logic)) {
+            require_once('mail/folder.csp');
+            $this->_folder_logic = GRN_Mail_FolderLogic::getInstance();
+        }
+
+        return $this->_folder_logic;
+    }
+
+    /**
+     * 検索ロジックオブジェクトを取得
+     *
+     * @return GRN_Mail_SearchLogic
+     */
+    function getSearchLogic()
+    {
+        if (is_null($this->_search_logic)) {
+            require_once('mail/include_search.csp');
+            $this->_search_logic = GRN_Mail_SearchLogic::getInstance();
+        }
+
+        return $this->_search_logic;
+    }
+
+    /**
+     * 外部通知メールロジックオブジェクトを取得
+     *
+     * @return GRN_Mail_NotificationMailLogic
+     */
+    function getNotificationMailLogic()
+    {
+        if (is_null($this->_notification_mail_logic)) {
+            require_once('mail/notification_mail.csp');
+            $this->_notification_mail_logic
+                = GRN_Mail_NotificationMailLogic::getInstance();
+        }
+
+        return $this->_notification_mail_logic;
+    }
+
+    /**
+     * 送受信記録ロジックオブジェクトを取得
+     *
+     * @return GRN_Mail_AddressHistoryLogic
+     */
+    function getAddressHistoryLogic()
+    {
+        if (is_null($this->_address_history)) {
+            require_once('mail/address_history.csp');
+            $this->_address_history
+                = GRN_Mail_AddressHistoryLogic::getInstance();
+        }
+
+        return $this->_address_history;
+    }
+
+
+    //////////////////////////////////////////////////////////////////////////
+
+    /**
+     * 一時ファイルを作成する
+     *
+     * @param        $object
+     * @param        $content
+     * @param string $additional
+     *
+     * @return string
+     */
+    public function makeTempFile($object, $content, $additional = '')
+    {
+        $fileName = self::static_makeTempFileName($object, $additional);
+        $ret = ($fileName) ? file_put_contents($fileName, $content)
+            : false;
+        if ($ret === false) {
+            // ファイル作成失敗
+            require_once('fw/error_code.csp');
+            cb_throw_error(E_COMMON_FOPEN_WRITE, null, ['file' => $fileName]);
+        }
+
+        return $fileName;
+    }
+
+    /**
+     * 一時ファイルの名前を生成する
+     *
+     * @param        $object
+     * @param string $additional 付加文字列
+     *
+     * @return  string  一時ファイル名
+     */
+    private static function static_makeTempFileName($object, $additional)
+    {
+        $tmpdir = self::static_formatDir(cb_tmpdir(), $object, true);
+
+        if (strlen($additional) > 0) {
+            $tmpdir .= '/' . $additional;
+            cb_mkdir($tmpdir, 0777, true, true);
+        }
+
+        return tempnam($tmpdir, '');
+    }
+
+    /**
+     * オブジェクト用のテンポラリディレクトリを作成する
+     *
+     * @param string $root
+     * @param        $object
+     * @param bool   $mkdir
+     *
+     * @return  string  一時ファイル名
+     */
+    private static function static_formatDir($root, $object, $mkdir = false)
+    {
+        if ( ! is_string($root) || ! is_object($object)) {
+            return cb_tmpdir();
+        }
+
+        $table_info = $object->getTableInfo();
+        $table_name = $table_info->getTableName();
+
+        $t = "${root}/${table_name}";
+        if ($mkdir) {
+            cb_mkdir($t, 0777, true, true);
+        }
+
+        return $t;
+    }
+
+    /**
+     * 名前の「\」と「"」エスケープする
+     *
+     * @param  string $name 名前
+     *
+     * @return string  文字列
+     */
+    public static function static_escapeDisplayName($name)
+    {
+        return str_replace(['\\', '"'], ['\\\\', '\"'], $name);
+    }
+
+    /**
+     * エスケープした文字を元に戻す
+     *
+     * @param  string $name 名前
+     *
+     * @return string  文字列
+     */
+    public static function static_unescapeDisplayName($name)
+    {
+        return str_replace(['\\\\', '\"'], ['\\', '"'], $name);
+    }
+
+    /**
+     * 名前の前後に""を追加/削除処理
+     *
+     * @param   string $name      名前
+     * @param   string $operation 追加/削除処理（'add'/'remove'）
+     *
+     * @return  string  文字列
+     */
+    public static function static_addNameQuotation($name, $operation)
+    {
+        assert('is_string( $name )');
+        assert('is_string( $operation )');
+
+        $len = strlen($name);
+        if ($len > 0) {
+            if ($operation == 'add') {
+                if ($name[0] != '"' || ($len > 1 && $name[$len - 1] != '"')) {
+                    $name = '"' . $name . '"';
+                }
+            } elseif ($operation == 'remove') {
+                if ($name[0] == '"' && $len > 1 && $name[$len - 1] == '"') {
+                    $name = substr($name, 1);
+                    $len--;
+                    $name = substr($name, 0, $len - 1);
+                }
+            }
+        }
+
+        return $name;
+    }
+
+    /**
+     * メールアドレスの前後に<>を追加/削除処理
+     *
+     * @param   string $email     E-Mailアドレス
+     * @param   string $operation 追加/削除処理（'add'/'remove'）
+     *
+     * @return  string  文字列
+     */
+    public static function static_addEmailBracket($email, $operation)
+    {
+        assert('is_string( $email )');
+        assert('is_string( $operation )');
+
+        $len = strlen($email);
+        if ($len > 0) {
+            if ($operation == 'add') {
+                if ($email[0] != '<') {
+                    $email = '<' . $email;
+                    $len++;
+                }
+                if ($email[$len - 1] != '>') {
+                    $email .= '>';
+                }
+            } elseif ($operation == 'remove') {
+                if ($email[0] == '<') {
+                    $email = substr($email, 1);
+                    $len--;
+                }
+                if ($email[$len - 1] == '>') {
+                    $email = substr($email, 0, $len - 1);
+                }
+            }
+        }
+
+        return $email;
+    }
+
+    /**
+     * メールアドレスを指定された書式の文字列に変換する
+     *
+     * @param   CB_MailAddress[]|string $address_list     メールアドレスオブジェクトの配列(array of {@link CB_MailAddress})、または文字列
+     * @param   boolean                 $b_name           名前フラグ
+     * @param   boolean                 $b_name_quotation 名前の前後に'""'を付加するフラグ
+     * @param   boolean                 $b_email          E-Mailフラグ（FALSEの場合でも、名前が空の場合はE-Mailが使われる）
+     * @param   boolean                 $b_email_bracket  E-Mailの前後に'<>'を付加するフラグ
+     * @param   string                  $return_type      戻り値の型（'string' or 'array'）
+     * @param bool                      $display_escape
+     *
+     * @return  string  文字列
+     */
+    public static function static_formatAddressString(
+        & $address_list,
+        $b_name,
+        $b_name_quotation,
+        $b_email,
+        $b_email_bracket,
+        $return_type = 'string',
+        $display_escape = false
+    ) {
+        $return_string = '';
+        $return_array = [];
+        $_address_list = null;
+        if (is_string($address_list)) {
+            require_once('fw/mail_message.csp');
+            $_address_list =& CB_MailAddress::static_parse_list($address_list,
+                null, true, $display_escape);
+        } elseif (is_array($address_list)) {
+            $_address_list =& $address_list;
+        }
+
+        require_once('fw/string_util.csp');
+        if (is_array($_address_list) && ($b_name || $b_email)) {
+            foreach (array_keys($_address_list) as $key) {
+                $address = $_address_list[$key];
+                if ( ! is_object($address)) {
+                    continue;
+                }
+
+                if (strlen($return_string) > 0) {
+                    $return_string .= ', ';
+                }
+
+                // 名前
+                $name = null;
+                $name_exists = false;        // 名前あり
+                if ($b_name) {
+                    $name = cb_trim($address->name);
+                    $len = strlen($name);
+                    if ($len > 0) {
+                        if ($b_name_quotation) {
+                            $name
+                                = GRN_Mail_Utility::static_addNameQuotation($name,
+                                'add');
+                        }
+
+                        $return_string .= $name;
+                        $name_exists = true;
+                    }
+                }
+
+                // E-Mail
+                $email = null;
+                if ($b_email || ! $name_exists) {
+                    $email = cb_trim($address->address);
+                    $len = strlen($email);
+                    if ($len > 0) {
+                        if ($name_exists) {
+                            $return_string .= ' ';
+                        }
+
+                        if ($b_email_bracket || $name_exists) {
+                            $email
+                                = GRN_Mail_Utility::static_addEmailBracket($email,
+                                'add');
+                        }
+
+                        $return_string .= $email;
+                    }
+                }
+
+                $return_array[] = ['name' => $name, 'email' => $email];
+            }
+        }
+
+        if ($return_type === 'array') {
+            return $return_array;
+        }
+
+        return $return_string;
+    }
+
+    /**
+     * メールの総サイズがエラーであれば例外をスロー
+     *
+     * @param int $user_limit メールの総サイズ上限値（バイト）
+     * @param int $total_size 現在のメールの総サイズ（バイト）
+     */
+    function checkTotalSize($user_limit, $total_size)
+    {
+        if ( ! is_int($user_limit) || ! is_int($total_size)
+             || ($user_limit < 0)
+        ) {
+            return;
+        }
+
+        // サイズチェック
+        if ($total_size >= $user_limit) {
+            if ($user_limit >= 1024 * 1024) {
+                $user_limit_for_view = number_format($user_limit / 1048576.0, 0)
+                                       . ' MB';
+            } elseif ($user_limit >= 1024) {
+                $user_limit_for_view = number_format($user_limit / 1024.0, 0)
+                                       . ' KB';
+            } else {
+                $user_limit_for_view = $user_limit . ' byte';
+            }
+
+            if ($total_size >= 1024 * 1024) {
+                $total_size_for_view = number_format($total_size / 1048576.0, 0)
+                                       . ' MB';
+            } elseif ($total_size >= 1024) {
+                $total_size_for_view = number_format($total_size / 1024.0, 0)
+                                       . ' KB';
+            } else {
+                $total_size_for_view = $total_size . ' byte';
+            }
+
+            $diagnosis = ['limit' => $user_limit_for_view];
+            $cause = [
+                'limit' => $user_limit_for_view,
+                'total' => $total_size_for_view
+            ];
+            cb_throw_error(E_GRN_MAIL_LIMIT, $diagnosis, $cause);
+        }
+    }
+
+    /**
+     * リッチエディタで編集したデータのテキストのみを取り出す
+     *
+     * @param bool   $is_html リッチエディタの場合TRUE
+     * @param string $data    テキストデータ
+     * @param string $html    リッチエディタの編集データ
+     */
+    function prepareData($is_html, & $data, & $html)
+    {
+        if ($is_html) {
+            $content = str_replace("<BR>", "\n", $html);
+            $content = str_replace("<br>", "\n", $content);
+            $data = strip_tags($content);
+        } else {
+            $html = null;
+        }
+    }
+
+    /**
+     * リッチエディタで編集したデータのテキストのみを取り出す
+     *
+     * @param      $user
+     * @param null $account_id
+     * @param null $page_title
+     * @param bool $no_link
+     *
+     * @return array
+     */
+    function getIndexSitePosition(
+        $user,
+        $account_id = null,
+        $page_title = null,
+        $no_link = false
+    ) {
+        $account = null;
+        $page_index = 'mail/index';
+        if (is_string($page_title)) {
+            $page_name = $page_title;
+        } else {
+            $page_name = grn_get_page_display_name($page_index);
+
+            if (is_string($account_id) && (strlen($account_id) > 0)) {
+                $system_config = $this->getSystemConfig();
+                $account = $system_config->_getAccountRow($account_id,
+                    false, false);
+            } else {
+                $personal_config = $this->getPersonalConfig($user);
+                $account = $personal_config->_getDefaultAccountRow();
+            }
+        }
+
+        if (is_object($account)) {
+            // アカウント名付加
+            $page_name .= '(' . $account->getTitle() . ')';
+        }
+
+        $site_position = [
+            'page' => ! $no_link ? $page_index : '',
+            'name' => $page_name,
+            'aid'  => $account_id
+        ];
+
+        return $site_position;
+    }
+
+    /**
+     * Get available encodings for mail application
+     *
+     * @global <type> $G_config_common
+     * @return array  $available_encodings  Available encodings for mail application
+     */
+    public static function getAvailableEncodings()
+    {
+        global $G_config_common;
+        $available_encodings = explode(' ',
+            $G_config_common->get('Mail', 'mail_available_encoding'));
+
+        return $available_encodings;
+    }
+
+    /**
+     * Truncate mail data if line number is too large
+     *
+     * @param string &$data
+     * @param int    $line
+     *
+     * @return boolean  if truncated TRUE, or FALSE
+     */
+    public static function truncateMailData(&$data, $line = 10000)
+    {
+        $array = explode("\n", $data);
+        if (count($array) > $line) {
+            array_splice($array, $line);
+            $data = implode("\n", $array);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Remove src attribute from img tag.
+     *
+     * @param string  $html_source
+     * @param boolean $show_picture
+     *
+     * @return string
+     */
+    public static function washHtmlMail($html_source, $show_picture = false)
+    {
+        $files = new \grn\mail\HtmlMailInlineContents([], '0');
+
+        return (new \grn\mail\HtmlMailProcessor())->process($html_source,
+            $files, $show_picture);
+    }
+
+    /**
+     * @param string $html
+     * @param bool   $show_picture
+     *
+     * @return bool
+     */
+    public function isShowDisplayImageButton($html, $show_picture)
+    {
+        return ! $show_picture
+               && (preg_match('/<(img[^>]*(src)|[^>]*(background))+[^>]*>/i',
+                    $html) > 0)
+               && $this->getSystemConfig()->canUserUseHtmlMailPicture();
+    }
+
+    /**
+     * @param string $user_id
+     * @param string $mail_id
+     *
+     * @return CB_Session
+     */
+    private function getSessionOfHtmlMailShowPicture($user_id, $mail_id)
+    {
+        $session_key = $user_id . '_' . $mail_id;
+        require_once('fw/session_manager.csp');
+        $sm = CB_SessionManager::getInstance();
+
+        return $sm->getSession(GRN_MAIL_MODULE_ID . $session_key);
+    }
+
+    /**
+     * @param $user_id
+     * @param $mail_id
+     * @param $sent
+     *
+     * @return bool
+     */
+    public function isHtmlMailShowPicture($user_id, $mail_id, $sent)
+    {
+        if ( ! $this->getSystemConfig()->canUserUseHtmlMailPicture()) {
+            return false;
+        }
+
+        if (strcmp($sent, '1') == 0) {
+            return true;
+        }
+
+        $session = $this->getSessionOfHtmlMailShowPicture($user_id, $mail_id);
+        $show_pict = $session->get('show_picture');
+        if (is_null($show_pict)) {
+            return false;
+        }
+
+        return $show_pict;
+    }
+
+    /**
+     * @param string $user_id
+     * @param string $mail_id
+     * @param bool   $new_value
+     */
+    public function updateSessionOfHtmlMailShowPicture(
+        $user_id,
+        $mail_id,
+        $new_value
+    ) {
+        $session = $this->getSessionOfHtmlMailShowPicture($user_id, $mail_id);
+        $session->set('show_picture', $new_value);
+    }
+
+    /**
+     * Add sign data to mail content.
+     * It's used only for html mail.
+     */
+    public static function insertSignData(
+        $data,
+        $sign_data,
+        $properties = [],
+        &$data_for_view,
+        &$utility = null
+    ) {
+        if ( ! is_array($properties)) {
+            $data_for_view['data'] = '';
+            $data_for_view['data_plain_text'] = '';
+
+            return;
+        }
+
+        $mail_id = cb_at($properties, 'original_mid', null);
+        $position = cb_at($properties, 'position', 'bottom');
+        $action = cb_at($properties, 'action');
+        $data_plain_text = cb_at($properties, 'data_plain_text', '');
+        $sign_data = htmlspecialchars($sign_data);
+        $sign_html_data = $sign_data;
+        $sign_html_data = preg_replace("'\r?\n's", "<BR /></div><div>",
+            $sign_html_data);
+        $sign_html_data = "<div>" . $sign_html_data . "</div>\n";
+        if (strtolower($position) == "bottom" || $action == "reuse"
+            || is_null($action)
+            || strlen($action) == 0
+        ) {
+            $data_plain_text = $data_plain_text . "\r\n" . $sign_data;
+            $data = $data . $sign_html_data;
+        } elseif (strtolower($position) == "top") {
+            if ( ! ($action == "reply" || $action == "reply-all"
+                    || $action == "forward")
+            ) {
+                $data_plain_text = $data . "\r\n" . $sign_data;
+                $data = $data . $sign_html_data;
+            } else {
+                $mail_data = null;
+                if ( ! is_null($utility)) {
+                    $mail_logic = $utility->getMailLogic();
+                    $mail_data = $mail_logic->getMailData($mail_id, true);
+                }
+                $matches = [];
+                if ($action == "reply" || $action == "reply-all") {
+                    $info_data = GRN_Mail_Utility::makeReplyInfo($mail_data,
+                        true);
+                } elseif ($action == "forward") {
+                    $info_data = GRN_Mail_Utility::makeForwardInfo($mail_data,
+                        true);
+                }
+                $info_data = "<div>" . $info_data . "</div>";
+                $info_data = preg_replace("'<div></div>'si", "", $info_data);
+                if ($action == "reply" || $action == "reply-all") {
+                    if (preg_match("'(.*?)<blockquote'si", $data, $matches)) {
+                        if (strlen($matches[1]) == 0) {
+                            $data = $sign_html_data . $data;
+                        } else {
+                            $temp_data = $matches[1];
+                            $temp = explode($temp_data, $data);
+                            $temp = array_slice($temp, 1);
+                            $data = implode($temp_data, $temp);
+                            $temp_datas = explode($info_data, $temp_data);
+                            if (count($temp_datas) > 1) {
+                                $temp_datas[0] .= $sign_html_data;
+                                $temp_data = implode($info_data,
+                                    $temp_datas);
+                                $data = $temp_data . $data;
+                            } else {
+                                $data = implode('',
+                                    [$temp_data, $data, $sign_html_data]);
+                            }
+                        }
+                    } else {
+                        $info_data = preg_replace("' 's", "&nbsp;",
+                            $info_data);
+                        $temp_datas = explode($info_data, $data);
+                        if (count($temp_datas) > 1) {
+                            $temp_datas[0] .= $sign_html_data;
+                            $data = implode($info_data, $temp_datas);
+                        } else {
+                            $data .= $sign_html_data;
+                        }
+                    }
+                } elseif ($action == "forward") {
+                    $temp_data_array
+                        = preg_split("'<div[^>]*\bcbmail-quote\b[^>]*>.*?</div>'si",
+                        $data);
+                    if (count($temp_data_array) > 1) {
+                        $temp_datas = explode($info_data, $temp_data_array[0]);
+                        if (count($temp_datas) > 1) {
+                            $temp_datas[0] .= $sign_html_data;
+                            $temp_data_array[0] = implode($info_data,
+                                $temp_datas);
+                            $data = implode('', $temp_data_array);
+                        } else {
+                            $temp_data_array[] = $sign_html_data;
+                            $data = implode('', $temp_data_array);
+                        }
+                    } else {
+                        $info_data = preg_replace("' 's", "&nbsp;",
+                            $info_data);
+                        $temp_datas = explode($info_data, $data);
+                        if (count($temp_datas) > 1) {
+                            $temp_datas[0] .= $sign_html_data;
+                            $data = implode($info_data, $temp_datas);
+                        } else {
+                            $data .= $sign_html_data;
+                        }
+                    }
+                }
+            }
+        }
+        $data_for_view['data'] = $data;
+        $data_for_view['data_plain_text']
+            = grn_strip_tags(grn_wash_script_without_style_attribute($data));
+    }
+
+    /**
+     * Create the original mail sender information.
+     *
+     * @param Object $mail_data
+     * @param bool   $html
+     *
+     * @return mixed|string
+     */
+    public static function makeForwardInfo($mail_data, $html = false)
+    {
+        if (is_null($mail_data) || ! is_array($mail_data)) {
+            return "";
+        }
+        $info = [];
+        $info[] = "----- Original Message -----\r\n";
+        $info[] = "Subject: " . cb_trim($mail_data['subject']) . "\r\n";
+        $info[] = "Date: " . cb_trim($mail_data['date']) . "\r\n";
+        $info[] = "From: " . cb_trim($mail_data['from']) . "\r\n";
+        if ( ! is_null($mail_data['to']) && (strlen($mail_data['to']) > 0)) {
+            $to = mb_ereg_replace("\r\n", "", $mail_data['to']);
+            $to = mb_ereg_replace("\t+", " ", $mail_data['to']);
+            if ($to === false) {
+                $to = '';
+            }
+
+            $info[] = "To: " . cb_trim($to) . "\r\n";
+        }
+        if ( ! is_null($mail_data['cc']) && (strlen($mail_data['cc']) > 0)) {
+            $cc = mb_ereg_replace("\r\n", "", $mail_data['cc']);
+            $cc = mb_ereg_replace("\t+", " ", $mail_data['cc']);
+            if ($cc === false) {
+                $cc = '';
+            }
+
+            $info[] = "Cc: " . cb_trim($cc) . "\r\n";
+        }
+        foreach ($info as $key => $value) {
+            $info[$key] = preg_replace("'[ |\t]+'", " ", $value);
+        }
+        $ret = implode("", $info);
+        if ($html) {
+            $ret = preg_replace("'<'s", "&lt;", $ret);
+            $ret = preg_replace("'>'s", "&gt;", $ret);
+            $ret = preg_replace("' 's", "&nbsp;", $ret);
+            $ret = preg_replace("'\r\n's", "</div>\r\n<div>", $ret);
+        }
+
+        return $ret;
+    }
+
+    public static function makeReplyInfo($mail_data, $html = false)
+    {
+        $info_data = GRN_Mail_Utility::makeForwardInfo($mail_data, $html);
+        $info_data = $info_data . GRN_Mail_Utility::getInstance()
+                                                  ->static_formatAddressString($mail_data['from'],
+                                                      true, false, false, false)
+                     . " wrote:";
+
+        return $info_data;
+    }
+
+    /**
+     * Convert html entity to correlative character
+     *
+     * @param String $input
+     *
+     * @return mixed
+     */
+    public static function htmlEntityDecode($input)
+    {
+        // ISO 8859-1
+        $patterns = [
+            // Symbols
+            "'(&#161;|&iexcl;)'",
+            "'(&#162;|&cent;)'",
+            "'(&#163;|&pound;)'",
+            "'(&#164;|&curren;)'",
+            "'(&#165;|&yen;)'",
+            "'(&#166;|&brvbar;)'",
+            "'(&#167;|&sect;)'",
+            "'(&#168;|&uml;)'",
+            "'(&#169;|&copy;)'",
+            "'(&#170;|&ordf;)'",
+            "'(&#171;|&laquo;)'",
+            "'(&#172;|&not;)'",
+            "'(&#173;|&shy;)'",
+            "'(&#174;|&reg;)'",
+            "'(&#175;|&macr;)'",
+            "'(&#176;|&deg;)'",
+            "'(&#177;|&plusmn;)'",
+            "'(&#178;|&sup2;)'",
+            "'(&#179;|&sup3;)'",
+            "'(&#180;|&acute;)'",
+            "'(&#181;|&micro;)'",
+            "'(&#182;|&para;)'",
+            "'(&#183;|&middot;)'",
+            "'(&#184;|&cedil;)'",
+            "'(&#185;|&sup1;)'",
+            "'(&#186;|&ordm;)'",
+            "'(&#187;|&raquo;)'",
+            "'(&#188;|&frac14;)'",
+            "'(&#189;|&frac12;)'",
+            "'(&#190;|&frac34;)'",
+            "'(&#191;|&iquest;)'",
+            "'(&#215;|&times;)'",
+            "'(&#247;|&divide;)'",
+            // Characters
+            "'(&#192;|&Agrave;)'",
+            "'(&#193;|&Aacute;)'",
+            "'(&#194;|&Acirc;)'",
+            "'(&#195;|&Atilde;)'",
+            "'(&#196;|&Auml;)'",
+            "'(&#197;|&Aring;)'",
+            "'(&#198;|&AElig;)'",
+            "'(&#199;|&Ccedil;)'",
+            "'(&#200;|&Egrave;)'",
+            "'(&#201;|&Eacute;)'",
+            "'(&#202;|&Ecirc;)'",
+            "'(&#203;|&Euml;)'",
+            "'(&#204;|&Igrave;)'",
+            "'(&#205;|&Iacute;)'",
+            "'(&#206;|&Icirc;)'",
+            "'(&#207;|&Iuml;)'",
+            "'(&#208;|&ETH;)'",
+            "'(&#209;|&Ntilde;)'",
+            "'(&#210;|&Ograve;)'",
+            "'(&#211;|&Oacute;)'",
+            "'(&#212;|&Ocirc;)'",
+            "'(&#213;|&Otilde;)'",
+            "'(&#214;|&Ouml;)'",
+            "'(&#216;|&Oslash;)'",
+            "'(&#217;|&Ugrave;)'",
+            "'(&#218;|&Uacute;)'",
+            "'(&#219;|&Ucirc;)'",
+            "'(&#220;|&Uuml;)'",
+            "'(&#221;|&Yacute;)'",
+            "'(&#222;|&THORN;)'",
+            "'(&#223;|&szlig;)'",
+            "'(&#224;|&agrave;)'",
+            "'(&#225;|&aacute;)'",
+            "'(&#226;|&acirc;)'",
+            "'(&#227;|&atilde;)'",
+            "'(&#228;|&auml;)'",
+            "'(&#229;|&aring;)'",
+            "'(&#230;|&aelig;)'",
+            "'(&#231;|&ccedil;)'",
+            "'(&#232;|&egrave;)'",
+            "'(&#233;|&eacute;)'",
+            "'(&#234;|&ecirc;)'",
+            "'(&#235;|&euml;)'",
+            "'(&#236;|&igrave;)'",
+            "'(&#237;|&iacute;)'",
+            "'(&#238;|&icirc;)'",
+            "'(&#239;|&iuml;)'",
+            "'(&#240;|&eth;)'",
+            "'(&#241;|&ntilde;)'",
+            "'(&#242;|&ograve;)'",
+            "'(&#243;|&oacute;)'",
+            "'(&#244;|&ocirc;)'",
+            "'(&#245;|&otilde;)'",
+            "'(&#246;|&ouml;)'",
+            "'(&#248;|&oslash;)'",
+            "'(&#249;|&ugrave;)'",
+            "'(&#250;|&uacute;)'",
+            "'(&#251;|&ucirc;)'",
+            "'(&#252;|&uuml;)'",
+            "'(&#253;|&yacute;)'",
+            "'(&#254;|&thorn;)'",
+            "'(&#255;|&yuml;)'"
+        ];
+
+        return preg_replace_callback(
+            $patterns, function ($matches) {
+            return html_entity_decode($matches[1], null, "UTF-8");
+        }, $input
+        );
+    }
+
+    /**
+     * Convert html entity to correlative character
+     * http://msdn.microsoft.com/ja-jp/library/cc410349.aspx
+     * http://msdn.microsoft.com/ja-jp/library/cc392316.aspx
+     * http://msdn.microsoft.com/ja-jp/library/cc410351.aspx
+     *
+     * @param String $input
+     *
+     * @return mixed
+     */
+    public static function htmlEntityDecodeExt($input)
+    {
+        $patterns = [
+            // http://msdn.microsoft.com/ja-jp/library/cc410349.aspx
+            // Symbols
+            "'(&#161;|&iexcl;)'",
+            "'(&#162;|&cent;)'",
+            "'(&#163;|&pound;)'",
+            "'(&#164;|&curren;)'",
+            "'(&#165;|&yen;)'",
+            "'(&#166;|&brvbar;)'",
+            "'(&#167;|&sect;)'",
+            "'(&#168;|&uml;)'",
+            "'(&#169;|&copy;)'",
+            "'(&#170;|&ordf;)'",
+            "'(&#171;|&laquo;)'",
+            "'(&#172;|&not;)'",
+            "'(&#173;|&shy;)'",
+            "'(&#174;|&reg;)'",
+            "'(&#175;|&macr;)'",
+            "'(&#176;|&deg;)'",
+            "'(&#177;|&plusmn;)'",
+            "'(&#178;|&sup2;)'",
+            "'(&#179;|&sup3;)'",
+            "'(&#180;|&acute;)'",
+            "'(&#181;|&micro;)'",
+            "'(&#182;|&para;)'",
+            "'(&#183;|&middot;)'",
+            "'(&#184;|&cedil;)'",
+            "'(&#185;|&sup1;)'",
+            "'(&#186;|&ordm;)'",
+            "'(&#187;|&raquo;)'",
+            "'(&#188;|&frac14;)'",
+            "'(&#189;|&frac12;)'",
+            "'(&#190;|&frac34;)'",
+            "'(&#191;|&iquest;)'",
+            "'(&#215;|&times;)'",
+            "'(&#247;|&divide;)'",
+            // Characters
+            "'(&#192;|&Agrave;)'",
+            "'(&#193;|&Aacute;)'",
+            "'(&#194;|&Acirc;)'",
+            "'(&#195;|&Atilde;)'",
+            "'(&#196;|&Auml;)'",
+            "'(&#197;|&Aring;)'",
+            "'(&#198;|&AElig;)'",
+            "'(&#199;|&Ccedil;)'",
+            "'(&#200;|&Egrave;)'",
+            "'(&#201;|&Eacute;)'",
+            "'(&#202;|&Ecirc;)'",
+            "'(&#203;|&Euml;)'",
+            "'(&#204;|&Igrave;)'",
+            "'(&#205;|&Iacute;)'",
+            "'(&#206;|&Icirc;)'",
+            "'(&#207;|&Iuml;)'",
+            "'(&#208;|&ETH;)'",
+            "'(&#209;|&Ntilde;)'",
+            "'(&#210;|&Ograve;)'",
+            "'(&#211;|&Oacute;)'",
+            "'(&#212;|&Ocirc;)'",
+            "'(&#213;|&Otilde;)'",
+            "'(&#214;|&Ouml;)'",
+            "'(&#216;|&Oslash;)'",
+            "'(&#217;|&Ugrave;)'",
+            "'(&#218;|&Uacute;)'",
+            "'(&#219;|&Ucirc;)'",
+            "'(&#220;|&Uuml;)'",
+            "'(&#221;|&Yacute;)'",
+            "'(&#222;|&THORN;)'",
+            "'(&#223;|&szlig;)'",
+            "'(&#224;|&agrave;)'",
+            "'(&#225;|&aacute;)'",
+            "'(&#226;|&acirc;)'",
+            "'(&#227;|&atilde;)'",
+            "'(&#228;|&auml;)'",
+            "'(&#229;|&aring;)'",
+            "'(&#230;|&aelig;)'",
+            "'(&#231;|&ccedil;)'",
+            "'(&#232;|&egrave;)'",
+            "'(&#233;|&eacute;)'",
+            "'(&#234;|&ecirc;)'",
+            "'(&#235;|&euml;)'",
+            "'(&#236;|&igrave;)'",
+            "'(&#237;|&iacute;)'",
+            "'(&#238;|&icirc;)'",
+            "'(&#239;|&iuml;)'",
+            "'(&#240;|&eth;)'",
+            "'(&#241;|&ntilde;)'",
+            "'(&#242;|&ograve;)'",
+            "'(&#243;|&oacute;)'",
+            "'(&#244;|&ocirc;)'",
+            "'(&#245;|&otilde;)'",
+            "'(&#246;|&ouml;)'",
+            "'(&#248;|&oslash;)'",
+            "'(&#249;|&ugrave;)'",
+            "'(&#250;|&uacute;)'",
+            "'(&#251;|&ucirc;)'",
+            "'(&#252;|&uuml;)'",
+            "'(&#253;|&yacute;)'",
+            "'(&#254;|&thorn;)'",
+            "'(&#255;|&yuml;)'",
+
+            // https://msdn.microsoft.com/ja-jp/library/cc392316.aspx
+            "'(&#402;|&fnof;)'",
+            "'(&#913;|&Alpha;)'",
+            "'(&#914;|&Beta;)'",
+            "'(&#915;|&Gamma;)'",
+            "'(&#916;|&Delta;)'",
+            "'(&#917;|&Epsilon;)'",
+            "'(&#918;|&Zeta;)'",
+            "'(&#919;|&Eta;)'",
+            "'(&#920;|&Theta;)'",
+            "'(&#921;|&Iota;)'",
+            "'(&#922;|&Kappa;)'",
+            "'(&#923;|&Lambda;)'",
+            "'(&#924;|&Mu;)'",
+            "'(&#925;|&Nu;)'",
+            "'(&#926;|&Xi;)'",
+            "'(&#927;|&Omicron;)'",
+            "'(&#928;|&Pi;)'",
+            "'(&#929;|&Rho;)'",
+            "'(&#931;|&Sigma;)'",
+            "'(&#932;|&Tau;)'",
+            "'(&#933;|&Upsilon;)'",
+            "'(&#934;|&Phi;)'",
+            "'(&#935;|&Chi;)'",
+            "'(&#936;|&Psi;)'",
+            "'(&#937;|&Omega;)'",
+            "'(&#945;|&alpha;)'",
+            "'(&#946;|&beta;)'",
+            "'(&#947;|&gamma;)'",
+            "'(&#948;|&delta;)'",
+            "'(&#949;|&epsilon;)'",
+            "'(&#950;|&zeta;)'",
+            "'(&#951;|&eta;)'",
+            "'(&#952;|&theta;)'",
+            "'(&#953;|&iota;)'",
+            "'(&#954;|&kappa;)'",
+            "'(&#955;|&lambda;)'",
+            "'(&#956;|&mu;)'",
+            "'(&#957;|&nu;)'",
+            "'(&#958;|&xi;)'",
+            "'(&#959;|&omicron;)'",
+            "'(&#960;|&pi;)'",
+            "'(&#961;|&rho;)'",
+            "'(&#962;|&sigmaf;)'",
+            "'(&#963;|&sigma;)'",
+            "'(&#964;|&tau;)'",
+            "'(&#965;|&upsilon;)'",
+            "'(&#966;|&phi;)'",
+            "'(&#967;|&chi;)'",
+            "'(&#968;|&psi;)'",
+            "'(&#969;|&omega;)'",
+            "'(&#977;|&thetasym;)'",
+            "'(&#978;|&upsih;)'",
+            "'(&#982;|&piv;)'",
+            "'(&#8226;|&bull;)'",
+            "'(&#8230;|&hellip;)'",
+            "'(&#8242;|&prime;)'",
+            "'(&#8243;|&Prime;)'",
+            "'(&#8254;|&oline;)'",
+            "'(&#8260;|&frasl;)'",
+            "'(&#8472;|&weierp;)'",
+            "'(&#8465;|&image;)'",
+            "'(&#8476;|&real;)'",
+            "'(&#8482;|&trade;)'",
+            "'(&#8501;|&alefsym;)'",
+            "'(&#8592;|&larr;)'",
+            "'(&#8593;|&uarr;)'",
+            "'(&#8594;|&rarr;)'",
+            "'(&#8595;|&darr;)'",
+            "'(&#8596;|&harr;)'",
+            "'(&#8629;|&crarr;)'",
+            "'(&#8656;|&lArr;)'",
+            "'(&#8657;|&uArr;)'",
+            "'(&#8658;|&rArr;)'",
+            "'(&#8659;|&dArr;)'",
+            "'(&#8660;|&hArr;)'",
+            "'(&#8704;|&forall;)'",
+            "'(&#8706;|&part;)'",
+            "'(&#8707;|&exist;)'",
+            "'(&#8709;|&empty;)'",
+            "'(&#8711;|&nabla;)'",
+            "'(&#8712;|&isin;)'",
+            "'(&#8713;|&notin;)'",
+            "'(&#8715;|&ni;)'",
+            "'(&#8719;|&prod;)'",
+            "'(&#8722;|&sum;)'",
+            "'(&#8722;|&minus;)'",
+            "'(&#8727;|&lowast;)'",
+            "'(&#8730;|&radic;)'",
+            "'(&#8733;|&prop;)'",
+            "'(&#8734;|&infin;)'",
+            "'(&#8736;|&ang;)'",
+            "'(&#8869;|&and;)'",
+            "'(&#8870;|&or;)'",
+            "'(&#8745;|&cap;)'",
+            "'(&#8746;|&cup;)'",
+            "'(&#8747;|&int;)'",
+            "'(&#8756;|&there4;)'",
+            "'(&#8764;|&sim;)'",
+            "'(&#8773;|&cong;)'",
+            "'(&#8773;|&asymp;)'",
+            "'(&#8800;|&ne;)'",
+            "'(&#8801;|&equiv;)'",
+            "'(&#8804;|&le;)'",
+            "'(&#8805;|&ge;)'",
+            "'(&#8834;|&sub;)'",
+            "'(&#8835;|&sup;)'",
+            "'(&#8836;|&nsub;)'",
+            "'(&#8838;|&sube;)'",
+            "'(&#8839;|&supe;)'",
+            "'(&#8853;|&oplus;)'",
+            "'(&#8855;|&otimes;)'",
+            "'(&#8869;|&perp;)'",
+            "'(&#8901;|&sdot;)'",
+            "'(&#8968;|&lceil;)'",
+            "'(&#8969;|&rceil;)'",
+            "'(&#8970;|&lfloor;)'",
+            "'(&#8971;|&rfloor;)'",
+            "'(&#9001;|&lang;)'",
+            "'(&#9002;|&rang;)'",
+            "'(&#9674;|&loz;)'",
+            "'(&#9824;|&spades;)'",
+            "'(&#9827;|&clubs;)'",
+            "'(&#9829;|&hearts;)'",
+            "'(&#9830;|&diams;)'",
+
+            // https://msdn.microsoft.com/ja-jp/library/cc410351.aspx
+
+            "'(&#338;|&OElig;)'",
+            "'(&#339;|&oelig;)'",
+            "'(&#352;|&Scaron;)'",
+            "'(&#353;|&scaron;)'",
+            "'(&#376;|&Yuml;)'",
+            "'(&#710;|&circ;)'",
+            "'(&#732;|&tilde;)'",
+            "'(&#8194;|&ensp;)'",
+            "'(&#8195;|&emsp;)'",
+            "'(&#8201;|&thinsp;)'",
+            "'(&#8204;|&zwnj;)'",
+            "'(&#8205;|&zwj;)'",
+            "'(&#8206;|&lrm;)'",
+            "'(&#8207;|&rlm;)'",
+            "'(&#8211;|&ndash;)'",
+            "'(&#8212;|&mdash;)'",
+            "'(&#8216;|&lsquo;)'",
+            "'(&#8217;|&rsquo;)'",
+            "'(&#8218;|&sbquo;)'",
+            "'(&#8220;|&ldquo;)'",
+            "'(&#8221;|&rdquo;)'",
+            "'(&#8222;|&bdquo;)'",
+            "'(&#8224;|&dagger;)'",
+            "'(&#8225;|&Dagger;)'",
+            "'(&#8240;|&permil;)'",
+            "'(&#8249;|&lsaquo;)'",
+            "'(&#8250;|&rsaquo;)'"
+
+        ];
+
+        return preg_replace_callback(
+            $patterns, function ($matches) {
+            return html_entity_decode($matches[1], null, "UTF-8");
+        }, $input
+        );
+    }
+
+    public function getPaneInfo()
+    {
+        $login_user = $this->getLoginUser();
+        $personal_config = $this->getPersonalConfig($login_user);
+        $system_config = $this->getSystemConfig();
+
+        $screen_layout = $system_config->getScreenLayout();
+        if ($screen_layout['3pane'] && $screen_layout['2pane']) {
+            $pane = $personal_config->getPersonalPane();
+            if (2 !== $pane && 3 !== $pane) {
+                $pane = $screen_layout['default_pane'];
+            }
+            $only_one_layout = false;
+        } elseif ($screen_layout['3pane']) {
+            $pane = 3;
+            $only_one_layout = true;
+        } else {
+            $pane = 2;
+            $only_one_layout = true;
+        }
+
+        $pane_info = [];
+        if (3 == $pane) {
+            $pane_info = $personal_config->getPaneInfo();
+        }
+
+        $pane_info['pane'] = $pane;
+        $pane_info['only_one_layout'] = $only_one_layout;
+
+        return $pane_info;
+    }
+
+    public function addIncrementalSearch($to, $cc = null, $bcc = null)
+    {
+        if ( ! $this->checkAvailableForIncrementalSearch($book_ids)) {
+            return false;
+        }
+
+        $to = cb_trim($to);
+        $cc = cb_trim($cc);
+        $bcc = cb_trim($bcc);
+
+        $to_list = [];
+        if (grn\grn\Validate::isNotNull($to)) {
+            $to_list = CB_MailAddress::static_parse_list([$to]);
+        }
+
+        $cc_list = [];
+        if (grn\grn\Validate::isNotNull($cc)) {
+            $cc_list = CB_MailAddress::static_parse_list([$cc]);
+        }
+
+        $bcc_list = [];
+        if (grn\grn\Validate::isNotNull($bcc)) {
+            $bcc_list = CB_MailAddress::static_parse_list([$bcc]);
+        }
+
+        $incremental_search_dao = new GrnMailIncrementalSearchDAO();
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login_user = $uum->getLoginUser();
+        // add record
+        $address_info_list = array_merge($to_list, $cc_list, $bcc_list);
+        $incrementalSearchDataFinder
+            = new \grn\mail\IncrementalSearchDataFinder();
+        $unregistered_address_info_list
+            = $incrementalSearchDataFinder->getAddresseesListNotExistsInAddressBook($address_info_list,
+            $book_ids);
+        $incremental_search_dao->updateMailSendHistory($login_user,
+            $unregistered_address_info_list);
+
+        // delete old record
+        $ids
+            = $incremental_search_dao->selectWillBeRemovedDataByUserId($login_user->getOID());
+        if (count($ids) > 0) {
+            $incremental_search_dao->deleteById($ids);
+        }
+
+        return true;
+    }
+
+    public function checkAvailableForIncrementalSearch(& $book_ids)
+    {
+        $system_config = $this->getSystemConfig();
+        $system_config->getGeneralSetting($general_settings);
+        if ( ! $general_settings['incremental_search']) {
+            return false;
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login_user = $uum->getLoginUser();
+
+        // アドレス帳を取得する
+        require_once('address/application.csp');
+        require_once('grn/application.csp');
+        $app_locator = GRN_ApplicationLocator::instance();
+        /** @var GRN_Address_Application $app */
+        $app = $app_locator->getInstance(GRN_ADDRESS_APPLICATION_ID);
+        if ( ! is_object($app) || ! is_a($app, 'GRN_Address_Application')) {
+            return false;
+        }
+
+        $book_manager = $app->getBookManager();
+
+        // 使用権限を取得する
+        require_once('address/access.csp');
+        $access_manager = GRN_Address_AccessManager::getInstance();
+        if ( ! ($row
+            = $access_manager->getAbstractData(GRN_ADDRESS_AVAILABLE))
+        ) {
+            assert('FALSE');
+        }
+
+        // ダイナミックロールを取得する
+        $dynamic_roles = $uum->listGrantedRoles();
+
+        // 使用権限を評価する
+        $authorities = ['private_address', 'shared_address'];
+        $security_model = $access_manager->getSecurityModel($row);
+        $access = $access_manager->evaluateAccess($row, $login_user,
+            $dynamic_roles, $authorities, $security_model);
+
+        // 共有アドレス帳の使用権限を評価する
+        $authorities = ['shared_address'];
+        $access_for_view['shared_address']
+            = $access_manager->isAllowedAccess($access, $authorities,
+            $security_model);
+
+        require_once('address/view_util.csp');
+        $view_util = GRN_Address_ViewUtil::getInstance();
+        $shared_address_books = [];
+        $allowed_books = [];
+        $books_for_view = [];
+        if ($access_for_view['shared_address']) {
+            // 共有アドレスブック一覧を取得する
+            $shared_address_books = $book_manager->listSharedAddressBooks();
+
+            if (0 < count($shared_address_books)) {
+                // 閲覧権限を持つ共有アドレスブック一覧を取得する
+                $rows = [];
+                foreach (array_keys($shared_address_books) as $book_id) {
+                    $book = $shared_address_books[$book_id];
+                    $rows[$book_id] = $book->getRow();
+                }
+                $authorities = ['browse'];
+                $allowed_books = $access_manager->pickAllowedObjects($rows,
+                    $login_user, $dynamic_roles, $authorities);
+
+                // 共有アドレスブック情報一覧を取得する
+                $books_for_view = $view_util->listBooks($shared_address_books,
+                    $allowed_books);
+            }
+        }
+
+        //get share book_id
+        $book_ids = [];
+        foreach ($books_for_view as $book) {
+            $book_ids[] = $book['oid'];
+        }
+
+        return true;
+    }
+
+    /**
+     * @return bool
+     */
+    public function checkAvailableForRicheditor()
+    {
+        $system_config = $this->getSystemConfig();
+        $detector = new grn\re\SupportedBrowserDetector();
+
+        return $system_config->canUserSendHtmlMail() && $detector->detect();
+    }
+
+    public function checkEmailValid($value, $address_only = false)
+    {
+        $display_error = false;
+        if ( ! $address_only) {
+            if (preg_match('/\\r|\\n|%0d|%0a/', $value)
+                || strpos($value, '\r') !== false
+                || strpos($value, '\n') !== false
+            ) {
+                $display_error = true;
+            }
+        } else {
+            if (strpos($value, ':') !== false) {
+                $display_error = true;
+            }
+        }
+        if ($display_error) {
+            cb_throw_error(E_GRN_MAIL_INVALID_EMAIL_ADDRESS);
+        }
+    }
+
+    static public function static_formatBodyText($text)
+    {
+        require_once("grn/smarty.csp");
+        $smarty = new \GRN_Smarty();
+        require_once("plugins/function.grn_format.php");
+
+        return smarty_function_grn_format(["body" => $text], $smarty);
+    }
+
+    public function partVCalendar($content, $charset, $encording = '')
+    {
+        require_once('File/IMC.php');
+        $parse = File_IMC::parse('vCalendar');
+        $cal_info = $parse->fromText($content, $charset, $encording);
+        $event_info = [
+            'startdate' => 'DTSTART',
+            'enddate'   => 'DTEND',
+            'where'     => 'LOCATION',
+            'content'   => 'DESCRIPTION'
+        ];
+        $body = '';
+        if (array_key_exists('VCALENDAR', $cal_info)) {
+            $vcal_info = $cal_info['VCALENDAR'][0];
+            if (array_key_exists('VEVENT', $vcal_info)) {
+                $vevent_info = $vcal_info['VEVENT'][0];
+                foreach ($event_info as $key => $value) {
+                    if (array_key_exists($value, $vevent_info)) {
+                        $info = $vevent_info[$value][0];
+                        if (array_key_exists('value', $info)) {
+                            $event_info[$key] = $info['value'][0][0];
+                        }
+                    } else {
+                        $event_info[$key] = '';
+                    }
+                }
+            } else {
+                foreach ($event_info as $key => $value) {
+                    $event_info[$key] = '';
+                }
+            }
+            $start_date = date('l, F j, Y H:i:s',
+                strtotime($event_info['startdate']));
+            $end_date = date('l, F j, Y H:i:s',
+                strtotime($event_info['enddate']));
+            $when = null;
+
+            if (array_key_exists('VTIMEZONE', $vcal_info)) {
+                // TZ start
+                $tz_start = null;
+                $vtz_start = $vcal_info['VTIMEZONE'][0];
+                if (count($vtz_start) > 1) {
+                    $tz
+                        = $vtz_start['STANDARD'][0]['TZOFFSETTO'][0]['value'][0][0];
+                    $tz_name = $vtz_start['TZID'][0]['value'][0][0];
+                    $tz_start = "(UTC" . $tz . ")" . $tz_name;
+                }
+                // TZ end
+                $tz_end = null;
+                if (count($cal_info['VCALENDAR'][0]['VTIMEZONE']) > 1) {
+                    $vtz_end = $vcal_info['VTIMEZONE'][1];
+                    if (count($vtz_end) > 1) {
+                        $tz
+                            = $vtz_end['STANDARD'][0]['TZOFFSETTO'][0]['value'][0][0];
+                        $tz_name = $vtz_end['TZID'][0]['value'][0][0];
+                        $tz_end = "(UTC" . $tz . ")" . $tz_name;
+                    }
+                    $when = $start_date . $tz_start . ' - ' . $end_date
+                            . $tz_end;
+                } else {
+                    $tz_end = $tz_start;
+                    $when = $start_date . ' - ' . $end_date . $tz_end;
+                }
+            } else {
+                $when = $start_date . ' - ' . $end_date;
+            }
+            $body = 'When: ' . $when . "\n" . 'Where: ' . $event_info['where']
+                    . "\n\n" . $event_info['content'];
+        }
+
+        return $body;
+    }
+}

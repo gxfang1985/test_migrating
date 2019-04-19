@@ -1,0 +1,185 @@
+<?php
+
+/**
+ * API schedule search event : search text by title, memo, customer or follow
+ *
+ * @author : Tien Nguyen
+ **/
+if (isset($cbpapi_service)) {
+    $node_parameters = $cbpapi_service->getRequestParameters();
+    $node_parameters_attribute = [];
+    if (array_key_exists('attributes', $node_parameters)) {
+        $node_parameters_attribute = $node_parameters['attributes'];
+    }
+
+    $required_fields = [
+        'text',
+        'title_search',
+        'customer_search',
+        'memo_search',
+        'follow_search',
+        'all_repeat_events'
+    ];
+    foreach ($required_fields as $field) {
+        if ( ! array_key_exists($field, $node_parameters_attribute)) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => $field]);
+        }
+    }
+
+    //get soap input parameter
+    $setdate = null;
+    $enddate = null;
+    if (isset($node_parameters_attribute['start'])) {
+        $start = grn_cbpapi_parse_iso8601($node_parameters_attribute['start']);
+        if ($start) {
+            $setdate = grn_cbpapi_convert_utc_to_local($start);
+            $setdate = new CB_DateEx($setdate);
+        } else {
+            cb_throw_error(E_GRN_SCHD_API_INVALID_STARTDATETIME);
+        }
+    }
+    if (isset($node_parameters_attribute['end'])) {
+        $end = grn_cbpapi_parse_iso8601($node_parameters_attribute['end']);
+        if ($end) {
+            $enddate = grn_cbpapi_convert_utc_to_local($end);
+            $enddate = new CB_DateEx($enddate);
+        } else {
+            cb_throw_error(E_GRN_SCHD_API_INVALID_ENDDATETIME);
+        }
+    }
+    if (isset($node_parameters_attribute['start_for_daily'])) {
+        $start_for_daily = $node_parameters_attribute['start_for_daily'];
+        $setdate = new CB_Date();
+        if ($setdate->parse($start_for_daily)) {
+            $setdate = new CB_DateEx($setdate);
+        } else {
+            cb_throw_error(E_GRN_SCHD_INVALID_SETDATE);
+        }
+
+        $enddate = null;
+        if (isset($node_parameters_attribute['end_for_daily'])) {
+            $end_for_daily = $node_parameters_attribute['end_for_daily'];
+            $enddate = new CB_Date();
+            if ($enddate->parse($end_for_daily)) {
+                $enddate = new CB_DateEx($enddate);
+            } else {
+                cb_throw_error(E_GRN_SCHD_INVALID_ENDDATE);
+            }
+        }
+    }
+    if (is_a($setdate, 'CB_DateEx') && ! $enddate) {
+        cb_throw_error(E_GRN_SCHD_INVALID_ENDDATE);
+    }
+    if (is_a($enddate, 'CB_DateEx') && ! $setdate) {
+        cb_throw_error(E_GRN_SCHD_INVALID_SETDATE);
+    }
+    if ( ! $setdate && ! $enddate) {
+        $ts = new CB_TimeStampEx();
+        $today = $ts->getDate();
+        $setdate = new CB_DateEx($today);
+        $enddate = new CB_DateEx($today);
+        $setdate->moveMonths(-3);
+        $enddate->moveMonths(3);
+        $enddate->moveDays(-1);
+    }
+
+    // 日付が前後している
+    if ($setdate->compare($enddate) > 0) {
+        cb_throw_error(E_GRN_SCHD_INVALID_DATE);
+    }
+
+    $text = $node_parameters_attribute['text'];
+    $title_search = $node_parameters_attribute['title_search'];
+    $customer_search = $node_parameters_attribute['customer_search'];
+    $memo_search = $node_parameters_attribute['memo_search'];
+    $follow_search = $node_parameters_attribute['follow_search'];
+    $all_repeat_events = $node_parameters_attribute['all_repeat_events'];
+    //begin process search event
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    $login_id = $login->getOID();
+
+    $search_options = [];
+    if ($title_search == 'true') {
+        $search_options['title'] = true;
+    }
+    if ($customer_search == 'true') {
+        $search_options['companyinfo'] = true;
+    }
+    if ($memo_search == 'true') {
+        $search_options['memo'] = true;
+    }
+    if ($follow_search == 'true') {
+        $search_options['follow'] = true;
+    }
+    $search_options['exclude_private'] = true;
+    //only search info relate to login user
+    $member_ids = [];
+    $temp_users = [$login_id => $login_id];
+    require_once('schedule/access_logic.csp');
+    $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+    $dynamic_roles = $uum->listGrantedRoles();
+    $access_mids = $acc_logic->evaluateAccessesById($login,
+        $temp_users, ['read'], $dynamic_roles, 'user');
+    $expand_repeat_and_temporary = false;
+    if ($all_repeat_events == 'true') {
+        $search_options['expand_repeat_and_temporary'] = true;
+        $expand_repeat_and_temporary = true;
+    }
+
+    require_once('schedule/search_logic.csp');
+    $search_logic = GRN_Schedule_SearchLogic::getInstance();
+    $search_options['member_ids'] = $access_mids;
+    $retval = $search_logic->search($login,
+        $search_options, $text, 0, 18446744073709551615, $setdate, $enddate);
+    $num_event_found = $retval['total'];
+
+    require_once('cbpapi/schedule_logic.csp');
+    $base_logic = GRN_CBPApi_Schedule_Logic::getInstance();
+
+    $events_for_view = [];
+    $event_ids = [];
+    for ($index = 0; $index < $num_event_found; $index++) {
+        $event =& $retval[$index];
+        $eid = $event['event_id'];
+        if (array_key_exists('repeat', $event) && $event['repeat'] == 1) {
+            $evt = $base_logic->getEventsForViewByIds($login, [$eid]);
+            if (array_key_exists($eid, $evt)) {
+                if (array_key_exists('setdatetime', $event)) {
+                    $evt[$eid]['start_date_time']
+                        = grn_cbpapi_iso8601($event['setdatetime']);
+                }
+                if (array_key_exists('enddatetime', $event)) {
+                    $evt[$eid]['end_date_time']
+                        = grn_cbpapi_iso8601($event['enddatetime']);
+                }
+                if (array_key_exists('setdate', $event)) {
+                    $evt[$eid]['start_date_time']
+                        = $event['setdate']->format();;
+                }
+                if (array_key_exists('enddate', $event)) {
+                    $evt[$eid]['end_date_time'] = $event['enddate']->format();
+                }
+                $events_for_view[$index] = $evt[$eid];
+            }
+        } elseif (array_search($eid, $event_ids) === false) {
+            $event_ids[$eid] = $eid;
+            $evt = $base_logic->getEventsForViewByIds($login,
+                [$eid]);
+            if (array_key_exists($eid, $evt)) {
+                $events_for_view[$index] = $evt[$eid];
+            }
+        }
+    }
+
+    //change to event_type for soap output
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty;
+    $t->assign('events', $events_for_view);
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('schedule')]);
+    $t->assign('action', $cbpapi_service->getAction());
+    grn_cbpapi_response($t, __FILE__);
+}

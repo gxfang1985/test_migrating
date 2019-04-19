@@ -1,0 +1,502 @@
+<?php
+
+use grn\schedule\AttendanceStatusLogic;
+use grn\schedule\FacilityApprovalLogic;
+use grn\schedule\ScheduleMemberLogic;
+
+$apply = null;
+
+// イベントの取得
+require_once('schedule/application.csp');
+$app = GRN_Schedule_Application::getInstance();
+require_once('schedule/view_util.csp');
+$util = GRN_Schedule_View_Util::getInstance();
+
+require_once('schedule/facility_system_logic.csp');
+$facility_logic = GRN_Facility_SystemLogic::getInstance();
+
+global $G_container_base;
+$uum = $G_container_base->getInstance('uum');
+$login = $uum->getLoginUser();
+$login_id = $login->getOID();
+
+$date = new CB_Date();
+if ( ! $date->parse($str_date)) {
+    $date = null;
+}
+
+// 変更前のイベントの取得
+$old_event = $app->getEvent($login, $event_id, $date);
+if ( ! $old_event) {
+    cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+}
+
+if (is_array($old_event->facilities) && count($old_event->facilities) > 0) {
+    $f_settings
+        = $facility_logic->getFacilitySetting(array_keys($old_event->facilities));
+    foreach (array_keys($old_event->facilities) as $key) {
+        $object = $old_event->facilities[$key];
+        $faid = $object->getOID();
+        $modify_user = $facility_logic->getModifyUserByPriority($f_settings,
+            $faid);
+        // 登録者にのみ変更を許可する
+        if ($modify_user === 'creator') {
+            // 施設で登録者しか変更を許していない場合
+            if ((is_array($old_event->facilities)
+                 && count($old_event->facilities) > 0)
+                || (is_a($old_event, 'GRN_Schedule_TemporaryEvent')
+                    && $old_event->isORSearch())
+            ) {
+                require_once('schedule/facility_privilege.csp');
+                $privilege_logic = GRN_Facility_Privilege_Logic::getInstance();
+                if ( ! $privilege_logic->hasPrivilegeOfFacilities($login,
+                        $old_event->facilities, 'OR')
+                     && ((is_a($old_event->creator, 'CB_User')
+                          && $login_id != $old_event->creator->getOID())
+                         || is_string($old_event->creator))
+                ) {
+                    cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+                }
+            }
+        } // 登録者と共有メンバーに変更を許可する
+        elseif ($modify_user === 'member') {
+            // 施設で登録者と共有メンバーしか変更を許していない場合
+            if ((is_array($old_event->facilities)
+                 && count($old_event->facilities) > 0)
+                || (is_a($old_event, 'GRN_Schedule_TemporaryEvent')
+                    && $old_event->isORSearch())
+            ) {
+                require_once('schedule/facility_privilege.csp');
+                $privilege_logic = GRN_Facility_Privilege_Logic::getInstance();
+                if ( ! $privilege_logic->hasPrivilegeOfFacilities($login,
+                        $old_event->facilities, 'OR')
+                     && (
+                         (is_array($old_event->users)
+                          && ! array_key_exists($login_id, $old_event->users))
+                         || is_null($old_event->users)
+                     )
+                     && ((is_a($old_event->creator, 'CB_User')
+                          && $login_id !== $old_event->creator->getOID())
+                         || is_string($old_event->creator))
+                ) {
+                    cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+                }
+            }
+        }
+    }
+}
+
+// アクセス権のチェック
+require_once('schedule/access_logic.csp');
+$acc_logic = GRN_Schedule_Access_Logic::getInstance();
+$dynamic_role = $uum->listGrantedRoles();
+$access = $acc_logic->getEventAccess($login, $old_event,
+    ['read', 'modify'], $dynamic_role);
+if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+    cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+}
+if ($access['modify'] == GRN_SCHD_ACCESS_DENY) {
+    cb_throw_error(E_GRN_SCHD_ACCESSDENY_MODIFY);
+}
+
+$new_event = $util->createEvent($sche_input);
+
+if (is_a($new_event, 'GRN_Schedule_NormalEvent')) {
+    $new_event->setUsingPurpose(
+        cb_at($sche_input, 'using_purpose'), function () {
+        cb_throw_error(E_GRN_SCHD_FACILITY_USING_PURPOSE_IS_REQUIRED);
+    }
+    );
+}
+
+$new_event->id = $old_event->id;
+
+// keep setting attendance check of event
+if ($old_event instanceof GRN_Schedule_NormalEvent
+    && $new_event instanceof GRN_Schedule_NormalEvent
+) {
+    $new_event->attendanceCheck = $old_event->attendanceCheck;
+}
+/* 
+if( @ $G_INPUT['RP'] )
+{
+    $new_event->setdatetime = $old_event->setdatetime;
+    $new_event->enddatetime = $old_event->enddatetime;
+    if( @ $G_INPUT['apply'] == 'after' )
+    {
+        $new_event->setdate = $this_date;
+    }
+    else if( $G_INPUT['apply'] == 'this' )
+    {
+        $new_event->setdate = $this_date;
+        $new_event->enddate = $this_date;
+    }
+}
+else if( is_a( $old_event, 'GRN_Schedule_TemporaryEvent' ) )
+{
+    $new_event->setdates = $old_event->setdates;
+    $new_event->users = $old_event->users;
+    $new_event->groups = $old_event->groups;
+    $new_event->facilities = $old_event->facilities;
+}
+*/
+
+
+// データのチェック
+$app->checkEventData($new_event);
+
+// 公開先のチェック
+ScheduleMemberLogic::getInstance()
+                   ->checkModifyPublicToUser($new_event, $old_event);
+
+if (is_a($new_event, 'GRN_Schedule_NormalEvent')) {
+    if (is_a($new_event->setdatetime, 'CB_DateTime')
+        && is_a($new_event->enddatetime, 'CB_Date')
+    ) {
+        $new_event->enddatetime = null;
+    }
+} elseif (is_a($new_event, 'GRN_Schedule_RepeatEvent')) {
+    if ( ! $app->checkRepeatLimit($new_event->enddate, $new_event->setdate)) {
+        cb_throw_error(E_GRN_SCHD_REPEAT_LIMIT,
+            ['limit' => cb_date_format($app->getRepeatLimitDate($new_event->setdate))]);
+    }
+}
+
+// 施設の予約期間,最大時間をチェック(運用管理者は無制限)
+require_once('schedule/facility_privilege.csp');
+$facility_privilege = GRN_Facility_Privilege_Logic::getInstance();
+if ($obj_facilities = $facility_privilege->getFacilitiesWithoutAuthority($login,
+    $new_event->facilities)
+) {
+    if (is_array($new_event->facilities) && count($new_event->facilities) > 0) {
+        if (is_a($new_event, 'GRN_Schedule_NormalEvent')) {
+            $facility_logic->checkFacilityMaxTime($obj_facilities,
+                $new_event->enddatetime, $new_event->setdatetime);
+            $facility_logic->checkFacilityLimit($obj_facilities,
+                $new_event->enddatetime);
+        } elseif (is_a($new_event, 'GRN_Schedule_RepeatEvent')) {
+            $facility_logic->checkFacilityMaxTime($obj_facilities,
+                $new_event->enddatetime, $new_event->setdatetime);
+            $facility_logic->checkFacilityLimit($obj_facilities,
+                $new_event->enddate);
+        }
+    }
+}
+
+// 通知のメンバーの取得
+$add_members = [];
+$mod_members = [];
+$del_members = [];
+if ($old_event->users && count($old_event->users) > 0) {
+    // 人がいなくなったら削除
+    if ( ! $new_event->users || count($new_event->users) == 0) {
+        $del_members = $old_event->users;
+    } else {
+        foreach (array_keys($old_event->users) as $key_old) {
+            $old_user = $old_event->users[$key_old];
+            if ( ! $old_user) {
+                continue;
+            }
+            $b_found = false;
+            foreach (array_keys($new_event->users) as $key_new) {
+                $new_user = $new_event->users[$key_new];
+                if ( ! $new_user) {
+                    continue;
+                }
+                if ($old_user->getOID() == $new_user->getOID()) {
+                    // 見つかった場合は変更
+                    $b_found = true;
+                    $mod_members[] = $old_user;
+                    break;
+                }
+            }
+            // 見つからなかった場合は削除
+            if ( ! $b_found) {
+                $del_members[] = $old_user;
+            }
+        }
+    }
+}
+// 新規に追加された人
+if ($new_event->users && count($new_event->users) > 0) {
+    if ($old_event->users && count($old_event->users) > 0) {
+        foreach (array_keys($new_event->users) as $key_new) {
+            $new_user = $new_event->users[$key_new];
+            if ( ! $new_user) {
+                continue;
+            }
+            $b_found = false;
+            foreach (array_keys($old_event->users) as $key_old) {
+                $old_user = $old_event->users[$key_old];
+                if ( ! $old_user) {
+                    continue;
+                }
+                if ($old_user->getOID() == $new_user->getOID()) {
+                    $b_found = true;
+                    break;
+                }
+            }
+            if ( ! $b_found) {
+                $add_members[] = $new_user;
+            }
+        }
+    } else {
+        // 今までユーザーがいなかったのですべて新規登録
+        $add_members = $new_event->users;
+    }
+
+}
+// アクセス権チェック用
+$add_groups = null;
+$add_facilities = null;
+// 新規に追加された組織
+if ($new_event->groups && count($new_event->groups) > 0) {
+    $add_groups = [];
+    if ($old_event->groups && count($old_event->groups) > 0) {
+        foreach (array_keys($new_event->groups) as $key_new) {
+            $new_group = $new_event->groups[$key_new];
+            if ( ! $new_group) {
+                continue;
+            }
+            $b_found = false;
+            foreach (array_keys($old_event->groups) as $key_old) {
+                $old_group = $old_event->groups[$key_old];
+                if ( ! $old_group) {
+                    continue;
+                }
+                if ($old_group->getOID() == $new_group->getOID()) {
+                    $b_found = true;
+                    break;
+                }
+            }
+            if ( ! $b_found) {
+                $add_groups[] = $new_group;
+            }
+        }
+    } else {
+        // 今までユーザーがいなかったのですべて新規登録
+        $add_groups = $new_event->groups;
+    }
+
+}
+// 新規に追加された施設
+if ($new_event->facilities && count($new_event->facilities) > 0) {
+    $add_facilities = [];
+    if ($old_event->facilities && count($old_event->facilities) > 0) {
+        foreach (array_keys($new_event->facilities) as $key_new) {
+            $new_facility = $new_event->facilities[$key_new];
+            if ( ! $new_facility) {
+                continue;
+            }
+            $b_found = false;
+            foreach (array_keys($old_event->facilities) as $key_old) {
+                $old_facility = $old_event->facilities[$key_old];
+                if ( ! $old_facility) {
+                    continue;
+                }
+                if ($old_facility->getOID() == $new_facility->getOID()) {
+                    $b_found = true;
+                    break;
+                }
+            }
+            if ( ! $b_found) {
+                $add_facilities[$new_facility->getOID()] = $new_facility;
+            }
+        }
+    } else {
+        // 今までユーザーがいなかったのですべて新規登録
+        $add_facilities = $new_event->facilities;
+    }
+
+}
+$dynamic_roles = $uum->listGrantedRoles();
+// 追加された人/組織/施設のアクセス権のチェック
+if (count($add_members) > 0) {
+    // ログインユーザーを抜く
+    foreach (array_keys($add_members) as $key) {
+        $add_user = $add_members[$key];
+        if ($add_user->getOID() == $login_id) {
+            unset($add_members[$key]);
+            break;
+        }
+    }
+
+    $access = $acc_logic->evaluateAccesses($login, $add_members,
+        ['read', 'add', 'modify'], $dynamic_roles, 'user', true);
+    if (count($add_members) != count($access)) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_MODIFY);
+    }
+}
+if (is_array($add_groups) && count($add_groups) > 0) {
+    $access = $acc_logic->evaluateAccesses($login, $add_groups,
+        ['read', 'add', 'modify'], $dynamic_roles, 'group', true);
+    if (count($add_groups) != count($access)) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_MODIFY);
+    }
+}
+if (is_array($add_facilities) && count($add_facilities) > 0) {
+    $access = $acc_logic->evaluateAccesses($login, $add_facilities,
+        ['read', 'add', 'modify'], $dynamic_roles, 'facility', true);
+    if (count($add_facilities) != count($access)) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_MODIFY);
+    }
+}
+
+// 更新者
+$new_event->modifier = $login;
+// 非修正情報
+$new_event->private = $old_event->private;
+$new_event->notify_address = $old_event->notify_address;
+$new_event->company_name = $old_event->company_name;
+$new_event->zip_code = $old_event->zip_code;
+$new_event->physical_address = $old_event->physical_address;
+$new_event->map = $old_event->map;
+$new_event->route = $old_event->route;
+$new_event->route_time = $old_event->route_time;
+$new_event->route_fare = $old_event->route_fare;
+$new_event->company_telephone_number = $old_event->company_telephone_number;
+$new_event->facsimile_number = $old_event->facsimile_number;
+$new_event->company_url = $old_event->company_url;
+
+$eid = $app->modifyEvent($new_event, $date, $apply);
+
+if (is_a($new_event, 'GRN_Schedule_NormalEvent')
+    && is_a($old_event, 'GRN_Schedule_NormalEvent')
+) {
+    $facilityApprovalLogic = new FacilityApprovalLogic();
+    $facilityApprovalLogic->invalidateFacilitiesForEventUpdate($old_event,
+        $new_event);
+    $facilityApprovalLogic->processApplyingInfoFacilitiesForUpdate($old_event,
+        $new_event);
+}
+
+$new_event->id = $eid;
+
+// 今日を求める
+$tsex = new CB_TimeStampEx();
+$today = $tsex->getDate();
+
+$bdate = $new_event->getFirstDate($today);
+
+if ($today->compare($bdate) <= 0) {
+    $remote_notification_list = [];
+    // 登録の通知
+    if (count($add_members) > 0) {
+        $title = _schedule_cellular_modify_getNotifyTitle($new_event);
+        $app->setNotify($add_members, $login, $new_event, $bdate, $title, '',
+            GRN_SCHEDULE_NOTIFY_ENTRY, $tsex);
+        $remote_notification_list[GRN_SCHEDULE_NOTIFY_ENTRY] = $add_members;
+    }
+
+    // 変更の通知
+    if (count($mod_members) > 0) {
+        $title = _schedule_cellular_modify_getNotifyTitle($new_event);
+        $app->setNotify($mod_members, $login, $new_event, $bdate, $title, '',
+            GRN_SCHEDULE_NOTIFY_MODIFY, $tsex);
+        $remote_notification_list[GRN_SCHEDULE_NOTIFY_MODIFY] = $mod_members;
+    }
+
+    // 削除の通知
+    if (count($del_members) > 0) {
+        $title = _schedule_cellular_modify_getNotifyTitle($new_event);
+        $app->setNotify($del_members, $login, $new_event, $bdate, $title, '',
+            GRN_SCHEDULE_NOTIFY_DELETE, $tsex);
+        $remote_notification_list[GRN_SCHEDULE_NOTIFY_DELETE] = $del_members;
+    }
+
+    if (count($remote_notification_list) > 0) {
+        $app->forwardMail($new_event, $remote_notification_list, $login);
+        $app->sendPushNotification(
+            $new_event, $remote_notification_list, $login, true, $bdate, null);
+    }
+
+    // 通知先の指定がある場合
+    if ($new_event->private && is_array($new_event->notify_address)
+        && count($new_event->notify_address) > 0
+    ) {
+        $title = _schedule_cellular_modify_getNotifyTitle($new_event);
+        $app->sendNotificationsToPublic($login, $new_event, $bdate, '', $tsex,
+            $title, false, true, GRN_SCHEDULE_NOTIFY_MODIFY);
+    }
+
+    if (is_a($new_event, 'GRN_Schedule_NormalEvent')
+        && is_a($old_event, 'GRN_Schedule_NormalEvent')
+    ) {
+        $app->sendFacilityApprovalRequestNotifyForUpdate($old_event, $new_event,
+            $login, $tsex);
+        $app->forwardFacilityRelyMailForUpdate($old_event, $new_event);
+        $app->sendPushNotificationOfUpdatedFacilityRequest($old_event,
+            $new_event);
+    }
+}
+
+if ($old_event->isAttendanceCheckEvent()) {
+    // Setting attendance check of $new_event is same as $old_event.
+    // So, we don't need to consider a change of it.
+
+    // delete data attendance check of user which was removed for attendees list
+    $attendanceStatusLogic = new AttendanceStatusLogic();
+    if (count($del_members) > 0) {
+        $del_members_id = [];
+        foreach ($del_members as $del_member) {
+            $del_members_id[] = $del_member->getOID();
+        }
+        $attendanceStatusLogic->deleteAttendanceStatusByEventIdAndUsersId(
+            $new_event->id, $del_members_id
+        );
+    }
+}
+
+// あっちゃいけないけどどうしよう？
+if ( ! $bdate) {
+    $bdate = new CB_DateEx($today);
+}
+
+$b_view = true;
+// 非公開の場合
+if ($new_event->private != 0) {
+    $b_view = false;
+    if (is_array($new_event->users) && count($new_event->users)) {
+        foreach (array_keys($new_event->users) as $key) {
+            $user = $new_event->users[$key];
+            if ( ! $user) {
+                continue;
+            }
+
+            // 自分がいる場合は詳細画面に
+            if ($user->getOID() == $login_id) {
+                $b_view = true;
+                break;
+            }
+        }
+    }
+    // 自分がいない場合は、登録者を見る
+    if ( ! $b_view) {
+        if (is_a($new_event->creator, 'CB_User')
+            && $new_event->creator->getOID() == $login_id
+        ) {
+            $b_view = true;
+        }
+    }
+}
+
+function _schedule_cellular_modify_getNotifyTitle($new_event)
+{
+    require_once('schedule/view_util.csp');
+    $util = GRN_Schedule_View_Util::getInstance();
+
+    if (is_a($new_event, 'GRN_Schedule_NormalEvent')) {
+        return $util->getNotifyTitle(html_entity_decode($new_event->getTitle()));
+    } elseif (is_a($new_event, 'GRN_Schedule_RepeatEvent')) {
+        // 繰り返しの場合だけ変更されたイベントを再取得
+        $title = html_entity_decode($new_event->getTitle());
+
+        return $util->getNotifyTitle($title);
+    } elseif (is_a($new_event, 'GRN_Schedule_BannerEvent')) {
+        return $util->getNotifyTitle(html_entity_decode($new_event->getTitle()));
+    } elseif (is_a($new_event, 'GRN_Schedule_TemporaryEvent')) {
+        return $util->getNotifyTitle(html_entity_decode($new_event->getTitle()));
+    }
+    assert(false);
+}
+

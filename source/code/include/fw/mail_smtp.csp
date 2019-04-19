@@ -1,0 +1,1429 @@
+<?php
+
+/**
+ * Mail sender/receiver implementation.
+ * <p>
+ *   It supports authentication methods, NONE, AUTO, LOGIN, PLAIN, CRAM-MD5 and DIGEST-MD5.
+ * </p>
+ *
+ * @author  Mizuno, Kuniaki     2004/07
+ * @author  Miyabe, Tatsuhiko   2004/09
+ * @version 1.0
+ * @package fw.mail
+ */
+
+/* vim: set expandtab softtabstop=4 tabstop=4 shiftwidth=4: */
+// +----------------------------------------------------------------------+
+// | PHP Version 4                                                        |
+// +----------------------------------------------------------------------+
+// | Copyright ( c) 1997-2003 The PHP Group                                |
+// +----------------------------------------------------------------------+
+// | This source file is subject to version 2.02 of the PHP license,      |
+// | that is bundled with this package in the file LICENSE, and is        |
+// | available at through the world-wide-web at                           |
+// | http://www.php.net/license/2_02.txt.                                 |
+// | If you did not receive a copy of the PHP license and are unable to   |
+// | obtain it through the world-wide-web, please send a note to          |
+// | license@php.net so we can mail you a copy immediately.               |
+// +----------------------------------------------------------------------+
+// | Authors: Chuck Hagenbuch <chuck@horde.org>                           |
+// |          Jon Parise <jon@php.net>                                    |
+// |          Damian Alejandro Fernandez Sosa <damlists@cnba.uba.ar>      |
+// +----------------------------------------------------------------------+
+
+require_once('PEAR.php');
+require_once('Net/Socket.php');
+require_once('fw/i18n.csp');
+require_once('fw/transaction.csp');
+require_once('fw/mail_sender.csp');
+
+use grn\mail\exception\MailServiceException;
+
+/** The SMTP default port. */
+define('CB_MAIL_PORT_SMTP', '25');
+
+/**
+ * Common SMTP implementation of CB_MailSender.
+ *
+ * @abstract
+ * @package fw.mail
+ */
+class CB_MailSMTPSenderBase extends CB_MailSender
+{
+    /**
+     * The protocol handler.
+     *
+     * @var object CB_MailSMTPProtocol
+     * @access private
+     */
+    var $_p;
+
+    /**
+     * If true, this sender has connected the server.
+     *
+     * @var boolean
+     * @access private
+     */
+    var $_connected = false;
+
+    /**
+     * is need connect to socks
+     * @var boolean
+     */
+    var $is_need_connect_to_socks;
+
+    function __construct()
+    {
+        parent::__construct();
+        $this->_p = new CB_MailSMTPProtocol();
+    }
+
+    /**
+     * Implementation of {@link CB_MailService} method.
+     *
+     * @param object $logger Instance of {@link CB_Logger}
+     */
+    function setLogger($logger)
+    {
+        parent::setLogger($logger);
+        $this->_p->_logger = $logger;
+    }
+
+    /**
+     * Implementation of {@link CB_MailService} method.
+     *
+     * @param object $listener Instance of {@link CB_MailErrorListener}
+     */
+    function setErrorListener($listener)
+    {
+        parent::setErrorListener($listener);
+        $this->_p->_listener = $listener;
+    }
+
+    /**
+     * Implementation of {@link CB_MailSender} method.
+     *
+     * @param array $info_array
+     *
+     * @return bool
+     */
+    function connect($info_array)
+    {
+        assert('!is_null( $info_array)');
+
+        if ($this->_connected) {
+            $msg = cb_msg('fw.mail', 'Already connected to the server.');
+            if ( ! is_null($this->_listener)) {
+                $this->_listener->error(-1, $msg);
+            }
+            if ( ! is_null($this->_logger)) {
+                $this->_logger->warning($msg);
+            }
+
+            return false;
+        }
+        $this->is_need_connect_to_socks = cb_at($info_array, 'is_need_connect_to_socks', TRUE);
+        $ret = $this->_setDefaultConnInfo($info_array);
+        if (PEAR::isError(
+            $err = $this->_p->connect($ret['hostname'], $ret['port'], $ret['domain'], $ret['uid'], $ret['password'],
+                $ret['auth'], $ret['timeout'], true, $ret['smtp_ssl'], $ret['smtp_tls'], $ret['socks']))
+        ) {
+            return false;
+        }
+        $this->_connected = true;
+
+        return true;
+    }
+
+    /**
+     * @access private
+     */
+    function _setDefaultConnInfo($info_array)
+    {
+        $ret = [];
+        $ret['hostname'] = cb_get_host_domain();
+        $ret['port'] = CB_MAIL_PORT_SMTP;
+        $ret['smtp_ssl'] = false;
+        $ret['smtp_tls'] = false;
+        $ret['domain'] = $this->_getSmtpDomain();
+        $ret['timeout'] = CB_MAIL_DEFAULT_TIMEOUT;
+        $ret['auth'] = 'NONE';
+        $ret['uid'] = '';
+        $ret['password'] = '';
+
+        foreach (array_keys($ret) as $key) {
+            if (isset($info_array[$key]) && isset($ret[$key])) {
+                $ret[$key] = $info_array[$key];
+            }
+        }
+        $ret['socks']['is_need_connect_to_socks'] = $this->isNeedConnectToSocks();
+        $ret['socks']['socks_info'] = cb_get_socks_info();
+        $ret['auth'] = strtoupper($ret['auth']);
+
+        return $ret;
+    }
+
+    /**
+     * @return string
+     */
+    function _getSmtpDomain()
+    {
+        if (cb_is_forest()) {
+            require_once('fw/forest_util.csp');
+            $region_json = CB_RegionManager::getRegionJson();
+
+            require_once('fw/slash_util.csp');
+            $region = CB_SlashUtil::getRegion();
+
+            return $region_json[$region]['SOCKS']['FQDN'];
+        }
+
+        return cb_get_host_domain();
+    }
+
+    /**
+     * Implementation of {@link CB_MailSender} method.
+     *
+     * @param array  $messages Array of {@link CB_MailMessage}.
+     * @param string $locale   Locale code
+     *
+     * @return bool|int
+     */
+    function sendMails(&$messages, $locale)
+    {
+        assert('!is_null( $messages )');
+
+        if ( ! $this->_connected) {
+            $msg = cb_msg('fw.mail', 'Has not connected to the server yet.');
+            if ( ! is_null($this->_listener)) {
+                $this->_listener->error(-1, $msg);
+            }
+            if ( ! is_null($this->_logger)) {
+                $this->_logger->warning($msg);
+            }
+
+            return false;
+        }
+
+        $count = 0;
+        foreach ($messages as $message) {
+            if (PEAR::isError($err = $this->_p->sendMail($message, $locale))) {
+                $this->_p->_cmdRSET();
+                break;
+            }
+            ++$count;
+        }
+
+        return $count;
+    }
+
+    /**
+     * Implementation of {@link CB_MailSender} method.
+     */
+    function disconnect()
+    {
+        $this->_connected = false;
+        if (PEAR::isError($err = $this->_p->disconnect())) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Implementation of {@link CB_MailService} method.
+     */
+    function isConnected()
+    {
+        return ($this->_connected);
+    }
+
+    /**
+     * Implementation of {@link CB_MailService} method.
+     *
+     * @param array $info_array
+     *
+     * @return bool
+     */
+    function isAvailable($info_array)
+    {
+        if ( ! is_array($info_array)) {
+            return false;
+        }
+        $this->is_need_connect_to_socks = cb_at($info_array, 'is_need_connect_to_socks', TRUE);
+        $ret = $this->_setDefaultConnInfo($info_array);
+        if (PEAR::isError(
+            $err = $this->_p->connect($ret['hostname'], $ret['port'], $ret['domain'], $ret['uid'], $ret['password'],
+                $ret['auth'], $ret['timeout'], false, $ret['smtp_ssl'], $ret['smtp_tls'], $ret['socks']))
+        ) {
+            return false;
+        }
+
+        if (PEAR::isError($result = $this->_p->checkSupportedAuthMethod($ret['auth']))) {
+            $this->disconnect();
+
+            return false;
+        }
+
+        $this->disconnect();
+
+        return true;
+    }
+
+    /**
+     * Is need connect to Socks5
+     *
+     * @return bool
+     */
+    function isNeedConnectToSocks()
+    {
+        if (cb_is_forest() && $this->is_need_connect_to_socks) {
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+}
+
+/**
+ * A SMTP transport, namely that it immediately transmits mails on sendMails method.
+ *
+ * @package fw.mail
+ */
+class CB_MailSMTPSender_NotTransactional extends CB_MailSMTPSenderBase
+{
+    function __construct()
+    {
+        parent::__construct();
+    }
+
+    /**
+     * Implementation of {@link CB_Transactional} method.
+     */
+    function commit()
+    {
+        return true;
+    }
+
+    /**
+     * Implementation of {@link CB_Transactional} method.
+     */
+    function abort()
+    {
+        @$this->disconnect();
+
+        return true;
+    }
+}
+
+/**
+ * A SMTP transport that reserves mails on sendMails and transmit them on commit.
+ *
+ * @package fw.mail
+ */
+class CB_MailSMTPSender_Transactional extends CB_MailSMTPSenderBase
+{
+    /**
+     * The tasks that are reserved by sendMails.
+     * Elements that array contains CB_MailMessage (keyed 'MESSAGES' ) and locale string (keyed 'LOCALE' ).
+     *
+     * @var array
+     * @access private
+     */
+    var $_tasks = [];
+
+    function __construct()
+    {
+        parent::__construct();
+    }
+
+    function boot()
+    {
+        $tm = CB_TransactionManager::getInstance();
+        $tm->register(CB_TRANSACTION_LEVEL_AUDIT, $this);
+    }
+
+    /**
+     * Implementation of {@link CB_Transactional} method.
+     */
+    function commit()
+    {
+        for ($i = 0; $i < count($this->_tasks); ++$i) {
+            $task =& $this->_tasks[$i];
+            if (parent::sendMails($task['MESSAGES'], $task['LOCALE']) === false) {
+                return false;
+            }
+        }
+        $this->_tasks = [];
+
+        return true;
+    }
+
+    /**
+     * Implementation of {@link CB_Transactional} method.
+     */
+    function abort()
+    {
+        $this->_tasks = [];
+        @$this->disconnect();
+
+        return true;
+    }
+
+    /**
+     * Implementation of {@link CB_MailSender} method.
+     *
+     * @param array  $messages array of {@link CB_MailMessage}.
+     * @param string $locale   Locale code
+     *
+     * @return int              The number of mails sent successfully.
+     */
+    function sendMails(&$messages, $locale)
+    {
+        assert('!is_null( $messages )');
+
+        $this->_tasks[] = ['MESSAGES' => $messages, 'LOCALE' => $locale];
+
+        return count($messages);
+    }
+}
+
+/**
+ * Provides an implementation of the SMTP protocol using PEAR's
+ * Net_Socket:: class.
+ *
+ * @package fw.mail
+ * @access  protected
+ */
+class CB_MailSMTPProtocol
+{
+    /**
+     * The logger object.
+     *
+     * @var object CB_Logger
+     * @access protected
+     */
+    var $_logger;
+
+    /**
+     * The error listener.
+     *
+     * @var object CB_ErrorListener
+     * @access protected
+     */
+    var $_listener;
+
+    /**
+     * The server to connect to.
+     *
+     * @var string
+     * @access private
+     */
+    var $_host;
+
+    /**
+     * The value to give when sending EHLO or HELO.
+     *
+     * @var string
+     * @access private
+     */
+    var $_domain;
+
+    /**
+     * List of supported authentication methods, in preferential order.
+     *
+     * @var array
+     * @access private
+     */
+    var $_authMethods = ['DIGEST-MD5', 'CRAM-MD5', 'LOGIN', 'PLAIN'];
+
+    /**
+     * The socket resource being used to connect to the SMTP server.
+     *
+     * @var resource
+     * @access private
+     */
+    var $_socket = null;
+
+    /**
+     * The most recent server response code.
+     *
+     * @var integer
+     * @access private
+     */
+    var $_code = -1;
+
+    /**
+     * The most recent server response arguments.
+     *
+     * @var array
+     * @access private
+     */
+    var $_arguments = [];
+
+    /**
+     * Stores detected features of the SMTP server.
+     *
+     * @var array
+     * @access private
+     */
+    var $_esmtp = [];
+
+    /**
+     * That varibale is used when seding an email with SMTP TLS.
+     */
+    var $_smtp_tls = false;
+
+    /**
+     * socks
+     * @var array
+     */
+    var $_socks = [];
+
+    function __construct()
+    {
+        $this->_socket = new Net_Socket();
+
+        /*
+         * Include the Auth_SASL package.  If the package is not available,
+         * we disable the authentication methods that depend upon it.
+         */
+        if ((@include_once 'Auth/SASL.php') === false) {
+            $pos = array_search('DIGEST-MD5', $this->_authMethods);
+            unset($this->_authMethods[$pos]);
+            $pos = array_search('CRAM-MD5', $this->_authMethods);
+            unset($this->_authMethods[$pos]);
+        }
+    }
+
+    /**
+     * Makes connection to the server and do authentication process.
+     *
+     * @param string  $host
+     * @param string  $port
+     * @param string  $domain
+     * @param string  $user
+     * @param string  $password
+     * @param string  $auth
+     * @param string  $timeout
+     * @param boolean $login
+     * @param boolean $smtp_ssl
+     * @param boolean $smtp_tls
+     * @param array  $socks
+     *
+     * @return mixed true or PEAR_Error.
+     */
+    function connect(
+        $host,
+        $port,
+        $domain,
+        $user,
+        $password,
+        $auth,
+        $timeout,
+        $login = true,
+        $smtp_ssl = false,
+        $smtp_tls = false,
+        $socks
+    ) {
+        $this->_smtp_tls = $smtp_tls;
+
+        assert('!is_null( $host)');
+        assert('!is_null( $port)');
+        assert('!is_null( $domain)');
+        assert('!is_null( $timeout)');
+
+        $auth = strtoupper($auth);
+        $this->_host = $host;
+        $this->_domain = $domain;
+        $this->_socks = $socks;
+
+        $options = ["ssl" => ["verify_peer" => false, "verify_peer_name" => false]];
+
+        try {
+            $this->_socket->timeout = $timeout;
+            $this->checkError($this->connectToSocksServer($timeout, $options), false);
+            $this->checkError($this->connectToMailServer($host, $port, $timeout, $options, $smtp_ssl, $smtp_tls), false);
+            if ($smtp_ssl && $socks['is_need_connect_to_socks']) {
+                $this->checkError($this->_socket->enableCrypto(true, STREAM_CRYPTO_METHOD_SSLv23_CLIENT), false);
+            }
+            $this->checkError($err = $this->_readResponses([220]));
+            if ($smtp_tls) {
+                $this->checkError($this->_cmdEHLO());
+                $this->checkError($this->_cmdSTARTTLS());
+                $this->checkError($this->_socket->enableCrypto(true, STREAM_CRYPTO_METHOD_TLS_CLIENT));
+                $this->checkError($this->_cmdEHLO());
+            } else {
+                $this->checkError($this->_cmdEHLO());
+            }
+            if ($login && $auth != 'NONE') {
+                $this->checkError($this->_auth($user, $password, $auth));
+            }
+        } catch (MailServiceException $err) {
+            return new PEAR_Error();
+        }
+        return true;
+    }
+
+    /**
+     * check the PEAR_Error
+     *
+     * @param $err
+     * @param bool $is_need_disconnect
+     * @throws MailServiceException
+     */
+    public function checkError($err, $is_need_disconnect = true)
+    {
+        if (PEAR::isError($err)) {
+            if ($is_need_disconnect) {
+                $this->disconnect();
+            }
+            throw new MailServiceException();
+        }
+    }
+
+    /**
+     * connect to the socks server (.com server only)
+     *
+     * @param $timeout
+     * @param $options
+     *
+     * @return bool|mixed|PEAR_Error
+     */
+    public function connectToSocksServer($timeout, $options)
+    {
+        $socks = $this->_socks;
+        if ($socks['is_need_connect_to_socks']) {
+            $socks5_host = $socks['socks_info']['host'];
+            $socks5_port = $socks['socks_info']['port'];
+            $connect_code = pack("C3", 0x05, 0x01, 0x00);
+            if (PEAR::isError($err =
+                $this->_socket->connect($socks5_host, $socks5_port, FALSE, $timeout, $options))) {
+                return $err;
+            } elseif (PEAR::isError($err = $this->_socket->write($connect_code))) {
+                return $err;
+            } else {
+                $buffer = $this->_socket->read(3);
+                $response = unpack('C*', $buffer);
+                if (count($response) != 2) {
+                    return new PEAR_Error();
+                } elseif ($response['1'] != 5) {
+                    return new PEAR_Error();
+                } elseif ($response['2'] != 0) {
+                    return new PEAR_Error();
+                }
+            }
+        }
+        return TRUE;
+    }
+
+    /**
+     * @param $host
+     * @param $host_port
+     * @param $timeout
+     * @param $options
+     * @param $smtp_ssl
+     * @param $smtp_tls
+     *
+     * @return bool|PEAR_Error
+     */
+    public function connectToMailServer($host, $host_port, $timeout, $options, $smtp_ssl, $smtp_tls)
+    {
+        $socks = $this->_socks;
+        if ($socks['is_need_connect_to_socks']) {
+            $host_ip = @gethostbyname($host);
+            $connect_code =
+                chr(5) . chr(1) . "\x00" . chr(1) . pack('Nn', ip2long($host_ip),
+                    $host_port);
+
+            if (PEAR::isError($err = $this->_socket->write($connect_code))) {
+                return $err;
+            } else {
+                $buffer = $this->_socket->read(11);
+                $response = unpack("C*", $buffer);
+                if (count($response) != 10) {
+                    return new PEAR_Error();
+                } elseif ($response['1'] != 5) {
+                    return new PEAR_Error();
+                } elseif ($response['2'] != 0) {
+                    return new PEAR_Error();
+                }
+            }
+            $this->_domain = $host;
+
+            return TRUE;
+        } else {
+            if (PEAR::isError($err = $this->_socket->connect($host, $host_port,
+                FALSE, $timeout, $options, $smtp_ssl, $smtp_tls))) {
+                if (!is_null($this->_listener)) {
+                    $this->_listener->error(-1, cb_msg('fw.mail', 'Failed to connect the server.'));
+                }
+                if (!is_null($this->_logger)) {
+                    $this->_logger->warning($err->getMessage());
+                }
+                return $err;
+            }
+            return TRUE;
+        }
+    }
+
+    /**
+     * Disconnects from the server.
+     *
+     * @return mixed true or PEAR_Error.
+     */
+    function disconnect()
+    {
+        if (PEAR::isError($err = $this->_writeLine('QUIT'))) {
+            //ignore
+        }
+        if (PEAR::isError($err = $this->_readResponses([221]))) {
+            //ignore
+        }
+        if (PEAR::isError($err = $this->_socket->disconnect())) {
+            if ( ! is_null($this->_listener)) {
+                $this->_listener->error(-1, cb_msg('fw.mail', 'Failed to disconnect from the server.'));
+            }
+            if ( ! is_null($this->_logger)) {
+                $this->_logger->warning($err->getMessage());
+            }
+
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Sends mails by the locale.
+     *
+     * @param array  $message
+     * @param string $locale
+     *
+     * @return mixed true or PEAR_Error.
+     */
+    function sendMail($message, $locale)
+    {
+        assert('!is_null( $message )');
+
+        $froms = $message->getFrom();
+        if (PEAR::isError($err = $this->_cmdMAIL($froms[0]->address))) {
+            return $err;
+        }
+        $data =& $message->getSourceData($locale, CB_MAIL_ENC_B);
+
+        /*
+         * RFC 1870, section 3, subsection 3 states "a value of zero indicates
+         * that no fixed maximum message size is in force".  Furthermore, it
+         * says that if "the parameter is omitted no information is conveyed
+         * about the server's fixed maximum message size".
+         */
+        if (isset($this->_esmtp['SIZE']) && ($this->_esmtp['SIZE'] > 0)) {
+            if (strlen($data) >= $this->_esmtp['SIZE']) {
+                $msg = cb_msg('fw.mail', 'Message size excedes the server limit.');
+                if ( ! is_null($this->_listener)) {
+                    $this->_listener->error(-1, $msg);
+                }
+                if ( ! is_null($this->_logger)) {
+                    $this->_logger->debug($msg);
+                }
+
+                return new PEAR_Error();
+            }
+        }
+
+        $addresses = $message->getTo();
+        if (is_null($addresses)) {
+            $addresses = [];
+        }
+        $cc = $message->getCc();
+        if ( ! is_null($cc)) {
+            $addresses = array_merge($addresses, $cc);
+        }
+        $bcc = $message->getBcc();
+        if ( ! is_null($bcc)) {
+            $addresses = array_merge($addresses, $bcc);
+        }
+        $unique = [];
+
+        foreach ($addresses as $address) {
+            $unique[] = $address->address;
+        }
+        $unique = array_unique($unique);
+        foreach ($unique as $address) {
+            if (PEAR::isError($err = $this->_cmdRCPT($address))) {
+                return $err;
+            }
+            if (PEAR::isError($err = $this->_readResponses([250, 251]))) {
+                return $err;
+            }
+        }
+        if (PEAR::isError($err = $this->_cmdDATA())) {
+            return $err;
+        }
+        if (PEAR::isError($err = $this->_readResponses([354]))) {
+            return $err;
+        }
+        if (PEAR::isError($err = $this->_writeData($data))) {
+            return $err;
+        }
+
+        return true;
+    }
+
+
+    /**
+     *
+     * @return boolean
+     * @access public
+     */
+    function checkSupportedAuthMethod($user_method)
+    {
+        if ($user_method == 'NONE') {
+            return true;
+        }
+
+        if (isset($this->_esmtp['AUTH'])) {
+            $available_methods = explode(' ', $this->_esmtp['AUTH']);
+
+            foreach ($this->_authMethods as $method) {
+                if (in_array($user_method, $available_methods)) {
+                    return true;
+                }
+            }
+        }
+
+
+        $msg = cb_msg('fw.mail', 'The server does not support authentication.');
+        if ( ! is_null($this->_listener)) {
+            $this->_listener->error(-1, $msg);
+        }
+
+        return new PEAR_Error();
+    }
+
+    /**
+     * Returns the name of the best authentication method that the server
+     * has advertised.
+     *
+     * @return mixed    Returns a string containing the name of the best
+     *                  supported authentication method or a PEAR_Error object
+     *                  if a failure condition is encountered.
+     * @access private
+     */
+    function _getBestAuthMethod()
+    {
+        if (isset($this->_esmtp['AUTH'])) {
+            $available_methods = explode(' ', $this->_esmtp['AUTH']);
+
+            foreach ($this->_authMethods as $method) {
+                if (in_array($method, $available_methods)) {
+                    return $method;
+                }
+            }
+        }
+
+        return 'NONE';
+    }
+
+    /**
+     * Attempt to do SMTP authentication.
+     *
+     * @param string The userid to authenticate as.
+     * @param string The password to authenticate with.
+     * @param string The requested authentication method.  If none is
+     *               specified, the best supported method will be used.
+     *
+     * @return mixed Returns a PEAR_Error with an error message on any
+     *               kind of failure, or true on success.
+     * @access private
+     */
+    function _auth($uid, $pwd, $method = null)
+    {
+        assert('!is_null( $uid)');
+        assert('!is_null( $pwd)');
+
+        if (empty($this->_esmtp['AUTH'])) {
+            if ($method == "AUTO") {
+                return true;
+            }
+            $msg = cb_msg('fw.mail', 'The server does not support authentication.');
+            if ( ! is_null($this->_listener)) {
+                $this->_listener->error(-1, $msg);
+            }
+
+            return new PEAR_Error();
+        }
+
+        /*
+         * If no method has been specified, get the name of the best supported
+         * method advertised by the SMTP server.
+         */
+        if ($method == 'AUTO') {
+            if (PEAR::isError($method = $this->_getBestAuthMethod())) {
+                return $method;
+            }
+            if ($method == 'NONE') {
+                return true;
+            }
+        } else {
+            $method = strtoupper($method);
+            if ( ! in_array($method, $this->_authMethods)) {
+                $msg = cb_msg('fw.mail', '&&method&& is not a supported authentication method.', ['method' => $method]);
+                if ( ! is_null($this->_listener)) {
+                    $this->_listener->error(-1, $msg);
+                }
+                if ( ! is_null($this->_logger)) {
+                    $this->_logger->debug($msg);
+                }
+
+                return new PEAR_Error();
+            }
+        }
+
+        switch ($method) {
+            case 'DIGEST-MD5':
+                $result = $this->_authDIGEST_MD5($uid, $pwd);
+                break;
+            case 'CRAM-MD5':
+                $result = $this->_authCRAM_MD5($uid, $pwd);
+                break;
+            case 'LOGIN':
+                $result = $this->_authLOGIN($uid, $pwd);
+                break;
+            case 'PLAIN':
+                $result = $this->_authPLAIN($uid, $pwd);
+                break;
+            default:
+                $msg = cb_msg('fw.mail', '&&method&& is not a supported authentication method.', ['method' => $method]);
+                if ( ! is_null($this->_listener)) {
+                    $this->_listener->error(-1, $msg);
+                }
+                if ( ! is_null($this->_logger)) {
+                    $this->_logger->debug($msg);
+                }
+
+                return new PEAR_Error();
+        }
+
+        if (PEAR::isError($result)) {
+            if ($this->_code == 535) {
+                if ( ! is_null($this->_listener)) {
+                    $this->_listener->error(-1, cb_msg('fw.mail', 'Authentication failed.'));
+                }
+            }
+
+            return $result;
+        }
+
+        global $G_config_common;
+        if ($G_config_common->get('Mail', 'mail_smtp_auth_no_resent_ehlo') == 1) {
+            return true;
+        }
+
+        /* RFC-2554 requires us to re-negotiate ESMTP after an AUTH. */
+        if (PEAR::isError($error = $this->_cmdEHLO())) {
+            return $error;
+        }
+
+        return true;
+    }
+
+    /**
+     * Authenticates the user using the DIGEST-MD5 method.
+     *
+     * @param string The userid to authenticate as.
+     * @param string The password to authenticate with.
+     *
+     * @return mixed Returns a PEAR_Error with an error message on any
+     *               kind of failure, or true on success.
+     * @access private
+     */
+    function _authDIGEST_MD5($uid, $pwd)
+    {
+        assert('!is_null( $uid)');
+        assert('!is_null( $pwd)');
+
+        if (PEAR::isError($err = $this->_writeLine('AUTH DIGEST-MD5'))) {
+            return $err;
+        }
+        /* 334: Continue authentication request */
+        if (PEAR::isError($err = $this->_readResponses([334]))) {
+            return $err;
+        }
+
+        $challenge = base64_decode($this->_arguments[0]);
+        if ( ! is_null($this->_logger)) {
+            $this->_logger->debug("challenge: $challenge");
+        }
+        $digest = Auth_SASL::factory('DIGESTMD5');
+        $auth_str = $digest->getResponse($uid, $pwd, $challenge,
+            $this->_host, 'smtp', null, $this->_domain);
+        if ( ! is_null($this->_logger)) {
+            $this->_logger->debug("response: $auth_str");
+        }
+        $auth_str = base64_encode($auth_str);
+
+        if (PEAR::isError($err = $this->_writeLine($auth_str))) {
+            return $err;
+        }
+        /* 334: Continue authentication request */
+        if (PEAR::isError($err = $this->_readResponses([334]))) {
+            return $err;
+        }
+
+        /*
+         * We don't use the protocol's third step because SMTP doesn't allow
+         * subsequent authentication, so we just silently ignore it.
+         */
+        if (PEAR::isError($err = $this->_writeLine(''))) {
+            return $err;
+        }
+        /* 235: Authentication successful */
+        if (PEAR::isError($err = $this->_readResponses([235]))) {
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Authenticates the user using the CRAM-MD5 method.
+     *
+     * @param string The userid to authenticate as.
+     * @param string The password to authenticate with.
+     *
+     * @return mixed Returns a PEAR_Error with an error message on any
+     *               kind of failure, or true on success.
+     * @access private
+     */
+    function _authCRAM_MD5($uid, $pwd)
+    {
+        assert('!is_null( $uid)');
+        assert('!is_null( $pwd)');
+
+        if (PEAR::isError($err = $this->_writeLine('AUTH CRAM-MD5'))) {
+            return $err;
+        }
+        /* 334: Continue authentication request */
+        if (PEAR::isError($err = $this->_readResponses([334]))) {
+            return $err;
+        }
+
+        $challenge = base64_decode($this->_arguments[0]);
+        if ( ! is_null($this->_logger)) {
+            $this->_logger->debug("challenge: $challenge");
+        }
+        $cram = Auth_SASL::factory('CRAMMD5');
+        $auth_str = $cram->getResponse($uid, $pwd, $challenge);
+        if ( ! is_null($this->_logger)) {
+            $this->_logger->debug("response: $auth_str");
+        }
+        $auth_str = base64_encode($auth_str);
+
+        if (PEAR::isError($err = $this->_writeLine($auth_str))) {
+            return $err;
+        }
+
+        /* 235: Authentication successful */
+        if (PEAR::isError($err = $this->_readResponses([235]))) {
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Authenticates the user using the LOGIN method.
+     *
+     * @param string The userid to authenticate as.
+     * @param string The password to authenticate with.
+     *
+     * @return mixed Returns a PEAR_Error with an error message on any
+     *               kind of failure, or true on success.
+     * @access private
+     */
+    function _authLOGIN($uid, $pwd)
+    {
+        assert('!is_null( $uid)');
+        assert('!is_null( $pwd)');
+
+        if (PEAR::isError($err = $this->_writeLine('AUTH LOGIN'))) {
+            return $err;
+        }
+        /* 334: Continue authentication request */
+        if (PEAR::isError($err = $this->_readResponses([334]))) {
+            return $err;
+        }
+
+        if (PEAR::isError($err = $this->_writeLine(base64_encode($uid)))) {
+            return $err;
+        }
+        /* 334: Continue authentication request */
+        if (PEAR::isError($err = $this->_readResponses([334]))) {
+            return $err;
+        }
+
+        if (PEAR::isError($err = $this->_writeLine(base64_encode($pwd)))) {
+            return $err;
+        }
+
+        /* 235: Authentication successful */
+        if (PEAR::isError($err = $this->_readResponses([235]))) {
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Authenticates the user using the PLAIN method.
+     *
+     * @param string The userid to authenticate as.
+     * @param string The password to authenticate with.
+     *
+     * @return mixed Returns a PEAR_Error with an error message on any
+     *               kind of failure, or true on success.
+     * @access private
+     */
+    function _authPLAIN($uid, $pwd)
+    {
+        assert('!is_null( $uid )');
+        assert('!is_null( $pwd )');
+
+        if (PEAR::isError($err = $this->_writeLine('AUTH PLAIN'))) {
+            return $err;
+        }
+        /* 334: Continue authentication request */
+        if (PEAR::isError($err = $this->_readResponses([334]))) {
+            return $err;
+        }
+
+        $auth_str = base64_encode($uid . chr(0) . $uid . chr(0) . $pwd);
+
+        if (PEAR::isError($err = $this->_writeLine($auth_str))) {
+            return $err;
+        }
+
+        /* 235: Authentication successful */
+        if (PEAR::isError($err = $this->_readResponses([235]))) {
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Attempt to send the EHLO command and obtain a list of ESMTP
+     * extensions available, and failing that just send HELO.
+     *
+     * @return mixed Returns a PEAR_Error with an error message on any
+     *               kind of failure, or true on success.
+     *
+     * @access private
+     */
+    function _cmdEHLO()
+    {
+        if (PEAR::isError($err = $this->_writeLine('EHLO ' . $this->_domain))) {
+            return $err;
+        }
+
+        if (PEAR::isError($this->_readResponses([250, 503]))) {
+            return $this->_cmdHELO();
+        }
+        /* If we receive a 503 response, we're already authenticated. */
+        if ($this->_code === 503) {
+            return true;
+        }
+
+
+        foreach ($this->_arguments as $argument) {
+            $verb = strtok($argument, ' ');
+            $arguments = substr($argument, strlen($verb) + 1,
+                strlen($argument) - strlen($verb) - 1);
+            $this->_esmtp[$verb] = $arguments;
+        }
+
+        return true;
+    }
+
+    /**
+     * Sends the HELO command.
+     *
+     * @return mixed Returns a PEAR_Error with an error message on any
+     *               kind of failure, or true on success.
+     * @access private
+     */
+    function _cmdHELO()
+    {
+        /* If the EHLO failed, try the simpler HELO command. */
+        if (PEAR::isError($err = $this->_writeLine('HELO ' . $this->_domain))) {
+            return $err;
+        }
+        if (PEAR::isError($err = $this->_readResponses([250]))) {
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Sends the RSET command.
+     *
+     * @return mixed Returns a PEAR_Error with an error message on any
+     *               kind of failure, or true on success.
+     * @access private
+     */
+    function _cmdRSET()
+    {
+        if (PEAR::isError($err = $this->_writeLine('RSET'))) {
+            return $err;
+        }
+        if (PEAR::isError($err = $this->_readResponses([250]))) {
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Send the MAIL FROM: command.
+     *
+     * @param string The sender (reverse path) to set.
+     *
+     * @return mixed Returns a PEAR_Error with an error message on any
+     *               kind of failure, or true on success.
+     * @access private
+     */
+    function _cmdMAIL($sender, $par = null)
+    {
+        assert('!is_null( $sender)');
+
+        if (is_null($par)) {
+            if (PEAR::isError($err = $this->_writeLine("MAIL FROM:<$sender>"))) {
+                return $err;
+            }
+        } else {
+            if (PEAR::isError($err = $this->_writeLine("MAIL FROM:<$sender> $par"))) {
+                return $err;
+            }
+        }
+        if (PEAR::isError($err = $this->_readResponses([250]))) {
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Send the RCPT TO: command.
+     *
+     * @param string The recipient (forward path) to add.
+     *
+     * @return mixed Returns a PEAR_Error with an error message on any
+     *               kind of failure, or true on success.
+     * @access private
+     */
+    function _cmdRCPT($recipient)
+    {
+        assert('!is_null( $recipient)');
+
+        if (PEAR::isError($err = $this->_writeLine("RCPT TO:<$recipient> "))) {
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Send the DATA command.
+     *
+     * @param string The message body to send.
+     *
+     * @return mixed Returns a PEAR_Error with an error message on any
+     *               kind of failure, or true on success.
+     * @access private
+     */
+    function _cmdDATA()
+    {
+        if (PEAR::isError($err = $this->_writeLine('DATA'))) {
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Sends the STARTTLS command.
+     *
+     * @ using  for TLS
+     * @ access private
+     */
+    function _cmdSTARTTLS()
+    {
+        if (PEAR::isError($err = $this->_writeLine('STARTTLS'))) {
+            return $err;
+        }
+
+        if (PEAR::isError($err = $this->_readResponses([220]))) {
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Writes mail data.
+     *
+     * @access private
+     */
+    function _writeData($data)
+    {
+        /*
+         * Because a single leading period (.) signifies an end to the data,
+         * legitimate leading periods need to be "doubled" (e.g. '..' ).
+         */
+        $data = preg_replace("/\n\./", "\n..", $data);
+
+        if (PEAR::isError($err = $this->_writeLine($data . '.'))) {
+            return $err;
+        }
+        if (PEAR::isError($err = $this->_readResponses([250]))) {
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Send the given string of data to the server.
+     *
+     * @param   string $data The string of data to send.
+     *
+     * @return  mixed   True on success or a PEAR_Error object on failure.
+     *
+     * @access  private
+     */
+    function _writeLine($data)
+    {
+        if ( ! is_null($this->_logger)) {
+            if ($this->_logger->isDebugEnabled()) {
+                $this->_logger->debug("C: $data");
+            }
+        }
+
+        if (PEAR::isError($err = $this->_socket->write("$data\r\n"))) {
+            if ( ! is_null($this->_listener)) {
+                $this->_listener->error(-1, cb_msg('fw.mail', 'Failed to write data.'));
+            }
+            if ( ! is_null($this->_logger)) {
+                $this->_logger->debug($err->getMessage());
+            }
+
+            return $err;
+        }
+
+        return true;
+    }
+
+    /**
+     * Read a reply from the SMTP server.  The reply consists of a response
+     * code and a response message.
+     *
+     * @param   mixed $valid        The set of valid response codes.  These
+     *                              may be specified as an array of integer
+     *                              values or as a single integer value.
+     *
+     * @return  mixed   True if the server returned a valid response code or
+     *                  a PEAR_Error object is an error condition is reached.
+     *
+     * @access  private
+     */
+    function _readResponses($valid, $waitfor = null)
+    {
+        assert('!is_null( $valid)');
+        $this->_code = -1;
+        $this->_arguments = [];
+
+        $invalid = true;
+
+        while ($line = $this->_socket->readLine()) {
+            if (PEAR::isError($line)) {
+                $msg = cb_msg('fw.mail', 'Failed to read data.');
+                if ( ! is_null($this->_listener)) {
+                    $this->_listener->error(-1, $msg);
+                }
+                if ( ! is_null($this->_logger)) {
+                    $this->_logger->debug($msg);
+                }
+
+                return $line;
+            }
+            if ( ! is_null($this->_logger)) {
+                if ($this->_logger->isDebugEnabled()) {
+                    $this->_logger->debug("S: $line");
+                }
+            }
+
+            /* Read the code and store the rest in the arguments array. */
+            $code = substr($line, 0, 3);
+            $this->_arguments[] = trim(substr($line, 4));
+
+            /* Check the syntax of the response code. */
+            if (is_numeric($code)) {
+                $this->_code = ( int)$code;
+                /* Compare the server's response code with the valid code. */
+                if ( ! is_null($waitfor) && in_array($this->_code, $waitfor)) {
+                    $invalid = false;
+                    break;
+                } elseif ( ! in_array($this->_code, $valid)) {
+                    $invalid = true;
+                    if ( ! is_null($this->_listener)) {
+                        $this->_listener->error($this->_code, $line);
+                    }
+                } else {
+                    $invalid = false;
+                }
+            } else {
+                $this->_code = -1;
+                $invalid = true;
+                break;
+            }
+
+            /* If this is not a multiline response, we're done. */
+            if (is_null($waitfor) && substr($line, 3, 1) != '-') {
+                break;
+            }
+        }
+
+        if ($invalid) {
+            if ( ! is_null($this->_listener)) {
+                $this->_listener->error(-1, cb_msg('fw.mail', 'The server returned an error response.'));
+            }
+
+            if ( ! is_null($this->_logger)) {
+                $this->_logger->debug(cb_msg('fw.mail', 'The server returned an error response.'));
+            }
+
+            return new PEAR_Error();
+        }
+
+        return true;
+    }
+
+    /**
+     * Return a 2-tuple containing the last response from the SMTP server.
+     *
+     * @return  array   A two-element array: the first element contains the
+     *                  response code as an integer and the second element
+     *                  contains the response's arguments as a string.
+     *
+     * @access  private
+     */
+    function _getResponse()
+    {
+        return array($this->_code, join("\n", $this->_arguments));
+    }
+}
+
+

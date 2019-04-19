@@ -1,0 +1,1130 @@
+<?php
+
+namespace grn\space\logic;
+
+use grn\grn\access\service\AppAccess;
+use grn\grn\MemberLogic;
+use grn\space\common\data\bean\LanguageStatus;
+use grn\space\common\data\bean\SpaceMember;
+use grn\space\common\db\CategoryFacade;
+use grn\space\data\bean\MemberOpenStatus;
+use grn\space\data\condition\SpaceWithFileSearchCondition;
+use grn\space\data\bean\SpaceLocal;
+use grn\space\data\bean\SpaceMemoOpenStatus;
+use grn\space\data\collection\SpaceCollection;
+use grn\space\data\collection\SpaceLocalCollection;
+use grn\space\data\bean\SpaceMemo;
+use grn\space\data\collection\SpaceUserCollection;
+use grn\space\db\SpaceFacade;
+use grn\space\data\condition\SpaceSearchCondition;
+use grn\space\data\condition\SpaceUserSearchCondition;
+use grn\space\data\bean\Space;
+use grn\space\data\bean\SpaceUser;
+use grn\space\service\SpaceService;
+
+/**
+ * Class SpaceLogic
+ */
+class SpaceLogic
+{
+    private static $_cache = [];
+    private static $_instance = null;
+
+    /**
+     * コンストラクタ
+     */
+    public function __construct()
+    {
+    }
+
+    /**
+     * Get Instance(Singleton pattern)
+     *
+     * @return SpaceLogic $_instance
+     */
+    public static function getInstance()
+    {
+        if (is_null(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * Create a space
+     *
+     * @param \grn\space\data\bean\Space                      $space
+     * @param \grn\space\data\collection\SpaceLocalCollection $spaceLocalCollection
+     * @param \grn\space\data\bean\SpaceMemo                  $spaceMemo
+     *
+     * @return \grn\space\data\bean\Space
+     */
+    public function createSpace(
+        Space $space,
+        SpaceLocalCollection $spaceLocalCollection,
+        SpaceMemo $spaceMemo
+    ) {
+        $spaceFacade = new SpaceFacade();
+
+        //Set current time
+        $space->setCreateTimestamp(time());
+        $space->setModifyTimestamp($space->getCreateTimestamp());
+        $space->setComponentModifyTimestamp($space->getCreateTimestamp());
+        $spaceMemo->setCreateTimestamp($space->getCreateTimestamp());
+        $spaceMemo->setModifyTimestamp($space->getCreateTimestamp());
+
+        // Set new space id
+        $space->setId($spaceFacade->getSpaceNextSequenceId());
+
+        // Create a space
+        $space = $spaceFacade->insertSpace($space);
+
+        // Setup the localized name of the space.
+        if (count($spaceLocalCollection) > 0) {
+            foreach ($spaceLocalCollection as $eachSpaceLocal) {
+                /** @var \grn\space\data\bean\SpaceLocal $eachSpaceLocal */
+                $eachSpaceLocal->setSpaceId($space->getId());
+                $this->setupSpaceLocal($eachSpaceLocal);
+            }
+        }
+
+        // Create a memo
+        $spaceMemo->setId($space->getId());
+        $spaceFacade->insertSpaceMemo($spaceMemo);
+
+        return $space;
+    }
+
+    /**
+     * Create space users
+     *
+     * @param \grn\space\data\bean\Space                     $space
+     * @param \grn\space\data\collection\SpaceUserCollection $spaceUserCollection
+     *
+     * @return \grn\space\data\collection\SpaceUserCollection
+     */
+    public function createSpaceUsers(
+        Space $space,
+        SpaceUserCollection $spaceUserCollection
+    ) {
+        $this->canJoinRoleAsMember($space, $spaceUserCollection);
+        //Rewrite $spaceUserCollection
+        for ($i = 0; $i < count($spaceUserCollection); $i++) {
+            /** @var \grn\space\data\bean\SpaceUser $eachSpaceUser */
+            $eachSpaceUser = $spaceUserCollection->getBean($i);
+
+            $eachSpaceUser->setSpaceId($space->getId());
+            $eachSpaceUser->setDisplayOrder($i
+                                            + 1); // DisplayOrder starts from 1
+        }
+
+        $spaceFacade = new SpaceFacade();
+        $spaceFacade->insertSpaceUserCollection($spaceUserCollection);
+
+        return $spaceUserCollection;
+    }
+
+    /**
+     * @return bool
+     */
+    protected function isAllowedRole(): bool
+    {
+        return (bool)MemberLogic::getInstance()->isAllowedRole();
+    }
+
+    /**
+     * Throw E_GRN_USER_ROLE_CAN_NOT_USED when not allowed roles are included in new space members.
+     *
+     * @param Space               $space
+     * @param SpaceUserCollection $new_space_members
+     *
+     * @return void
+     */
+    protected function canJoinRoleAsMember(
+        Space $space,
+        SpaceUserCollection $new_space_members
+    ) {
+        if ($this->isAllowedRole()) {
+            return;
+        }
+
+        $old_roles = $this->getSpaceRolesArray($space);
+
+        /** @var SpaceUser $space_member */
+        foreach ($new_space_members as $space_member) {
+            if ( ! $space_member->isTypeEqualsRole()) {
+                continue;
+            }
+            if ( ! array_key_exists($space_member->getRole(), $old_roles)) {
+                cb_throw_error(E_GRN_USER_ROLE_CAN_NOT_USED);
+            }
+        }
+    }
+
+    /**
+     * @param Space $space
+     *
+     * @return array [$role_id => $role_id ...]
+     */
+    public function getSpaceRolesArray(Space $space): array
+    {
+        $old_space_members = $this->getSpaceMembers($space);
+        $result = [];
+        /** @var SpaceUser $space_member */
+        foreach ($old_space_members as $space_member) {
+            if ($space_member->isTypeEqualsRole()) {
+                $role_id = $space_member->getMemberID();
+                $result[$role_id] = $role_id;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param Space $space
+     *
+     * @return SpaceUserCollection
+     */
+    public function getSpaceMembers(Space $space)
+    {
+        $space_service = SpaceService::getInstance();
+
+        return $space_service->getSpaceUserCollection($space->getId(),
+            cb_get_login_user_id());
+    }
+
+    /**
+     * Search for SpaceUser objects by the given condition.
+     *
+     * @param \grn\space\data\condition\SpaceUserSearchCondition $spaceUserSearchCondition
+     * @param string                                             $operationUserId
+     *
+     * @return \grn\space\data\collection\SpaceUserCollection
+     */
+    public function searchSpaceUsers(
+        SpaceUserSearchCondition $spaceUserSearchCondition,
+        $operationUserId
+    ) {
+        global $G_container_base;
+        /** @var \GRN_Uum $uum */
+        $uum = $G_container_base->getInstance('uum');
+        $item_values = $uum->getDefaultItemProperties();
+
+        $spaceFacade = new SpaceFacade();
+        if ($spaceUserSearchCondition->getSearchItemBit()
+            === SpaceUserSearchCondition::SEARCH_ITEM_NONE
+        ) {
+            $searchSpaceId = $spaceUserSearchCondition->getSearchSpaceId();
+            $orderSortArray = $spaceUserSearchCondition->getOrderSortArray();
+            $order_sort = implode('', $orderSortArray);
+            $offset = $spaceUserSearchCondition->getOffset();
+            $limit = $spaceUserSearchCondition->getLimit();
+            if (isset(self::$_cache['searchSpaceUsers'][$searchSpaceId][$order_sort][$offset][$limit])) {
+                $spaceUserCollection
+                    = self::$_cache['searchSpaceUsers'][$searchSpaceId][$order_sort][$offset][$limit];
+            } else {
+                $spaceUserCollection
+                    = $spaceFacade->searchSpaceUser($spaceUserSearchCondition,
+                    $operationUserId, $item_values);
+                self::$_cache['searchSpaceUsers'][$searchSpaceId][$order_sort][$offset][$limit]
+                    = $spaceUserCollection;
+            }
+        } else {
+            $spaceUserCollection
+                = $spaceFacade->searchSpaceUser($spaceUserSearchCondition,
+                $operationUserId, $item_values);
+        }
+
+        if ($spaceUserSearchCondition->isSearchUsersOnly()
+            && count($spaceUserCollection) > 0
+        ) {
+            $result = self::getSpaceUsersMemberOnly(
+                $spaceUserCollection,
+                $spaceUserSearchCondition->getSearchSpaceId());
+            /** @var SpaceUserCollection $userOnlyCollection */
+            $userOnlyCollection = $result['user_collection'];
+
+            return $userOnlyCollection;
+        }
+
+        return $spaceUserCollection;
+    }
+
+    /**
+     * get space user member ids.
+     *
+     * @param SpaceUserCollection $spaceUserCollection
+     * @param string              $space_id
+     *
+     * @return array user ids
+     */
+    public function getSpaceUserMemberIds(
+        SpaceUserCollection $spaceUserCollection,
+        $space_id
+    ) {
+        $result = self::getSpaceUsersMemberOnly($spaceUserCollection,
+            $space_id);
+
+        return $result['user_ids'];
+    }
+
+    /**
+     * get only users member.
+     *
+     * @param SpaceUserCollection $spaceUserCollection
+     * @param string              $spaceId
+     * @param string              $offset
+     * @param string              $limit
+     *
+     * @return array
+     */
+    private function getSpaceUsersMemberOnly(
+        SpaceUserCollection $spaceUserCollection,
+        $spaceId = null,
+        $offset = '0',
+        $limit = '18446744073709551615'
+    ) {
+        $user_ids = [];
+        $display_user_ids = [];
+        $more_display_user_ids = [];
+
+        $spaceUserOnlyCollection = new SpaceUserCollection();
+
+        if (count($spaceUserCollection) < 1) {
+            return [
+                'user_ids'              => $user_ids,
+                'display_user_ids'      => $display_user_ids,
+                'more_display_user_ids' => $more_display_user_ids,
+                'user_collection'       => $spaceUserOnlyCollection,
+            ];
+        }
+
+        $uum = cb_lwc_uum();
+
+        $columns = [];
+        $columns[] = 'tab_cb_user.col_display_name';
+        $columns[] = 'tab_cb_user.col_valid';
+        $columns[] = 'tab_cb_user.col_slash';
+
+        $user_data_array = [];
+        $user_data_array[SpaceUser::SPACE_ID] = $spaceId;
+        $user_data_array[SpaceUser::ID] = '';
+        $user_data_array[SpaceUser::MEMBER_ID] = '';
+        $user_data_array[SpaceUser::MEMBER_TYPE] = 'user';
+        $user_data_array[SpaceUser::DISPLAY_NAME] = '';
+        $user_data_array[SpaceUser::DISPLAY_ORDER] = '';
+        $user_data_array[MemberLogic::IS_INVALID_USER] = '';
+        $user_data_array[SpaceUser::SLASH_ID] = '';
+
+        $additional_condition = "tab_cb_user.col_deleted IS NULL";
+
+        $user_count = 0;
+        $duplicate_check = [];
+        /** @var $eachSpaceUser SpaceUser */
+        foreach ($spaceUserCollection as $eachSpaceUser) {
+            $member_id = $eachSpaceUser->getMemberID();
+            $member_type = $eachSpaceUser->getMemberType();
+            switch ($member_type) {
+                case MemberLogic::TYPE_USER :
+
+                    if (isset($duplicate_check[$member_id])) {
+                        continue;
+                    }
+                    $duplicate_check[$member_id] = $member_id;
+
+                    $user_count++;
+                    $user_ids[$member_id] = $member_id;
+
+                    $eachSpaceUser->setDisplayOrder($user_count);
+                    $spaceUserOnlyCollection->appendBean($eachSpaceUser);
+                    if ($offset < $user_count
+                        && count($spaceUserOnlyCollection) < $limit
+                    ) {
+                        $display_user_ids[$member_id] = $member_id;
+                    } else {
+                        $more_display_user_ids[$member_id] = $member_id;
+                    }
+                    break;
+                case MemberLogic::TYPE_ORGANIZATION :
+                    $group_users = $uum->getGroupUsersInfo($member_id,
+                        0, -1, $columns, $additional_condition);
+                    $user_data_array[SpaceUser::ID] = $member_id;
+                    foreach ($group_users as $user_id => $user_array) {
+                        if (isset($duplicate_check[$user_id])) {
+                            continue;
+                        }
+                        $duplicate_check[$user_id] = $user_id;
+
+                        $user_count++;
+                        $user_ids[$user_id] = $user_id;
+
+                        $user_data_array[SpaceUser::MEMBER_ID]
+                            = (string)$user_id;
+                        $user_data_array[SpaceUser::DISPLAY_NAME]
+                            = $user_array['col_display_name'];
+                        $user_data_array[SpaceUser::DISPLAY_ORDER]
+                            = $user_count;
+                        $user_data_array[MemberLogic::IS_INVALID_USER]
+                            = $user_array['col_valid'];
+                        $user_data_array[SpaceUser::SLASH_ID]
+                            = $user_array['col_slash'];
+
+                        $new_space_user = new SpaceUser($user_data_array,
+                            SpaceUser::NOT_CHECK_INPUT);
+                        $spaceUserOnlyCollection->appendBean($new_space_user);
+                        if ($offset < $user_count
+                            && count($spaceUserOnlyCollection) < $limit
+                        ) {
+                            $display_user_ids[$user_id] = $user_id;
+                        } else {
+                            $more_display_user_ids[$user_id] = $user_id;
+                        }
+                    }
+                    break;
+                case MemberLogic::TYPE_STATIC_ROLE :
+                    $role_users = $uum->getRoleUsersInfo($member_id,
+                        null, 0, -1, $columns);
+                    $user_data_array[SpaceUser::ID] = $member_id;
+                    foreach ($role_users as $user_id => $user_array) {
+                        if (isset($duplicate_check[$user_id])) {
+                            continue;
+                        }
+                        $duplicate_check[$user_id] = $user_id;
+
+                        $user_count++;
+                        $user_ids[$user_id] = $user_id;
+
+                        $user_data_array[SpaceUser::MEMBER_ID]
+                            = (string)$user_id;
+                        $user_data_array[SpaceUser::DISPLAY_NAME]
+                            = $user_array['col_display_name'];
+                        $user_data_array[SpaceUser::DISPLAY_ORDER]
+                            = $user_count;
+                        $user_data_array[MemberLogic::IS_INVALID_USER]
+                            = $user_array['col_valid'];
+                        $user_data_array[SpaceUser::SLASH_ID]
+                            = $user_array['col_slash'];
+
+                        $new_space_user = new SpaceUser($user_data_array,
+                            SpaceUser::NOT_CHECK_INPUT);
+                        $spaceUserOnlyCollection->appendBean($new_space_user);
+
+                        if ($offset < $user_count
+                            && count($spaceUserOnlyCollection) < $limit
+                        ) {
+                            $display_user_ids[$user_id] = $user_id;
+                        } else {
+                            $more_display_user_ids[$user_id] = $user_id;
+                        }
+                    }
+                    break;
+            }
+
+        }
+        $spaceUserOnlyCollection->setCountNoLimit($user_count);
+
+        $result = [
+            'user_ids'              => $user_ids,
+            'display_user_ids'      => $display_user_ids,
+            'more_display_user_ids' => $more_display_user_ids,
+            'user_collection'       => $spaceUserOnlyCollection,
+        ];
+
+        return $result;
+    }
+
+    /**
+     * Get a specific Space
+     *
+     * @param string $spaceId
+     * @param string $languageCode
+     *
+     * @return \grn\space\data\bean\Space
+     * @throws \grn\space\common\exception\GrnDataNotFoundException
+     */
+    public function getSpace($spaceId, $languageCode)
+    {
+        if (isset(self::$_cache['getSpace'][$spaceId][$languageCode])) {
+            return self::$_cache['getSpace'][$spaceId][$languageCode];
+        }
+
+        $spaceFacade = new SpaceFacade();
+        $ret = $spaceFacade->getSpace($spaceId, $languageCode);
+
+        self::$_cache['getSpace'][$spaceId][$languageCode] = $ret;
+
+        return $ret;
+    }
+
+    /**
+     * Get a specific Space
+     *
+     * @param string $categoryId
+     * @param string $languageCode
+     *
+     * @return \grn\space\data\bean\Space
+     * @throws \grn\space\common\exception\GrnDataNotFoundException
+     */
+    public function getSpaceByApplicationCategoryId($categoryId, $languageCode)
+    {
+        if (isset(self::$_cache['getSpaceByApplicationCategoryId'][$categoryId][$languageCode])) {
+            return self::$_cache['getSpaceByApplicationCategoryId'][$categoryId][$languageCode];
+        }
+
+        $spaceFacade = new SpaceFacade();
+        $ret
+            = $spaceFacade->getSpaceByApplicationCategoryId($categoryId,
+            $languageCode);
+
+        self::$_cache['getSpaceByApplicationCategoryId'][$categoryId][$languageCode]
+            = $ret;
+
+        return $ret;
+    }
+
+    /**
+     * Get a specific Space
+     *
+     * @param string     $threadId
+     * @param string     $languageCode
+     * @param bool|FALSE $isNotThrow Throw error if $isNotThrow is FALSE and error occurs.
+     *
+     * @return \grn\space\data\bean\Space|null
+     * @throws \grn\space\common\exception\GrnDataNotFoundException
+     */
+    public function getSpaceByThreadId(
+        $threadId,
+        $languageCode,
+        $isNotThrow = false
+    ) {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->getSpaceByThreadId($threadId, $languageCode,
+            $isNotThrow);
+    }
+
+    /**
+     * Get a specific Space
+     *
+     * @param string     $todoId
+     * @param string     $languageCode
+     * @param bool|FALSE $isNotThrow Throw error if $isNotThrow is FALSE
+     *
+     * @return \grn\space\data\bean\Space|null
+     * @throws \grn\space\common\exception\GrnDataNotFoundException
+     */
+    public function getSpaceByTodoId(
+        $todoId,
+        $languageCode,
+        $isNotThrow = false
+    ) {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->getSpaceByTodoId($todoId, $languageCode,
+            $isNotThrow);
+    }
+
+    /**
+     * Get SpaceMemo
+     *
+     * @param string $spaceId
+     *
+     * @return \grn\space\data\bean\SpaceMemo
+     */
+    public function getSpaceMemo($spaceId)
+    {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->getSpaceMemo($spaceId);
+    }
+
+    /**
+     * Get SpaceMemo with its status whether it is open or closed.
+     *
+     * @param string $spaceId Space ID
+     * @param string $userId  User ID
+     *
+     * @return \grn\space\data\bean\SpaceMemo
+     */
+    public function getSpaceMemoWithStatus($spaceId, $userId)
+    {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->getSpaceMemoWithStatus($spaceId, $userId);
+    }
+
+    /**
+     * Update SpaceMemo
+     *
+     * @param \grn\space\data\bean\SpaceMemo $spaceMemo
+     *
+     * @return \grn\space\data\bean\SpaceMemo
+     */
+    public function updateSpaceMemo(SpaceMemo $spaceMemo)
+    {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->updateSpaceMemo($spaceMemo);
+    }
+
+    /**
+     * Toggle the memo field
+     *
+     * @param \grn\space\data\bean\SpaceMemoOpenStatus $spaceMemoOpenStatus
+     *
+     * @return \grn\space\data\bean\SpaceMemoOpenStatus
+     *
+     */
+    public function toggleSpaceMemoOpenStatus(
+        SpaceMemoOpenStatus $spaceMemoOpenStatus
+    ) {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->toggleSpaceMemoOpenStatus($spaceMemoOpenStatus);
+    }
+
+    /**
+     * Open the memo field for all users
+     *
+     * @param string $spaceId
+     */
+    public function openMemoFieldForAllUsers($spaceId)
+    {
+        $spaceFacade = new SpaceFacade();
+        $spaceFacade->deleteSpaceMemoOpenStatusBySpaceId($spaceId);
+    }
+
+    /**
+     * Search for the spaces
+     *
+     * This method uses the following methods of $spaceSearchCondition
+     * - getLanguageCode
+     * - getOrderSortArray
+     * - getSearchCategoryId
+     *
+     * @param \grn\space\data\condition\SpaceSearchCondition $spaceSearchCondition
+     *
+     * @return \grn\space\data\collection\SpaceCollection
+     */
+    public function searchSpace(SpaceSearchCondition $spaceSearchCondition)
+    {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->searchSpace($spaceSearchCondition);
+    }
+
+    /**
+     * Get spaces
+     *
+     * @param string $spaceCode
+     * @param string $languageCode
+     *
+     * @throws \grn\space\common\exception\GrnDatabaseException     Any error in the database.
+     * @return \grn\space\data\collection\SpaceCollection
+     */
+    public function getSpaceCollectionBySpaceCode($spaceCode, $languageCode)
+    {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->selectSpaceListBySpaceCode($spaceCode,
+            $languageCode);
+    }
+
+    /**
+     * Set up the number of the members belonging to the each space of $spaceCollection
+     * After calculating the number then, this method update $spaceCollection
+     *
+     * @param \grn\space\data\collection\SpaceCollection $spaceCollection
+     *
+     * @return \grn\space\data\collection\SpaceCollection
+     *
+     */
+    public function appendSpaceUserCount(SpaceCollection $spaceCollection)
+    {
+        assert('count($spaceCollection) > 0');
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->appendSpaceUserCount($spaceCollection);
+    }
+
+    /**
+     * Insert a record into tab_grn_space_space_local.
+     * When the record is duplicated, this method updates col_name value of the record.
+     *
+     * The returned value is a little tricky.
+     * 0 : There had been the same record already so that no record was changed.
+     * 1 : There had been no record whose col_category and col_language were the same with $categoryLocal so that a new record was inserted.
+     * 2 : There had been the record whose col_category and col_language were the same with $categoryLocal so that only col_category_name of the record was updated.
+     *
+     * @param \grn\space\data\bean\SpaceLocal $spaceLocal
+     *
+     * @return boolean the number of affected rows.
+     * @throws \grn\space\common\exception\GrnInvalidArgumentException
+     */
+    public function setupSpaceLocal(SpaceLocal $spaceLocal)
+    {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->insertOnDuplicateUpdateSpaceLocal($spaceLocal);
+    }
+
+    /**
+     * Select SpaceLocal by Space ID
+     *
+     * @param string $spaceId
+     *
+     * @return \grn\space\data\collection\SpaceLocalCollection
+     */
+    public function getSpaceLocalCollection($spaceId)
+    {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->searchSpaceLocalBySpaceId($spaceId);
+    }
+
+    /**
+     * Update Space
+     *
+     * @param \grn\space\data\bean\Space $space
+     *
+     * @return \grn\space\data\bean\Space
+     *
+     */
+    public function modifySpace(Space $space)
+    {
+        //Set current time
+        $space->setModifyTimestamp(time());
+        $space->setComponentModifyTimestamp($space->getModifyTimestamp());
+
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->updateSpace($space);
+    }
+
+    /**
+     * Update Space component modify timestamp
+     *
+     * @param \grn\space\data\bean\Space $space Space
+     *
+     * @throws \grn\space\common\exception\GrnDatabaseException     Any error in the database.
+     * @return \grn\space\data\bean\Space
+     */
+    public function modifySpaceComponentModifyTimestamp(Space $space)
+    {
+        $space->setComponentModifyTimestamp(time());
+
+        $spaceFacade = new SpaceFacade();
+        $spaceFacade->updateSpaceComponentModifyTimestamp($space);
+
+        return $space;
+    }
+
+    /**
+     * Insert/Modify SpaceLocal
+     *
+     * @param \grn\space\data\bean\Space                      $space
+     * @param \grn\space\data\collection\SpaceLocalCollection $spaceLocalCollection
+     *
+     * @return bool
+     */
+    public function modifySpaceLocal(
+        Space $space,
+        SpaceLocalCollection $spaceLocalCollection
+    ) {
+        $spaceFacade = new SpaceFacade();
+        /** @var \grn\space\data\bean\SpaceLocal $eachSpaceLocal */
+        foreach ($spaceLocalCollection as $eachSpaceLocal) {
+            $eachSpaceLocal->setSpaceId($space->getId());
+            $spaceFacade->insertOnDuplicateUpdateSpaceLocal($eachSpaceLocal);
+        }
+
+        return true;
+    }
+
+    /**
+     * Delete SpaceLocal
+     *
+     * @param \grn\space\data\collection\SpaceLocalCollection $spaceLocalCollection
+     *
+     * @return bool
+     *
+     */
+    public function deleteSpaceLocal(SpaceLocalCollection $spaceLocalCollection)
+    {
+        $spaceFacade = new SpaceFacade();
+        $languageTableArray = $spaceFacade->getLanguageTableArray();
+
+        foreach ($spaceLocalCollection as $eachSpaceLocal) {
+            /** @var \grn\space\data\bean\SpaceLocal $eachSpaceLocal */
+            $spaceFacade->deleteSpaceLocal($eachSpaceLocal,
+                $languageTableArray[$eachSpaceLocal->getLanguageCode()]);
+        }
+
+        return true;
+    }
+
+    /**
+     * Insert/Modify SpaceUser
+     *
+     * @param \grn\space\data\collection\SpaceUserCollection $spaceUserCollection
+     *
+     * @return bool
+     */
+    public function modifySpaceUser(SpaceUserCollection $spaceUserCollection)
+    {
+        $spaceFacade = new SpaceFacade();
+        foreach ($spaceUserCollection as $eachSpaceUser) {
+            $spaceFacade->insertOnDuplicateUpdateSpaceUser($eachSpaceUser);
+        }
+
+        return true;
+    }
+
+    /**
+     * Delete SpaceUser
+     *
+     * @param \grn\space\data\collection\SpaceUserCollection $spaceUserCollection
+     *
+     * @return boolean
+     * @throws \grn\space\common\exception\GrnDataNotFoundException
+     */
+    public function deleteSpaceUser(SpaceUserCollection $spaceUserCollection)
+    {
+        $spaceFacade = new SpaceFacade();
+        foreach ($spaceUserCollection as $eachSpaceUser) {
+            $spaceFacade->deleteSpaceUser($eachSpaceUser);
+        }
+
+        return true;
+    }
+
+    /**
+     * Delete SpaceUser All
+     *
+     * @param string $spaceId
+     *
+     * @return void
+     * @throw GrnDataNotFoundException
+     */
+    public function deleteSpaceUserAll($spaceId)
+    {
+        $spaceFacade = new SpaceFacade();
+        $spaceFacade->deleteSpaceUserAll($spaceId);
+    }
+
+    /**
+     * Delete Space
+     *
+     * @param string $spaceId
+     *
+     * @return boolean Always true
+     * @throw GrnDataNotFoundException
+     */
+    public function deleteSpace($spaceId)
+    {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->deleteSpace($spaceId);
+    }
+
+    /**
+     * Get all the categories used by all the application related to the Space
+     *
+     * @param string $spaceId
+     *
+     * @return \grn\space\common\data\collection\CategoryCollection
+     */
+    public function getApplicationCategoryListBySpaceId($spaceId)
+    {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->selectApplicationCategoryListBySpaceId($spaceId);
+    }
+
+    /**
+     * Get space list with the disk space which is consumed by each space.
+     *
+     * @param \grn\space\data\condition\SpaceWithFileSearchCondition $condition
+     *
+     * @return \grn\space\data\collection\SpaceCollection
+     */
+    public function getSpaceListWithFileUsage(
+        SpaceWithFileSearchCondition $condition
+    ) {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->selectSpaceListWithFileUsage($condition);
+    }
+
+    /**
+     *
+     * @param \grn\space\data\bean\MemberOpenStatus $memberOpenStatus
+     *
+     * @return boolean
+     */
+    public function isMemberFieldOpen(MemberOpenStatus $memberOpenStatus)
+    {
+        $spaceFacade = new SpaceFacade();
+
+        // When there is a record, the field is regarded closed
+        return ! $spaceFacade->isExistMemberOpenStatus($memberOpenStatus);
+    }
+
+    /**
+     *
+     * @param \grn\space\data\bean\MemberOpenStatus $memberOpenStatus
+     *
+     * @return \grn\space\data\bean\MemberOpenStatus
+     */
+    public function closeMemberField(MemberOpenStatus $memberOpenStatus)
+    {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->insertMemberOpenStatus($memberOpenStatus);
+    }
+
+    /**
+     *
+     * @param \grn\space\data\bean\MemberOpenStatus $memberOpenStatus
+     *
+     */
+    public function openMemberField(MemberOpenStatus $memberOpenStatus)
+    {
+        $spaceFacade = new SpaceFacade();
+        $spaceFacade->deleteMemberOpenStatus($memberOpenStatus);
+    }
+
+    /**
+     * @return \grn\space\data\collection\SpaceCollection
+     */
+    public function getAllSpaceForFtsFullIndexer()
+    {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->getAllSpaceForFtsFullIndexer();
+    }
+
+    /**
+     * @param int $startId
+     * @param int $endId
+     * @param int $maxLength
+     *
+     * @return array
+     */
+    public function getAllSpaceMemoForFtsFullIndexer(
+        $startId,
+        $endId,
+        $maxLength
+    ) {
+        $spaceFacade = new SpaceFacade();
+
+        return $spaceFacade->getAllSpaceMemoForFtsFullIndexer($startId, $endId,
+            $maxLength);
+    }
+
+    /**
+     * @param  string $category_id
+     * @param  string $user_id
+     * @param  int    $expiration_type
+     *
+     * @return string[]
+     */
+    public function getSpaceIdsRecursively(
+        $category_id,
+        $user_id,
+        $expiration_type = null
+    ) {
+        $categoryFacade = new CategoryFacade();
+        $category_ids = array_merge([$category_id],
+            $categoryFacade->selectCategoryIdsRecursively([$category_id]));
+        $spaceFacade = new SpaceFacade();
+        $user_group_ids = self::getUserGroupIds($user_id);
+        $user_role_ids = self::getUserRoleIds($user_id);
+
+        return $spaceFacade->selectSpaceIdsByCategoryIds($category_ids,
+            $user_id, $user_group_ids, $user_role_ids,
+            $expiration_type);
+    }
+
+    /**
+     *
+     * @param string $user_id
+     *
+     * @return string user group ids
+     */
+    public function getUserGroupIds($user_id)
+    {
+        $user_group_ids = [];
+        if ($user_id) {
+            global $G_container_base;
+            $uum = $G_container_base->getInstance('uum');
+            $user_groups_info = $uum->getUserGroupsInfo($user_id);
+
+            foreach ($user_groups_info as $info) {
+                $user_group_ids[$info['_id']] = $info['_id'];
+            }
+        }
+
+        return $user_group_ids;
+    }
+
+    /**
+     *
+     * @param string $user_id
+     *
+     * @return string user role ids
+     */
+    public function getUserRoleIds($user_id)
+    {
+        $user_role_ids = [];
+        if ($user_id) {
+            global $G_container_base;
+            $uum = $G_container_base->getInstance('uum');
+            $user_roles_info = $uum->getUserRolesInfo($user_id);
+
+            $user_role_ids = [];
+            foreach ($user_roles_info as $info) {
+                $user_role_ids[$info['_id']] = $info['_id'];
+            }
+        }
+
+        return $user_role_ids;
+    }
+
+    /**
+     * @return bool
+     */
+    public function isAllowedToUseUnlimitedExpirationDate()
+    {
+        $space_system_logic = new SpaceSystemLogic();
+
+        return $space_system_logic->getIsUnlimitedExpirationDate();
+    }
+
+    /**
+     * @return bool
+     */
+    public function isDefaultUnlimitedExpirationDate()
+    {
+        $spaceSystemLogic = new SpaceSystemLogic();
+
+        return $spaceSystemLogic->getDefaultExpirationDateType();
+    }
+
+    /**
+     * @return int
+     */
+    public function getDefaultDaysExpirationDate()
+    {
+        $spaceSystemLogic = new SpaceSystemLogic();
+        $default_days_public_limited
+            = $spaceSystemLogic->getDefaultDaysExpirationDate();
+
+        return $default_days_public_limited;
+    }
+
+    /**
+     * @return \CB_TimeStampEx
+     */
+    public function getDefaultDateExpirationDate()
+    {
+        $time_stampEx = new \CB_TimeStampEx();
+        $time_stampEx->add(new \CB_DateTimeSpan(86400
+                                                * $this->getDefaultDaysExpirationDate()));
+        if ($time_stampEx->unix_ts
+            > 2145830399
+        ) //The timestamp value of December 30, 2037 23:59:59
+        {
+            $time_stampEx->unix_ts
+                = 2145744000;  //The timestamp value of December 30, 2037 00:00:00
+        }
+
+        return $time_stampEx;
+    }
+
+    /**
+     * @param CB_DateTime $limited_datetime
+     *
+     * @return bool
+     */
+    public function isValidExpirationDate($limited_datetime)
+    {
+        if ( ! cb_date_validate_datetime($limited_datetime)) {
+            return false;
+        }
+        $expiration_date = new \CB_TimeStampEx();
+        $expiration_date->setDateTime($limited_datetime);
+
+        $now = new \CB_TimeStampEx();
+        if ($expiration_date->compare($now) <= 0) {
+            return false;
+        }
+
+        $max_datetime_expiration_date = new \CB_DateTime();
+        $max_datetime_expiration_date->parse("2037-12-30 23:59:59");
+        if ($expiration_date->getDateTime()
+                            ->compare($max_datetime_expiration_date) > 0
+        ) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Filter User IDs do not have permission in space
+     *
+     * @param array $user_ids User ID list
+     * @param int   $space_id Space ID
+     *
+     * @return array User IDs
+     */
+    public function filterUsersNotHavingPermission(
+        int $space_id,
+        array $user_ids
+    ) {
+        $mention_user_ids_filtered
+            = AppAccess::filterUserIdsInternalAccessByAppId($user_ids,
+            'space');
+        $space_logic = SpaceLogic::getInstance();
+        $space = $space_logic->getSpace($space_id,
+            LanguageStatus::STANDARD_LANGUAGE_CODE);
+        $is_public = $space->isPublic();
+        if ( ! $is_public) {
+            $space_members = $space_logic->getSpaceMembers($space);
+            $space_user_ids = $space_members->getUserIds();
+            $mention_user_ids_filtered
+                = array_intersect($mention_user_ids_filtered,
+                $space_user_ids);
+        }
+        $no_permission_user_ids = array_diff($user_ids,
+            $mention_user_ids_filtered);
+
+        return $no_permission_user_ids;
+    }
+
+    /**
+     * Get list Organization ID of space
+     *
+     * @param Space $space
+     *
+     * @return array [$group_id => $group_id ...]
+     */
+    public function getSpaceOrganizationIds(Space $space): array
+    {
+        $space_members = $this->getSpaceMembers($space);
+        $result = [];
+        /** @var SpaceUser $space_member */
+        foreach ($space_members as $space_member) {
+            if ($space_member->isTypeEqualsOrganization()) {
+                $organization_id = $space_member->getMemberID();
+                $result[$organization_id] = $organization_id;
+            }
+        }
+
+        return $result;
+    }
+}

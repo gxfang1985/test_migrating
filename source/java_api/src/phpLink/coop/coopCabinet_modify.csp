@@ -1,0 +1,165 @@
+<?php
+
+use grn\fts\Application as FtsApplication;
+use grn\fts\cabinet\IndexService;
+
+/*
+* Created on 2007-03-23
+*
+* ファイルの情報変更
+* 
+* ■受信データ仕様 
+* 名前       | 必須 |   値    | 個数 | 備考
+* ----------------------------|------------------------------------------------------------------------
+* fid        |  ○  | 数値    |  1   | ファイルID
+* title      |  ×  | 文字列  |  1   | タイトル (改行なし、100文字まで)
+* ver        |  ×  | 数値    |  1   | バージョン管理
+* memo       |  ×  | 文字列  |  1   | ファイルの説明
+* registrant |  ×  | 文字列  |  1   | 更新者 のログインアカウント
+*            |      |         |      | →coopLogin.cspにて、LoginAsを行う
+* app        |  ○  | 固定値  |  1   | "cabinet"
+*            |      |         |      | →coopLogin.cspにて、各アプリケーションオブジェクトの生成時使用*
+* ■機能
+* ・ファイル管理上のファイル情報を変更する ( ファイルの実体以外のタイトル・バージョン管理値・ファイルの説明）
+* ・[受信データ]を受取り、指定されたファイルIDのファイル情報を変更する
+* ・受信データが存在しない項目については、""扱いとする(バージョン管理値については、 "管理しない" 扱い)
+* ・全項目更新とする ( 項目単位での更新はしない）
+* ・以下のシステム設定値については、画面と同じく判定を行うものとする
+*   フォルダに対するアクセス権      →フォルダに対する書込権限がない場合はエラー ( GRN_CBNT_17009 )
+*  grn.exe/cabinet/command_modify
+*/
+
+global $G_INPUT;
+
+// coopLogin.cspのファイル存在
+if ( ! is_file('coopLogin.csp')) {
+    global $G_state_set;
+    $G_state_set->set('copyright_should_be_written', false);
+    $G_state_set->set('html_should_be_closed', false);
+
+    include_once("error_code.csp");
+
+    header("X-Cybozu-Error:" . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Header Data><CR><LF>");
+    print("1," . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Footer Data><CR><LF>");
+    print("ERROR<CR><LF>");
+    cb_safe_exit();
+}
+
+//ログイン認証
+require('coopLogin.csp');
+unset($uum);
+
+// 受信データチェック//////////////////////////////////////
+
+$error_msg = null;
+// $G_INPUT,$_FILES のチェック
+if ( ! array_key_exists('fid', $G_INPUT) || ! is_numeric($G_INPUT['fid'])) {
+    $error_msg = 'fid';
+} elseif (array_key_exists('ver', $G_INPUT) && ! is_numeric($G_INPUT['ver'])) {
+    $error_msg = 'ver';
+}
+// エラーメッセージをリターン
+if ($error_msg) {
+    include_once("error_code.csp");
+    api_response_data(null, E_API_CABINET_PARAM_WRONG . "[" . $error_msg . "]");
+    cb_safe_exit();
+}
+unset($error_msg);
+
+// 任意パラムの初期値セット
+if ( ! array_key_exists('ver', $G_INPUT)) {
+    $G_INPUT['ver'] = "0";
+}
+if ( ! array_key_exists('title', $G_INPUT)) {
+    $G_INPUT['title'] = "";
+}
+if ( ! array_key_exists('memo', $G_INPUT)) {
+    $G_INPUT['memo'] = "";
+}
+
+// 改行コード削除 101文字以降切捨て
+$G_INPUT['title'] = mb_substr(preg_replace('/\x0D\x0A|\x0D|\x0A/', '',
+    $G_INPUT['title']), 0, 100);
+
+// 2007-05-08 ファイル情報更新の上限値-仕様変更 (269） 
+// 指定値 == oldversion の場合は、変更しない
+if ($G_INPUT['ver'] > 10 || $G_INPUT['ver'] == -1) {
+    $G_INPUT['ver'] = -1;
+} elseif ($G_INPUT['ver'] < -1) {
+    $G_INPUT['ver'] = 0;
+}
+
+
+///////////////////////////////////////////////////////////
+
+// 2007.04.23 アクセス権メッセージが不正な箇所が存在する 不具合管理(238)
+// ファイル取得
+/** @var GRN_Cabinet $G_application */
+if ( ! ($file =& $G_application->getFile($G_login, $G_INPUT['fid'],
+    GRN_CABINET_ACCESS_R))
+) {
+    cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+}
+if ( ! ($file =& $G_application->getFile($G_login, $G_INPUT['fid'],
+    GRN_CABINET_ACCESS_W))
+) {
+    cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+}
+
+//start 2008/01/15 G2.5対応 
+//不具合№286対応 ファイル情報取得で、ファイルID 1 指定時のエラー不正
+if ( ! $folder =& $G_application->getFileFolder($file)) {
+    cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+}
+//ゴミ箱ファイルを省く
+if ($file->isInTrash())       // Huy added
+{
+    cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+}
+//end 2008/01/15 G2.5対応
+
+$file->setTitle($G_INPUT['title']);
+$file->setDescription($G_INPUT['memo']);
+
+
+// 2007-05-08 ファイル情報更新の上限値-仕様変更 (269） 
+// 指定値 == oldversion の場合は、変更しない
+
+// 値が異なる場合のみ 更新する (→これは元から)
+if ($G_INPUT['ver'] != $file->getMaxVersion()) {
+
+    $config = GRN_FileManagerConfig::getInstance();
+    $system_max_version = $config->getMaxVersion();
+    $ver = $G_INPUT['ver'];
+
+    // システム設定が無制限でない 且つ,(指定値 > システム設定値 又は 指定値 == 無制限) の場合は、
+    // システム設定の上限値 をセットする
+    if ($system_max_version != -1
+        && ($ver > $system_max_version || $ver == -1)
+    ) {
+        $ver = $system_max_version;
+    }
+
+    if ($ver != $file->getMaxVersion()) {
+        $file->setMaxVersion($ver);
+    }
+
+}
+
+if (FtsApplication::isAvailable()) {
+    $searchService = new IndexService();
+    $searchService->updateFileIndex($file);
+}
+// Write log: modify file information 
+require_once('cabinet/inspection.csp');
+$inspection = GRN_Cabinet_Inspection::getInstance();
+//start 2008/01/15 G2.5対応
+$inspection->writeLogFile('modify', $file, $folder->getOID());
+//end 2008/01/15 G2.5対応
+
+
+//ファイルIDを戻す
+api_response_data($file->getOID());
+

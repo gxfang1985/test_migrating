@@ -1,0 +1,412 @@
+<?php
+
+use grn\grn\access\service\AppAccess;
+use grn\system\sandbox\GRN_ControllerUtilSandbox;
+use grn\system\sandbox\GRN_Uum_SearchSandbox;
+use grn\system\sandbox\SandboxConstants;
+
+/**
+ *
+ * @param string      $org_id used.
+ * @param string      $search_text
+ * @param bool|string $system_flg
+ * @param bool|string $sensitive
+ *
+ * @param bool        $cellular
+ *
+ * @return string
+ */
+function grn_get_user_info_search_condition(
+    $org_id,
+    $search_text,
+    $system_flg = false,
+    $sensitive = false,
+    $cellular = false
+) {
+    require_once('fw/string_util.csp');
+
+    global $G_container_base;
+    $dbconn = $G_container_base->getInstance('dbconn');
+    $query = 'LIKE ';
+    if ($sensitive) {
+        $query .= 'BINARY ';
+    }
+
+    $uum = $G_container_base->getInstance('uum');
+    $item_values = [];
+    $item_values = $uum->getDefaultItemProperties();
+
+    $texts = cb_parse_search_text($search_text);
+    $conditions = [];
+    foreach ($texts as $text) {
+        if (0 < strlen($text)) {
+            $format = cb_queryf($dbconn,
+                " (tab_cb_user.col_display_name @S '%@L%') ", $query, $text);
+            if ( ! $cellular) {
+                $format .= cb_queryf($dbconn,
+                    " OR (tab_cb_user.col_nickname @S '%@L%') ", $query, $text);
+            }
+            if ($system_flg) {
+                $format .= cb_queryf($dbconn,
+                    "OR (tab_cb_user.col_foreign_key @S '%@L%') ", $query,
+                    $text);
+                if ($item_values['sort_key']['use']) {
+                    $format .= cb_queryf($dbconn,
+                        "OR (tab_cb_user.col_normalized_sort_key @S '%@L%') ",
+                        $query, cb_normalize_sort_key($text));
+                }
+                if ($item_values['email_address']['use']) {
+                    $format .= cb_queryf($dbconn,
+                        "OR (tab_cb_user.col_email_address @S '%@L%') ", $query,
+                        $text);
+                }
+                if ($item_values['post']['use']) {
+                    $format .= cb_queryf($dbconn,
+                        "OR (tab_grn_userinfo.col_post @S '%@L%') ", $query,
+                        $text);
+                }
+            } else {
+                if ($item_values['foreign_key']['show']) {
+                    $format .= cb_queryf($dbconn,
+                        "OR (tab_cb_user.col_foreign_key @S '%@L%') ", $query,
+                        $text);
+                }
+                if ($item_values['sort_key']['use']
+                    && $item_values['sort_key']['show']
+                ) {
+                    $format .= cb_queryf($dbconn,
+                        "OR (tab_cb_user.col_normalized_sort_key @S '%@L%') ",
+                        $query, cb_normalize_sort_key($text));
+                }
+                if ($item_values['email_address']['use']
+                    && $item_values['email_address']['show']
+                ) {
+                    $format .= cb_queryf($dbconn,
+                        "OR (tab_cb_user.col_email_address @S '%@L%') ", $query,
+                        $text);
+                }
+                if ($item_values['post']['use']
+                    && $item_values['post']['show']
+                ) {
+                    $format .= cb_queryf($dbconn,
+                        "OR (tab_grn_userinfo.col_post @S '%@L%') ", $query,
+                        $text);
+                }
+            }
+
+            $extend_condition = 'r.col_user=tab_cb_user._id'
+                                . ' AND i.col_use=1 AND i.col_type<>"password"';
+            if ( ! $system_flg) {
+                $extend_condition .= ' AND i.col_show=1';
+            }
+            $extend_condition .= ' AND i.col_search=1';
+
+            $extend_format
+                = "OR ((SELECT GROUP_CONCAT(r.col_string SEPARATOR ' ')"
+                  . " FROM tab_grn_itemuserrelation r INNER JOIN tab_grn_useritem i ON r.col_item=i._id"
+                  . " WHERE " . $extend_condition . ") @S '%@L%')";
+
+            $format .= cb_queryf($dbconn, $extend_format, $query, $text);
+
+            $format = "( " . $format . " )";
+            $conditions[] = $format;
+        }
+    }
+    $condition = implode(' AND ', $conditions);
+
+    return $condition;
+}
+
+/**
+ * @param     $org_id
+ * @param     $condition
+ * @param int $sandbox
+ *
+ * @return bool|int
+ */
+function grn_get_user_info_search_count(
+    $org_id,
+    $condition,
+    $sandbox = SandboxConstants::NO_SANDBOX_MODE
+) {
+    require_once('fw/string_util.csp');
+    if (strlen(cb_trim($condition)) < 1) {
+        return 0;
+    }
+
+    if ($sandbox === SandboxConstants::NO_SANDBOX_MODE) {
+        require_once('grn/uum_search.csp');
+        $uum_search = new GRN_Uum_Search();
+    } else {
+        $uum_search = new GRN_Uum_SearchSandbox();
+    }
+
+    if (is_array($org_id)) {
+        return $uum_search->getGroupsUserInfoCount($org_id, $condition);
+    } elseif (0 == strlen($org_id)) {
+        return $uum_search->getUserInfoCountWithCondition($condition);
+    } elseif (0 > $org_id) {
+        return $uum_search->getNoGroupUserInfoCount($condition);
+    } else {
+        return $uum_search->getGroupUserInfoCount($org_id, $condition);
+    }
+}
+
+/**
+ * @param      $org_id
+ * @param      $condition
+ * @param      $navigation_info
+ * @param bool $cellular
+ * @param null $app_id
+ * @param int  $sandbox
+ *
+ * @return array
+ */
+function &grn_search_user_info(
+    $org_id,
+    $condition,
+    & $navigation_info,
+    $cellular = false,
+    $app_id = null,
+    $sandbox = SandboxConstants::NO_SANDBOX_MODE
+) {
+    require_once('fw/string_util.csp');
+    if (strlen(cb_trim($condition)) < 1) {
+        $ret = [];
+
+        return $ret;
+    }
+
+    if ($sandbox === SandboxConstants::NO_SANDBOX_MODE) {
+        require_once('grn/uum_search.csp');
+        $uum_search = new GRN_Uum_Search();
+    } else {
+        $uum_search = new GRN_Uum_SearchSandbox();
+    }
+
+    $offset = $navigation_info['offset'];
+    $limit = $navigation_info['limit'];
+    $order_by = 'tab_cb_user.col_position, tab_cb_user._id';
+    if (is_array($org_id)) {
+        $user_rows = $uum_search->getGroupsUserInfos($org_id, $offset, $limit,
+            $order_by, $condition);
+    } elseif (0 == strlen($org_id)) {
+        $user_rows = $uum_search->getUserInfos($offset, $limit, $order_by,
+            $condition);
+    } elseif (-2 == $org_id) {
+        // 使用停止中のユーザー
+        $user_rows = $uum_search->getDeactiveUserInfos($offset, $limit,
+            $order_by, $condition);
+    } elseif (0 > $org_id) {
+        // 組織に未所属のユーザー
+        $user_rows = $uum_search->getNoGroupUserInfos($offset, $limit,
+            $order_by, $condition);
+    } elseif (mb_substr($org_id, 0, 1) == 'm') {
+        // MyGroup
+        $my_group_id = mb_substr($org_id, 1);
+        $user_rows = $uum_search->getMyGroupUserInfos($my_group_id, $offset,
+            $limit, $order_by, $condition);
+    } else {
+        $user_rows = $uum_search->getGroupUserInfos($org_id, $offset, $limit,
+            $order_by, $condition);
+    }
+    if (false === $user_rows) {
+        cb_throw_error(E_GRN_GROUP_NOT_FOUND);
+    }
+
+    $uum = cb_lwc_uum();
+    $login_user = $uum->getLoginUser();
+
+    require_once("grn/controller.csp");
+    $keys = array_keys($user_rows);
+    if ($sandbox === SandboxConstants::NO_SANDBOX_MODE) {
+        $users_info
+            = GRN_ControllerUtil::getUserInfoToShowUserName(array_keys($user_rows),
+            $login_user, $app_id);
+        $uum->loadAndCache($keys);
+    } else {
+        $users_info
+            = GRN_ControllerUtilSandbox::getUserInfoToShowUserName(array_keys($user_rows),
+            $login_user, $app_id);
+    }
+
+    $user_list = [];
+    $login_id = $login_user->getOID();
+    foreach ($keys as $id) {
+        if ($app_id != null
+            && (array_key_exists('col_using_app', $users_info[$id])
+                && is_null($users_info[$id]['col_using_app']))
+        ) {
+            continue;
+        }
+        /** @var CB_User $user */
+        $user = $user_rows[$id];
+
+        if ($sandbox === SandboxConstants::NO_SANDBOX_MODE) {
+            $display_name = ($cellular)
+                ? $user->get('display_name')
+                : GRN_ControllerUtil::getUserNameText($login_id, $id,
+                    $users_info);
+        } else {
+            $display_name
+                = GRN_ControllerUtilSandbox::getUserNameText($login_id, $id,
+                $users_info);
+        }
+
+        $user_list[$id] = [
+            'uid'          => $id,
+            'display_name' => $display_name,
+            'position'     => $users_info[$id]['col_position'],
+            'foreign_key'  => $user->get('foreign_key'),
+            'valid'        => is_null($users_info[$id]['col_valid']) ? true
+                : false,
+            //GRN35-440
+            'row'          => $user,
+            //GRN35-440
+        ];
+    }
+
+    return $user_list;
+}
+
+/**
+ * @param string      $org_id
+ * @param string      $condition
+ * @param array       $navigation_info
+ * @param bool        $cellular
+ * @param array       $params
+ * @param int|null    $number_on_page
+ * @param string|null $app_id
+ *
+ * @return array
+ */
+function &grn_search_user_info_by_application(
+    $org_id,
+    $condition,
+    & $navigation_info,
+    $cellular = false,
+    $params,
+    $number_on_page = null,
+    $app_id = null
+) {
+    require_once('fw/string_util.csp');
+    if (strlen(cb_trim($condition)) < 1) {
+        $ret = [];
+        $navigation_info = grn_get_user_navigation_info(0, $params,
+            $number_on_page);
+
+        return $ret;
+    }
+
+    require_once('grn/uum_search.csp');
+    $uum_search = new GRN_Uum_Search();
+
+    if (0 == strlen($org_id)) {
+        $user_rows = $uum_search->getUserIds($condition);
+    } elseif (0 > $org_id) {
+        // 組織に未所属のユーザー
+        $user_rows = $uum_search->getNoGroupUserIds($condition);
+    } elseif (mb_substr($org_id, 0, 1) == 'm') {
+        // MyGroup
+        $my_group_id = mb_substr($org_id, 1);
+        $user_rows = $uum_search->getMyGroupUserIds($my_group_id, $condition);
+    } else {
+        $user_rows = $uum_search->getGroupUserIds($org_id, $condition);
+    }
+
+    if (isset($app_id)) {
+        $user_rows = AppAccess::filterUserIdsInternalAccessByAppId($user_rows,
+            $app_id);
+    }
+    $navigation_info = grn_get_user_navigation_info(count($user_rows), $params,
+        $number_on_page);
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login_user = $uum->getLoginUser();
+    $login_id = $login_user->getOID();
+
+    require_once("grn/controller.csp");
+
+    $user_rows = array_values($user_rows);
+    $result = [];
+    if ($navigation_info['count'] > 0) {
+        $uid_list = array_slice($user_rows, $navigation_info['start_count'] - 1,
+            $navigation_info['end_count']);
+        $uum->loadAndCache($uid_list);
+
+        $users_info = GRN_ControllerUtil::getUserInfoToShowUserName($uid_list,
+            $login_user);
+
+        $count_loop = $navigation_info['end_count'];
+        for ($i = $navigation_info['start_count'] - 1; $i < $count_loop; $i++) {
+            $uid = $user_rows[$i];
+            $user = $uum->getUser($uid);
+            $result[$uid] = [
+                'uid'          => $uid,
+                'display_name' => ($cellular)
+                    ? $users_info[$uid]['col_display_name']
+                    : GRN_ControllerUtil::getUserNameText($login_id, $uid,
+                        $users_info),
+                'position'     => $users_info[$uid]['col_position'],
+                'foreign_key'  => $users_info[$uid]['col_foreign_key'],
+                'valid'        => is_null($users_info[$uid]['col_valid']) ? true
+                    : false,
+                //GRN35-440
+                'row'          => $user,
+                //GRN35-440
+            ];
+        }
+    }
+
+    return $result;
+}
+
+/**
+ * @param string $org_id
+ * @param string $condition
+ * @param int    $sandbox
+ *
+ * @return array
+ */
+function grn_search_user_ids(
+    $org_id,
+    $condition,
+    $sandbox = SandboxConstants::NO_SANDBOX_MODE
+) {
+    require_once('fw/string_util.csp');
+    if (strlen(cb_trim($condition)) < 1) {
+        $ret = [];
+
+        return $ret;
+    }
+
+    if ($sandbox === SandboxConstants::NO_SANDBOX_MODE) {
+        require_once('grn/uum_search.csp');
+        $uum_search = new GRN_Uum_Search();
+    } else {
+        $uum_search = new GRN_Uum_SearchSandbox();
+    }
+
+
+    if (0 == strlen($org_id)) {
+        $user_ids = $uum_search->getUserIds($condition);
+    } elseif (-2 == $org_id) {
+        $user_ids = $uum_search->getDeactiveUserIds($condition);
+    } elseif (0 > $org_id) {
+        // 組織に未所属のユーザー
+        $user_ids = $uum_search->getNoGroupUserIds($condition);
+    } elseif (mb_substr($org_id, 0, 1) == 'm') {
+        // MyGroup
+        $my_group_id = mb_substr($org_id, 1);
+        $user_ids = $uum_search->getMyGroupUserIds($my_group_id, $condition);
+    } else {
+        $user_ids = $uum_search->getGroupUserIds($org_id, $condition);
+    }
+
+    if ( ! is_array($user_ids)) {
+        $user_ids = [];
+    }
+
+    return $user_ids;
+}

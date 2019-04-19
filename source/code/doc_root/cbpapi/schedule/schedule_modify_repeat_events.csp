@@ -1,0 +1,113 @@
+<?php
+
+if (isset($cbpapi_service)) {
+    //response SOAP message
+    require_once("grn/smarty.csp");
+    $t = new GRN_Smarty;
+    // get parameters of SOAP message
+    $node_parameters = $cbpapi_service->getRequestParameters();
+    $operations = $cbpapi_service->selectNodes($node_parameters, 'operation');
+    if ( ! $operations) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null, ['param' => 'operation']);
+    }
+
+    $results = modifyRepeatEvents($operations);
+
+    $t->assign('results', $results);
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('schedule')]);
+
+    grn_cbpapi_response($t, __FILE__);
+}
+
+function modifyRepeatEvents($operations)
+{
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    require_once('cbpapi/schedule_logic.csp');
+    $cbpapi_base_logic = GRN_CBPApi_Schedule_Logic::getInstance();
+    foreach ($operations as $operation) {
+        $event = $operation['children'];
+        if (0 >= count($event)) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null, ['param' => 'schedule_event']);
+        }
+    }
+
+    $old_ids_event = [];
+    $new_ids_event = [];
+    foreach ($operations as $operation) {
+        if (array_key_exists('attributes', $operation)) {
+            $attributes = $operation['attributes'];
+            $apply = array_key_exists('type', $attributes) ? $attributes['type'] : false;
+
+            $str_date = array_key_exists('date', $attributes) ? $attributes['date'] : '';
+            $date = new CB_Date();
+            if ( ! $date->parse($str_date)) {
+                $date = null;
+            }
+
+            $event_params = $cbpapi_base_logic->getInputParamerters($login, $operation);
+
+            foreach (array_keys($event_params) as $key) {
+                $param = $event_params[$key];
+
+                //頻度更新
+                require_once('grn/uum_util.csp');
+                $uum_util = GRN_UumUtil::getInstance();
+                $input_keys = array_keys($param);
+                foreach ($input_keys as $input_key) {
+                    if (preg_match('#^selected_users_.*$#', $input_key)) {
+                        $input_value = $param[$input_key];
+                        if (is_array($input_value) && count($input_value) > 0) {
+                            $input_values = explode(':', $input_value[0]);
+                            if ($input_value[0] && is_array($input_values)) {
+                                $uum_util->selectUsers($login, $input_values);
+                            }
+                        }
+                    } elseif (preg_match('#^selected_groups_.*$#', $input_key)) {
+                        $input_value = $param[$input_key];
+                        if (is_array($input_value) && count($input_value) > 0) {
+                            $input_values = explode(':', $input_value[0]);
+                            if ($input_value[0] && is_array($input_values)) {
+                                $uum_util->selectGroups($login, $input_values);
+                            }
+                        }
+                    }
+                }
+
+                $adapter = new \grn\schedule\api\adapter\events\ModifyEventSoapAdapter();
+                $event_ids = $adapter->modifyRepeatEvent(cb_get_login_user(), $param, $apply, $date);
+                if ($event_ids) {
+                    $event_id = $event_ids['old_event_id'];
+                    $old_ids_event[$event_id] = $event_id;
+                    $new_ids_event[$event_id] = $event_ids['new_event_id'];
+                }
+            }
+        }
+    }
+    // commit schedule tables
+    $cbpapi_base_logic->saveNow();
+
+    $events_for_view_original = $cbpapi_base_logic->getEventsForViewByIds($login, $old_ids_event);
+    // Get new event for view.
+    $events_for_view_modify = $cbpapi_base_logic->getEventsForViewByIds($login, $new_ids_event);
+    $events_for_view = [];
+    foreach ($old_ids_event as $index_key => $event_ori_key) {
+        $events_for_view_original[$event_ori_key]['root'] = 'original';
+        $modified_event_for_view = null;
+        if (isset($new_ids_event[$index_key])) {
+            $modified_event_for_view =& $events_for_view_modify[$new_ids_event[$index_key]];
+            $modified_event_for_view['root'] = 'modified';
+        }
+        $events_for_view[] = [
+            $events_for_view_original[$event_ori_key],
+            $modified_event_for_view
+        ];
+    }
+
+    return $events_for_view;
+}
+
+

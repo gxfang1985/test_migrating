@@ -1,0 +1,325 @@
+<?php
+
+cb_require_role('CommandLine');
+
+define('GRN_CLI_DELETE_SCHEDULES_COMMIT_NUM', 1000);
+
+require_once('grn/cli.csp');
+$summary = "";
+
+$opts = cb_cli_start(
+// Mandatory command-line options
+    [],
+
+    // Optional command-line options
+    [
+        new CB_CLI_BEFORE_OPTION(),
+        new CB_CLI_EXEC_OPTION(),
+        new CB_CLI_MAX_COUNT_OPTION(),
+        new CB_CLI_MAX_DURATION_OPTION()
+    ]
+);
+
+require_once('schedule/system_logic.csp');
+$system_logic = GRN_Schedule_SystemLogic::getInstance();
+
+if (count($opts) == 0) {
+    $nums_event = $system_logic->getEventsNumber();
+    $summary = "Hit $nums_event record";
+    $summary .= ($nums_event > 1) ? "s." : ".";
+}
+if (array_key_exists(CB_CLI_BEFORE_OPTION, $opts)) {
+    if ( ! array_key_exists(CB_CLI_EXEC_OPTION, $opts)) {
+        $nums_event
+            = $system_logic->getEventsNumber($opts[CB_CLI_BEFORE_OPTION]);
+        $summary = "Hit $nums_event record";
+        $summary .= ($nums_event > 1) ? "s." : ".";
+    } else {
+        // max_duration
+        $max_duration = array_key_exists(CB_CLI_MAX_DURATION_OPTION, $opts)
+            ? intval($opts[CB_CLI_MAX_DURATION_OPTION]) * 60 : null;
+        $max_count = array_key_exists(CB_CLI_MAX_COUNT_OPTION, $opts)
+            ? intval($opts[CB_CLI_MAX_COUNT_OPTION]) : 0;
+
+        require_once('schedule/file.csp');
+        $fm = GRN_Schedule_FileManager::getInstance();
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('schedule');
+        $reportScheduleRelationDao
+            = new \grn\report\dao\ReportScheduleRelationDAO();
+        $before_timestamp
+            = cb_date_convert2timestamp($opts[CB_CLI_BEFORE_OPTION]);
+        $date = $opts[CB_CLI_BEFORE_OPTION];
+        if (is_a($date, 'CB_DateTime')) {
+            $ex = new CB_DateTimeEx($date);
+            $objdate = $ex->getDate();
+            $time = $ex->getTime();
+            $before_date = $objdate->format();
+        }
+
+        global $_cb_cli_starting_timestamp;
+        $start_ts = cb_date_convert2timestamp($_cb_cli_starting_timestamp);
+
+        $del_counter = 0;
+        $count = 0;
+        $commit_flag = true;
+        $stop_duration = false;
+
+        // Delete the repeat event
+        $repeat_query
+            = "SELECT rp.col_event AS event_id FROM tab_grn_schedule_repeatcondition rp LEFT JOIN tab_grn_schedule_event AS e ON rp.col_event=e._id WHERE (rp.col_enddate < ";
+        $repeat_query .= cb_queryf($db, "'@S')", $before_date);
+        $repeat_result = $db->query($repeat_query);
+        if ($repeat_result === false) {
+            $db->throwError([
+                'query' => 'failed query on SELECT: ' . $repeat_query
+            ]);
+        }
+
+        while ($repeat_row = $db->fetch_assoc($repeat_result)) {
+            if (is_null($max_duration) !== true
+                && (time() - $start_ts) > $max_duration
+            ) {
+                cb_cli_log("Stopped processing by passing the max_duration.");
+                $stop_duration = true;
+                break;
+            }
+            if (($max_count > 0) && ($del_counter >= $max_count)) {
+                break;
+            }
+            $commit_flag = false;
+
+            $event_id = $repeat_row['event_id'];
+            // delete an event
+            $del_query = cb_queryf($db,
+                "DELETE FROM tab_grn_schedule_event WHERE _id='@S'", $event_id);
+            $del_ret = $db->query($del_query);
+            if ($del_ret === false) {
+                $db->throwError(['query' => 'failed query: ' . $del_query]);
+            }
+
+            cb_cli_log(sprintf("Deleted eid=%s.", $event_id));
+            // check commit num
+            $count++;
+            if ($count == GRN_CLI_DELETE_SCHEDULES_COMMIT_NUM) {
+                $db->commit();
+                $commit_flag = true;
+                cb_cli_log("Committed.");
+
+                $count = 0;
+            }
+            // count number of events deleted
+            $del_counter++;
+        }
+        $db->free_result($repeat_result);
+
+        if ( ! $stop_duration) {
+            // Delete the normal all day and banner event
+            $date_query
+                = "SELECT d.col_event AS event_id FROM tab_grn_schedule_eventdate AS d LEFT JOIN tab_grn_schedule_event AS e ON d.col_event=e._id WHERE (d.col_enddate < ";
+            $date_query .= cb_queryf($db, "'@S' AND d.col_event_type <> '@S')",
+                $before_date, (GRN_SCHEDULE_EVENT_TYPE_REPEAT
+                               + GRN_SCHEDULE_EVENT_TYPE_ALLDAY));
+            $date_result = $db->query($date_query);
+            if ($date_result === false) {
+                $db->throwError([
+                    'query' => 'failed query on SELECT: ' . $date_query
+                ]);
+            }
+
+            while ($date_row = $db->fetch_assoc($date_result)) {
+                if (is_null($max_duration) !== true
+                    && (time() - $start_ts) > $max_duration
+                ) {
+                    cb_cli_log("Stopped processing by passing the max_duration.");
+                    $stop_duration = true;
+                    break;
+                }
+                if (($max_count > 0) && ($del_counter >= $max_count)) {
+                    break;
+                }
+                $commit_flag = false;
+
+                $event_id = $date_row['event_id'];
+                $fm->deleteFiles($event_id);
+                // delete an event
+                $del_query = cb_queryf($db,
+                    "DELETE FROM tab_grn_schedule_event WHERE _id='@S'",
+                    $event_id);
+                $db->query($del_query);
+                $reportScheduleRelationDao->deleteReportRelationByScheduleId($event_id);
+
+                cb_cli_log(sprintf("Deleted eid=%s.", $event_id));
+                // check commit num
+                $count++;
+                if ($count == GRN_CLI_DELETE_SCHEDULES_COMMIT_NUM) {
+                    $db->commit();
+                    $reportScheduleRelationDao->commitByReportConnection();
+                    $commit_flag = true;
+                    cb_cli_log("Committed.");
+
+                    $count = 0;
+                }
+                // count number of events deleted
+                $del_counter++;
+            }
+            $db->free_result($date_result);
+        }
+
+        if ( ! $stop_duration) {
+            // Delete the normal event
+            $datetime_query
+                = "SELECT dt.col_event AS event_id FROM tab_grn_schedule_eventdatetime AS dt LEFT JOIN tab_grn_schedule_event AS e ON dt.col_event=e._id WHERE (dt.col_enddatetime < ";
+            $datetime_query .= cb_queryf($db,
+                "'@S' AND dt.col_event_type <> '@S' AND dt.col_event_type <> '@S' AND dt.col_event_type <> '@S')",
+                $before_timestamp, (GRN_SCHEDULE_EVENT_TYPE_REPEAT),
+                (GRN_SCHEDULE_EVENT_TYPE_REPEAT
+                 + GRN_SCHEDULE_EVENT_TYPE_START),
+                (GRN_SCHEDULE_EVENT_TYPE_TEMPORARY));
+            $datetime_result = $db->query($datetime_query);
+            if ($datetime_result === false) {
+                $db->throwError([
+                    'query' => 'failed query on SELECT: ' . $datetime_query
+                ]);
+            }
+            while ($datetime_row = $db->fetch_assoc($datetime_result)) {
+                if (is_null($max_duration) !== true
+                    && (time() - $start_ts) > $max_duration
+                ) {
+                    cb_cli_log("Stopped processing by passing the max_duration.");
+                    $stop_duration = true;
+                    break;
+                }
+                if (($max_count > 0) && ($del_counter >= $max_count)) {
+                    break;
+                }
+                $commit_flag = false;
+
+                $event_id = $datetime_row['event_id'];
+                $fm->deleteFiles($event_id);
+                // delete an event
+                $del_query = cb_queryf($db,
+                    "DELETE FROM tab_grn_schedule_event WHERE _id='@S'",
+                    $event_id);
+                $db->query($del_query);
+                $reportScheduleRelationDao->deleteReportRelationByScheduleId($event_id);
+
+                cb_cli_log(sprintf("Deleted eid=%s.", $event_id));
+                // check commit num
+                $count++;
+                if ($count == GRN_CLI_DELETE_SCHEDULES_COMMIT_NUM) {
+                    $db->commit();
+                    $reportScheduleRelationDao->commitByReportConnection();
+                    $commit_flag = true;
+                    cb_cli_log("Committed.");
+
+                    $count = 0;
+                }
+                // count number of events deleted
+                $del_counter++;
+            }
+            $db->free_result($datetime_result);
+        }
+
+        if ( ! $stop_duration) {
+            // Delete the temporary event
+            $temp_query
+                = "SELECT dt.col_event AS event_id FROM tab_grn_schedule_eventdatetime AS dt LEFT JOIN tab_grn_schedule_event AS e ON dt.col_event=e._id WHERE (col_enddatetime < ";
+            $temp_query .= cb_queryf($db,
+                "'@S' AND dt.col_event_type = '@S') GROUP BY dt.col_event ",
+                $before_timestamp, (GRN_SCHEDULE_EVENT_TYPE_TEMPORARY));
+            $temp_result = $db->query($temp_query);
+            if ($temp_result === false) {
+                $db->throwError([
+                    'query' => 'failed query on SELECT: ' . $temp_query
+                ]);
+            }
+            while ($temp_row = $db->fetch_assoc($temp_result)) {
+                $event_id = $temp_row['event_id'];
+
+                $count_temp_query
+                    = "SELECT COUNT(_id) AS count FROM tab_grn_schedule_eventdatetime WHERE (col_setdatetime > ";
+                $count_temp_query .= cb_queryf($db,
+                    "'@S' AND col_event = '@S' ) LIMIT 0, 1 ",
+                    $before_timestamp, $event_id);
+                $count_temp_result = $db->query($count_temp_query);
+                if ($count_temp_result === false) {
+                    $db->throwError([
+                        'query' => 'failed query on SELECT: '
+                                   . $count_temp_query
+                    ]);
+                }
+                $count_temp_row = $db->fetch_assoc($count_temp_result);
+                if ($count_temp_row['count'] == 0) {
+                    if (is_null($max_duration) !== true
+                        && (time() - $start_ts) > $max_duration
+                    ) {
+                        cb_cli_log("Stopped processing by passing the max_duration.");
+                        $stop_duration = true;
+                        break;
+                    }
+                    if (($max_count > 0) && ($del_counter >= $max_count)) {
+                        break;
+                    }
+                    $commit_flag = false;
+
+                    // delete an event
+                    $del_query = cb_queryf($db,
+                        "DELETE FROM tab_grn_schedule_event WHERE _id='@S'",
+                        $event_id);
+                    $del_ret = $db->query($del_query);
+                    if ($del_ret === false) {
+                        $db->throwError([
+                            'query' => 'failed query: ' . $del_query
+                        ]);
+                    }
+                    cb_cli_log(sprintf("Deleted eid=%s.", $event_id));
+                    // check commit num
+                    $count++;
+                    if ($count == GRN_CLI_DELETE_SCHEDULES_COMMIT_NUM) {
+                        $db->commit();
+                        $commit_flag = true;
+                        cb_cli_log("Committed.");
+
+                        $count = 0;
+                    }
+                    // count number of events deleted
+                    $del_counter++;
+                }
+            }
+            $db->free_result($temp_result);
+        }
+        // write log notice
+        if ($del_counter > 0) {
+            require_once('grn/logger.csp');
+            $lm = CB_LoggerManager::getInstance();
+            $schedule_log = $lm->getLogger(GRN_SCHEDULE_MODULE_ID);
+            $log_params
+                = [
+                'before_date' => html_entity_decode(cb_date_format('DateFull_YMDW',
+                    $date))
+            ];
+            $schedule_log->noticeEx('delete_all', 'command_line_delete_event',
+                $log_params);
+        }
+        if ($commit_flag === false) {
+            $db->commit();
+            $reportScheduleRelationDao->commitByReportConnection();
+            cb_cli_log("Committed.");
+        }
+
+        $summary = "Deleted $del_counter record";
+        $summary .= ($del_counter > 1) ? "s." : ".";
+    }
+} else {
+    if (array_key_exists(CB_CLI_EXEC_OPTION, $opts)) {
+        cb_cli_log('Can not be processing because missing the before parameter.');
+        cb_cli_log('Please enter the before parameter.');
+        die();
+    }
+}
+
+cb_cli_end($summary);
+
+

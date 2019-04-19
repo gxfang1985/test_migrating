@@ -1,0 +1,1 @@
+{include file='report/ajax/address_index.tpl'}

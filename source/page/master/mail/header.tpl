@@ -1,0 +1,1 @@
+{if $mail_3pane}{grn_load_css file="grn/html/mail_3pane.css"}{/if}

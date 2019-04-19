@@ -1,0 +1,358 @@
+<?php
+
+namespace grn\message\dao;
+
+require_once("message/resources.csp");
+
+class GrnMessageFoldersDAO
+{
+    /**
+     * @param array $parentIds
+     * @param bool  $exclude_gabage
+     *
+     * @return array
+     */
+    public function getChildFolderIds(array $parentIds, $exclude_gabage = false)
+    {
+        $ids = [];
+
+        $app_locator = \GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('message');
+        $query = cb_queryf($db,
+            "SELECT _id FROM tab_grn_message_folders WHERE col_parent_folder IN (@A)",
+            $parentIds);
+        if ($exclude_gabage === true) {
+            $query .= $db->format(" AND (col_folder_type IS NULL OR col_folder_type NOT IN (@A)) ",
+                [[GRN_MESSAGE_GARBAGEFOLDER, GRN_MESSAGE_DRAFTFOLDER]]);
+        }
+
+        $result = $db->query($query);
+        while ($row = $db->fetch_assoc($result)) {
+            $ids[] = $row['_id'];
+        }
+
+        return $ids;
+    }
+
+    /**
+     * @param array $parentIds
+     * @param bool  $exclude_gabage
+     *
+     * @return array
+     */
+    public function getChildFolderIdsRecursively(
+        array $parentIds,
+        $exclude_gabage = false
+    ) {
+        $ids = $this->getChildFolderIds($parentIds, $exclude_gabage);
+        if (count($ids) > 0) {
+            $ids = array_merge($ids,
+                $this->getChildFolderIdsRecursively($ids, $exclude_gabage));
+        }
+
+        return $ids;
+    }
+
+    /**
+     * @param string $childId
+     *
+     * @return string|null
+     */
+    public function getParentFolderId($childId)
+    {
+        $app_locator = \GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('message');
+        $query = cb_queryf($db,
+            "SELECT col_parent_folder FROM tab_grn_message_folders WHERE _id='@S'",
+            $childId);
+        $result = $db->query($query);
+        $row = $db->fetch_assoc($result);
+
+        return $row['col_parent_folder'];
+    }
+
+    /**
+     * @param array $users
+     *
+     * @return array
+     */
+    private function getUserIdsNotFolderInitialized(array $users)
+    {
+        $db = cb_get_app_db("message");
+        if (empty($users)) {
+            return [];
+        }
+
+        // get user ids which has root folder
+        $query
+            = "SELECT col_user AS userId FROM tab_grn_message_folders WHERE col_user IN (@A) AND col_folder_type = '6'";
+        $usersId = array_keys($users);
+        $query = $db->format($query, [$usersId]);
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_SHARED_LOCK);
+        $result = $db->query($query);
+
+        while ($row = $db->fetch_assoc($result)) {
+            $key = array_search($row["userId"], $usersId);
+            if ($key === false) {
+                continue;
+            }
+            unset($usersId[$key]);
+        }
+
+        return $usersId;
+    }
+
+    /**
+     * @param array $userIds
+     *
+     * @return array
+     */
+    private function getUserIdRootFolderId(array $userIds)
+    {
+        $db = cb_get_app_db("message");
+        $query
+            = "SELECT _id AS rootFolderId, col_user AS userId FROM tab_grn_message_folders WHERE col_user IN (@A) AND col_folder_type='6' LOCK IN SHARE MODE";
+        $result = $db->query($db->format($query, [$userIds]));
+        $ids = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $ids[] = $row;
+        }
+
+        return $ids;
+
+    }
+
+    /**
+     *
+     * @param array $users CB_User[]
+     */
+    public function initializeFolders(array $users)
+    {
+        $userIds = $this->getUserIdsNotFolderInitialized($users);
+        if (empty($userIds)) {
+            return;
+        }
+        $this->createRootFolder($userIds);
+
+        $ids = $this->getUserIdRootFolderId($userIds);
+
+
+        // inbox
+        $inbox = new \StdClass;
+        $inbox->folderType = GRN_MESSAGE_RECEIVINGFOLDER;
+        $inbox->folderName = 'inbox';
+        $inbox->viewOrder = 1;
+        $inbox->subscriptionFlag = 1;
+        $inbox->level = 1;
+
+        // outbox
+        $outbox = new \StdClass;
+        $outbox->folderType = GRN_MESSAGE_SENDINGFOLDER;
+        $outbox->folderName = 'outbox';
+        $outbox->viewOrder = 2;
+        $outbox->subscriptionFlag = 1;
+        $outbox->level = 1;
+
+        // draft box
+        $draft = new \StdClass;
+        $draft->folderType = GRN_MESSAGE_DRAFTFOLDER;
+        $draft->folderName = 'draftbox';
+        $draft->viewOrder = 3;
+        $draft->subscriptionFlag = 0;
+        $draft->level = 1;
+
+        // garbage box
+        $garbage = new \StdClass;
+        $garbage->folderType = GRN_MESSAGE_GARBAGEFOLDER;
+        $garbage->folderName = 'garbagebox';
+        $garbage->viewOrder = 0x7FFFFFFF;
+        $garbage->subscriptionFlag = 0;
+        $garbage->level = 1;
+
+        $this->createFolders($ids, [$inbox, $outbox, $draft, $garbage]);
+
+    }
+
+    /**
+     * @param array $usersAndRootFolderIds    => ["userId"]
+     *                                        ["rootFolderId"]
+     * @param array $foldersInfo              \StdClass
+     *                                        properties : folderName, folderType, level, memo, subscriptionFlag,viewOrder
+     */
+    private function createFolders(
+        array $usersAndRootFolderIds,
+        array $foldersInfo
+    ) {
+        $db = cb_get_app_db("message");
+        $columns = [
+            "col_ctime",
+            "col_mtime",
+            "col_folder_name",
+            "col_folder_type",
+            "col_level",
+            "col_memo",
+            "col_subscription_flag",
+            "col_view_order",
+            "col_user",
+            "col_parent_folder"
+        ];
+
+        $valueStatements = [];
+        foreach ($foldersInfo as $folderInfo) {
+            foreach ($usersAndRootFolderIds as $userAndRootFolderId) {
+                $valueStatements[] = $db->format(
+                    "("
+                    . "UNIX_TIMESTAMP()," //ctime
+                    . "UNIX_TIMESTAMP()," //mtime
+                    . "'@S',"                //folder_name
+                    . "'@S',"                //folder_type
+                    . "'@S',"                //level
+                    . "'@S',"                //memo
+                    . "'@S',"                //subscription_flag
+                    . "'@S',"                //view_order
+                    . "'@S',"                 //user
+                    . "'@S'"                 //parent_folder
+                    . ")",
+                    [
+                        $folderInfo->folderName,
+                        $folderInfo->folderType,
+                        $folderInfo->level,
+                        isset($folderInfo->memo) ? $folderInfo->memo : "",
+                        $folderInfo->subscriptionFlag,
+                        $folderInfo->viewOrder,
+                        $userAndRootFolderId["userId"],
+                        $userAndRootFolderId["rootFolderId"]
+                    ]
+                );
+            }
+
+        }
+
+        $query = sprintf("INSERT INTO tab_grn_message_folders (%s) VALUES %s",
+            implode($columns, ","), implode($valueStatements, ","));
+        $db->query($query);
+    }
+
+    /**
+     * @param array $users
+     */
+    private function createRootFolder(array $users)
+    {
+        $db = cb_get_app_db("message");
+        $columns = [
+            "col_ctime",
+            "col_mtime",
+            "col_folder_name",
+            "col_folder_type",
+            "col_level",
+            "col_memo",
+            "col_subscription_flag",
+            "col_user",
+            "col_view_order"
+        ];
+        $valueStatements = [];
+        foreach ($users as $userId) {
+            $valueStatements[] = $db->format(
+                "("
+                . "UNIX_TIMESTAMP()," //ctime
+                . "UNIX_TIMESTAMP()," //mtime
+                . "'@S',"                //folder_name
+                . "'@S',"                //folder_type
+                . "'@S',"                //level
+                . "'@S',"                //memo
+                . "'@S',"                //subscription_flag
+                . "'@S',"                //user
+                . "'@S'"                 //view_order
+                . ")",
+                ['root_folder', GRN_MESSAGE_ROOTFOLDER, 0, "", 0, $userId, 0]);
+        }
+
+        $query = sprintf("INSERT INTO tab_grn_message_folders (%s) VALUES %s",
+            implode($columns, ","), implode($valueStatements, ","));
+        $db->query($query);
+    }
+
+    /**
+     * @param       $folder_type
+     * @param array $usersId
+     *
+     * @return array
+     */
+    public function getFolderIdsHashByUserId($folder_type, array $usersId)
+    {
+        if (empty($usersId)) {
+            return [];
+        }
+        $db = cb_get_app_db("message");
+        $query = "SELECT "
+                 . "_id AS folderId, "
+                 . "col_user AS userId "
+                 . "FROM tab_grn_message_folders "
+                 . "WHERE col_folder_type='@S' AND col_user IN (@A)";
+        $result = $db->query($db->format($query, [$folder_type, $usersId]));
+        $folderIds = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $folderIds[$row["userId"]] = $row["folderId"];
+        }
+
+        return $folderIds;
+    }
+
+    /**
+     * @param array $foldersId
+     *
+     * @return array
+     */
+    public function getFolderInfoHashByUserId(array $foldersId)
+    {
+        if (empty($foldersId)) {
+            return [];
+        }
+
+        $db = cb_get_app_db("message");
+        $query = "SELECT "
+                 . "_id AS folderId, "
+                 . "col_folder_type AS folderType, "
+                 . "col_subscription_flag AS subscriptionFlag, "
+                 . "col_user AS userId "
+                 . "FROM tab_grn_message_folders "
+                 . "WHERE _id IN (@A)";
+        $result = $db->query($db->format($query, [$foldersId]));
+
+        $folders = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $folders[$row["userId"]] = $row;
+        }
+
+        return $folders;
+    }
+
+    /**
+     * @param string $user_id
+     * @param string $parent_id
+     *
+     * @return array
+     */
+    public function getChildren($user_id, $parent_id)
+    {
+        $db = cb_get_app_db("message");
+        $query_format
+            = "SELECT _id, col_folder_type, col_folder_name, col_subscription_flag FROM tab_grn_message_folders USE INDEX(idx_user_parent_folder_view_order) "
+              . "WHERE col_parent_folder = '@S' AND col_user= '@S' ORDER BY col_view_order ";
+        $query = cb_queryf($db, $query_format, $parent_id, $user_id);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $folders = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $folders[$row["_id"]] = $row;
+        }
+        $db->free_result($result);
+
+        return $folders;
+    }
+
+}

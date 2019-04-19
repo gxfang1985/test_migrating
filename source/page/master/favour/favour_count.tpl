@@ -1,0 +1,1 @@
+<div class="like_grn"><span class="like_btn_left_grn"></span><span class="like_btn_bg_grn"><span class="like_btn_font_grn">{$favour_count}</span></span><span class="like_btn_righ_grn"></span></div>

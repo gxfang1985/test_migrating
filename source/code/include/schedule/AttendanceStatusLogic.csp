@@ -1,0 +1,564 @@
+<?php
+
+namespace grn\schedule;
+
+use grn\schedule\bean\AttendanceStatus;
+use grn\schedule\bean\AttendanceStatusCondition;
+
+require_once('grn/application.csp');
+require_once('schedule/application.csp');
+require_once('schedule/error_code.csp');
+
+class AttendanceStatusLogic
+{
+
+    /**
+     * @return bool
+     */
+    public function isEnableAttendanceCheck()
+    {
+        require_once('schedule/system_logic.csp');
+        $logic = \GRN_Schedule_SystemLogic::getInstance();
+        if ($logic->getAllowAttendanceCheck() == '1') {
+            $result = true;
+        } else {
+            $result = false;
+        }
+
+        return $result;
+
+    }
+
+    /**
+     * @return bool
+     */
+    public function defaultAttendanceCheck()
+    {
+        require_once('schedule/system_logic.csp');
+        $logic = \GRN_Schedule_SystemLogic::getInstance();
+        if ($logic->getDefaultAttendanceCheck() == '1') {
+            $result = true;
+        } else {
+            $result = false;
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param AttendanceStatus $attendanceCheck
+     * @param \CB_Date|NULL    $bdate
+     * The method will insert a row attendance status
+     * Note: In the case the value of Status properties invalid the default value is set: 1 (attendant this appointment)
+     */
+    public function addAttendanceStatus(
+        AttendanceStatus $attendanceCheck,
+        $bdate = null
+    ) {
+        $scheduleFacade = new ScheduleFacade();
+        $sender = $attendanceCheck->getUser();
+        if ( ! is_object($sender)) {
+            $sender = grn_schedule_getUserObject($attendanceCheck->getUserId());
+        }
+
+        $event = $attendanceCheck->getEvent();
+        if ( ! is_object($event)) {
+            $event = $this->getEventObject($sender,
+                $attendanceCheck->getEventId());
+        }
+
+        $status = $attendanceCheck->getStatus();
+        $message = $attendanceCheck->getMessage();
+        if ( ! $this->isAttendanceCheckEvent($event)) {
+            cb_throw_error(E_GRN_SCHD_NOT_ATTENDANCE_CHECK);
+        }
+        if ( ! is_object($sender) && ! $this->isUserValid($sender)) {
+            cb_throw_error(E_GRN_USER_NOT_FOUND);
+        }
+        $statusInt = $scheduleFacade->convertStatus($status);
+        if ($statusInt != 0 && $statusInt != 1) {
+            $statusInt = 1;//Default value, Attendant this appointment
+        }
+        $attendanceCheck->setStatus($statusInt);
+        $scheduleFacade->insertEventAttendanceStatus($attendanceCheck);
+
+        // send notify
+        $this->sendConfirmNotify($event, $sender);
+
+        // GTM-1632 forward Mail
+        require_once("schedule/notification.csp");
+        $scheduleNotifyLogic = \GRN_Schedule_Notify_Logic::getInstance();
+        $scheduleNotifyLogic->forwardAttendanceConfirmMail($event, $sender,
+            $status, $message);
+
+        $app = \GRN_Schedule_Application::getInstance();
+        $app->sendPushNotificationOfAttendanceConfirm($event, $sender, $status,
+            $message, $bdate);
+
+        // logging
+        $this->exportLog($attendanceCheck);
+    }
+
+    /**
+     * @param AttendanceStatus $attendanceCheck
+     * The function updated a row exist in DB
+     * Note: In the case the value of Status properties invalid the default value is set: 1 (attendant this appointment
+     */
+    public function editAttendanceStatus(AttendanceStatus $attendanceCheck)
+    {
+        $this->addAttendanceStatus($attendanceCheck);
+    }
+
+    /**
+     * The method delete a row attendance status exists in DB
+     *
+     * @param $eventId
+     * @param $userId
+     *
+     */
+    public function deleteAttendanceStatusByEventIdAndUserId($eventId, $userId)
+    {
+        if ( ! $this->isInt($eventId)) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        $attendanceStatusCondition = new AttendanceStatusCondition();
+        $attendanceStatusCondition->setEventId($eventId);
+        $attendanceStatusCondition->setUserIds([$userId]);
+
+        return $this->deleteAttendanceStatusByCondition($attendanceStatusCondition);
+    }
+
+    /**
+     * Support delete attendance status records by User id
+     *
+     * @param $eventId int required
+     * @param $usersId array user id
+     *
+     */
+    public function deleteAttendanceStatusByEventIdAndUsersId(
+        $eventId,
+        $usersId
+    ) {
+        if ( ! $this->isInt($eventId)) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        $attendanceStatusCondition = new AttendanceStatusCondition();
+        $attendanceStatusCondition->setUserIds($usersId);
+        $attendanceStatusCondition->setEventId($eventId);
+
+        return $this->deleteAttendanceStatusByCondition($attendanceStatusCondition);
+    }
+
+    /**
+     * Support delete attendance status records by event id
+     *
+     * @param $eventId int required
+     * @param $usersId array event id
+     */
+    public function deleteAttendanceStatusByEventId($eventId)
+    {
+        $attendanceStatusCondition = new AttendanceStatusCondition();
+        $attendanceStatusCondition->setEventId($eventId);
+
+        return $this->deleteAttendanceStatusByCondition($attendanceStatusCondition);
+    }
+
+    /**
+     * @param AttendanceStatusCondition $condition
+     */
+    public function deleteAttendanceStatusByCondition(
+        AttendanceStatusCondition $condition
+    ) {
+        $scheduleFacade = new ScheduleFacade();
+
+        return $scheduleFacade->deleteByConditionEventAttendanceStatus($condition);
+    }
+
+    /**
+     * Return AttendanceStatus object
+     *
+     * @param $userId     int
+     * @param $event      int|event object
+     */
+
+    public function getAttendanceStatusByUserIdAndEventId($userId, $event)
+    {
+        if (is_object($event)) {
+            $eventId = $event->id;
+        } else {
+            $eventId = $event;
+        }
+        if ( ! $this->isInt($eventId)) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        } elseif ( ! $this->isAttendanceCheckEvent($event)) {
+            cb_throw_error(E_GRN_SCHD_NOT_ATTENDANCE_CHECK);
+        }
+        $scheduleFacade = new ScheduleFacade();
+        if (isset($userId) && $this->isInt($userId) && isset($eventId)) {
+            $condition = new AttendanceStatusCondition();
+            $condition->setEventId($eventId);
+            $condition->setUserId($userId);
+            $condition->setAttendanceStatus(1);
+
+            return $scheduleFacade->getEventAttendanceStatusByUserIdAndEventId($condition);
+        }
+    }
+
+    /**
+     * @param AttendanceStatusCondition $attendanceStatusObj
+     *
+     */
+    public function getAttendanceStatusListByCondition(
+        AttendanceStatusCondition $attendanceStatusObj
+    ) {
+        $scheduleFacade = new ScheduleFacade();
+        if ($attendanceStatusObj->getEventId() != "") {
+            if ( ! $this->isInt($attendanceStatusObj->getEventId())) {
+                cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+            } elseif ( ! $this->isAttendanceCheckEvent($attendanceStatusObj->getEventId())) {
+                cb_throw_error(E_GRN_SCHD_NOT_ATTENDANCE_CHECK);
+            }
+        }
+
+        if ($attendanceStatusObj->getUserId() != ""
+            && ( ! $this->isInt(
+                    $attendanceStatusObj->getUserId()
+                )
+                 || ! $this->isUserValid($attendanceStatusObj->getUserId())
+            )
+        ) {
+            cb_throw_error(E_GRN_USER_NOT_FOUND);
+        }
+        if ( ! isset($attendanceStatusObj)) {
+            return null;
+        }
+
+        return $scheduleFacade->getEventAttendanceStatusListByCondition($attendanceStatusObj);
+    }
+
+    /**
+     * @param $event   int|event object
+     * @param $status  string| absent, attendant, unconfirmed,''(all)
+     *
+     */
+
+    public function getAttendanceStatusListByEventAndStatus($event, $status)
+    {
+        if (is_object($event)) {
+            $eventId = $event->id;
+        } else {
+            $eventId = $event;
+        }
+        if ( ! $this->isInt($eventId)) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        } elseif ( ! $this->isAttendanceCheckEvent($event)) {
+            cb_throw_error(E_GRN_SCHD_NOT_ATTENDANCE_CHECK);
+        }
+
+        $attendanceStatusCondition = new AttendanceStatusCondition();
+        $attendanceStatusCondition->setEventId($eventId);
+        $attendanceStatusCondition->setStatus($status);
+
+        $scheduleFacade = new ScheduleFacade();
+
+        return $scheduleFacade->getEventAttendanceStatusListByCondition($attendanceStatusCondition);
+    }
+
+    /**
+     * @param AttendanceStatusCondition $attendanceStatusCondition
+     *
+     */
+    public function countAttendanceStatusByCondition(
+        AttendanceStatusCondition $attendanceStatusCondition
+    ) {
+
+        $scheduleFacade = new ScheduleFacade();
+        $attendanceStatusCondition->setIsCountFunction(1);
+        $attendanceStatusCondition->setAttendanceStatus(1);
+
+        return (int)$scheduleFacade->countEventAttendanceStatusByCondition($attendanceStatusCondition);
+    }
+
+    /**
+     * @param \GRN_Schedule_NormalEvent $event
+     *
+     * @return bool
+     */
+    public function hasConfirmationUpdateForCreator(
+        \GRN_Schedule_NormalEvent $event
+    ) {
+        $eventId = $event->id;
+        if ( ! $this->isInt($eventId)) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        } elseif ( ! $this->isAttendanceCheckEvent($event)) {
+            cb_throw_error(E_GRN_SCHD_NOT_ATTENDANCE_CHECK);
+        }
+        $scheduleFacade = new ScheduleFacade();
+        $attendanceStatusCondition = new AttendanceStatusCondition();
+        $attendanceStatusCondition->setEventId($eventId);
+        $attendanceStatusCondition->setUser($event->creator);
+
+        $lastAccessTime
+            = $scheduleFacade->getLastAccessTimeForCreator($attendanceStatusCondition);;
+        $lastConfirmationTime
+            = $scheduleFacade->getLastConfirmationTime($attendanceStatusCondition);
+
+        if ($lastAccessTime < $lastConfirmationTime) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param $event int|event object
+     *
+     */
+    public function setLastAccessTimeForCreator($event)
+    {
+        if (is_object($event)) {
+            $eventId = $event->id;
+        } else {
+            $eventId = $event;
+        }
+        if ($this->isInt($eventId)) {
+            if ($this->isAttendanceCheckEvent($event)) {
+                $attendanceStatusCondition = new AttendanceStatusCondition();
+                $attendanceStatusCondition->setEventId($eventId);
+                $scheduleFacade = new ScheduleFacade();
+
+                return (bool)$scheduleFacade->setEventAttendanceStatusTimeCreatorAccess(
+                    $attendanceStatusCondition
+                );
+            } else {
+                cb_throw_error(E_GRN_SCHD_NOT_ATTENDANCE_CHECK);
+            }
+        } else {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+    }
+
+    /**
+     * @param $event int|event object
+     *
+     */
+    public function deleteLastAccessTimeOfEvent($event)
+    {
+        if (is_object($event)) {
+            $eventId = $event->id;
+        } else {
+            $eventId = $event;
+        }
+        if ($this->isInt($eventId)) {
+            $attendanceStatusCondition = new AttendanceStatusCondition();
+            $attendanceStatusCondition->setEventId($eventId);
+            $scheduleFacade = new ScheduleFacade();
+
+            return $scheduleFacade->deleteLastAccessTimeOfEvent($attendanceStatusCondition);
+        } else {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+    }
+
+    /**
+     * @param mixed $event $event maybe a CB_Row or int value
+     *
+     * @return \CB_TimeStampEx
+     */
+    public function getLastConfirmationTime($event)
+    {
+        $lastConfirmationTime = new \CB_TimeStampEx();
+        $lastConfirmationTime->unix_ts = 0;
+        $eventId = $event;
+        if (is_object($event)) {
+            $eventId = $event->id;
+        }
+        $scheduleFacade = new ScheduleFacade();
+        $attendanceStatusCondition = new AttendanceStatusCondition();
+        $attendanceStatusCondition->setEventId($eventId);
+        $lastConfirmationTime->unix_ts
+            = (int)$scheduleFacade->getLastConfirmationTime($attendanceStatusCondition);
+
+        return $lastConfirmationTime;
+    }
+
+    /**
+     * @param \GRN_Schedule_EventBase $event
+     * @param \CB_User                $sender User who send a confirmation notification
+     */
+    function sendConfirmNotify(\GRN_Schedule_EventBase $event, \CB_User $sender)
+    {
+        if ( ! ($event instanceof \GRN_Schedule_NormalEvent)) {
+            return;
+        }
+
+        //GRB-16905
+        require_once("schedule/notification.csp");
+        $scheduleNotifyLogic = \GRN_Schedule_Notify_Logic::getInstance();
+        $receiver
+            = $scheduleNotifyLogic->getEventCreatorForNotification($event,
+            $sender);
+        if (empty($receiver)) {
+            return;
+        }
+
+        require_once("grn/notification.csp");
+        $notificationData = new \GRN_Notification_Data();
+        $notificationData->setModuleId(GRN_SCHEDULE_MODULE_ID);
+        $notificationData->setUniqueId($event->id);
+
+        // Get today
+        $timeStamp = new \CB_TimeStampEx();
+        $today = $timeStamp->getDate();
+        $date = $event->getFirstDate($today);
+        $orgDatas = [
+            'event'                            => $event->id,
+            'bdate'                            => $date->format(),
+            'type'                             => $event->getEventType(),
+            AttendanceStatus::STATUS_ATTENDANT => true
+        ];
+        $notificationData->setOrgData($orgDatas);
+
+        require_once('schedule/view_util.csp');
+        $util = \GRN_Schedule_View_Util::getInstance();
+        $subject
+            = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+        $notificationData->setSubjectData($subject);
+
+        $notificationData->setSenderData($sender->get('display_name'),
+            $sender->getOID());
+
+        require_once('notification/resources.csp');
+        $notificationData->setAbstractData(
+            $scheduleNotifyLogic->cb_msg(GRN_NOTIFICATION_MODULE_ID,
+                GRN_NOTIFICATION_SCHEDULE_ATTENDANCE_RESPONSE)
+        );
+
+        $notificationData->setActionId(GRN_NOTIFICATION_ACTION_STATUS_RESPONSE_ID);
+        $notificationData->setTimeStampData($timeStamp);
+        $notificationData->setStatusToUnread();
+
+        require_once('fw/i18n.csp');
+        $timezone = $event->timezone;
+        $eventStartTimeStamp = new \CB_TimeStampEx();
+        $eventType = $event->getEventType();
+        // Event which has start time
+        if ($eventType == GRN_SCHEDULE_EVENT_TYPE_NORMAL
+            || $eventType & GRN_SCHEDULE_EVENT_TYPE_START
+        ) {
+            $eventStartTimeStamp->setDateTime($event->setdatetime, $timezone);
+        } else {
+            $datetime = new \CB_DateTime();
+            $datetime->year = $event->setdatetime->year;
+            $datetime->month = $event->setdatetime->month;
+            $datetime->day = $event->setdatetime->day;
+            $datetime->hour = 0;
+            $datetime->minute = 0;
+            $datetime->second = 0;
+            $eventStartTimeStamp->setDateTime($datetime, $timezone);
+        }
+        $notificationData->setEventStartTs($eventStartTimeStamp->unix_ts);
+
+        $notificationService = \GRN_Notification_Service::getInstance();
+        $notificationService->modifyNotifyData($receiver, $notificationData,
+            true, true);
+    }
+
+    /**
+     * @param $id int
+     */
+    private function isInt($id)
+    {
+
+        if (isset($id) && ! is_object($id) && ! is_array($id)
+            && preg_match('/^[1-9][0-9]{0,19}$/', $id)
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param $uid int
+     */
+    private function isUserValid($uid)
+    {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $user = $uum->getUser($uid);
+        if ( ! $user) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @param $event int|event object
+     *
+     * @return mixed
+     */
+    private function isAttendanceCheckEvent($event)
+    {
+        $result = false;
+        if (is_object($event)) {
+            $result = $event->isAttendanceCheckEvent();
+
+        } else//event id
+        {
+            require_once('schedule/eventfactory.csp');
+            $factory = \GRN_Schedule_EventFactory::getInstance();
+            $eventtable = $factory->_getEventTable();
+            $eventrow = $eventtable->getRow($event);
+            if ( ! $eventrow) {
+                return false;
+            }
+            $attendanceCheck = $eventrow->get(GRN_SCHEDULE_ATTENDANCE_CHECK);
+            if ($attendanceCheck) {
+                $result = true;
+            }
+        }
+
+        return $result;
+    }
+
+    private function exportLog(AttendanceStatus $attendanceStatusObj)
+    {
+        $status = 'attend';
+        if ($attendanceStatusObj->getStatus() == 0) {
+            $status = 'absent';
+        }
+        // logging
+        require_once('grn/logger.csp');
+        $lm = \CB_LoggerManager::getInstance();
+        $scheduleLog = $lm->getLogger(GRN_SCHEDULE_MODULE_ID);
+        $logParams = [
+            'eid'     => $attendanceStatusObj->getEventId(),
+            'value'   => $status,
+            'comment' => $attendanceStatusObj->getMessage()
+        ];
+
+        $scheduleLog->noticeEx('modify', 'attendance_status', $logParams);
+    }
+
+    /**
+     * @param \CB_User $user
+     * @param mixed    $event
+     *
+     * @return mixed($event object or FALSE)
+     */
+    private function getEventObject($user, $event)
+    {
+        if (is_object($event)) {
+            return $event;
+        }
+        $eventId = $event;
+        $appSchedule = \GRN_Schedule_Application::getInstance();
+        $date = null;
+        $lockMode = CB_DATABASE_SHARED_LOCK;
+
+        return $appSchedule->getEvent($user, $eventId, $date, $lockMode, false);
+    }
+
+}

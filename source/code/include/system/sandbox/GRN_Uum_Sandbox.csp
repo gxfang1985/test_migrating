@@ -1,0 +1,650 @@
+<?php
+
+namespace grn\system\sandbox;
+
+use grn\system\sandbox\dao\CbUserDiffSandboxDAO;
+use grn\system\sandbox\dao\CbUserGroupRelationSandboxDAO;
+use grn\system\sandbox\dao\GRN_Uum_SearchSandboxDAO;
+
+require_once('grn/uum.csp');
+
+class GRN_Uum_Sandbox extends \Grn_Uum
+{
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Uum_Sandbox
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        self::setupSandboxMode();
+
+        return self::$_instance;
+    }
+
+    function __construct()
+    {
+        parent::__construct();
+        $this->sandbox = SandboxConstants::SANDBOX_MODE;
+        $this->_group_table_name = 'tab_cb_group_sandbox';
+
+        $this->_core = new GRN_UumCoreAPISandbox();
+        // don't replace _sp
+        // because, on GRN_Uum_Sandbox, using info of authentication is same as GRN_Uum
+    }
+
+    /**
+     * @param string $id
+     * @param bool   $isUseLocal
+     *
+     * @return \CB_Group
+     */
+    public function getGroup($id, $isUseLocal = true)
+    {
+        $group = parent::getGroup($id, $isUseLocal);
+        if ($group) {
+            $group->sandbox = SandboxConstants::SANDBOX_MODE;
+        }
+
+        return $group;
+    }
+
+    /**
+     * setup sandbox mode
+     */
+    public static function setupSandboxMode()
+    {
+        // stop table info cache
+        $uum = cb_lwc_uum();
+        $uum->getGroupTable()->stopRowCache();
+    }
+
+    /**
+     * get primary group information of user
+     *
+     * @param int  $uid ユーザーID.
+     * @param bool $include_deleted
+     * @param bool $use_cache
+     *
+     * @return bool|\CB_Group
+     */
+    function getUserPrimaryGroup(
+        $uid,
+        $include_deleted = false,
+        $use_cache = false
+    ) {
+        $info = $this->getManyUserPrimaryGroupInfoList([$uid]);
+        if ( ! isset($info[$uid])) {
+            return false;
+        }
+
+        return $this->getGroup($info[$uid]["_id"]);
+    }
+
+    /**
+     * get primary group information of users
+     *
+     * ******** result type
+     * [result type1]
+     * 事前設定の優先する組織を優先する組織とするユーザー
+     *
+     * [result type2]
+     * 運用中の組織図で、優先する組織が設定されており、
+     * 未来の組織図で、優先する組織を変更されておらず、
+     * その組織に引き続き所属するユーザー
+     *
+     * [result type3-1]
+     * 未来の組織図で、組織に1つ以上所属しており、
+     * 優先する組織の設定がされていないユーザ
+     *
+     * [result type3-2]
+     * 未来の組織図で、所属する組織がないユーザ
+     * 結果セットには含まれない
+     *
+     * ******** how to make a decision
+     *   on sandbox, the user was modified?
+     *   (=the user has a record of tab_cb_user_sandbox_diff?)
+     *      Yes -> on sandbox, user's primary group is explicit?
+     *             (=tab_cb_user_sandbox_diff.col_primary_group has value)?
+     *                Yes -> type1
+     *                No  -> type3
+     *      No  -> on current organization chart, user's primary group is explicit?
+     *             (=tab_grn_userinfo.col_primary_group has value)?
+     *                Yes -> on sandbox, the user belongs to its group, continuously?
+     *                          Yes -> type2
+     *                          No  -> type3
+     *                No  -> type3
+     *   on sandbox and type3, the user belongs to any group?
+     *      Yes => type3-1
+     *      no  => type3-2
+     *
+     * @param string[] $inUserIdArray
+     *
+     * @return array
+     */
+    public function getManyUserPrimaryGroupInfoList($inUserIdArray = [])
+    {
+        if ( ! is_array($inUserIdArray) || count($inUserIdArray) == 0) {
+            return [];
+        }
+
+        $primaryGroups = [];
+
+        // 事前設定の優先する組織を、優先する組織とするユーザーidのリスト
+        $cbUserDiffDao = new CbUserDiffSandboxDAO();
+        $diffInfos
+            = $cbUserDiffDao->getPrimaryGroupIdsByIds($inUserIdArray);
+
+        // 運用中の優先する組織を優先する組織のとするユーザーidのリスト
+        $userHasNoDiff = array_diff($inUserIdArray, array_keys($diffInfos));
+
+        // 事前設定で所属する組織の先頭を、優先する組織とする ユーザ idのリスト
+        $userIdsForType3 = [];
+
+        foreach ($diffInfos as $userId => $primaryGroupId) {
+            if ( ! is_null($primaryGroupId)) {
+                // [result type1]
+                // 事前設定の優先する組織を優先する組織とするユーザー
+                $primaryGroups[$userId] = [
+                    'uid'      => $userId,
+                    '_id'      => $primaryGroupId,
+                    'col_name' => $this->getGroup($primaryGroupId)->get('name')
+                ];
+            } else {
+                $userIdsForType3[] = $userId;
+            }
+        }
+
+        require_once('fw/dao/CbUserDAO.csp');
+        $i18n = \CB_I18N::getInstance();
+        $inDataObj = [
+            'db'       => cb_get_master_db(),
+            'language' => $i18n->getCurrentLanguage(),
+        ];
+
+        // 運用中の組織図で、優先する組織が設定されているユーザを取得する
+        $cbUserDAO = new \CbUserDAO();
+        $userList
+            = $cbUserDAO->getUserPrimaryGroupListByIdsFromUserInfo($inDataObj,
+            $userHasNoDiff);
+
+        $userIdList = [];
+        foreach ($userList as $user) {
+            $userIdList[] = $user->getId();
+        }
+
+        //未来の組織において変更されていないユーザーのうち、
+        //明示的に、運用中の組織図において、優先する組織の値を所持しないユーザーたちは、[Type3]に分類される
+        $userIdsForType3 = array_merge($userIdsForType3,
+            array_diff($userHasNoDiff, $userIdList));
+
+        $userGroups = $this->getUsersGroupsInfo($userIdList);
+        foreach ($userList as $user) {
+            $userId = $user->getId();
+            $primaryGroupId = $user->getGroupId();
+            // search
+            if (isset($userGroups[$userId][$primaryGroupId])) {
+                // [result type2]
+                // 運用中の組織図で、優先する組織が設定されており、
+                // 未来の組織図で、優先する組織を変更されておらず、
+                // その組織に引き続き所属するユーザー
+                $primaryGroups[$userId] = [
+                    'uid'      => $userId,
+                    '_id'      => $primaryGroupId,
+                    'col_name' => $userGroups[$userId][$primaryGroupId]['col_name']
+                ];
+            } else {
+                $userIdsForType3[] = $userId;
+            }
+        }
+
+        $cbUserDAOSandbox = new \CbUserDAO(SandboxConstants::SANDBOX_MODE);
+        $userListForType3
+            = $cbUserDAOSandbox->findUserPrimaryGroupListByIdsFromRelation(
+            $inDataObj, $userIdsForType3
+        );
+        foreach ($userListForType3 as $user) {
+            $userId = $user->getId();
+            $primaryGroupId = $user->getGroupId();
+
+            // [result type3-1]
+            // 未来の組織図で、組織に1つ以上所属しており、
+            // 優先する組織の設定がされていないユーザ
+            $primaryGroups[$userId] = [
+                'uid'      => $userId,
+                '_id'      => $primaryGroupId,
+                'col_name' => $user->getGroupName()
+            ];
+        }
+
+        // [result type-2]
+        // 未来の組織図で、所属する組織がないユーザ
+        // (type3の判定が行なわれたが、所属する組織が0だったユーザ)
+        // 結果セットには含まれない
+
+        return $primaryGroups;
+    }
+
+    /**
+     * @param string $id
+     * @param bool   $include_deleted
+     *
+     * @return \CB_User|false
+     */
+    function getUser($id, $include_deleted = false)
+    {
+        $user = parent::getUser($id, $include_deleted);
+        if ( ! $user) {
+            return $user;
+        }
+
+        $dao = new CbUserDiffSandboxDAO();
+        $userDiff = cb_at($dao->getByIds([$id]), $id);
+        if ( ! empty($userDiff)) {
+            $user->sandbox_values = [
+                "position" => $userDiff['col_position'],
+                "valid"    => $userDiff['col_valid'],
+            ];
+        }
+
+        return $user;
+    }
+
+    /**
+     * @param array $userIds
+     *
+     * @return \CB_User[]
+     */
+    function getUsersById(array $userIds)
+    {
+        $users = parent::getUsersById($userIds);
+
+        $dao = new CbUserDiffSandboxDAO();
+        $userDiffs = $dao->getByIds(array_keys($users));
+        foreach ($userDiffs as $userId => $userDiff) {
+            $user = &$users[$userId];
+            $user->sandbox_values = [
+                "position" => $userDiff['col_position'],
+                "valid"    => $userDiff['col_valid'],
+            ];
+        }
+
+        return $users;
+    }
+
+    /**
+     * @param \CB_User $user
+     *
+     * @return \CB_UserBaseSetting
+     */
+    public function getBaseSettingByUser(\CB_User $user)
+    {
+        $baseSetting = parent::getBaseSettingByUser($user);
+        if (is_null($baseSetting)) {
+            require_once("fw/i18n/base.csp");
+            $baseSetting = \CB_BaseManager::getDefaultUserBaseSetting();
+        }
+
+        $dao = new CbUserDiffSandboxDAO();
+        $userDiff = cb_at($dao->getByIds([$user->getOID()]), $user->getOID());
+        if ($userDiff) {
+            $baseSetting->setBase($userDiff['col_base']);
+        }
+
+        return $baseSetting;
+    }
+
+    /**
+     * 使用中のユーザー数を取得する
+     *
+     * @return int     ユーザー数
+     */
+    function getActiveUserCount()
+    {
+        return (new CbUserDiffSandboxDAO())->getActiveUserCount();
+    }
+
+    /**
+     * @param        $gid
+     * @param int    $offset
+     * @param        $limit
+     * @param string $order_by
+     * @param null   $additional_condition
+     *
+     * @return array
+     */
+    public function getGroupUsersId(
+        $gid,
+        $offset = 0,
+        $limit = -1,
+        $order_by = 'tab_cb_user.col_position, tab_cb_user._id',
+        $additional_condition = null
+    ) {
+        // this method does not support following parameters.
+        assert('$order_by === "tab_cb_user.col_position, tab_cb_user._id"');
+        assert('is_null($additional_condition)');
+
+        if ( ! $gid) {
+            return [];
+        }
+        $dao = new CbUserGroupRelationSandboxDAO();
+
+        return $dao->getGroupUsersIds($gid, $limit, $offset);
+    }
+
+    /**
+     * 複数ユーザー情報を取得する
+     *
+     * @param string[]      $uids
+     * @param string[]|null $columns
+     * @param int           $offset
+     * @param int           $limit
+     * @param string|null   $order_by
+     * @param string|null   $add_condition
+     * @param string        $type
+     * @param bool          $include_deleted
+     *
+     * @return array
+     */
+    function getUsersInfo(
+        $uids = null,
+        $columns = null,
+        $offset = 0,
+        $limit = -1,
+        $order_by = null,
+        $add_condition = null,
+        $type = '_id',
+        $include_deleted = false
+    ) {
+        // this method does not support following parameters.
+        assert('is_null($order_by) || "ORDER BY col_position, _id" === $order_by');
+        assert('is_null($add_condition)');
+        assert('FALSE === $include_deleted');
+
+        $diffColumns = [
+            "col_position",
+            "col_valid"
+        ];
+
+        if (is_null($columns)) {
+            $columns = [];
+            $columns[] = 'col_display_name';
+            $columns[] = 'col_foreign_key';
+        }
+        $columns[] = '_id';
+
+        $caseFormat = ' CASE WHEN diff.col_user IS NOT NULL THEN diff.%1$s'
+                      . ' ELSE tab_cb_user.%1$s'
+                      . ' END AS %1$s ';
+
+        $willBeRemoved = [];
+        foreach ($diffColumns as $diffColumn) {
+            $hit = false;
+            foreach ($columns as $key => $column) {
+                $column = trim($column);
+                if ($diffColumn === $column) {
+                    $columns[$key] = sprintf($caseFormat, $column);
+                    $hit = true;
+                    break;
+                }
+            }
+            if ( ! $hit) {
+                $columns[] = sprintf($caseFormat, $diffColumn);
+                $willBeRemoved[] = $diffColumn;
+            }
+        }
+        $columns = implode(',', $columns);
+
+        if (is_null($order_by)) {
+            $order_by = 'ORDER BY col_position, _id';
+        }
+        $condition = '';
+        if (is_array($uids) && count($uids) > 0) {
+            $uid_list = [];
+            foreach ($uids as $key => $value) {
+                $uid_list[$key] = cb_queryf($this->_db, "'@S'", $value);
+            }
+
+            $condition = sprintf("WHERE ( {$type} IN ( %s ) ) ",
+                implode(',', $uid_list));
+        }
+
+        if ( ! $include_deleted) {
+            if (strlen($condition) > 0) {
+                $condition .= 'AND ';
+            } else {
+                $condition .= 'WHERE ';
+            }
+            $condition .= $this->_getLiveUserCondition();
+        }
+
+        if (strlen($add_condition) > 0) {
+            if (strlen($condition) > 0) {
+                $condition .= "AND (${add_condition})";
+            } else {
+                $condition .= "WHERE (${add_condition})";
+            }
+        }
+
+        $query = sprintf(
+            'SELECT %s FROM tab_cb_user '
+            . ' LEFT JOIN tab_cb_user_diff_sandbox AS diff'
+            . '  ON diff.col_user = tab_cb_user._id  %s %s',
+            $columns,
+            $condition, $order_by
+        );
+        $query = $this->_db->select_format($query, $offset, $limit,
+            CB_DATABASE_NO_LOCK);
+        $result = $this->_db->query($query);
+        if ($result === false) {
+            $this->_db->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        $users = [];
+        $n = $this->_db->num_rows($result);
+
+        for ($i = 0; $i < $n; $i++) {
+            $r = $this->_db->fetch_assoc($result);
+            foreach ($willBeRemoved as $remove) {
+                unset($r[$remove]);
+            }
+            $users[$r[$type]] = $r;
+        }
+        $this->_db->free_result($result);
+
+        return $users;
+    }
+
+    /**
+     * @param int    $offset
+     * @param int    $limit
+     * @param string $order_by
+     * @param null   $additional_condition
+     *
+     * @return \CB_User[]
+     */
+    function getNoGroupUsers(
+        $offset = 0,
+        $limit = -1,
+        $order_by = 'tab_cb_user.col_position, tab_cb_user._id',
+        $additional_condition = null
+    ) {
+        // this method does not support following parameters.
+        assert('is_null($order_by) || "tab_cb_user.col_position, tab_cb_user._id" === $order_by');
+        assert('is_null($additional_condition)');
+
+        $cbUserGroupRelationSandboxDAO = new CbUserGroupRelationSandboxDAO();
+        $userIds
+            = $cbUserGroupRelationSandboxDAO->getNoGroupUsersIds($limit,
+            $offset);
+
+        $users = $this->getUsersById($userIds);
+        $sortedUsers = [];
+        foreach ($userIds as $userId) {
+            $sortedUsers[$userId] = $users[$userId];
+        }
+
+        return $sortedUsers;
+    }
+
+    /**
+     * @return int
+     */
+    function getDeactiveUserCount()
+    {
+        return (new CbUserDiffSandboxDAO())->getDeactiveUserCount();
+    }
+
+    /**
+     * @param int    $offset
+     * @param        $limit
+     * @param string $order_by
+     * @param null   $add_condition
+     *
+     * @return \CB_User[]
+     */
+    function getDeactiveUsers(
+        $offset = 0,
+        $limit = -1,
+        $order_by = 'tab_cb_user.col_position, tab_cb_user._id',
+        $add_condition = null
+    ) {
+        assert('is_null($add_condition)');
+        assert('"tab_cb_user.col_position, tab_cb_user._id" === $order_by');
+
+        $userIds = (new CbUserDiffSandboxDAO())->getDeactiveUserIds($offset,
+            $limit);
+
+        $users = $this->getUsersById($userIds);
+        $sortedUsers = [];
+        foreach ($userIds as $userId) {
+            $sortedUsers[$userId] = $users[$userId];
+        }
+
+        return $sortedUsers;
+    }
+
+    /**
+     * @param array $user_list
+     *
+     * @return array
+     */
+    public function addUpdatedUserFlag(array $user_list)
+    {
+        $userIds = array_keys($user_list);
+
+        $searchDao = new GRN_Uum_SearchSandboxDAO();
+        $updatedUserIds = array_unique(
+            array_merge(
+                $this->getPrimaryGroupUpdatedUsers($userIds),
+                $searchDao->getUpdatedUserIdsExceptPrimaryGroup($userIds)
+            )
+        );
+
+        foreach ($updatedUserIds as $userId) {
+            assert('isset($user_list[$userId])');
+            $user_list[$userId]["updated"] = true;
+        }
+
+        return $user_list;
+    }
+
+    /**
+     * @param int $limit
+     * @param int $offset
+     *
+     * @return array
+     */
+    public function getUpdatedUsers($limit, $offset)
+    {
+        // get updated user ids
+        $updatedUserIds = $this->getUpdatedUserIds();
+
+        $searchDao = new GRN_Uum_SearchSandboxDAO();
+        $user_id_for_view = $searchDao->sortAndLimitByUserIds($updatedUserIds,
+            $limit, $offset);
+
+        // create display information
+        $login_user = $this->getLoginUser();
+        $users_info
+            = GRN_ControllerUtilSandbox::getUserInfoToShowUserName($user_id_for_view,
+            $login_user);
+
+        $user_list = [];
+        foreach ($user_id_for_view as $id) {
+            $display_name
+                = GRN_ControllerUtilSandbox::getUserNameText($login_user->getOID(),
+                $id, $users_info);
+            $user_list[$id] = [
+                'uid'          => $id,
+                'display_name' => $display_name,
+                'position'     => $users_info[$id]['col_position'],
+                'foreign_key'  => $users_info[$id]['col_foreign_key'],
+                'valid'        => is_null($users_info[$id]['col_valid']) ? true
+                    : false,
+                //'row' => ..., // on sandbox, 'row' is not used. 'row' is instance of CB_User
+                'updated'      => true,
+            ];
+        }
+
+        return [
+            'total_count' => count($updatedUserIds),
+            'user_list'   => $user_list
+        ];
+    }
+
+    /**
+     * @return array
+     */
+    public function getUpdatedUserIds()
+    {
+        $allAliveUsers = $this->getUsers();
+        $allAliveUserIds = array_keys($allAliveUsers);
+
+        $searchDao = new GRN_Uum_SearchSandboxDAO();
+        $updatedUserIds = array_unique(
+            array_merge(
+                $this->getPrimaryGroupUpdatedUsers($allAliveUserIds),
+                array_intersect($allAliveUserIds,
+                    $searchDao->getUpdatedUserIdsExceptPrimaryGroup())
+            )
+        );
+
+        return $updatedUserIds;
+    }
+
+    /**
+     * @param array $allAliveUserIds
+     *
+     * @return array
+     */
+    public function getPrimaryGroupUpdatedUsers(array $allAliveUserIds)
+    {
+        $uum = cb_lwc_uum();
+        $nowPrimaryGroups
+            = $uum->getManyUserPrimaryGroupInfoList($allAliveUserIds);
+        $sandboxPrimaryGroups
+            = $this->getManyUserPrimaryGroupInfoList($allAliveUserIds);
+
+        $updatedUserIds = [];
+        foreach ($allAliveUserIds as $userId) {
+            $nowPrimaryGroup = array_key_exists($userId, $nowPrimaryGroups)
+                ? $nowPrimaryGroups[$userId]['_id'] : null;
+            $sandboxPrimaryGroup = array_key_exists($userId,
+                $sandboxPrimaryGroups)
+                ? $sandboxPrimaryGroups[$userId]['_id'] : null;
+
+            if ($nowPrimaryGroup !== $sandboxPrimaryGroup) {
+                $updatedUserIds[] = $userId;
+            }
+        }
+
+        return $updatedUserIds;
+    }
+}

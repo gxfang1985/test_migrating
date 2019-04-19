@@ -1,0 +1,265 @@
+<?php
+
+namespace grn\grn\customization\logic;
+
+use grn\grn\customization\bean\Proxy;
+use grn\grn\ErrorCode;
+use grn\grn\LogMessage;
+use grn\grn\TextLogger;
+
+class ProxyConnection
+{
+    /**
+     * @var Proxy
+     */
+    private $setting;
+
+    public function __construct(Proxy $setting)
+    {
+        $this->setting = $setting;
+    }
+
+    /**
+     * @param string            $url
+     * @param string            $method
+     * @param array             $headers
+     * @param string|array|NULL $data
+     *
+     * @return array
+     */
+    public function send($url, $method = 'GET', $headers = [], $data = null)
+    {
+        if ( ! $this->setting->getActive()) {
+            cb_throw_error(ErrorCode::PROXY_API_NOT_AVAILABLE);
+        }
+
+        if ( ! $this->isValidRequest($url, $method)) {
+            cb_throw_error(ErrorCode::PROXY_API_CANNOT_SEND_INVALID_PARAMS);
+        }
+
+        require_once('grn/http_proxy.csp');
+        $proxy_http_client = new \GRN_ProxyHttpClient();
+        $http_client = $proxy_http_client->getHttp();
+
+        // set URL
+        $target_url = $this->mergeUrlParams($url);
+        $log_params['url'] = $target_url;
+
+        // set headers
+        $target_headers = $this->createHeaders($headers);
+        $log_params['headers'] = $target_headers;
+        $http_client->setCurlOption(CURLOPT_HTTPHEADER, $target_headers);
+
+        // content-type
+        $content_type = $this->getContentType($target_headers);
+
+        // set method
+        $log_params['method'] = $method;
+        if ($method != 'GET') {
+            $http_client->setCurlOption(CURLOPT_CUSTOMREQUEST, $method);
+        }
+
+        // set post fields
+        if ($method == 'POST' || $method == 'PUT') {
+            $post_fields = $this->createPostFields($data, $content_type);
+            $log_params['data'] = $post_fields;
+            $http_client->setCurlOption(CURLOPT_POSTFIELDS, $post_fields);
+        }
+
+        // set other options
+        $http_client->setCurlOption(CURLOPT_TIMEOUT, 10);
+        $http_client->setCurlOption(CURLOPT_RETURNTRANSFER, true);
+
+        // execute request
+        $this->log($this->setting, 'Request', print_r($log_params, true));
+
+        $success = $proxy_http_client->execute($target_url);
+        if ( ! $success) {
+            cb_throw_error(ErrorCode::PROXY_API_FAIL_TO_CONNECT);
+        }
+
+        $return_data = [];
+
+        $return_data['status_code']
+            = ($http_client->getStatusLine())['status-code'];
+        $return_data['headers'] = $this->convertResponseHeaders(
+            $http_client->getHeaders()
+        );
+
+        if ($success) {
+            $return_data['data'] = $http_client->getBody();
+        }
+
+        $this->log($this->setting, 'Response', print_r($return_data, true));
+
+        return $return_data;
+    }
+
+    /**
+     * @param array $headers
+     *
+     * @return null|string
+     */
+    private function getContentType(array $headers)
+    {
+        foreach ($headers as $header) {
+            $pair = explode(':', strtolower($header));
+            if ($pair[0] == 'content-type') {
+                return trim($pair[1]);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param $url string
+     *
+     * @return string
+     */
+    private function mergeUrlParams($url)
+    {
+        $return_url = $url;
+
+        if (count($this->setting->getParams()) == 0) {
+            return $return_url;
+        }
+
+        $saved_url_params = [];
+        foreach ($this->setting->getParams() as $param) {
+            $saved_url_params[$param['key']] = $param['value'];
+        }
+
+        $saved_url_params_str = http_build_query($saved_url_params);
+
+        $pos = strpos($url, '?');
+
+        if ($pos === false) {
+            $return_url .= '?';
+        } else {
+            $query_has_param = substr($url, $pos + 1);
+            if ($query_has_param) {
+                $return_url .= '&';
+            }
+        }
+
+        $return_url .= $saved_url_params_str;
+
+        return $return_url;
+    }
+
+    private function mergeBodyParams(array $data)
+    {
+        $body = $this->setting->getBody();
+
+        $saved_body_data = [];
+        foreach ($body as $param) {
+            $saved_body_data[$param['key']] = $param['value'];
+        }
+
+        $result = array_merge($data, $saved_body_data);
+
+        return $result;
+    }
+
+    /**
+     * @param $data         string|array
+     * @param $content_type string
+     *
+     * @return string
+     */
+    private function createPostFields($data, $content_type)
+    {
+        $post_fields = '';
+
+        if (is_string($data)) {
+            $post_fields = $data;
+        } elseif (is_array($data)) {
+            if ($content_type == 'application/x-www-form-urlencoded') {
+                $post_fields = http_build_query($this->mergeBodyParams($data));
+            } else {
+                $post_fields = json_encode($this->mergeBodyParams($data));
+            }
+        }
+
+        return $post_fields;
+    }
+
+    /**
+     * @param array $headers
+     *
+     * @return array
+     */
+    private function createHeaders(array $headers)
+    {
+        $pairs = $headers;
+
+        foreach ($this->setting->getHeaders() as $header) {
+            $key = $header['key'];
+            $pairs[$key] = $header['value'];
+        }
+
+        $return_headers = [];
+        foreach ($pairs as $key => $value) {
+            $return_headers[] = "{$key}: {$value}";
+        }
+
+        return $return_headers;
+    }
+
+    /**
+     * @param $url
+     * @param $method
+     *
+     * @return bool
+     */
+    private function isValidRequest($url, $method)
+    {
+        if (strpos($url, $this->setting->getURL()) === 0
+            && $method == $this->setting->getMethod()
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param array $headers
+     *
+     * @return array
+     */
+    private function convertResponseHeaders(array $headers)
+    {
+        $converted_headers = [];
+        foreach ($headers as $name => $value) {
+            if (count($value) == 1) {
+                $converted_headers[$name] = $value[0];
+            } else {
+                $converted_headers[$name] = $value;
+            }
+        }
+
+        return $converted_headers;
+    }
+
+    /**
+     * @param Proxy  $setting
+     * @param string $action
+     * @param string $message
+     */
+    private function log(Proxy $setting, $action, $message)
+    {
+        global $G_config_common;
+        $is_enable_log = $G_config_common->get('Customization',
+            'enable_proxy_api_log');
+        if ( ! $is_enable_log) {
+            return;
+        }
+        $logFileName = 'proxy_api.log';
+        $logger = new TextLogger('proxy_api', $logFileName);
+        $logger->shouldNotCleanUp();
+        $log_message = "{$setting->getCode()} $action \n$message";
+        $logger->log(new LogMessage($log_message));
+    }
+}

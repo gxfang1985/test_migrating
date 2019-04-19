@@ -1,0 +1,235 @@
+<?php
+
+namespace grn\space\screen\application\discussion;
+
+use grn\favour\service\FavourService;
+use grn\space\screen\application\discussion\DiscussionBase;
+use grn\space\service\DiscussionService;
+use grn\space\service\SpaceService;
+use grn\space\data\bean\Thread;
+use grn\space\data\collection\ThreadCollection;
+use grn\space\data\condition\ThreadSearchCondition;
+use grn\space\common\data\bean\Authority;
+use grn\space\common\exception\GrnDataNotFoundException;
+use grn\space\common\exception\GrnInvalidPermissionException;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\utility\SpaceDatetimeUtility;
+use grn\space\common\utility\SpaceFileUtility;
+use grn\space\common\utility\ValidateUtility;
+use grn\space\logic\SpaceLogic;
+use grn\space\common\data\bean\LanguageStatus;
+
+/**
+ * Class ThreadDetail
+ */
+class ThreadDetail extends DiscussionBase
+{
+    const MAX_NUM_NOTIFICATION_MEMBER = 20;
+
+    /**
+     * @return mixed|string|void
+     * @throws GrnInvalidPermissionException
+     * @throws \grn\favour\exception\FavourException
+     * @throws \grn\space\common\exception\GrnInvalidArgumentException
+     */
+    public function fetch()
+    {
+        $input = $this->getInput();
+        $config = $this->getUserConfig();
+        $login_id = $this->getLoginUserId();
+
+        $parameter = [self::ARG_SPACE_ID];
+        $this->checkArgFromInput($parameter, $input);
+        $this->verifySpaceIsNotExpired();
+        $space_id = $this->getSpaceId();
+        $thread_id = $this->getArrayValue(self::ARG_THREAD_ID, $input);
+        if ( ! ValidateUtility::isNumber($thread_id,
+            ValidateUtility::DISABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            $thread_id = $this->getSystemThreadId();
+        }
+        $this->setThreadId($thread_id);
+
+        $discussion_service = DiscussionService::getInstance();
+        $thread_write_auth
+            = $discussion_service->hasThreadAccessControl(Authority::AUTHORITY_CODE_WRITE,
+            $space_id, $thread_id, $login_id);
+        $thread_read_auth
+            = $discussion_service->hasThreadAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $space_id, $thread_id, $login_id);
+        if ($thread_read_auth) {
+            $thread_obj = $discussion_service->getThread($thread_id, $login_id);
+            $discussion_service->registerReadThread($thread_id, $login_id);
+            $discussion_service->addInspectionUserInfo($thread_obj, $login_id,
+                $this->isSystemUseEnglish(), $this->isEnglishDisplayAfterName(),
+                $this->isOrganizationDisplayAfterName(),
+                $this->getLanguageCode());
+            SpaceDatetimeUtility::constructDisplayDatetimeOfInspection($thread_obj,
+                $this->getDatetimeFormat(),
+                SpaceDatetimeUtility::DISPLAY_TYPE_LONGDATE_AND_TIME,
+                $this->getLanguageCode(), $this->getTimezoneName());
+        } else {
+            throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_ACCESS_PERMISSION);
+        }
+
+        $space_file_collection = $thread_obj->getSpaceFileCollection();
+        $attached_files = [];
+        foreach ($space_file_collection as $file) {
+            /** @var \grn\space\common\data\bean\SpaceFile $file */
+            $attached_files[$file->getId()]
+                = SpaceFileUtility::getSpaceFileLinkView($file);
+        }
+
+        $deletable = $this->discussionDeletable($thread_obj,
+            SpaceService::getInstance(), $thread_write_auth, $space_id,
+            $login_id);
+        $delete_info = [
+            'title'      => grn_get_page_display_name('space/discussion/thread_delete'),
+            'page'       => 'space/application/discussion/thread_delete.tpl',
+            'no_confirm' => 'FALSE',
+            'data'       => ['thread' => $thread_obj],
+            'handler'    => 'lnk_delete',
+        ];
+
+        require_once('grn/smarty.csp');
+        $smarty = new \GRN_Smarty();
+        $smarty->assign('attached_files', $attached_files);
+        $smarty->assign('thread_obj', $thread_obj);
+        $smarty->assign('delete_info', $delete_info);
+        $smarty->assign('deletable', $deletable);
+
+        if ($thread_read_auth) {
+            $space_service = SpaceService::getInstance();
+            $is_member = $space_service->isSpaceMember($login_id, $space_id,
+                $login_id);
+            if ($is_member) {
+                $subscribe = $discussion_service->isNotificationUser($thread_id,
+                    $login_id, $space_id, $login_id);
+            } else {
+                $subscribe
+                    = $discussion_service->isDiscussionNotificationUser($thread_id,
+                    $login_id);
+            }
+            $smarty->assign('subscribe', $subscribe);
+        }
+        $smarty->assign('thread_read_auth', $thread_read_auth);
+
+        require_once('star/logic.csp');
+        $star_logic = \GRN_Star_StarLogic::getInstance();
+        $use_star = $star_logic->isActive();
+        $smarty->assign('use_star', $use_star);
+        if ($use_star) {
+            $smarty->assign('star_infos',
+                $star_logic->getStatusByIDs($this->getLoginUser(), 'grn.space',
+                    [$thread_obj->getId()]));
+            $smarty->assign('sub_module', 'grn.discussion');
+        }
+        $smarty->assign('inline', $config->getInlineSetting());
+        $smarty->assign('thread_write_auth', $thread_write_auth);
+        $smarty->assign('has_privilege',
+            $this->isSpaceAdminOrOperator(SpaceService::getInstance(),
+                $space_id, $login_id));
+        $smarty->assign('space_id', $space_id);
+
+        $this->setWindowTitle($thread_obj->getTitle());
+
+        // for favour
+        $favour_service = new FavourService();
+        $is_favour_active = $favour_service->isFavourAppActive();
+        if ($is_favour_active) {
+            $params = [self::ARG_SPACE_ID => $space_id];
+            require_once('space/GrnSpaceApplication.csp');
+            $favour_info
+                = $favour_service->constructFavourInfo(\GrnSpaceApplication::GRN_SPACE_MODULE_ID,
+                \GrnSpaceApplication::FAVOUR_DISCUSSION_BODY,
+                $thread_id,
+                $login_id,
+                $params,
+                \GrnSpaceApplication::GRN_DISCUSSION_SUB_MODULE_ID);
+            $smarty->assign('favour_info', $favour_info);
+        }
+        $smarty->assign('is_favour_active', $is_favour_active);
+
+        $spaceLogic = SpaceLogic::getInstance();
+        $space_obj = $spaceLogic->getSpace($space_id,
+            LanguageStatus::STANDARD_LANGUAGE_CODE);
+        $browse_log = [
+            "space_id"    => $space_id,
+            "category_id" => $space_obj->getCategoryId(),
+            "space_name"  => $space_obj->getSpaceName(),
+            "thread_id"   => $thread_id,
+            "thread_name" => $thread_obj->getTitle()
+        ];
+        if ($thread_obj->getFolderId() > 0) {
+            $browse_log['directory_id'] = $thread_obj->getFolderId();
+        }
+        $discussion_service->addBrowseThreadLog($browse_log);
+
+        return $smarty->fetch("space/application/discussion/thread_detail.tpl");
+    }
+
+    /**
+     * @return bool
+     * @throws GrnInvalidPermissionException
+     */
+    public function isUnreadUnder()
+    {
+        $login_id = $this->getLoginUserId();
+        $space_id = $this->getSpaceId();
+        $thread_id = $this->getThreadId();
+
+        $discussion_service = DiscussionService::getInstance();
+        $thread_read_auth
+            = $discussion_service->hasThreadAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $space_id, $thread_id, $login_id);
+        if ($thread_read_auth) {
+            return $discussion_service->isUnreadUnder($thread_id, $login_id);
+        } else {
+            throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_ACCESS_PERMISSION);
+        }
+
+        return false;
+    }
+
+
+    /**
+     * @return \grn\space\data\collection\SpaceUserCollection
+     * @throws GrnInvalidPermissionException
+     */
+    public function getNotificationUser()
+    {
+        $input = $this->getInput();
+        $login_id = $this->getLoginUserId();
+
+        $parameter = [self::ARG_SPACE_ID, self::ARG_MEMBER];
+        $this->checkArgFromInput($parameter, $input);
+        $space_id = $this->getSpaceId();
+        $thread_id = $this->getArrayValue(self::ARG_THREAD_ID, $input);
+        if ( ! ValidateUtility::isNumber($thread_id,
+            ValidateUtility::DISABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            $thread_id = $this->getSystemThreadId();
+        }
+
+        $discussion_service = DiscussionService::getInstance();
+        $thread_read_auth
+            = $discussion_service->hasThreadAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $space_id, $thread_id, $login_id);
+        if ( ! $thread_read_auth) {
+            throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_ACCESS_PERMISSION);
+        }
+
+        $notification_user_collection
+            = $discussion_service->getNotificationUserCollection($space_id,
+            $thread_id, $login_id, false);
+        $space_service = SpaceService::getInstance();
+        $space_service->addUserInfo($notification_user_collection, $login_id,
+            $this->isSystemUseEnglish(),
+            $this->isEnglishDisplayAfterName(),
+            $this->isOrganizationDisplayAfterName(), $this->getLanguageCode());
+
+        return $notification_user_collection;
+    }
+}

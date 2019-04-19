@@ -1,0 +1,712 @@
+<?php
+
+use grn\fts\Application as FtsApplication;
+use grn\fts\cabinet\IndexService;
+
+/**
+ * ファイル管理アプリケーションクラス
+ *
+ * @author  Kuniaki, Mizuno         2004/12
+ * @author  Tanaka, Yoshiaki        2004/11
+ * @package grn.cabinet
+ */
+
+require_once('grn/application.csp');
+require_once('cabinet/table.csp');
+require_once('cabinet/file_util.csp'); // Huy added
+require_once('cabinet/file.csp');
+require_once('cabinet/folder.csp');
+
+/**
+ * @package grn.cabinet
+ */
+class GRN_Cabinet extends GRN_ApplicationBase
+{
+    /*
+     * @access private
+     */
+    var $_prefix = 'sort_';
+
+    function __construct()
+    {
+        parent::__construct('cabinet');
+    }
+
+    /**
+     * フォルダーを作成する
+     *
+     * @param CB_User $user       作成ユーザー
+     * @param string  $parent_fid 親フォルダーID、ルートに作成する場合は null
+     * @param array   $properties フォルダーの内容
+     *
+     * @return mixed  成功の場合に GRN_Cabinet_Folder、失敗の場合にFALSE
+     */
+    function createFolder(& $user, $parent_fid, $properties)
+    {
+        require_once('cabinet/folder.csp');
+        $foldermgr = GRN_Cabinet_FolderManager::getInstance();
+        $ret = $foldermgr->createFolder($user, $parent_fid, $properties);
+
+        return $ret;
+    }
+
+    /**
+     * ルートフォルダーを取得する
+     *
+     * @param CB_User $user 操作ユーザー
+     *
+     * @return object
+     */
+    function getRootFolder(& $user)
+    {
+        require_once('cabinet/folder.csp');
+        $foldermgr = GRN_Cabinet_FolderManager::getInstance();
+        $ret = $foldermgr->getRootFolder($user);
+
+        return $ret;
+    }
+
+    /**
+     * フォルダーを取得する
+     *
+     * @param CB_User $user 操作ユーザー
+     * @param string  $cid  フォルダーID
+     *
+     * @return GRN_Cabinet_Folder
+     */
+    function getFolder(& $user, $cid)
+    {
+        require_once('cabinet/folder.csp');
+        $foldermgr = GRN_Cabinet_FolderManager::getInstance();
+        $ret = $foldermgr->getFolder($user, $cid, GRN_CABINET_ACCESS_R,
+            false);
+
+        return $ret;
+    }
+
+    function &getFileFolder(& $file)
+    {
+        require_once('cabinet/file.csp');
+        $filemgr = GRN_Cabinet_FileManager::getInstance();
+        $ret = $filemgr->getFolder($file);
+
+        return $ret;
+    }
+
+
+    function &createFile(& $user, & $folder, & $file, $comment)
+    {
+        require_once('cabinet/file.csp');
+        $filemgr = GRN_Cabinet_FileManager::getInstance();
+        $object = $filemgr->createFile($user, $folder, $file, $comment);
+
+        if ($object) {
+            $this->readFile($user, $object);
+        }
+
+        return $object;
+    }
+
+    /**
+     * ファイルを削除する
+     *
+     * @param CB_User $user         ユーザー
+     * @param string  $fid          ファイルID
+     * @param string  $hid          フォルダID
+     * @param bool    $force_delete (FALSE: move file to trash, TRUE: is permanent delete )      // Huy added
+     *
+     * @return bool
+     */
+    function deleteFile(& $user, $fid, $hid = null, $force_delete = false)
+    {
+        if ( ! is_a($user, 'CB_User')) {
+            return false;
+        }
+
+        // ファイルを取得
+        if ( ! ($file = $this->getFile($user, $fid))) {
+            cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+        }
+
+        $folder = null;
+
+        if ( ! $hid) {
+            $folder = $this->getFileFolder($file);
+        } else {
+            require_once('cabinet/folder.csp');
+            $factory = GRN_Cabinet_FolderFactory::getInstance();
+            $folder = $factory->get($hid);
+        }
+
+        if ( ! $folder) {
+            cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+        }
+
+        if ($hid) {
+            $f_folder = $this->getFileFolder($file);
+            $f_hid = $f_folder->getOId();
+            if ($hid !== $f_hid) {
+                cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+            }
+        }
+
+        // 削除が許可されたユーザーかチェック
+        $folder->isDeletableFile($user, $file, true);
+
+        if ($force_delete) {
+            if ($file->isInTrash() == false) {
+                cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+            }
+            // delete notification message
+            require_once('cabinet/notification.csp');
+            $nm = GRN_Cabinet_NotificationManager::getInstance();
+            $nm->deleteNotification($file);
+
+            // Write log: delete file
+            require_once('cabinet/inspection.csp');
+            $inspection = GRN_Cabinet_Inspection::getInstance();
+            $inspection->writeLogFile('delete', $file, $folder);
+
+            // delete
+            $file->delete();
+        } else {
+            $lock = $file->getLockObject();
+            if ($lock->isLocked() == 2) {
+                $lock->releaseLock();
+            }
+            // move to Trash
+            $file->moveToTrash();
+
+            // delete notification message
+            require_once('cabinet/notification.csp');
+            $nm = GRN_Cabinet_NotificationManager::getInstance();
+            $nm->deleteNotification($file);
+            // Write log: move file to trash
+            require_once('cabinet/inspection.csp');
+            $inspection = GRN_Cabinet_Inspection::getInstance();
+            $inspection->writeLogFile('move', $file, 'garbage',
+                $folder->getOID());
+        }
+
+        if (FtsApplication::isAvailable()) {
+            $searchService = new IndexService();
+            $searchService->deleteFileIndex($file->getOID());
+        }
+
+        return true;
+    }
+
+    // Huy added
+    function restoreFileFromTrash(& $user, $fid)
+    {
+        if ( ! is_a($user, 'CB_User')) {
+            return false;
+        }
+
+        // ファイルを取得
+        if ( ! ($file = $this->getFile($user, $fid))) {
+            cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+        }
+
+        if ($file->isExpired()) {
+            cb_throw_error(E_GRN_CABINET_FILE_EXPIRED);
+        }
+
+        $file->restoreFileFromTrash();
+
+        // Full Text Search
+        if (FtsApplication::isAvailable()) {
+            $searchService = new IndexService();
+            $searchService->createFileIndex($file);
+        }
+
+        // Write log: recover file from trash 
+        require_once('cabinet/inspection.csp');
+        $inspection = GRN_Cabinet_Inspection::getInstance();
+        $folder = $this->getFileFolder($file);
+        $inspection->writeLogFile('move', $file, $folder->getOID(), 'garbage');
+
+        return true;
+    }
+
+    // Huy added
+    function deleteExpiredFiles(& $user, $hid = null)
+    {
+        // check folder
+        $folder = null;
+        $file = null;
+
+        if ( ! $hid) {
+            $folder = $this->getFileFolder($file);
+        } else {
+            require_once('cabinet/folder.csp');
+            $factory = GRN_Cabinet_FolderFactory::getInstance();
+            $folder = $factory->get($hid);
+        }
+
+        if ( ! $folder) {
+            cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+        }
+        $folder = $this->getFolder($user, $hid);
+        $files = $folder->getFiles(GRN_CABINET_FILELIST_MODE_IN_TRASH);
+        foreach ($files as $file) {
+            if ($file->isExpired()) {
+                // Write log: delete file
+                require_once('cabinet/inspection.csp');
+                $inspection = GRN_Cabinet_Inspection::getInstance();
+                $inspection->writeLogFile('delete', $file, $folder);
+
+                // delete
+                $file->delete();
+            }
+        }
+    }
+
+    /**
+     * ファイルを取得する
+     *
+     * @param CB_User $user
+     * @param string  $fid ファイルID
+     * @param int     $acc_mode
+     * @param bool    $throw_error
+     *
+     * @return GRN_Cabinet_File
+     */
+    function getFile(
+        $user,
+        $fid,
+        $acc_mode = GRN_CABINET_ACCESS_R,
+        $throw_error = true
+    ) {
+        require_once('cabinet/file.csp');
+        $filemgr = GRN_Cabinet_FileManager::getInstance();
+        $ret = $filemgr->getFile($user, $fid, $acc_mode, $throw_error);
+
+        return $ret;
+    }
+
+    /**
+     * システム設定
+     *
+     * @return array
+     */
+    function getSystemConfigArray()
+    {
+        $ret = [
+            'cabinet_config' =>
+                [
+                    [
+                        'page' => 'cabinet/system/common_set',
+                        'icon' => 'general32'
+                    ],
+                    [
+                        'page' => 'cabinet/system/folder_list',
+                        'icon' => 'folder32'
+                    ],
+                    [
+                        'page' => 'cabinet/system/access_index',
+                        'icon' => 'access32'
+                    ],
+                    [
+                        'page' => 'cabinet/system/privilege_index',
+                        'icon' => 'manager32'
+                    ],
+                    [
+                        'page' => 'cabinet/system/notify_index',
+                        'icon' => 'notify32'
+                    ],
+                    [
+                        'page' => 'cabinet/system/import_index',
+                        'icon' => 'import32'
+                    ],
+                    [
+                        'page' => 'cabinet/system/export_index',
+                        'icon' => 'export32'
+                    ],
+                ],
+        ];
+
+        return $ret;
+    }
+
+    /**
+     * 既読処理
+     *
+     * @param $user
+     * @param $file
+     *
+     * @return bool
+     */
+    function readFile(& $user, & $file)
+    {
+        require_once('cabinet/notification.csp');
+        $nm = GRN_Cabinet_NotificationManager::getInstance();
+
+        return $nm->read($user, $file);
+    }
+
+    /**
+     * 既読状態確認
+     *
+     * @param $user
+     * @param $file
+     *
+     * @return bool
+     */
+    function isReadFile(& $user, & $file)
+    {
+        require_once('cabinet/notification.csp');
+        $nm = GRN_Cabinet_NotificationManager::getInstance();
+
+        return $nm->isRead($user, $file);
+    }
+
+    /**
+     * 通知の更新
+     *
+     * @param $user
+     * @param $last_timestamp
+     * @param $new_timestamp
+     */
+    function updateNotificationData(& $user, $last_timestamp, & $new_timestamp)
+    {
+        require_once('cabinet/notification.csp');
+        $nm = GRN_Cabinet_NotificationManager::getInstance();
+        $nm->updateNotification($user, $last_timestamp, $new_timestamp);
+    }
+
+    /**
+     * 通知の既読処理
+     *
+     * @param $user
+     * @param $module_id
+     * @param $unique_id
+     * @param $org_data
+     * @param $timestamp
+     *
+     * @return bool
+     */
+    function confirmApplicationData(
+        & $user,
+        $module_id,
+        $unique_id,
+        $org_data,
+        $timestamp
+    ) {
+        if (($file = $this->getFile($user, $unique_id, GRN_CABINET_ACCESS_R,
+            false))
+        ) {
+            require_once('cabinet/notification.csp');
+            $nm = GRN_Cabinet_NotificationManager::getInstance();
+            $nm->read($user, $file, $timestamp, false);
+        }
+
+        return true;
+    }
+
+    /**
+     * 通知リンク情報
+     *
+     * @param $user
+     * @param $app_id
+     * @param $unique_id
+     * @param $org_data
+     * @param $status
+     * @param $action_id
+     * @param $sub_module_id
+     *
+     * @return array
+     */
+    function getNotificationPageInfo(
+        $user,
+        $app_id,
+        $unique_id,
+        $org_data,
+        $status,
+        $action_id,
+        $sub_module_id
+    ) {
+        $info = [];
+        $info['subject_page'] = 'cabinet/view';
+
+        if ($status == 'update') {
+            $info['subject_icon'] = cb_msg(GRN_NOTIFICATION_MODULE_ID,
+                GRN_NOTIFICATION_CABINET_ICON_CODE_MOD);
+        } else {
+            $info['subject_icon'] = cb_msg(GRN_NOTIFICATION_MODULE_ID,
+                GRN_NOTIFICATION_CABINET_ICON_CODE_ADD);
+        }
+
+        $info['abstract_page'] = 'cabinet/download';
+        $info['abstract_icon'] = 'disk20';
+
+        if (is_array($org_data) && array_key_exists('name', $org_data)) {
+            $info['abstract_postfix'] = $org_data['name'];
+        }
+
+        if (array_key_exists("hid", $org_data)) {
+            $info['url_params'] = [
+                'fid' => $unique_id,
+                'hid' => $org_data['hid']
+            ];
+        } else {
+            $info['url_params'] = ['fid' => $unique_id];
+        }
+
+        return $info;
+    }
+
+    /**
+     * ポートレット
+     *
+     * @return array
+     */
+    function &getPortletList()
+    {
+        $portlet = [
+            'name'             => $this->getName(),
+            'type'             => 'grn.cabinet.portlet',
+            //種別
+            'version'          => '1.0',
+            //バージョン
+            'set_template'     => 'cabinet/portlet/settings.csp',
+            //設定用テンプレート名
+            'command_template' => 'cabinet/portlet/command_settings.csp',
+            //設定用テンプレート名
+            'view_template'    => 'cabinet/portlet/view.csp'
+            //表示用テンプレート名
+        ];
+        $ret = [$portlet];
+
+        return $ret;
+    }
+
+    /**
+     * @param CB_User $user
+     * @param array   $params
+     *
+     * @return GRN_Star_Data
+     */
+    function getStarData($user, $params)
+    {
+        $file_id = array_key_exists('fid', $params) ? $params['fid'] : '';
+        $hid = array_key_exists('hid', $params) ? $params['hid'] : '';
+        if ( ! ($file_id)) {
+            require_once('cabinet/error_code.csp');
+            cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+        }
+        if ( ! ($file = $this->getFile($user, $file_id))) {
+            require_once('cabinet/error_code.csp');
+            cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+        }
+        if ($file->isInTrash())     // Huy added
+        {
+            require_once('cabinet/error_code.csp');
+            cb_throw_error(E_GRN_CABINET_FILE_NOT_FOUND);
+        }
+        require_once('star/application.csp');
+        $star_data = new GRN_Star_Data();
+        $star_data->setModuleId('grn.cabinet');
+        $star_data->setUniqueId($file_id);
+        $file_title = $file->get('title');
+        if (mb_strlen($file_title) == 0) {
+            $file_title = $file->get('title_sort_key');
+        }
+        $star_data->setSubjectData($file_title);
+        $org_data = ['fid' => $file_id, 'hid' => $hid];
+        $star_data->setOrgData($org_data);
+        $creator_file = $file->get('creator');
+        $creator_id = $creator_file ? $creator_file->getOID() : null;
+
+        $star_data->setSenderData($file->get('creator_name'), $creator_id);
+        $star_data->setTimeStampData($file->get('mtime'));
+
+        return $star_data;
+    }
+
+    function updateStarData(&$user)
+    {
+        assert('is_object($user) && is_a($user, \'cb_user\')');
+
+        require_once('star/logic.csp');
+        $logic = GRN_Star_StarLogic::getInstance();
+        $star_list = $logic->getList($user, 'grn.cabinet', 0, -1);
+
+        foreach ($star_list as $starid => $star_data) {
+            if (isset($star_data['org_data'])) {
+                $fid = array_key_exists('fid', $star_data['org_data'])
+                    ? $star_data['org_data']['fid'] : null;
+                $file = $this->getFile($user, $fid, GRN_CABINET_ACCESS_R,
+                    false);
+                if ( ! $file || $file->isInTrash()) {
+                    // if event don't exist, remove star item.
+                    $logic->removeByIds($user, [$starid]);
+                    continue;
+                }
+                if ( ! ($folder = $this->getFileFolder($file))) {
+                    continue;
+                }
+                $hid = $folder->getOID();
+                $folder_access = $this->getFolder($user, $hid);
+                if ( ! $folder_access) {
+                    $logic->removeByIds($user, [$starid]);
+                    continue;
+                }
+                $star_data = new GRN_Star_Data();
+                $file_title = $file->get('title');
+                if (mb_strlen($file_title) == 0) {
+                    $file_title = $file->get('title_sort_key');
+                }
+                $star_data->setSubjectData($file_title);
+                $org_data = ['fid' => $fid, 'hid' => $hid];
+                $star_data->setOrgData($org_data);
+                $time = new CB_TimeStamp();
+                $time->unix_ts = time();
+                $star_data->setTimeStampData($time);
+                $star_data->setModuleId('grn.cabinet');
+                $star_data->setUniqueId($fid);
+                $logic->modify($user, $star_data);
+            } else {
+                // if org_data isn't exist, remove star item
+                $logic->removeByIds($user, [$starid]);
+            }
+        }
+    }
+
+    function getZipFile($file_id_list, & $user, $encode = 'UTF-8')
+    {
+        if ( ! is_a($user, 'CB_User')) {
+            return false;
+        }
+
+        if ( ! is_array($file_id_list) || count($file_id_list) == 0) {
+            return false;
+        }
+
+        asort($file_id_list, SORT_NUMERIC);
+        $file_id_list = array_reverse($file_id_list);
+
+        require_once('grn/file.csp');
+        $zipfile = new GRN_ZipFile();
+
+        //zipファイル内で名前が衝突しないようにするために、
+        //全てのファイル名を取得
+        $allnames = [];
+        foreach ($file_id_list as $file_id) {
+            $file = $this->getFile($user, $file_id);
+            if ($file->isInTrash()) {
+                continue;
+            }
+            $body = $file->getCurrentBody();
+            $filename = $body->get('name');
+            $filename = grn_get_safe_filename($filename);
+            $filename = cb_encode($filename, $encode, 'UTF-8');
+            $allnames[] = $filename;
+        }
+
+        $usednames = [];
+        foreach ($file_id_list as $file_id) {
+            $file = $this->getFile($user, $file_id);
+            if ($file->isInTrash()) {
+                continue;
+            }
+            $body = $file->getCurrentBody();
+            $filename = $body->get('name');
+            $filename = grn_get_safe_filename($filename);
+            $filename = cb_encode($filename, $encode, 'UTF-8');
+
+            //Get Folder
+            $folder = $this->getFileFolder($file);
+            if ( ! $folder) {
+                cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+            }
+            $folder->access($user, GRN_CABINET_ACCESS_R, true);
+            $folder_id = $folder->getOID();
+
+            //自分自身を消す
+            unset($allnames[array_search($filename, $allnames)]);
+
+            //名前が衝突していないか調べる
+            if (array_search($filename, $usednames) === false) {
+                $usednames[] = $filename;
+            } else {
+                $count = 0;
+                $assumed_filename = $filename;
+                while (array_search($assumed_filename, $usednames) !== false
+                       || array_search($assumed_filename, $allnames)
+                          !== false) {
+                    //ファイル名をファイル名と拡張子に分割する
+                    $p = strrpos($filename, ".");
+
+                    if ($p === false) {
+                        //拡張子が無い場合
+                        $assumed_filename = $filename . " (" . ++$count . ")";
+                    } else {
+                        //拡張子が有る場合
+                        $name = substr($filename, 0, $p);
+                        $ext = substr($filename, $p,
+                            strlen($filename) - $p);
+                        $assumed_filename = $name . " (" . ++$count . ")"
+                                            . $ext;
+                    }
+                }
+                $filename = $assumed_filename;
+                $usednames[] = $filename;
+            }
+
+            $body = $file->getCurrentBody();
+            //check if file exists physically before zipping
+            if ($body->exists()) {
+                $data = $body->getContents();
+                $zipfile->addFile($data, $filename, "", false);
+                echo $zipfile->getBuffer();
+                $zipfile->clearBuffer();
+            }
+
+            //Write log: download file
+            require_once('cabinet/inspection.csp');
+            $inspection = GRN_Cabinet_Inspection::getInstance();
+            $inspection->writeLogFile('download_compress', $file, $folder_id);
+        }
+
+        return $zipfile;
+    }
+
+    public function cleanup()
+    {
+        $this->_cleanupExpiredFolders();
+        $this->_cleanupExpiredFiles();
+    }
+
+    private function _cleanupExpiredFiles()
+    {
+        $fm = new GRN_Cabinet_FileManager_Core();
+        $file_table = $fm->getFileTable();
+        $rowset = new CB_RowSet($file_table);
+
+        $condition = "col_dtime is not null";
+
+        $rowset->addCondition($condition);
+        while ($file = $rowset->iterate()) {
+            /** @var $file GRN_Cabinet_File */
+            if ($file->isExpired()) {
+                $file->delete();
+            }
+        }
+    }
+
+    private function _cleanupExpiredFolders()
+    {
+        $cm = GRN_Cabinet_FolderManager::getInstance();
+        $folders = $cm->getDeletedFolders();
+        foreach ($folders as $folder) {
+            if (is_object($folder) && is_object($folder->_folder)
+                && is_a($folder->_folder, 'GRN_Cabinet_FolderEntity')
+            ) {
+                if ($folder->isExpired()) {
+                    $folder->deleteFoldersPermanent();
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,698 @@
+<?php
+
+/**
+ * 外部通知
+ *
+ * @author  YOSHIDA, Hideyasu 2004/12
+ * @version 1.0
+ * @package grn.notification
+ */
+require_once('fw/persistent.csp');
+require_once('grn/application.csp');
+require_once('grn/notification.csp');
+require_once('grn/error_code.csp');
+
+// サイボウズからのお知らせ
+define('GRN_NOTIFICATION_CYBOZU_INFORMATION', 'Cybozu Information');
+
+/**
+ * 外部アプリケーションID
+ *
+ * @package grn.notification
+ */
+class GRN_Notification_ApplicationId extends CB_PersistentBase
+{
+    function __construct(& $row)
+    {
+        parent::__construct($row);
+    }
+
+    /** （外部通知管理が振り出す）アプリケーションID */
+    var $col_application
+        = [
+            'type'    => 'char',
+            'length'  => 60,
+            'notnull' => true
+        ];
+    /** （ユーザーが定義する）ID */
+    var $col_id = ['type' => 'char', 'length' => 60, 'notnull' => true];
+
+    /** 許可する URL */
+    var $col_urls
+        = [
+            'type'   => 'char',
+            'length' => '1048575',
+            'lazy'   => true
+        ];
+
+    /** インデックス */
+    var $idx_app = ['cols' => ['application'], 'unique' => true];
+    var $idx_id = ['cols' => ['id'], 'unique' => true];
+    var $idx_app_id = ['cols' => ['application', 'id'], 'unique' => true];
+
+    function _getPatterns($col_name)
+    {
+        $s = $this->get($col_name);
+        if (is_null($s)) {
+            $s = '';
+        }
+        if (is_string($s)) {
+            $patterns = mb_split("\r\n", $s);
+        }
+        foreach ($patterns as $key => $value) {
+            if (mb_strlen($value) == 0) {
+                unset($patterns[$key]);
+            }
+        }
+
+        return $patterns;
+    }
+
+    function _setPatterns($col_name, $values)
+    {
+        $set_value = '';
+        if (is_array($values)) {
+            foreach ($values as $value) {
+                $trim_value = trim($value);
+                if (mb_strlen($trim_menu) <= 0) {
+                    continue;
+                }
+                $set_value .= $trim_menu . "\r\n";
+            }
+        } else {
+            $values = explode("\n", $values);
+            $trim_values = [];
+            foreach ($values as $key => $value) {
+                $trim_value = trim($value);
+                if (mb_strlen($trim_value) > 0) {
+                    $trim_values[$key] = $trim_value;
+                }
+            }
+            $set_value = implode("\r\n", $trim_values);
+        }
+        $this->set($col_name, $set_value);
+    }
+
+    function getURLPatterns()
+    {
+        return $this->_getPatterns('urls');
+    }
+
+    function setURLPatterns($lines)
+    {
+        return $this->_setPatterns('urls', $lines);
+    }
+}
+
+/**
+ * 外部アプリケーション名
+ *
+ * @package grn.notification
+ */
+class GRN_Notification_ApplicationName extends CB_PersistentBase
+{
+    function __construct(& $row)
+    {
+        parent::__construct($row);
+    }
+
+    /** アプリケーションID */
+    var $col_application
+        = [
+            'type' => 'relation',
+            'to'   => 'GRN_Notification_ApplicationId'
+        ];
+    /** ロケール */
+    var $col_locale = ['type' => 'char', 'length' => 8, 'notnull' => true];
+    /** 表示名 */
+    var $col_name = ['type' => 'char', 'length' => 100];
+
+    /** インデックス */
+    var $idx_app_loc = ['cols' => ['application', 'locale'], 'unique' => true];
+}
+
+/**
+ * アプリケーションロジック
+ *
+ * @package grn.notification
+ */
+class GRN_Notification_Application extends GRN_ApplicationBase
+{
+    var $_app = null;
+    var $_apps = null;
+    var $_apps_by_id = null;
+    var $_utility = null;
+
+    /**
+     * コンストラクタ
+     *
+     * @param GRN_Notification_ApplicationId $app        外部アプリケーションID
+     *                                                   永続化オブジェクト
+     * @param array                          $apps       キーに（外部モジュール管理が決める）アプリケーション
+     *                                                   ID、値に外部アプリケーションID永続化オブジェクトを持つ連想配列
+     * @param array                          $apps_by_id キーに（ユーザーが定義し、ソートキーになる）ID
+     *                                                   、値に外部アプリケーションID永続化オブジェクトを持つ連想配列
+     * @param GRN_Notification_Utility       $utility    ユーティリティ
+     */
+    function __construct($app, & $apps, & $apps_by_id, $utility)
+    {
+        $this->_app = $app;
+        $this->_apps =& $apps;
+        $this->_apps_by_id =& $apps_by_id;
+        $this->_utility = $utility;
+
+        $app_id = $app->get('application');
+        parent::__construct($app_id);
+
+        $this->_my_id = 'x.' . $app_id;
+    }
+
+    /**
+     * アプリケーション名テーブルの行を取得する
+     *
+     * @param string $locale ロケール情報
+     *
+     * @return mixed  nullのときは失敗，その他のときはアプリケーション名テーブル行
+     * @access private
+     */
+    function _getRow($locale = null)
+    {
+        if (is_null($locale)) {
+            require_once('fw/i18n.csp');
+            $i18n = CB_I18N::getInstance();
+            $locale = $i18n->getCurrentLanguage();
+        }
+
+        if (array_key_exists($locale, $this->__names)) {
+            return $this->__names[$locale];
+        }
+
+        $table = cb_class2table('GRN_Notification_ApplicationName');
+        $db = $table->getDBConnection();
+        $app_id = "'" . $this->_app->getOID() . "'";
+        $escaped_locale = $db->escape($locale);
+        $condition
+            = "col_application=${app_id} AND col_locale='${escaped_locale}'";
+
+        $rowset = new CB_RowSet($table);
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+        if ( ! is_null($row)) {
+            $this->__names[$locale] = $row;
+
+            return $row;
+        }
+
+        $pos = strpos($locale, '_');
+        if ($pos === false) {
+            {
+                $___ret = null;
+
+                return $___ret;
+            }
+        }
+
+        $fixed_locale = substr($locale, 0, $pos);
+
+        if (array_key_exists($fixed_locale, $this->__names)) {
+            $row =& $this->__names[$fixed_locale];
+
+            return $row;
+        }
+
+        $escaped_locale = $db->escape($fixed_locale);
+        $condition
+            = "col_application=${app_id} AND col_locale='${escaped_locale}'";
+
+        $rowset = new CB_RowSet($table);
+        $rowset->addCondition($condition);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+        if ( ! is_null($row)) {
+            $this->__names[$fixed_locale] =& $row;
+
+            return $row;
+        }
+
+        {
+            $___ret = null;
+
+            return $___ret;
+        }
+    }
+
+    /**
+     * 表示名を取得する
+     *
+     * @param string $locale ロケール情報
+     *
+     * @return string  表示名
+     */
+    function getName($locale = null)
+    {
+        /**
+         * Garoon 2.6 doesn't support multilingal names of OutsideApplications.
+         * So, $locale is always set to 'ja'
+         **/
+        $locale = 'ja';
+        $row = $this->_getRow($locale);
+        if (is_null($row)) {
+            return $this->getId();
+        }
+
+        return $row->get('name');
+    }
+
+    /**
+     * 標準表示名を取得する
+     */
+    function getDefaultName($locale = null)
+    {
+        return $this->getName($locale);
+    }
+
+    /**
+     * 表示名を設定する
+     *
+     * @param string $name   表示名
+     * @param string $locale ロケール情報
+     */
+    function setName($name, $locale = null)
+    {
+        /**
+         * Garoon 2.6 doesn't support multilingal names of OutsideApplications.
+         * So, $locale is always set to 'ja'
+         **/
+        $locale = 'ja';
+        if (0 == strlen($name)) {
+            cb_throw_error(E_GRN_NTFC_INVALID_OUTSIDE_DISPLAY_NAME);
+        }
+
+        if (0 == strlen($locale)) {
+            require_once('fw/i18n.csp');
+            $i18n = CB_I18N::getInstance();
+            $locale = $i18n->getCurrentLanguage();
+        }
+
+        $row = null;
+        if (array_key_exists($locale, $this->__names)) {
+            $row =& $this->__names[$locale];
+        } else {
+            $table_info =& cb_class2table('GRN_Notification_ApplicationName');
+            $app_id = "'" . $this->_app->getOID() . "'";
+            $db =& $table_info->getDBConnection();
+            $escaped_locale = $db->escape($locale);
+
+            $rowset = new CB_RowSet($table_info);
+            $rowset->addCondition("col_application=${app_id} AND col_locale='${escaped_locale}'");
+            $row =& $rowset->iterate();
+            $rowset->destroy();
+
+            if (is_null($row)) {
+                $row =& $table_info->newRow();
+                $row->set('application', $this->_app);
+                $row->set('locale', $locale);
+            }
+        }
+
+        if ($name !== $row->get('name')) {
+            $row->set('name', $name);
+            $row->updateNow();
+        }
+    }
+
+    /**
+     * （ユーザーが定義し、ソートキーになる）IDを取得する
+     *
+     * @return int  （ユーザーが定義し、ソートキーになる）ID
+     */
+    function getId()
+    {
+        return $this->_app->get('id');
+    }
+
+    /**
+     * （ユーザーが定義し、ソートキーになる）IDを設定する
+     *
+     * @param int $id （ユーザーが定義し、ソートキーになる）ID
+     */
+    function setId($id)
+    {
+        if (0 == strlen($id)) {
+            cb_throw_error(E_GRN_NTFC_INVALID_OUTSIDE_ID);
+        }
+
+        $row =& $this->_app;
+        if ($id != $row->get('id')) {
+            $row->set('id', $id);
+            $row->updateNow();
+        }
+    }
+
+    /**
+     * アプリケーションを削除する
+     */
+    function delete()
+    {
+        $row =& $this->_app;
+
+        $app_id = $row->get('application');
+        $id = $row->get('id');
+
+        unset($this->_apps[$app_id]);
+        unset($this->_apps_by_id[$id]);
+
+        $row->delete();
+    }
+
+    function _convRegExp($simple_pattern)
+    {
+        $tmp = explode('*', $simple_pattern);
+        foreach ($tmp as $key => $value) {
+            $tmp[$key] = preg_quote($value, '/');
+        }
+
+        return '/^' . implode('.*', $tmp) . '$/';
+    }
+
+    function getURLPatterns()
+    {
+        return $this->_app->getURLPatterns();
+    }
+
+    function setURLPatterns($lines)
+    {
+        return $this->_app->setURLPatterns($lines);
+    }
+
+    function _validateNotificationMailEach($target_str, $notify_mail_data)
+    {
+        $url_patterns = $this->getURLPatterns();
+
+        foreach ($url_patterns as $pattern) {
+            $ret_str = $this->_convRegExp($pattern);
+            if (preg_match($ret_str, $target_str)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Validate a mail data sent as a outside notification
+     *
+     */
+    function validateNotificationMail($notify_mail_data)
+    {
+        $notify_app
+            = $notify_mail_data->getHeaderValue(GRN_MAIL_NOTTIFICATION_HEADER_NOTIFY_APP_URL);
+
+        //$notify_icon = $notify_mail_data->getHeaderValue( GRN_MAIL_NOTTIFICATION_HEADER_NOTIFY_ICON_URL );
+
+        return $this->_validateNotificationMailEach($notify_app,
+            $notify_mail_data);
+        //&& ( strlen( $notify_icon ) == 0
+        //     || $this->_validateNotificationMailEach( $notify_icon, $notify_mail_data ) );
+    }
+}
+
+/**
+ * アプリケーション管理ロジック
+ *
+ * @package grn.notification
+ */
+class GRN_Notification_ApplicationManager
+{
+    /**
+     * @return GRN_Notification_ApplicationManager
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_Notification_ApplicationManager();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * @access private
+     */
+    var $_utility = null;
+
+    /**
+     * コンストラクタ
+     */
+    function __construct()
+    {
+        $this->_utility = new GRN_Notification_Utility();
+    }
+
+    /**
+     * @access private
+     */
+    var $_apps = [];           // キーにアプリケーションID
+    var $_apps_by_id = [];     // キーにID
+
+    /**
+     * アプリケーションを生成する
+     *
+     * @param int $id （ユーザーが定義し、ソートキーになる）ID
+     *
+     * @return object GRN_Notification_Application  アプリケーション
+     */
+    function create($id)
+    {
+        if (0 == strlen($id)) {
+            cb_throw_error(E_GRN_CMMN_INVALID_OUTSIDE_ID);
+        }
+
+        $table_name = 'GRN_Notification_ApplicationId';
+        $table_info = $this->_utility->getTableInfo($table_name);
+        $row = $table_info->newRow();
+
+        $app_id = $row->getOID();
+
+        $row->set('application', $app_id);
+        $row->set('id', $id);
+
+        // 登録されていなかった通知メールを受信したときは、許可する URL を * にする
+        $row->set('urls', '*');
+        $row->registerNow();
+
+        $app = new GRN_Notification_Application($row,
+            $this->_apps, $this->_apps_by_id, $this->_utility);
+        $this->_apps[$app_id] =& $app;
+        $this->_apps_by_id[$id] =& $app;
+
+        return $app;
+    }
+
+    /**
+     * アプリケーションIDから外部通知を取得する
+     *
+     * @param int $app_id （外部通知管理が振り出す）アプリケーションID
+     *
+     * @return GRN_Notification_Application|null  nullのときは失敗，その他のときは外部アプリケーション
+     */
+    function get($app_id)
+    {
+        if (0 == strlen($app_id)) {
+            cb_throw_error(E_GRN_CMMN_INVALID_OUTSIDE_ID);
+        }
+
+        if (array_key_exists($app_id, $this->_apps)) {
+            return $this->_apps[$app_id];
+        }
+
+        $table_name = 'GRN_Notification_ApplicationId';
+        $table_info =& $this->_utility->getTableInfo($table_name);
+
+        $rowset = new CB_RowSet($table_info);
+        $rowset->addCondition($rowset->queryf("col_application = '@S'",
+            $app_id));
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        $app = null;
+        if ( ! is_null($row)) {
+            $app = new GRN_Notification_Application($row,
+                $this->_apps, $this->_apps_by_id, $this->_utility);
+            $id = $row->get('id');
+            $this->_apps[$app_id] = $app;
+            $this->_apps_by_id[$id] = $app;
+        }
+
+        return $app;
+    }
+
+    /**
+     * IDから外部アプリケーションを取得する
+     *
+     * @param int $id （ユーザーが定義し、ソートキーになる）ID
+     *
+     * @return mixed  nullのときは失敗，その他のときは外部アプリケーション
+     */
+    function getById($id)
+    {
+        if (0 == strlen($id)) {
+            cb_throw_error(E_GRN_CMMN_INVALID_OUTSIDE_ID);
+        }
+
+        if (array_key_exists($id, $this->_apps_by_id)) {
+            return $this->_apps_by_id[$id];
+        }
+
+        $table_name = 'GRN_Notification_ApplicationId';
+        $table_info = $this->_utility->getTableInfo($table_name);
+
+        $rowset = new CB_RowSet($table_info);
+        $rowset->addCondition($rowset->queryf("col_id = '@S'", $id));
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        $app = null;
+        if ( ! is_null($row)) {
+            $app = new GRN_Notification_Application($row,
+                $this->_apps, $this->_apps_by_id, $this->_utility);
+            $app_id = $row->get('application');
+            $this->_apps[$app_id] = $app;
+            $this->_apps_by_id[$id] = $app;
+        }
+
+        return $app;
+    }
+
+    /**
+     * 外部通知総数を取得する
+     *
+     * @param $add_condition
+     *
+     * @return int  外部通知総数
+     */
+    function count($add_condition)
+    {
+        $table_name = 'GRN_Notification_ApplicationId';
+        $table_info =& $this->_utility->getTableInfo($table_name);
+        $rowset = new CB_RowSet($table_info);
+
+        if (0 < strlen($add_condition)) {
+            $rowset->addCondition($add_condition);
+        }
+        $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+        $result = $rowset->iterate();
+        $rowset->destroy();
+
+        return $result['count'];
+    }
+
+    /**
+     * 外部アプリケーション一覧を取得する
+     *
+     * @param int $offset 一覧取得開始位置
+     * @param int $limit  一覧取得件数
+     *
+     * @return array  キーにアプリケーションID、値に外部アプリケーションオブジェクト
+     *  を持つ連想配列
+     */
+    function &getList($offset = 0, $limit = 20)
+    {
+        $table_name = 'GRN_Notification_ApplicationId';
+        $table_info =& $this->_utility->getTableInfo($table_name);
+
+        $rowset = new CB_RowSet($table_info);
+        $rowset->addOrderColumn('_id');
+        $rowset->limit($offset, $limit);
+        while ( ! is_null($row = $rowset->iterate())) {
+            $app = new GRN_Notification_Application($row,
+                $this->_apps, $this->_apps_by_id, $this->_utility);
+            $app_id = $row->get('application');
+            $id = $row->get('id');
+            $this->_apps[$app_id] = $app;
+            $this->_apps_by_id[$id] = $app;
+            unset($app);
+        }
+
+        return $this->_apps;
+    }
+
+    /**
+     * 全外部アプリケーション一覧を取得する
+     *
+     * @return array  キーにアプリケーションID、値に外部アプリケーションオブジェクト
+     *  を持つ連想配列
+     */
+    function &getAllList()
+    {
+        $table_name = 'GRN_Notification_ApplicationId';
+        $table_info = $this->_utility->getTableInfo($table_name);
+
+        $rowset = new CB_RowSet($table_info);
+        $rowset->addOrderColumn('_id');
+        while ( ! is_null($row = $rowset->iterate())) {
+            $app = new GRN_Notification_Application($row,
+                $this->_apps, $this->_apps_by_id, $this->_utility);
+            $app_id = $row->get('application');
+            $id = $row->get('id');
+            $this->_apps[$app_id] = $app;
+            $this->_apps_by_id[$id] = $app;
+            unset($app);
+        }
+
+        return $this->_apps;
+    }
+
+    /**
+     * 外部アプリケーション一覧を削除する
+     *
+     * @param mixed $id_list nullのときはすべての外部通知を削除する，
+     *                       それ以外は削除する外部通知コードの配列
+     */
+    function deleteList($app_id_list = null)
+    {
+        if (is_null($app_id_list)) {
+            $table_name = 'GRN_Notification_ApplicationId';
+            $table_info = $this->_utility->getTableInfo($table_name);
+
+            $rowset = new CB_RowSet($table_info);
+            $rowset->deleteAllMatched();
+            $rowset->destroy();
+
+            $this->_apps = [];
+            $this->_apps_by_id = [];
+
+            return;
+        }
+
+        foreach ($app_id_list as $key => $app_id) {
+            if (array_key_exists($app_id, $this->_apps)) {
+                $this->_apps[$app_id]->delete();
+                unset($app_id_list[$key]);
+            }
+        }
+
+        if (0 < count($app_id_list)) {
+            $table_name = 'GRN_Notification_ApplicationId';
+            $table_info = $this->_utility->getTableInfo($table_name);
+            $rowset = new CB_RowSet($table_info);
+
+            $query = '';
+            foreach ($app_id_list as $app_id) {
+                $query .= $rowset->queryf("col_application = '@S' OR ",
+                    $app_id);
+            }
+            $query = substr($query, 0, -4);
+
+            $rowset->addCondition($query);
+
+            while ( ! is_null($row = $rowset->iterate())) {
+                $row->delete();
+            }
+        }
+    }
+}
+
+

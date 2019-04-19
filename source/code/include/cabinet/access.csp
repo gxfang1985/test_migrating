@@ -1,0 +1,1077 @@
+<?php
+
+require_once('cabinet/uum_evaluation.csp');
+require_once('grn/application.csp');
+
+define('GRN_CABINET_ACCESS_CSV_FOREINKEY', 0);
+define('GRN_CABINET_ACCESS_CSV_ITEM', 1);
+define('GRN_CABINET_ACCESS_CSV_VALUE', 2);
+define('GRN_CABINET_ACCESS_CSV_TARGET', 3);
+
+/**
+ * アクセス権管理クラス
+ *
+ * @package grn.cabinet
+ */
+class GRN_Cabinet_AccessManager extends GRN_Cabinet_UumEvaluation
+{
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Cabinet_AccessManager
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * コンストラクタ
+     */
+    function __construct()
+    {
+        parent::__construct();
+
+        $this->_table_prefix = 'acl';
+        $this->_column_prefix = 'authority_';
+        $this->_auth_columns = ['read' => 0, 'write' => 0];
+    }
+
+    /**
+     * @access private
+     */
+    var $_admin_mode = null;
+
+    function isSuperAdminMode()
+    {
+        if (is_null($this->_admin_mode)) {
+            $current_page = strtolower(cb_get_pagename());
+            $page_parts = explode('/', $current_page);
+            if (@ $page_parts[1] === 'system'
+                && $current_page !== 'portal/system/preview'
+            ) {
+                $this->_admin_mode = true;
+            } else {
+                $this->_admin_mode = false;
+            }
+        }
+
+        return $this->_admin_mode;
+    }
+
+    function isSuperAdmin($user)
+    {
+        if ( ! $this->isSuperAdminMode()) {
+            return false;
+        }
+
+        // システム画面に入れていれば管理者とみなす
+        return true;
+    }
+
+    /**
+     * ユーザーが管理者かどうか判定する
+     * フォルダごとに管理者設定可能なように、引数にフォルダを持つ
+     *
+     * @param CB_User            $user   ユーザー
+     * @param GRN_Cabinet_Folder $folder フォルダ
+     *
+     * @return bool
+     */
+    function isAdmin(& $user, & $folder)
+    {
+        if ($this->isSuperAdmin($user)) {
+            return true;
+        }
+
+        if ( ! $folder) {
+            return false;
+        }
+
+        require_once('cabinet/privilege.csp');
+        $pm = GRN_Cabinet_PrivilegeManager::getInstance();
+
+        return $pm->privileged($user, $folder, ['operation']);
+    }
+
+
+    /**
+     * セキュリティ・モデルの取得
+     */
+    function getSecurityModel(& $object)
+    {
+        return $object ? $object->get('security_model') : null;
+    }
+
+    function getSecurityModelString(& $object)
+    {
+        return $this->getSecurityModel($object)
+               == GRN_CABINET_SECURITY_MODEL_REVOKE ? 'revoke' : 'grant';
+    }
+
+    /**
+     * セキュリティ・モデルの設定
+     */
+    function setSecurityModel(& $object, $model)
+    {
+        $current = $this->getSecurityModel($object);
+
+        if ($current == $model) {
+            return true;
+        }
+
+        if ($model != GRN_CABINET_SECURITY_MODEL_REVOKE
+            && $model != GRN_CABINET_SECURITY_MODEL_GRANT
+        ) {
+            return false;
+        }
+
+        if (is_null(($object_row =& $this->_getObjectRow($object)))) {
+            return false;
+        }
+
+        // 全アクセス権設定を削除
+        if ( ! $this->deleteTargets($object, null)) {
+            return false;
+        }
+
+        $object_row->set('security_model', $model);
+        $object_row->updateNow();
+
+        //Write log
+        $target = null;
+        $this->onAction('modify_model', $object, $target, null);
+        $this->_cacher->clear();
+
+        $object->runHook('update');
+
+        return true;
+    }
+
+    //GTM-528
+
+    /**
+     * init security model
+     */
+    function initSecurityModel(& $object, $model)
+    {
+        if ($model != GRN_CABINET_SECURITY_MODEL_REVOKE
+            && $model != GRN_CABINET_SECURITY_MODEL_GRANT
+        ) {
+            return false;
+        }
+
+        if (is_null(($object_row =& $this->_getObjectRow($object)))) {
+            return false;
+        }
+
+        // delete targets
+        if ( ! $this->deleteTargets($object, null)) {
+            return false;
+        }
+
+        $object_row->set('security_model', $model);
+        $object_row->updateNow();
+
+        $object->runHook('update');
+
+        return true;
+    }
+
+    /**
+     * セキュリティ・モデルがREVOKEかどうか問い合わせる
+     */
+    function isRevoke(& $object)
+    {
+        return $this->getSecurityModel($object)
+               == GRN_CABINET_SECURITY_MODEL_REVOKE;
+    }
+
+
+    /**
+     * override
+     *
+     * @access private
+     */
+    function isValidAuthorities($action, & $object, $authorities)
+    {
+        if ($action == 'add') {
+            // 追加の場合には閲覧を許可してその他を許可する設定はできない
+
+            if ( ! array_key_exists('read', $authorities)) {
+                cb_throw_error(E_GRN_CABINET_INVALID_ACCESS_VALUE);
+            }
+
+            if ($this->isRevoke($object)) {
+                if ($authorities['read']) {
+                    if ( ! @ $authorities['write']) {
+                        cb_throw_error(E_GRN_CABINET_INVALID_ACCESS_VALUE);
+                    }
+                }
+            } else {
+                if ( ! $authorities['read']) {
+                    if (@ $authorities['write']) {
+                        cb_throw_error(E_GRN_CABINET_INVALID_ACCESS_VALUE);
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @param object $object
+     * @param array  $targets
+     * @param array  $authorities
+     * @param bool   $create_flag TRUE
+     *
+     * @return bool
+     */
+    function modifyTargets(
+        & $object,
+        $targets,
+        $authorities,
+        $create_flag = false
+    ) {
+        if ($authorities && array_key_exists('read', $authorities)) {
+            // 閲覧権限を奪う場合にはその他の権限も剥奪
+
+            if ($this->isRevoke($object)) {
+                if ($authorities['read']) {
+                    $authorities['write'] = 1;
+                }
+            } else {
+                if ( ! $authorities['read']) {
+                    return $this->deleteTargets($object, $targets);
+                }
+            }
+        }
+
+        return parent::modifyTargets($object, $targets, $authorities,
+            $create_flag);
+    }
+
+    /**
+     * override
+     *
+     * @access private
+     */
+    function _evaluate($object_ids, $uid, $groups, $roles, $dynamic_roles)
+    {
+        $authorities = parent::_evaluate($object_ids, $uid, $groups, $roles,
+            $dynamic_roles);
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('cabinet');
+
+        $query = "SELECT _id, col_security_model FROM tab_"
+                 . $this->_object_class_name . " WHERE ";
+        $escaped_ids = [];
+        foreach (array_keys($object_ids) as $id) {
+            $escaped_ids[] = "'" . $db->escape($id) . "'";
+        }
+        $query .= " _id IN (" . implode(',', $escaped_ids) . ");";
+
+        $result = $db->query($query);
+
+        if (cb_is_db_result($result)) {
+            $n = $db->num_rows($result);
+            for ($i = 0; $i < $n; $i++) {
+                $row = $db->fetch_row($result);
+
+                if (array_key_exists($row[0], $authorities)
+                    && $row[1] == GRN_CABINET_SECURITY_MODEL_REVOKE
+                ) {
+                    foreach (array_keys($authorities[$row[0]]) as $key) {
+                        $authorities[$row[0]][$key]
+                            = $authorities[$row[0]][$key] ? 0 : 1;
+                    }
+                }
+            }
+            $db->free_result($result);
+        }
+
+        return $authorities;
+    }
+
+    /**
+     * @access private
+     */
+    var $_parent_cache = [];
+
+    /**
+     * フォルダのアクセス権限を取得する
+     *
+     * @param object $user   アクセスするユーザー
+     * @param object $folder フォルダ
+     *
+     * @return array  array( 'read'=>[0,1], 'write'=>[0,1] )
+     */
+    function getAuthorities(& $user, & $folder)
+    {
+        if ( ! is_object($folder) && ! is_string($folder)
+             && ! is_numeric($folder)
+        ) {
+            assert('FALSE');
+
+            return ['read' => 0, 'write' => 0];
+        }
+
+        if ($this->isSuperAdmin($user)) {
+            return ['read' => 1, 'write' => 1];
+        }
+
+        $hierarchy = [];
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('cabinet');
+
+        $current = is_object($folder) ? $folder->getOID() : $folder;
+        $current = $db->escape($current);
+
+        while ( ! is_null($current)) {
+            $hierarchy = [$current => 1] + $hierarchy;
+            if (array_key_exists($current, $this->_parent_cache)) {
+                $current = $this->_parent_cache[$current];
+            } else {
+                $query = "SELECT col_parent FROM tab_"
+                         . $this->_object_class_name
+                         . " WHERE _id = '{$current}';";
+                $result = $db->query($query);
+                if (cb_is_db_result($result)) {
+                    $row = $db->fetch_row($result);
+                    $this->_parent_cache[$current] = $row[0];;
+                    $current = $row[0];
+                    $db->free_result($result);
+                } else {
+                    $current = null;
+                }
+            }
+        }
+
+        $authorities = $this->evaluateUserObjects($user, $hierarchy);
+
+        if ( ! $authorities) {
+            return ['read' => 0, 'write' => 0];
+        }
+        $authorities_keys = array_keys($authorities);
+        $last = array_pop($authorities_keys);
+        $result = $authorities[$last];
+        unset($authorities[$last]);
+
+        foreach (array_keys($authorities) as $oid) {
+            if ( ! $result['read']) {
+                break;
+            }
+
+            $result['read'] = ($authorities[$oid]['read'] & $result['read']);
+        }
+
+        return $result;
+    }
+
+    /**
+     * 複数のフォルダのアクセス権限を取得する
+     *
+     * @param object $user    アクセスするユーザー
+     * @param array  $folders フォルダIDの配列
+     *
+     * @return array  array( $folder_id => array( 'read'=>[0,1], 'write'=>[0,1] ), ... )
+     */
+    function getFoldersAuthorities($user, & $folder_ids)
+    {
+        $results = [];
+
+        if ( ! is_array($folder_ids)) {
+            assert('FALSE');
+            foreach ($folder_ids as $id) {
+                $results[$id] = ['read' => 0, 'write' => 0];
+            }
+
+            return $results;
+        }
+
+        if ($this->isSuperAdmin($user)) {
+            foreach ($folder_ids as $id) {
+                $results[$id] = ['read' => 1, 'write' => 1];
+            }
+
+            return $results;
+        }
+
+        $hierarchy = [];
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('cabinet');
+
+        $currents = $folder_ids;
+        while (count($currents) > 0) {
+            $nexts = [];
+            $check_ids = [];
+            foreach ($currents as $current) {
+                if ( ! array_key_exists($current, $hierarchy)) {
+                    $hierarchy[$current] = 1;
+                }
+
+                if (array_key_exists($current, $this->_parent_cache)) {
+                    $parent_id = $this->_parent_cache[$current];
+                    if ( ! array_key_exists($parent_id, $hierarchy)
+                         && ! in_array($parent_id, $nexts)
+                         && ! is_null($parent_id)
+                    ) {
+                        $nexts[] = $this->_parent_cache[$current];
+                    }
+                } else {
+                    if ( ! in_array($current, $check_ids)
+                         && ! is_null($current)
+                    ) {
+                        $check_ids[] = $current;
+                    }
+                }
+            }
+
+            $str_ids = implode(',', $check_ids);
+            if (strlen($str_ids) > 0) {
+                $query = "SELECT _id, col_parent FROM tab_"
+                         . $this->_object_class_name
+                         . " WHERE _id IN ({$str_ids});";
+                $result = $db->query($query);
+                if ($result === false) {
+                    //Throw Query Error
+                    $db->throwError(['query' => 'query failed: ' . $query]);
+                }
+
+                $count = $db->num_rows($result);
+                for ($i = 0; $i < $count; $i++) {
+                    $row = $db->fetch_assoc($result);
+                    $this->_parent_cache[$row['_id']] = $row['col_parent'];
+                    if ( ! in_array($row['col_parent'], $nexts)
+                         && ! is_null($row['col_parent'])
+                    ) {
+                        $nexts[] = $row['col_parent'];
+                    }
+                }
+                $db->free_result($result);
+            }
+
+            $currents = $nexts;
+        }
+
+        $authorities = $this->evaluateUserObjects($user, $hierarchy);
+
+        if ( ! $authorities) {
+            foreach ($folder_ids as $id) {
+                $results[$id] = ['read' => 0, 'write' => 0];
+            }
+
+            return $results;
+        }
+
+        foreach ($folder_ids as $id) {
+            $results[$id] = $authorities[$id];
+            $current = $id;
+            while ( ! is_null($this->_parent_cache[$current])) {
+                if ( ! $results[$id]['read']) {
+                    break;
+                }
+
+                $parent_id = $this->_parent_cache[$current];
+                $results[$id]['read'] = ($authorities[$parent_id]['read']
+                                         & $results[$id]['read']);
+                $current = $parent_id;
+            }
+        }
+
+        return $results;
+    }
+
+    /**
+     * フォルダへのアクセスが許可されるか調べる
+     *
+     * @param object  $user     アクセスするユーザー
+     * @param object  $folder   フォルダ
+     * @param integer $acc_mode アクセスモード
+     *
+     * @return bool
+     */
+    function access(& $user, & $folder, $acc_mode)
+    {
+        if ($this->isSuperAdmin($user)) {
+            return true;
+        }
+
+        if ( ! $user || ! $folder || ! $acc_mode) {
+            return false;
+        }
+
+        $aint = intval($acc_mode);
+
+        if ( ! ($aint & GRN_CABINET_ACCESS_R)
+             && ! ($aint & GRN_CABINET_ACCESS_W)
+        ) {
+            return false;
+        }
+
+        $auth = $this->getAuthorities($user, $folder);
+
+        if ($aint & GRN_CABINET_ACCESS_R) {
+            if ( ! $auth['read']) {
+                return false;
+            }
+        }
+        if ($aint & GRN_CABINET_ACCESS_W) {
+            if ( ! $auth['write']) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 指定したフォルダIDからアクセスが許可されているフォルダのIDを返す
+     *
+     * @param object  $user       アクセスするユーザー
+     * @param array   $folder_ids フォルダIDの配列
+     * @param integer $acc_mode   アクセスモード
+     *
+     * @return array                アクセスが許可されているフォルダIDの配列
+     */
+    function getAccessibleFolderIds(& $user, $folder_ids, $acc_mode)
+    {
+        if ($this->isSuperAdmin($user)) {
+            return $folder_ids;
+        }
+        if ( ! $user || ! is_array($folder_ids) || ! $acc_mode) {
+            return [];
+        }
+
+        $aint = intval($acc_mode);
+
+        if ( ! ($aint & GRN_CABINET_ACCESS_R)
+             && ! ($aint & GRN_CABINET_ACCESS_W)
+        ) {
+            return [];
+        }
+
+        $authorities = $this->getFoldersAuthorities($user, $folder_ids);
+
+        foreach ($folder_ids as $key => $id) {
+            if ($aint & GRN_CABINET_ACCESS_R) {
+                if ( ! $authorities[$id]['read']) {
+                    unset($folder_ids[$key]);
+                }
+            }
+            if ($aint & GRN_CABINET_ACCESS_W) {
+                if ( ! $authorities[$id]['write']) {
+                    unset($folder_ids[$key]);
+                }
+            }
+        }
+
+        return $folder_ids;
+    }
+
+    function evaluateFolders(& $user, $folders, $acc_mode, $parent_id = null)
+    {
+        if ($this->isSuperAdmin($user)) {
+            return $folders;
+        }
+
+        if ( ! $user || ! $folders || ! $acc_mode) {
+            return [];
+        }
+
+        if ( ! is_null($parent_id)) {
+            $auth = $this->getAuthorities($user, $parent_id);
+            if ( ! $auth['read']) {
+                return [];
+            }
+        }
+
+        // cache authorities
+        $authorities = $this->evaluateUserObjects($user, $folders);
+
+        $acc_mode = intval($acc_mode);
+
+        $check_folder_ids = [];
+        foreach (array_keys($folders) as $id) {
+            if ( ! is_null($parent_id)) {
+                $this->_parent_cache[$id] = $parent_id;
+
+                if (($acc_mode & GRN_CABINET_ACCESS_R)
+                    && ! $authorities[$id]['read']
+                ) {
+                    unset($folders[$id]);
+                    continue;
+                }
+                if (($acc_mode & GRN_CABINET_ACCESS_W)
+                    && ! $authorities[$id]['write']
+                ) {
+                    unset($folders[$id]);
+                    continue;
+                }
+            } else {
+                $check_folder_ids[] = $id;
+            }
+        }
+
+        $accessible_folder_ids = $this->getAccessibleFolderIds($user,
+            $check_folder_ids, $acc_mode);
+        foreach ($check_folder_ids as $id) {
+            if ( ! in_array($id, $accessible_folder_ids)) {
+                unset($folders[$id]);
+            }
+        }
+
+        return $folders;
+    }
+
+
+    /**
+     * CSVへのフォルダアクセス権読み込み
+     *
+     * @param object $user   操作ユーザー
+     * @param object $folder 対象フォルダ
+     * @param array  $line   CSVから読み込んだ1行のデータ
+     *
+     * @return bool
+     */
+    function importCSV(& $user, & $folder, $line)
+    {
+        // inspection
+        require_once('cabinet/inspection.csp');
+        $inspection = GRN_Cabinet_Inspection::getInstance();
+
+        if ($line[GRN_CABINET_ACCESS_CSV_ITEM] == 'security_model') {
+            $target = null;
+            if ($line[GRN_CABINET_ACCESS_CSV_VALUE] == 'revoke') {
+                $ret = $this->setSecurityModel($folder,
+                    GRN_CABINET_SECURITY_MODEL_REVOKE);
+                //write log: import access
+                $this->onAction('import_access', $folder, $target, null);
+
+                return $ret;
+            } elseif ($line[GRN_CABINET_ACCESS_CSV_VALUE] == 'grant') {
+                $ret = $this->setSecurityModel($folder,
+                    GRN_CABINET_SECURITY_MODEL_GRANT);
+                //write log: import access
+                $this->onAction('import_access', $folder, $target, null);
+
+                return $ret;
+            }
+
+            cb_throw_error(E_GRN_CABINET_INVALID_SECURITY_MODEL);
+        }
+
+        $target_class_name = $line[GRN_CABINET_ACCESS_CSV_ITEM];
+
+        if ( ! $this->isTargetClass($target_class_name)) {
+            $target_class_name = 'cb_' . $target_class_name;
+        }
+
+        if ( ! $this->isTargetClass($target_class_name)) {
+            cb_throw_error(E_GRN_CABINET_INVALID_ACCESS_TARGET);
+        }
+
+        $authorities = $this->_auth_columns;
+
+        $value = $line[GRN_CABINET_ACCESS_CSV_VALUE];
+
+        if (preg_match('/[^RWF]/i', $value)) {
+            cb_throw_error(E_GRN_CABINET_INVALID_ACCESS_VALUE);
+        }
+
+        if ($this->getSecurityModel($folder)
+            == GRN_CABINET_SECURITY_MODEL_REVOKE
+        ) {
+            if (preg_match('/R/i', $value) === 0) {
+                $authorities['read'] = 1;
+            }
+            if (preg_match('/W/i', $value) === 0) {
+                $authorities['write'] = 1;
+            }
+
+            if ( ! $authorities['write']) {
+                // 書き込みが許可なら閲覧も許可
+                $authorities['read'] = 0;
+            }
+        } else {
+            if (preg_match('/R/i', $value) !== 0) {
+                $authorities['read'] = 1;
+            }
+            if (preg_match('/W/i', $value) !== 0) {
+                $authorities['write'] = 1;
+            }
+
+            if ($authorities['write']) {
+                // 書き込みが許可なら閲覧も許可
+                $authorities['read'] = 1;
+            }
+        }
+
+        $target = $line[GRN_CABINET_ACCESS_CSV_TARGET];
+
+        $target_name = null;
+        if ( ! $this->isStringTargetClass($target_class_name)) {
+            global $G_container_base;
+            $uum =& $G_container_base->getInstance('uum');
+
+            if ($target_class_name == 'cb_user') {
+                $target =& $uum->getUserByForeignKey($target);
+                if ($target !== false) {
+                    $target_name = $target->get('display_name');
+                }
+            } elseif ($target_class_name == 'cb_group') {
+                $target =& $uum->getGroupByForeignKey($target);
+                if ($target !== false) {
+                    $target_name = $target->get('name');
+                }
+            } elseif ($target_class_name == 'cb_role') {
+                $target =& $uum->getStaticRoleByForeignKey($target);
+                if ($target !== false) {
+                    $target_name = $target->get('foreign_key');
+                }
+            } else {
+                return false;
+            }
+
+            if (is_null($target)) {
+                return false;
+            }
+        }
+
+        if ($target_class_name === 'dynamic_role') {
+            require_once('grn/uum_util.csp');
+            $uum_util = GRN_UumUtil::getInstance();
+            $dynamic_roles = $uum_util->listDynamicRoles();
+            if ( ! array_key_exists($target, $dynamic_roles)) {
+                require_once('cabinet/error_code.csp');
+                cb_throw_error(E_GRN_CABINET_INVALID_ACCESS_TARGET);
+            }
+            $target_name = @$dynamic_roles[$target]['name'];
+        }
+
+        $ret = $this->modifyTarget($folder, $target, $authorities, true);
+
+        // inspection
+
+        $this->onAction('import_access', $folder, $target, $authorities);
+
+        return $ret;
+    }
+
+
+    /**
+     * CSVへのフォルダアクセス権書き出し
+     *
+     * @param object $folder 対象フォルダ
+     * @param object $csv    CB_CSVWriter
+     *
+     * @return bool
+     */
+    function exportCSV(& $folder, & $csv)
+    {
+        if ( ! ($accesses = $this->getTargets($folder, null))) {
+            return false;
+        }
+
+        $line = [];
+
+        $line[GRN_CABINET_ACCESS_CSV_FOREINKEY] = $folder->get('foreign_key');
+
+        $columns = $this->_auth_columns;
+
+        $security_model = $this->getSecurityModel($folder);
+
+        $line[GRN_CABINET_ACCESS_CSV_ITEM] = 'security_model';
+        $line[GRN_CABINET_ACCESS_CSV_VALUE] = $security_model
+                                              == GRN_CABINET_SECURITY_MODEL_REVOKE
+            ? 'revoke' : 'grant';
+        $line[GRN_CABINET_ACCESS_CSV_TARGET] = null;
+
+        $csv->writeLine($line);
+
+        foreach (array_keys($this->_targets) as $target_class_name) {
+            if ( ! array_key_exists($target_class_name, $accesses)) {
+                continue;
+            }
+
+            $targets = $accesses[$target_class_name];
+
+            foreach (array_keys($targets) as $id) {
+                $line[GRN_CABINET_ACCESS_CSV_ITEM] = null;
+                $line[GRN_CABINET_ACCESS_CSV_VALUE] = null;
+                $line[GRN_CABINET_ACCESS_CSV_TARGET] = null;
+
+                $target_access = $targets[$id];
+
+                $value = '';
+
+                if ($security_model == GRN_CABINET_SECURITY_MODEL_REVOKE) {
+                    if ( ! @ $target_access['read']) {
+                        $value .= 'R';
+                    }
+                    if ( ! @ $target_access['write']) {
+                        $value .= 'W';
+                    }
+                } else {
+                    if (@ $target_access['read']) {
+                        $value .= 'R';
+                    }
+                    if (@ $target_access['write']) {
+                        $value .= 'W';
+                    }
+                }
+
+                if ($this->isStringTargetClass($target_class_name)) {
+                    $line[GRN_CABINET_ACCESS_CSV_ITEM] = $target_class_name;
+                } else {
+                    $line[GRN_CABINET_ACCESS_CSV_ITEM]
+                        = substr($target_class_name, 3);
+                }
+
+                $line[GRN_CABINET_ACCESS_CSV_VALUE] = $value;
+
+                if ( ! $this->isStringTargetClass($target_class_name)) {
+                    global $G_container_base;
+                    $uum =& $G_container_base->getInstance('uum');
+
+                    $target = null;
+
+                    if ($target_class_name == 'cb_user') {
+                        $target =& $uum->getUser($id);
+                    } elseif ($target_class_name == 'cb_group') {
+                        $target =& $uum->getGroup($id);
+                    } elseif ($target_class_name == 'cb_role') {
+                        $target =& $uum->getStaticRole($id);
+                    } else {
+                        return false;
+                    }
+
+                    if ( ! $target) {
+                        return false;
+                    }
+
+                    $id = $target->get('foreign_key');
+                }
+
+                $line[GRN_CABINET_ACCESS_CSV_TARGET] = $id;
+
+                $csv->writeLine($line);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * レコードイベント処理
+     */
+    function onAction($action, &$object, &$target, $authorities)
+    {
+        require_once('inspection.csp');
+        $inspection = GRN_Cabinet_Inspection::getInstance();
+        //Write log
+        $inspection->writeLogAccess($action, $object, $target, $authorities);
+    }
+
+    /**
+     * フォルダのアクセス権コピー
+     *
+     * @param int   $src_id     コピー元カテゴリID
+     * @param array $target_ids コピー先カテゴリID
+     *
+     * @return bool
+     */
+    function copyAccess($src_id, $target_ids)
+    {
+        if ( ! $src_id) {
+            return false;
+        }
+        if ( ! is_array($target_ids) || 0 == count($target_ids)) {
+            return false;
+        }
+
+        require_once('grn/application.csp');
+        global $G_cabinet, $G_cabinet_login;
+        if ( ! ($src_folder = $G_cabinet->getFolder($G_cabinet_login,
+            $src_id))
+        ) {
+            cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        require_once('grn/uum_util.csp');
+        $uum_util = GRN_UumUtil::getInstance();
+        $dynamic_roles = $uum_util->listDynamicRoles();
+
+        // コピー元のフォルダのアクセス権情報を取得
+        $security_model = $this->isRevoke($src_folder)
+            ? GRN_CABINET_SECURITY_MODEL_REVOKE
+            : GRN_CABINET_SECURITY_MODEL_GRANT;
+        $target_classes = [
+            'dynamic_role' => null,
+            'cb_role'      => null,
+            'cb_group'     => null,
+            'cb_user'      => null
+        ];
+        $targets = $this->getTargets($src_folder, $target_classes);
+
+        $access_list = [];
+        require_once('grn/access_resources.csp');
+        foreach ($targets as $class_type => $accesses) {
+            switch ($class_type) {
+                case 'cb_user':
+                    $type = GRN_ACCESS_TARGET_TYPE_USER;
+                    break;
+                case 'cb_group':
+                    $type = GRN_ACCESS_TARGET_TYPE_GROUP;
+                    break;
+                case 'cb_role':
+                    $type = GRN_ACCESS_TARGET_TYPE_STATIC_ROLE;
+                    break;
+                default:
+                    $type = GRN_ACCESS_TARGET_TYPE_DYNAMIC_ROLE;
+                    break;
+            }
+
+            foreach ($accesses as $key => $authorities) {
+                $mixed = null;
+                switch ($type) {
+                    case 'user':
+                        if (($user = $uum->getUser($key))) {
+                            $mixed = $user;
+                        }
+                        break;
+                    case 'group':
+                        if (($group = $uum->getGroup($key))) {
+                            $mixed = $group;
+                        }
+                        break;
+                    case 'static_role':
+                        if (($role = $uum->getStaticRole($key))) {
+                            $mixed = $role;
+                        }
+                        break;
+                    case 'dynamic_role':
+                        if (array_key_exists($key, $dynamic_roles)) {
+                            $mixed = $key;
+                        }
+                        break;
+                }
+                $access_list[] = [
+                    'type'        => $type,
+                    'tid'         => $key,
+                    'authorities' => $authorities,
+                    'mixed'       => $mixed
+                ];
+            }
+        }
+
+        // 対象フォルダへコピー
+        foreach ($target_ids as $id) {
+            $folder = $G_cabinet->getFolder($G_cabinet_login, $id);
+            if ( ! $folder) {
+                cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+            }
+
+            // ルートは適用先として設定できないが念のためチェックしておく
+            if ($id == GRN_CABINET_ROOT_FOLDER_ID) {
+                continue;
+            }
+
+            // 登録されているアクセス権一覧をすべて削除
+            $this->deleteTargets($folder, null);
+            // セキュリティモデルをセット
+            $this->setSecurityModel($folder, $security_model);
+            // アクセス権をセット
+            foreach ($access_list as $access) {
+                if ( ! is_null($access['mixed'])) {
+                    $this->addTarget($folder, $access['mixed'],
+                        $access['authorities']);
+                }
+            }
+        }
+
+        return true;
+    }
+}
+
+
+class GRN_Cabinet_FolderEntity_ACL_Base extends CB_PersistentBase
+{
+    var $col_authority_read = ['type' => 'int'];
+    var $col_authority_write = ['type' => 'int'];
+    var $col_object
+        = [
+            'type' => 'relation',
+            'to'   => 'grn_cabinet_folderentity'
+        ];
+}
+
+class GRN_Cabinet_FolderEntity_ACL_CB_User
+    extends GRN_Cabinet_FolderEntity_ACL_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_user'];
+}
+
+class GRN_Cabinet_FolderEntity_ACL_CB_Group
+    extends GRN_Cabinet_FolderEntity_ACL_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_group'];
+}
+
+class GRN_Cabinet_FolderEntity_ACL_Dynamic_Role
+    extends GRN_Cabinet_FolderEntity_ACL_Base
+{
+    var $col_target = ['type' => 'char', 'length' => 100];
+}
+
+class GRN_Cabinet_FolderEntity_ACL_CB_Role
+    extends GRN_Cabinet_FolderEntity_ACL_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_role'];
+}
+
+class GRN_Cabinet_FolderEntity_Prv_Base extends CB_PersistentBase
+{
+    var $col_authority_operation = ['type' => 'int'];
+    var $col_object
+        = [
+            'type' => 'relation',
+            'to'   => 'grn_cabinet_folderentity'
+        ];
+}
+
+class GRN_Cabinet_FolderEntity_Prv_CB_User
+    extends GRN_Cabinet_FolderEntity_Prv_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_user'];
+}
+
+class GRN_Cabinet_FolderEntity_Prv_CB_Group
+    extends GRN_Cabinet_FolderEntity_Prv_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_group'];
+}
+
+class GRN_Cabinet_FolderEntity_Prv_Dynamic_Role
+    extends GRN_Cabinet_FolderEntity_Prv_Base
+{
+    var $col_target = ['type' => 'char', 'length' => 100];
+}
+
+class GRN_Cabinet_FolderEntity_Prv_CB_Role
+    extends GRN_Cabinet_FolderEntity_Prv_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_role'];
+}

@@ -1,0 +1,618 @@
+<?php
+
+require_once('mail/table.csp');
+require_once('grn/application.csp');
+
+/**
+ * Mail Search Logic
+ *
+ * @author  Mizuno, Kuniaki     2005/01
+ * @author  IKEDA, Atsushi      2005/03
+ * @version 1.0
+ * @package grn.mail
+ */
+class GRN_Mail_SearchLogic
+{
+    /**
+     * Return singleton.
+     *
+     * @return GRN_Mail_SearchLogic
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_Mail_SearchLogic();
+        }
+
+        return $_instance;
+    }
+
+    var $_tab_mail;
+    var $_tab_folder;
+    var $_tab_user;
+    var $_utility = null;                           // ユーティリティクラス
+    var $_target_hids;
+
+    function __construct()
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('mail');
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login = $uum->getLoginUser();
+        $table_name = grn_mail_get_personal_tablename($login->getOID(),
+            GRN_MAIL_MESSAGE_TABLE);
+        $this->_tab_mail = $tm->getTableInfo($table_name);
+        $this->_tab_folder = $tm->getTableInfo(GRN_MAIL_FOLDER_TABLE);
+        $this->_tab_user = $tm->getTableInfo('cb_user');
+        unset($tm);
+
+        $this->_target_hids = null;
+    }
+
+    function getUtility()
+    {
+        if (is_null($this->_utility)) {
+            require_once('mail/utility.csp');
+            $this->_utility = GRN_Mail_Utility::getInstance();
+        }
+
+        return $this->_utility;
+    }
+
+    /**
+     * 指定されたユーザーの全フォルダIDを取得
+     *
+     * @param string $uid
+     *
+     * @return array
+     * @access private
+     */
+    function _getAllFolders($uid)
+    {
+        $db = $this->_tab_folder->getDBConnection();
+        $uid = $db->escape($uid);
+
+        if ( ! is_string($uid)) {
+            return [];
+        }
+
+        $rowset = new CB_RowSet($this->_tab_folder);
+        $condition = $rowset->queryf("col_user = '@S'", $uid);
+        $on = CB_DATABASE_TABLE_PREFIX . GRN_MAIL_FOLDER_TABLE
+              . '.col_user = u._id '
+              . 'AND u.col_deleted IS NULL';
+        $rowset->addJoin($this->_tab_user, $on, CB_DATABASE_INNER_JOIN, 'u');
+        $rowset->addCondition($condition);
+        $rowset->setOidOnly();
+
+        unset($folders);
+        $folders = [];
+        while ( ! is_null($oid = $rowset->iterate())) {
+            $folders[] = $oid;
+        }
+
+        return $folders;
+    }
+
+    /**
+     * 指定されたアカウントの全フォルダIDを取得
+     *
+     * @param $aid
+     *
+     * @return array
+     * @access private
+     */
+    function _getFoldersByAccountID($aid)
+    {
+        $db = $this->_tab_folder->getDBConnection();
+        $aid = $db->escape($aid);
+
+        if ( ! is_string($aid)) {
+            return [];
+        }
+
+        $rowset = new CB_RowSet($this->_tab_folder);
+        $condition = $rowset->queryf("col_account = '@S'", $aid);
+        $rowset->addCondition($condition);
+        $rowset->setOidOnly();
+
+        unset($folders);
+        $folders = [];
+        while ( ! is_null($oid = $rowset->iterate())) {
+            $folders[] = $oid;
+        }
+
+        return $folders;
+    }
+
+    /**
+     * @param string $uid user_id
+     * @param string $hid folder_id
+     * @param bool   $subfolder
+     *
+     * @return array $cids
+     * @access private
+     */
+    function _getFoldersByFolderID($uid, $hid, $subfolder)
+    {
+        $db = $this->_tab_folder->getDBConnection();
+        $uid = $db->escape($uid);
+        $hid = $db->escape($hid);
+
+        $row = $this->_tab_folder->getRow($hid);
+        if ( ! is_object($row) || $row->getId('user') !== $uid) {
+            return [];
+        }
+
+        $folders = [];
+        $folders[] = $row->getOID();
+
+        if ($subfolder) {
+            $hids = [$hid];
+            $this->_getSubFolders($uid, $hids, $folders);
+        }
+
+        return $folders;
+    }
+
+    /**
+     * recursive function
+     *
+     * @param       $uid
+     * @param array $hids
+     * @param array $folders
+     *
+     * @return null
+     */
+    function _getSubFolders($uid, $hids, & $folders)
+    {
+        if ( ! is_array($hids) || count($hids) === 0) {
+            return null;
+        }
+
+        $rowset = new CB_RowSet($this->_tab_folder);
+        if (is_array($hids) && count($hids) > 0) {
+            $condition = [];
+            foreach ($hids as $hid) {
+                $condition[] = $rowset->queryf("'@S'", $hid);
+            }
+            $folder_condition = sprintf('col_parent IN ( %s )',
+                implode(', ', $condition));
+            $rowset->addCondition($folder_condition);
+        }
+        $rowset->addCondition($rowset->queryf("col_user = '@S'", $uid));
+        $on = CB_DATABASE_TABLE_PREFIX . GRN_MAIL_FOLDER_TABLE
+              . '.col_user = u._id '
+              . 'AND u.col_deleted IS NULL';
+        $rowset->addJoin($this->_tab_user, $on, CB_DATABASE_INNER_JOIN, 'u');
+        $rowset->setOidOnly();
+
+        $children = [];
+        while ( ! is_null($oid = $rowset->iterate())) {
+            $folders[] = $oid;
+            $children[] = $oid;
+        }
+
+        $rowset->destroy();
+        unset($rowset);
+
+        $this->_getSubFolders($uid, $children, $folders);
+    }
+
+    /**
+     *
+     * @param string $uid user id
+     * @param string $hid folder id
+     * @param bool   $subfolder
+     *
+     * @return array|null
+     * @access private
+     */
+    function _getTargetFolders($uid, $aid, $hid, $subfolder)
+    {
+        if ( ! is_null($this->_target_hids)) {
+            return $this->_target_hids;
+        }
+
+        $ret = [];
+        if ($aid === '-1') {
+            $ret = $this->_getAllFolders($uid);
+        } else {
+            $ret = $this->_getFoldersByFolderID($uid, $hid, $subfolder);
+        }
+
+        if ( ! is_array($ret)) {
+            $this->_target_hids = [];
+
+            return [];
+        }
+
+        $this->_target_hids = $ret;
+
+        return $ret;
+    }
+
+
+    /**
+     *
+     * @param object $user
+     * @param array  $items
+     * @param string $keyword
+     * @param int    $offset
+     * @param int    $limit
+     * @param string $sort（ 'rtime'/'timestamp'/'send_ts'/'dtime'/'data'/'from'/'to'/'size'）。デフォルト:'send_ts'
+     * @param object $start_ts
+     * @param object $last_ts
+     * @param string $aid
+     * @param string $hid
+     * @param bool   $subfolder
+     *
+     * @return array
+     * @access public
+     */
+    function getSearchItems(
+        &$user,
+        $items,
+        $keyword,
+        $offset,
+        $limit,
+        $sort = 'send_ts',
+        $start_ts = null,
+        $last_ts = null,
+        $aid = '-1',
+        $hid = '-1',
+        $subfolder = true
+    ) {
+        $cids = $this->_getTargetFolders($user->getOID(), $aid, $hid,
+            $subfolder);
+        if (count($cids) === 0) {
+            return [];
+        }
+
+        $rowset = $this->_getRowSet($cids, $items, $keyword,
+            $sort, $start_ts, $last_ts,
+            false, $offset, $limit);
+
+        if ($rowset === false) {
+            return [];
+        }
+
+        $ret = [];
+        $id = 0;
+        while ( ! is_null($rs = $rowset->iterate())) {
+            $ret[$id] = $this->_setValueForView($rs, $sort);
+            $id++;
+        }
+        $rowset->destroy();
+
+        return $ret;
+    }
+
+    /**
+     *
+     * @param  object $rs
+     * @param string  $sort（ 'rtime'/'timestamp'/'send_ts'/'dtime'/'data'/'from'/'to'/'size'）。デフォルト:'send_ts'
+     *
+     * @return array
+     * @private
+     */
+    function _setValueForView(&$rs, $sort = 'send_ts')
+    {
+        // if follow ID is 1, the object is MESSAGE
+        $result = [];
+
+        /** @var GRN_Mail_Message $msg_row */
+        $msg_row = $rs['m'];
+
+        $category_id = $msg_row->getId('folder');
+        if ($category_id === false) {
+            $category_id = null;
+        }
+        $account_id = $msg_row->getAccountId();
+
+        $result = $msg_row->getDataProperties(false, true);
+
+        $read_ts = $msg_row->get('read_ts');
+        $b_unread = ( ! is_object($read_ts)
+                      || ($read_ts->unix_ts == 0));
+        $result['unread'] = $b_unread;
+
+        switch ($result['confirmation_status']) {
+            case 'sent':
+                $result['open'] = '2';
+                break;
+            case 'received':
+                $result['open'] = '3';
+                break;
+        }
+
+        if (($sort == 'rtime') || ($sort == 'timestamp')) {
+            $result['time'] = $result['timestamp'];
+        } else {
+            $result['time'] = $result['send_ts'];
+        }
+
+        if ($msg_row->get('draft')) {
+            $result['type'] = '2';
+        } else {
+            $result['type'] = $msg_row->isSent() ? '1' : '0';
+        }
+
+        $size = $msg_row->get('size');
+        $size = is_null($size) ? 0 : (int)$size;
+        if (($size > 0) && ($size < 1024)) {
+            // 1KB未満の場合は1KBと表示させる
+            $result['size'] = 1024;
+        } else {
+            $result['size'] = $size;
+        }
+
+        // 操作した内容（1:返信 2:全員に返信 3:転送）
+        switch ($msg_row->get('action')) {
+            case 'reply':
+                $result['action'] = '1';
+                break;
+            case 'reply-all':
+                $result['action'] = '2';
+                break;
+            case 'forward':
+                $result['action'] = '3';
+                break;
+        }
+
+        // CCとBCC
+        $result['cc'] = $msg_row->get('cc');
+        $result['bcc'] = $msg_row->get('bcc');
+
+        return $result;
+    }
+
+    /**
+     * @param object $user
+     * @param array  $items
+     * @param string $keyword
+     * @param string $sort（ 'rtime'/'timestamp'/'send_ts'/'dtime'/'data'/'from'/'to'/'size'）。デフォルト:'send_ts'
+     * @param object $start_ts
+     * @param object $last_ts
+     * @param string $aid
+     * @param string $hid
+     * @param bool   $subfolder
+     *
+     * @return string
+     * @access private
+     */
+    function getSearchItemCount(
+        &$user,
+        $items,
+        $keyword,
+        $sort = 'send_ts',
+        $start_ts = null,
+        $last_ts = null,
+        $aid = '-1',
+        $hid = '-1',
+        $subfolder = true
+    ) {
+        $hids = $this->_getTargetFolders($user->getOID(), $aid, $hid,
+            $subfolder);
+
+        if (count($hids) === 0) {
+            return 0;
+        }
+        $rowset = $this->_getRowSet($hids, $items, $keyword, $sort, $start_ts,
+            $last_ts);
+
+        if ( ! is_object($rowset)) {
+            return 0;
+        }
+
+        $result = $rowset->iterate();
+        $rowset->destroy();
+
+        return $result['count'];
+    }
+
+    /**
+     *
+     * @param array        $hids
+     * @param array        $items
+     * @param string       $keyword
+     * @param bool         $count
+     * @param int          $offset
+     * @param int          $limit
+     * @param string       $sort（    'rtime'/'timestamp'/'send_ts'/'dtime'/'data'/'from'/'to'/'size'）。デフォルト:'send_ts'
+     * @param CB_TimeStamp $start_ts CB_TimeStamp
+     * @param CB_TimeStamp $last_ts
+     *
+     * @return CB_MultRowSet
+     * @access private
+     */
+    function _getRowSet(
+        $hids,
+        $items,
+        $keyword,
+        $sort = 'send_ts',
+        $start_ts = null,
+        $last_ts = null,
+        $count = true,
+        $offset = 0,
+        $limit = 20
+    ) {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('mail');
+        $folder_condition = '';
+        if (is_array($hids) && count($hids) > 0) {
+            $condition = [];
+            foreach ($hids as $hid) {
+                $condition[] = cb_queryf($dbconn, "'@S'", $hid);
+            }
+            $folder_condition = sprintf('m.col_folder IN ( %s )',
+                implode(', ', $condition));
+        }
+
+        $condition = $this->_makeCondition($folder_condition, $items,
+            $keyword, $sort, $start_ts, $last_ts);
+        if ( ! $condition) {
+            $___ret = false;
+
+            return $___ret;
+        }
+
+        $rowset = new CB_MultiRowSet($this->_tab_mail, 'm');
+
+        $rowset->addCondition($condition);
+
+        if ($count) { // count only
+            $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+        } else {
+            $utility = $this->getUtility();
+            $mail_logic = $utility->getMailLogic();
+            $sort_column = $mail_logic->_getSortColumnName($sort);
+
+            $rowset->addOrderColumn('m.' . $sort_column, true);
+            $rowset->addOrderColumn('m._id', true);
+
+            $rowset->limit($offset, $limit);
+        }
+
+        $rowset->setLock(CB_DATABASE_NO_LOCK);
+
+        return $rowset;
+    }
+
+
+    /**
+     *
+     * @param        $folder_condition
+     * @param array  $items
+     * @param string $keyword
+     * @param        $sort
+     * @param object $start_ts
+     * @param object $last_ts
+     *
+     * @return string or FALSE
+     * @access private
+     */
+    function _makeCondition(
+        $folder_condition,
+        $items,
+        $keyword,
+        $sort,
+        & $start_ts,
+        & $last_ts
+    ) {
+        if ( ! is_array($items) || strlen($keyword) === 0) {
+            return false;
+        }
+
+        // parse keyword
+        require_once('fw/string_util.csp');
+        $search_text = cb_parse_search_text($keyword);
+
+        $queries = [];
+        $conditions = [];
+
+        foreach ($search_text as $key) {
+            if (@ $items['subject']) {
+                if ($cond1 = $this->_makeColumnCondition('m.col_subject',
+                    $key)
+                ) {
+                    $conditions[] = $cond1;
+                }
+            }
+
+            if (@ $items['data']) {
+                if ($cond1 = $this->_makeColumnCondition('m.col_data', $key)) {
+                    $conditions[] = $cond1;
+                }
+            }
+
+            if (@ $items['from']) {
+                if ($cond1 = $this->_makeColumnCondition('m.col_from', $key)) {
+                    $conditions[] = $cond1;
+                }
+            }
+
+            if (@ $items['to']) {
+                if ($cond1 = $this->_makeColumnCondition('m.col_to', $key)) {
+                    $conditions[] = $cond1;
+                }
+            }
+
+            if (@ $items['cc']) {
+                if ($cond1 = $this->_makeColumnCondition('m.col_cc', $key)) {
+                    $conditions[] = $cond1;
+                }
+            }
+
+            if (@ $items['bcc']) {
+                if ($cond1 = $this->_makeColumnCondition('m.col_bcc', $key)) {
+                    $conditions[] = $cond1;
+                }
+            }
+
+            if (count($conditions) === 0) {
+                return false;
+            }
+
+            $queries[] = '(' . implode(' OR ', $conditions) . ')';
+            unset($conditions);
+            $condisions = [];
+        }
+
+        if (count($queries) === 0) {
+            return false;
+        }
+
+        $condition = null;
+        $condition .= '(' . implode(' AND ', $queries) . ')';
+
+        $utility = $this->getUtility();
+        $mail_logic = $utility->getMailLogic();
+        $sort_column = $mail_logic->_getSortColumnName($sort);
+
+        if (is_a($start_ts, 'CB_TimeStamp')) {
+            $condition .= sprintf(" AND m." . $sort_column . " >= '%d' ",
+                $start_ts->unix_ts);
+        }
+
+        if (is_a($last_ts, 'CB_TimeStamp')) {
+            $condition .= sprintf(" AND m." . $sort_column . " < '%d' ",
+                $last_ts->unix_ts);
+        }
+
+        return $condition . ' AND ' . $folder_condition;
+    }
+
+    /**
+     *
+     * @param string $col_name
+     * @param string $keyword
+     *
+     * @return bool|string
+     */
+    function _makeColumnCondition($col_name, $keyword)
+    {
+        if (strlen($keyword) === 0 || is_null($keyword)) {
+            return false;
+        }
+
+        if (strlen($col_name) === 0 || is_null($col_name)) {
+            return false;
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('mail');
+
+        if (is_null($db)) {
+            return false;
+        }
+
+        $format_base = '(' . $col_name . " LIKE '%@L%'" . ')';
+
+        return cb_queryf($db, $format_base, $keyword);
+    }
+}
+
+

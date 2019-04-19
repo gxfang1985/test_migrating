@@ -1,0 +1,1954 @@
+<?php
+
+require_once('fw/cydec.csp');
+require_once('fw/i18n/locale.csp');
+
+/**
+ * Uum sync class on forest
+ */
+class GRN_ForestUumSync
+{
+    const CODE_ID_MAP = 'garoonCodeIdMapData';
+    const SYNC_DATA = 'syncData';
+    const ADMINISTRATOR_USER_ID = '7532782697181632512';
+    const ROOT_ORGANIZATION_ID = '7532782697181632512';
+    const ADMIN_GROUP_ID = '7532782697181632512';
+    const DEFAULT_TIMEZONE = 'Asia/Tokyo';
+    private static $ENTITY_REQUIRED_ATTRIBUTES = ['code', 'id'];
+    private static $USER_REQUIRED_ATTRIBUTES
+        = [
+            'id',
+            'name',
+            'reading',
+            'code',
+            'valid',
+            'ctime',
+            'mtime',
+        ];
+    private static $LOCALNAME_REQUIRED_ATTRIBUTES = ['locale', 'name',];
+    private static $ORGANIZATION_REQUIRED_ATTRIBUTES
+        = [
+            'id',
+            'parentOrg',
+            'name',
+            'code',
+            'ctime',
+            'mtime',
+        ];
+    private static $UORELATION_REQUIRED_ATTRIBUTES = ['userId'];
+    private static $ORGANIZATIONTITLE_REQUIRED_ATTRIBUTES
+        = [
+            'organizationId',
+            'titleName'
+        ];
+    private static $GROUP_REQUIRED_ATTRIBUTES
+        = [
+            'id',
+            'name',
+            'code',
+            'ctime',
+            'mtime',
+        ];
+    private static $GURELATION_REQUIRED_ATTRIBUTES = ['groupId'];
+    private static $UGRELATION_REQUIRED_ATTRIBUTES = ['userId'];
+    private static $SORTORDER_REQUIRED_ATTRIBUTES = ['entityId', 'order'];
+    private static $CUSTOMITEM_REQUIRED_ATTRIBUTES
+        = [
+            'id',
+            'code',
+            'name',
+            'published',
+            'editable'
+        ];
+    private static $CUSTOMITEM_VALUE_REQUIRED_ATTRIBUTES = ['itemId', 'value'];
+    /** @var resource */
+    private $log = null;
+    /** @var GRN_Uum */
+    private $uum;
+    private $userForeignKey = [];
+    private $userPrimaryGroup = [];
+    private $groupForeignKey = [];
+    private $groupParent = [];
+    private $roleForeignKey = [];
+    private $defaultLocale;
+    private $xmlData = 'before get post data';
+    private $commandLine = false;
+    private $_customItems = null;
+
+    public function __construct()
+    {
+        global $G_container_base;
+        $this->uum = $G_container_base->getInstance('uum');
+        $this->defaultLocale = CB_I18N::getInstance()->getDefaultLanguage();
+    }
+
+    /**
+     * Start sync
+     */
+    public function main()
+    {
+        if ( ! defined('ON_FOREST')) {
+            $this->onFatalError("UUMSYNC00001", "Error: not forest mode");
+        }
+
+        $logname = CB_CyDECUtil::getInstance()->getLog('sync');
+        $this->log = fopen($logname, 'a');
+        if ($this->log === false) {
+            $this->onTemporaryError("UUMSYNC00005",
+                "Error: cannot open '{$logname}'");
+        }
+
+        $this->log("main start");
+
+        $use_errors = libxml_use_internal_errors(true);
+        $this->sync();
+        libxml_use_internal_errors($use_errors);
+
+        $this->log("main end\n");
+
+        fclose($this->log);
+    }
+
+    private function sync()
+    {
+        $this->log("sync start");
+        $xml = $this->getXML();
+
+        switch ($xml->getName()) {
+            case self::CODE_ID_MAP:
+                $this->syncCodeIdMap($xml);
+                break;
+            case self::SYNC_DATA:
+                $this->syncSyncData($xml);
+                break;
+            default:
+                $this->onFatalError("UUMSYNC00006",
+                    "Error: invalid xml element '{$xml->getName()}'");
+                break;
+        }
+
+        $this->log("sync end");
+    }
+
+    /**
+     * @return SimpleXMLElement
+     */
+    private function getXML()
+    {
+        if ($this->commandLine) {
+            global $G_INPUT;
+            if ( ! isset($G_INPUT['file'])) {
+                $this->onFatalError("UUMSYNC00016",
+                    "Error: file parameter is required");
+            }
+            $file = $G_INPUT['file'];
+            if ( ! is_readable($file)) {
+                $this->onFatalError("UUMSYNC00017",
+                    "Error: the file '{$file}' is not readable");
+            }
+            $this->xmlData = file_get_contents($file);
+        } else {
+            $this->xmlData = file_get_contents('php://input');
+        }
+
+        // suppress an error to handle invalid xml
+        $xml = @simplexml_load_string($this->xmlData, 'SimpleXMLElement',
+            LIBXML_COMPACT | LIBXML_PARSEHUGE);
+        if ($xml === false) {
+            $this->onXMLError();
+        }
+
+        return $xml;
+    }
+
+    /**
+     * @param SimpleXMLElement $codeIdMap
+     */
+    private function syncCodeIdMap(SimpleXMLElement $codeIdMap)
+    {
+        $this->log("sync codeIdMap start");
+
+        // userCodeIdMap: minOccurs="1", maxOccurs="1"
+        if (count($codeIdMap->userCodeIdMap) > 0) {
+            $userCodeIdMap = $codeIdMap->userCodeIdMap[0];
+            $this->syncUserCodeIdMap($userCodeIdMap);
+        }
+
+        // organizationIdMap: minOccurs="1", maxOccurs="1"
+        if (count($codeIdMap->organizationCodeIdMap) > 0) {
+            $organizationCodeIdMap = $codeIdMap->organizationCodeIdMap[0];
+            $this->syncOrganizationCodeIdMap($organizationCodeIdMap);
+        }
+
+        // groupCodeIdMap: minOccurs="1", maxOccurs="1"
+        if (count($codeIdMap->groupCodeIdMap) > 0) {
+            $groupCodeIdMap = $codeIdMap->groupCodeIdMap[0];
+            $this->syncGroupCodeIdMap($groupCodeIdMap);
+        }
+
+        // customItemCodeIdMap: minOccurs="1", maxOccurs="1"
+        if (count($codeIdMap->customItemCodeIdMap) > 0) {
+            $customItemCodeIdMap = $codeIdMap->customItemCodeIdMap[0];
+            $this->syncCustomItemCodeIdMap($customItemCodeIdMap);
+        }
+
+        $this->checkSlashIds();
+
+        $this->log("sync codeIdMap end");
+    }
+
+    protected function checkSlashIds()
+    {
+        $this->checkUsersSlashId();
+        $this->checkGroupsSlashId();
+        $this->checkStaticRolesSlashId();
+        $this->checkCustomItemsSlashId();
+    }
+
+    protected function checkUsersSlashId()
+    {
+        $allUsers = $this->uum->getUsers();
+        foreach ($allUsers as $user) {
+            if (is_null($user->get('slash'))) {
+                $this->onFatalError(
+                    "UUMSYNC00013",
+                    "Error: there is an user having no slash id, col_foreign_key='{$user->get('foreign_key')}'"
+                );
+            }
+        }
+    }
+
+    protected function checkGroupsSlashId()
+    {
+        $allGroups = $this->uum->getGroups();
+        foreach ($allGroups as $group) {
+            if (is_null($group->get('slash'))) {
+                $this->onFatalError(
+                    "UUMSYNC00014",
+                    "Error: there is a group having no slash id, col_foreign_key='{$group->get('foreign_key')}'"
+                );
+            }
+        }
+    }
+
+    protected function checkStaticRolesSlashId()
+    {
+        $allRoles = $this->uum->getStaticRoles();
+        foreach ($allRoles as $role) {
+            if (is_null($role->get('slash'))) {
+                $this->onFatalError(
+                    "UUMSYNC00015",
+                    "Error: there is a role having no slash id, col_foreign_key='{$role->get('foreign_key')}'"
+                );
+            }
+        }
+    }
+
+    protected function checkCustomItemsSlashId()
+    {
+        $customItems = $this->uum->listItems();
+        foreach ($customItems as $item) {
+            if (is_null($item->get('slash'))) {
+                $this->onFatalError(
+                    "UUMSYNC00021",
+                    "Error: there is a customItem having no slash id, col_id='{$item->get('id')}'"
+                );
+            }
+        }
+    }
+
+    /**
+     * @param SimpleXMLElement $userCodeIdMap
+     */
+    private function syncUserCodeIdMap(SimpleXMLElement $userCodeIdMap)
+    {
+        $this->log("sync userCodeIdMap start");
+
+        // entity: minOccurs="1", maxOccurs="unbounded"
+        foreach ($userCodeIdMap->entity as $entity) {
+            $this->syncUserEntity($entity);
+        }
+
+        $this->log("sync userCodeIdMap end");
+    }
+
+    /**
+     * @param SimpleXMLElement $entity
+     */
+    private function syncUserEntity(SimpleXMLElement $entity)
+    {
+        $this->validateEntity($entity);
+
+        if ($entity['id'] === self::ADMINISTRATOR_USER_ID) {
+            // ignore
+            return;
+        }
+
+        $user = $this->getUserByForeignKey((string)$entity['code']);
+        if ($user === false) {
+            // ignore
+            return;
+        }
+
+        $this->log("sync user entity code={$entity['code']} start");
+
+        $user->_setPrivately('slash', (string)$entity['id']);
+        $user->updateNow();
+
+        $this->log("sync user entity code={$entity['code']} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $organizationCodeIdMap
+     */
+    private function syncOrganizationCodeIdMap(
+        SimpleXMLElement $organizationCodeIdMap
+    ) {
+        $this->log("sync organizationCodeIdMap start");
+
+        // entity: minOccurs="1", maxOccurs="unbounded"
+        foreach ($organizationCodeIdMap->entity as $entity) {
+            $this->syncGroupEntity($entity);
+        }
+
+        $this->log("sync organizationCodeIdMap end");
+    }
+
+    /**
+     * @param SimpleXMLElement $entity
+     */
+    private function syncGroupEntity(SimpleXMLElement $entity)
+    {
+        $this->validateEntity($entity);
+
+        if ((string)$entity['id'] === self::ROOT_ORGANIZATION_ID) {
+            // ignore;
+            return;
+        }
+
+        $group = $this->getGroupByForeignKey((string)$entity['code']);
+        if ($group === false) {
+            // ignore;
+            return;
+        }
+
+        $this->log("sync organization entity code={$entity['code']} start");
+
+        $group->_setPrivately('slash', (string)$entity['id']);
+        $group->updateNow();
+
+        $this->log("sync organization entity code={$entity['code']} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $groupCodeIdMap
+     */
+    private function syncGroupCodeIdMap(SimpleXMLElement $groupCodeIdMap)
+    {
+        $this->log("sync roleCodeIdMap start");
+
+        // entity: minOccurs="1", maxOccurs="unbounded"
+        foreach ($groupCodeIdMap->entity as $entity) {
+            $this->syncRoleEntity($entity);
+        }
+
+        $this->log("sync roleCodeIdMap end");
+    }
+
+    /**
+     * @param SimpleXMLElement $entity
+     */
+    private function syncRoleEntity(SimpleXMLElement $entity)
+    {
+        $this->validateEntity($entity);
+
+        if ($entity['id'] === self::ADMIN_GROUP_ID) {
+            // ignore
+            return;
+        }
+
+        $role = $this->getStaticRoleByForeignKey((string)$entity['code']);
+        if ($role === false) {
+            // ignore
+            return;
+        }
+
+        $this->log("sync role entity code={$entity['code']} start");
+
+        $role->_setPrivately('slash', (string)$entity['id']);
+        $role->updateNow();
+
+        $this->log("sync role entity code={$entity['code']} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $customItemCodeIdMap
+     */
+    private function syncCustomItemCodeIdMap(
+        SimpleXMLElement $customItemCodeIdMap
+    ) {
+        $this->log("sync customItemCodeIdMap start");
+
+        // entity: minOccurs="1", maxOccurs="unbounded"
+        foreach ($customItemCodeIdMap->entity as $entity) {
+            $this->syncCustomItemEntity($entity);
+        }
+
+        $this->log("sync customItemCodeIdMap end");
+    }
+
+    /**
+     * @param SimpleXMLElement $entity
+     */
+    private function syncCustomItemEntity(SimpleXMLElement $entity)
+    {
+        $this->validateEntity($entity);
+
+        $customItem = $this->getCustomItemByCode((string)$entity['code']);
+        if ($customItem === false) {
+            // ignore
+            return;
+        }
+
+        $this->log("sync customItem entity code={$entity['code']} start");
+
+        $customItem->set('slash', (string)$entity['id']);
+        $customItem->updateNow();
+
+        $this->log("sync customItem entity code={$entity['code']} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $syncData
+     */
+    private function syncSyncData(SimpleXMLElement $syncData)
+    {
+        $this->log("sync syncData start");
+
+        // companyData: minOccurs="0", maxOccurs="1"
+        // ignore
+
+        // customItemData:minOccurs="0", maxOccurs="1"
+        if (count($syncData->customItems) > 0) {
+            $this->checkCustomItemsSlashId();
+            $customItems = $syncData->customItems[0];
+            $this->syncCustomItems($customItems);
+        }
+
+        // userData: minOccurs="0", maxOccurs="1"
+        if (count($syncData->userData) > 0) {
+            $this->checkUsersSlashId();
+            $userData = $syncData->userData[0];
+            $this->syncUserData($userData);
+        }
+
+        // systemConfigData: minOccurs="0", maxOccurs="1"
+        // ignore, a password policy is used only in slash
+
+        // organizationData: minOccurs="0", maxOccurs="1"
+        if (count($syncData->organizationData) > 0) {
+            $this->checkGroupsSlashId();
+            $organizationData = $syncData->organizationData[0];
+            $this->syncOrganizationData($organizationData);
+        }
+
+        // userOrganizationRelation: minOccurs="0", maxOccurs="1"
+        if (count($syncData->userOrganizationRelation) > 0) {
+            $this->checkUsersSlashId();
+            $this->checkGroupsSlashId();
+            $userOrganizationRelation = $syncData->userOrganizationRelation[0];
+            $this->syncUserOrganizationRelation($userOrganizationRelation);
+        }
+
+        // groupData: minOccurs="0", maxOccurs="1"
+        if (count($syncData->groupData) > 0) {
+            $this->checkStaticRolesSlashId();
+            $groupData = $syncData->groupData[0];
+            $this->syncGroupData($groupData);
+        }
+
+        // groupUserRelation: minOccurs="0", maxOccurs="1"
+        if (count($syncData->groupUserRelation) > 0) {
+            $this->checkUsersSlashId();
+            $this->checkStaticRolesSlashId();
+            $groupUserRelation = $syncData->groupUserRelation[0];
+            $this->syncGroupUserRelation($groupUserRelation);
+        }
+
+        // userGroupRelation: minOccurs="0", maxOccurs="1"
+        if (count($syncData->userGroupRelation) > 0) {
+            $this->checkUsersSlashId();
+            $this->checkStaticRolesSlashId();
+            $userGroupRelation = $syncData->userGroupRelation[0];
+            $this->syncUserGroupRelation($userGroupRelation);
+        }
+
+        // organizationSortOrder: minOccurs="0", maxOccurs="1"
+        if (count($syncData->organizationSortOrder) > 0) {
+            $this->checkGroupsSlashId();
+            $organizationSortOrder = $syncData->organizationSortOrder[0];
+            $this->syncOrganizationSortOrder($organizationSortOrder);
+        }
+
+        // groupSortOrder: minOccurs="0", maxOccurs="1"
+        if (count($syncData->groupSortOrder) > 0) {
+            $this->checkStaticRolesSlashId();
+            $groupSortOrder = $syncData->groupSortOrder[0];
+            $this->syncGroupSortOrder($groupSortOrder);
+        }
+
+        $this->finalize();
+
+        $this->log("sync syncData end");
+    }
+
+    /**
+     * @param SimpleXMLElement $userData
+     */
+    private function syncUserData(SimpleXMLElement $userData)
+    {
+        $this->log("sync userData start");
+        // user: minOccurs="0", maxOccurs="unbounded"
+        foreach ($userData->user as $userElement) {
+            $this->syncUser($userElement);
+        }
+
+        // removeUserId: minOccurs="0", maxOccurs="unbounded"
+        foreach ($userData->removeUserId as $removeUserId) {
+            $this->removeUser($removeUserId);
+        }
+        $this->log("sync userData end");
+    }
+
+    /**
+     * @param SimpleXMLElement $userElement
+     */
+    private function syncUser(SimpleXMLElement $userElement)
+    {
+        $this->validateUser($userElement);
+
+        $this->log("sync user col_slash={$userElement['id']} start");
+
+        $user = $this->getUserBySlashID($userElement['id']);
+        if ($user === false) {
+            $user = $this->addUser($userElement);
+        } else {
+            $this->updateUser($user, $userElement);
+        }
+
+        $this->log("sync user col_slash={$userElement['id']} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $userElement
+     *
+     * @return CB_User
+     */
+    private function addUser(SimpleXMLElement $userElement)
+    {
+        $properties = $this->getUserProperties($userElement);
+
+        $user = $this->uum->addUser($properties, null, true);
+
+        $this->setUserInfo($user, $userElement);
+
+        return $user;
+    }
+
+    /**
+     * @param CB_User          $user
+     * @param SimpleXMLElement $userElement
+     */
+    private function setUserInfo(CB_User $user, SimpleXMLElement $userElement)
+    {
+        // set ctime and mtime
+        $this->setUserTimestamp($user, $userElement);
+
+        // set user locale setting
+        $this->setUserLocaleSetting($user, $userElement);
+
+        // set primary group
+        $this->setUserPrimaryGroup($user, $userElement);
+
+        // set customItem
+        $this->setUserCustomItem($user, $userElement);
+    }
+
+    /**
+     * @param CB_User          $user
+     * @param SimpleXMLElement $userElement
+     */
+    private function setUserTimestamp(
+        CB_User $user,
+        SimpleXMLElement $userElement
+    ) {
+        $userInfo = $this->uum->getUserCreationInfo($user->getOID());
+
+        // ctime: required
+        $ctime = $this->convertToTimestamp($userElement['ctime']);
+        $user->_setPrivately('ctime', $ctime);
+        $userInfo->set('ctime', $ctime);
+        // mtime: required
+        $mtime = $this->convertToTimestamp($userElement['mtime']);
+        $user->_setPrivately('mtime', $mtime);
+        $userInfo->set('mtime', $mtime);
+        $user->updateNow();
+        $userInfo->updateNow();
+    }
+
+    /**
+     * @param CB_User          $user
+     * @param SimpleXMLElement $userElement
+     */
+    private function setUserLocaleSetting(
+        CB_User $user,
+        SimpleXMLElement $userElement
+    ) {
+        if (isset($userElement['locale'])) {
+            $userLocaleSetting = CB_UserLocaleSetting::select($user->getOID());
+            if (is_null($userLocaleSetting)) {
+                if ( ! $this->isBrowserLocale((string)$userElement['locale'])) {
+                    $this->insertUserLocaleSetting($user, $userElement);
+                }
+            } else {
+                $this->updateUserLocaleSetting($userLocaleSetting,
+                    $userElement);
+            }
+        }
+    }
+
+    private function insertUserLocaleSetting(
+        CB_User $user,
+        SimpleXMLElement $userElement
+    ) {
+        $userLocaleSetting = $this->createUserLocaleSetting($user,
+            $userElement);
+        $userLocaleSetting->insert();
+    }
+
+    /**
+     * @param CB_User          $user
+     * @param SimpleXMLElement $userElement
+     *
+     * @return CB_UserLocaleSetting
+     */
+    private function createUserLocaleSetting(
+        CB_User $user,
+        SimpleXMLElement $userElement
+    ) {
+        $locale = (string)$userElement['locale'];
+        $languageId = $this->getLanguageId($locale);
+        $locale = CB_LocaleManager::getLanguageCode($languageId);
+
+        $localeSettings = [
+            '_id'                   => $user->getOID(),
+            'col_locale'            => CB_UserLocaleSetting::$LOCALE_IS_NOT_RELATED,
+            'col_language'          => $languageId,
+            'col_long_date_format'  => CB_LocaleManager::getDefaultLongDateFormat($locale),
+            'col_short_date_format' => CB_LocaleManager::getDefaultShortDateFormat($locale),
+            'col_time_format'       => CB_LocaleManager::getDefaultTimeFormat($locale),
+        ];
+
+        $userLocaleSetting = new CB_UserLocaleSetting($localeSettings);
+
+        return $userLocaleSetting;
+    }
+
+    /**
+     * @param CB_UserLocaleSetting $userLocaleSetting
+     * @param SimpleXMLElement     $userElement
+     */
+    private function updateUserLocaleSetting(
+        CB_UserLocaleSetting $userLocaleSetting,
+        SimpleXMLElement $userElement
+    ) {
+        $locale = (string)$userElement['locale'];
+        if ($this->isBrowserLocale($locale)) {
+            $this->log($userLocaleSetting->getId());
+            $userLocaleSetting->delete();
+        } else {
+            $languageId = $this->getLanguageId($locale);
+            $userLocaleSetting->setLocale(CB_UserLocaleSetting::$LOCALE_IS_NOT_RELATED);
+            if ($userLocaleSetting->getLanguageCode() != $locale) {
+                $userLocaleSetting->setLongDateFormat(CB_LocaleManager::getDefaultLongDateFormat($locale));
+                $userLocaleSetting->setShortDateFormat(CB_LocaleManager::getDefaultShortDateFormat($locale));
+                $userLocaleSetting->setTimeFormat(CB_LocaleManager::getDefaultTimeFormat($locale));
+            }
+            $userLocaleSetting->setLanguage($languageId);
+            $userLocaleSetting->update();
+        }
+    }
+
+    /**
+     * @param string $locale
+     *
+     * @return string
+     */
+    private function getLanguageId($locale)
+    {
+        if ( ! CB_I18N::isAvailableLocale($locale)) {
+            $locale = $this->defaultLocale;
+        }
+
+        return CB_LanguageManager::getLanguageId($locale);
+    }
+
+    /**
+     * @param string $locale
+     *
+     * @return bool
+     */
+    private function isBrowserLocale($locale)
+    {
+        return strlen($locale) === 0;
+    }
+
+    /**
+     * @param SimpleXMLElement $userElement
+     *
+     * @return array
+     */
+    private function getUserProperties(SimpleXMLElement $userElement)
+    {
+        $properties = [];
+        $slashId = (string)$userElement['id'];
+        $properties['slash'] = $slashId;
+
+        // insert temporary key and update after
+        $properties['foreign_key'] = $this->getTemporaryForeignKey();
+        $this->userForeignKey[$slashId] = (string)$userElement['code'];
+
+        $properties['valid'] = ((string)$userElement['valid'] === 'true') ? '1'
+            : '0';
+
+        if (isset($userElement['reading'])) {
+            $properties['sort_key'] = (string)$userElement['reading'];
+        }
+        if (isset($userElement['email'])) {
+            $properties['email_address'] = (string)$userElement['email'];
+        }
+        if (isset($userElement['description'])) {
+            $properties['description'] = (string)$userElement['description'];
+        }
+        if (isset($userElement['phone'])) {
+            $properties['telephone_number'] = (string)$userElement['phone'];
+        }
+        if (isset($userElement['url'])) {
+            $properties['url'] = (string)$userElement['url'];
+        }
+        if (isset($userElement['timezone'])) {
+            $timezone = (string)$userElement['timezone'];
+            if ( ! CB_I18N::isAvailableTimezone($timezone)) {
+                $timezone = self::DEFAULT_TIMEZONE;
+            }
+            $properties['timezone'] = $timezone;
+        }
+        if (isset($userElement['password']) && isset($userElement['salt'])) {
+            $properties['slash_password'] = (string)$userElement['password'];
+            $properties['slash_salt'] = (string)$userElement['salt'];
+        }
+
+        $properties['display_name'] = (string)$userElement['name'];
+        if (count($userElement->localName) > 0) {
+            $localName = $userElement->localName[0];
+            $this->validateLocalName($localName);
+
+            $locale = (string)$localName['locale'];
+            $name = (string)$localName['name'];
+            if (strlen($name) > 0 && CB_I18N::isAvailableLocale($locale)) {
+                $properties['display_name'] = $name;
+                $properties['display_name_language'] = $locale;
+                $properties['nickname']
+                    = (string)$userElement['name'];
+            } else {
+                $properties['nickname'] = '';
+            }
+        } else {
+            $properties['nickname'] = '';
+        }
+
+        if (isset($userElement['sortOrder'])) {
+            $properties['position'] = (string)$userElement['sortOrder'];
+        }
+
+        return $properties;
+    }
+
+    /**
+     * @param CB_User          $user
+     * @param SimpleXMLElement $userElement
+     */
+    private function setUserPrimaryGroup(
+        CB_User $user,
+        SimpleXMLElement $userElement
+    ) {
+        if (isset($userElement['primaryOrganization'])) {
+            // set at the end, for user-organization relation must be needed
+            $this->userPrimaryGroup[$user->getOID()]
+                = (string)$userElement['primaryOrganization'];
+        }
+    }
+
+    private function setUserCustomItem(
+        CB_User $user,
+        SimpleXMLElement $userElement
+    ) {
+        if (count($userElement->customItemValues[0])) {
+
+            // とりあえず送られてきたXMLのデータをチェック
+            foreach ($userElement->customItemValues[0] as $customItemValue) {
+                $this->validateCustomItemValue($customItemValue);
+            }
+
+            // 持っているカスタマイズ項目すべてを処理する
+            foreach ($this->_getCustomItems() as $item) {
+                $found = false;
+
+                // XMLないからカスタマイズ項目を検索
+                foreach ($userElement->customItemValues[0] as $customItemValue) {
+                    if ((string)$customItemValue['itemId']
+                        == $item->get('slash')
+                    ) {
+                        $found = true;
+                        // カスタマイズ項目のデータの反映
+                        $this->uum->setExtensionItemData(
+                            $user, $item->get('id'),
+                            (string)$customItemValue['value'], false, true
+                        );
+                        break;
+                    }
+                }
+
+                // XMLにないカスタマイズ項目値は削除
+                if ( ! $found) {
+                    $this->uum->setExtensionItemData($user, $item->get('id'),
+                        '', false, true);
+                }
+            }
+        }
+    }
+
+    /**
+     * @param CB_User          $user
+     * @param SimpleXMLElement $userElement
+     *
+     * @return CB_User
+     */
+    private function updateUser(CB_User $user, SimpleXMLElement $userElement)
+    {
+        // restore the user if updating a deleted user
+        if ($user->get('deleted')) {
+            $this->uum->restoreUser($user);
+        }
+
+        // update columns
+        $properties = $this->getUserProperties($userElement);
+        $this->uum->setUserProperties($user->getOID(), $properties, false,
+            true);
+
+        $this->setUserInfo($user, $userElement);
+
+        return $user;
+    }
+
+    /**
+     * @param SimpleXMLElement $removeUserId
+     */
+    private function removeUser(SimpleXMLElement $removeUserId)
+    {
+        $this->log("remove user col_slash={$removeUserId} start");
+
+        $user = $this->getUserBySlashID((string)$removeUserId);
+        if ($user === false) {
+            // ignore
+            return;
+        }
+        $user->_setPrivately('foreign_key', ' ' . cb_create_uuid());
+        $user->updateNow();
+        $this->uum->removeUser($user->getOID());
+
+        $this->log("remove user col_slash={$removeUserId} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $organizationData
+     */
+    private function syncOrganizationData(SimpleXMLElement $organizationData)
+    {
+        $this->log("sync organizationData start");
+
+        // organization: minOccurs="0", maxOccurs="unbounded"
+        foreach ($organizationData->organization as $organization) {
+            $this->syncOrganization($organization);
+        }
+
+        // set group parent id
+        foreach ($this->groupParent as $slashId => $parentSlashId) {
+            $group = $this->getGroupBySlashID($slashId);
+            if ($parentSlashId === self::ROOT_ORGANIZATION_ID) {
+                // if parent is root, parent id set null
+                $this->uum->setParentGroup($group->getOID(), null, true, false);
+            } else {
+                $parentGroup = $this->getGroupBySlashID($parentSlashId);
+                if ($parentGroup === false) {
+                    $this->onFatalError(
+                        "UUMSYNC00009",
+                        "Error: parent organization not found, col_slash = [{$parentSlashId}]"
+                    );
+                }
+                $this->uum->setParentGroup($group->getOID(),
+                    $parentGroup->getOID(), true, false);
+            }
+        }
+
+        // removeOrganizationId: minOccurs="0", maxOccurs="unbounded"
+        foreach (
+            $organizationData->removeOrganizationId as $removeOrganizationId
+        ) {
+            $this->removeOrganization($removeOrganizationId);
+        }
+
+        $this->log("sync organizationData end");
+    }
+
+    /**
+     * @param SimpleXMLElement $organization
+     */
+    private function syncOrganization(SimpleXMLElement $organization)
+    {
+        $this->validateOrganization($organization);
+
+        if ((string)$organization['id'] === self::ROOT_ORGANIZATION_ID) {
+            // ignore root group
+            return;
+        }
+
+        $this->log("sync organization col_slash={$organization['id']} start");
+
+        $group = $this->getGroupBySlashID($organization['id']);
+        if ($group === false) {
+            $this->addGroup($organization);
+        } else {
+            $this->updateGroup($group, $organization);
+        }
+
+        $this->log("sync organization col_slash={$organization['id']} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $organization
+     *
+     * @return CB_Group
+     */
+    private function addGroup(SimpleXMLElement $organization)
+    {
+        $properties = $this->getGroupProperties($organization);
+        $group = $this->uum->addGroupDefaultOnly($properties, null, null,
+            true);
+
+        $this->setGroupInfo($group, $organization);
+
+        return $group;
+    }
+
+    /**
+     * @param CB_Group         $group
+     * @param SimpleXMLElement $organization
+     *
+     * @return CB_Group
+     */
+    private function updateGroup(
+        CB_Group $group,
+        SimpleXMLElement $organization
+    ) {
+        $properties = $this->getGroupProperties($organization);
+        $this->uum->setGroupProperties($group->getOID(), $properties, true);
+
+        $this->setGroupInfo($group, $organization, false);
+
+        return $group;
+    }
+
+    /**
+     * @param SimpleXMLElement $organization
+     *
+     * @return array
+     */
+    private function getGroupProperties(SimpleXMLElement $organization)
+    {
+        $properties = [];
+        $slashId = (string)$organization['id'];
+        $properties['slash'] = $slashId;
+
+        // insert temporary key and update after
+        $properties['foreign_key'] = $this->getTemporaryForeignKey();
+        $this->groupForeignKey[$slashId] = (string)$organization['code'];
+
+        $properties['description'] = (string)$organization['description'];
+        $properties['name'] = (string)$organization['name'];
+
+        if (isset($organization['sortOrder'])) {
+            $properties['list_index'] = (string)$organization['sortOrder'];
+        }
+
+        return $properties;
+    }
+
+    /**
+     * @param CB_Group         $group
+     * @param SimpleXMLElement $organization
+     * @param bool             $add
+     */
+    private function setGroupInfo(
+        CB_Group $group,
+        SimpleXMLElement $organization,
+        $add = true
+    ) {
+        $this->setGroupLocalName($group, $organization, $add);
+        $this->setGroupTimestamp($group, $organization);
+        $this->setGroupParent($organization);
+    }
+
+    /**
+     * @param CB_Group         $group
+     * @param SimpleXMLElement $organization
+     * @param bool             $add
+     */
+    private function setGroupLocalName(
+        CB_Group $group,
+        SimpleXMLElement $organization,
+        $add = true
+    ) {
+        // localName: minOccurs="0", maxOccurs="unbounded"
+        if (count($organization->localName) > 0) {
+            $names = [];
+            foreach ($organization->localName as $localName) {
+                $this->validateLocalName($localName);
+                $locale = (string)$localName['locale'];
+                if (CB_I18N::isAvailableLocale($locale)) {
+                    $names[$locale] = (string)$localName['name'];
+                }
+            }
+            $groupId = $group->getOID();
+            $sync = true;
+            if ($add) {
+                $this->uum->addGroupLocals($groupId, $names, $sync);
+            } else {
+                $this->uum->modifyGroupLocals($groupId, $names, $sync);
+            }
+        }
+    }
+
+    /**
+     * @param CB_Group         $group
+     * @param SimpleXMLElement $organization
+     */
+    private function setGroupTimestamp(
+        CB_Group $group,
+        SimpleXMLElement $organization
+    ) {
+        $groupInfo = $this->uum->getGroupCreationInfo($group->getOID());
+
+        // ctime: required
+        $ctime = $this->convertToTimestamp((string)$organization['ctime']);
+        $group->_setPrivately('ctime', $ctime);
+        $groupInfo->set('ctime', $ctime);
+        // mtime: required
+        $mtime = $this->convertToTimestamp((string)$organization['mtime']);
+        $group->_setPrivately('mtime', $mtime);
+        $groupInfo->set('mtime', $mtime);
+        $group->updateNow();
+        $groupInfo->updateNow();
+
+    }
+
+    /**
+     * @param SimpleXMLElement $organization
+     */
+    private function setGroupParent(SimpleXMLElement $organization)
+    {
+        $parentSlashId = (string)$organization['parentOrg'];
+        // set col_parent at the end
+        $this->groupParent[(string)$organization['id']] = $parentSlashId;
+    }
+
+    /**
+     * @param SimpleXMLElement $removeOrganizationId
+     */
+    private function removeOrganization(SimpleXMLElement $removeOrganizationId)
+    {
+        $group = $this->getGroupBySlashID((string)$removeOrganizationId);
+        if ($group === false) {
+            // ignore
+            return;
+        }
+
+        $this->log("remove organization col_slash={$removeOrganizationId} start");
+
+        $this->uum->removeGroup($group->getOID());
+
+        $this->log("remove organization col_slash={$removeOrganizationId} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $userOrganizationRelation
+     */
+    private function syncUserOrganizationRelation(
+        SimpleXMLElement $userOrganizationRelation
+    ) {
+        $this->log("sync userOrganizationRelation start");
+        // relation: minOccurs="1", maxOccurs="unbouded"
+        foreach ($userOrganizationRelation->relation as $relation) {
+            $this->syncUORelation($relation);
+        }
+
+        $this->log("sync userOrganizationRelation end");
+    }
+
+    /**
+     * @param SimpleXMLElement $relation
+     */
+    private function syncUORelation(SimpleXMLElement $relation)
+    {
+        $this->validateUORelation($relation);
+
+        $this->log("sync user-organization relation user's col_slash={$relation['userId']} start");
+
+        $user = $this->getUserBySlashID((string)$relation['userId']);
+        if ($user === false) {
+            $this->onFatalError("UUMSYNC00010",
+                "Error: user col_slash={$relation['userId']} not found");
+        }
+
+        $groupIds = [];
+        $titleName = [];
+        foreach ($relation->organizationTitle as $organizationTitle) {
+            $this->validateOrganizationTitle($organizationTitle);
+            $organizationId = (string)$organizationTitle['organizationId'];
+            $group = $this->getGroupBySlashID($organizationId);
+            if ($group === false) {
+                $this->onFatalError("UUMSYNC00011",
+                    "Error: organization col_slash={$organizationId} not found");
+            }
+            $groupIds[] = $group->getOID();
+            if (strlen((string)$organizationTitle['titleName']) > 0) {
+                $titleName[] = (string)$organizationTitle['titleName'];
+            }
+        }
+        $this->uum->setUserGroups($user->getOID(), $groupIds, false);
+        if (count($titleName) > 0) {
+            $post = implode(" ", $titleName);
+        } else {
+            $post = null;
+        }
+        $this->uum->setUserPost($user->getOID(), $post, true);
+
+        $this->log("sync user-organization relation user's col_slash={$relation['userId']} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $groupData
+     */
+    private function syncGroupData(SimpleXMLElement $groupData)
+    {
+        $this->log("sync roleData start");
+
+        // group: minOccurs="0", maxOccurs="unbounded"
+        foreach ($groupData->group as $group) {
+            $this->syncGroup($group);
+        }
+
+        // removeGroupId: minOccurs="0", maxOccurs="unbounded"
+        foreach ($groupData->removeGroupId as $removeGroupId) {
+            $this->removeGroup($removeGroupId);
+        }
+
+        $this->log("sync roleData end");
+    }
+
+    /**
+     * @param SimpleXMLElement $group
+     */
+    private function syncGroup(SimpleXMLElement $group)
+    {
+        $this->validateGroup($group);
+
+        $this->log("sync role col_slash={$group['id']} start");
+
+        $role = $this->getStaticRoleBySlashId((string)$group['id']);
+        if ($role === false) {
+            $this->addStaticRole($group);
+        } else {
+            $this->updateStaticRole($role, $group);
+        }
+
+        $this->log("sync role col_slash={$group['id']} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $group
+     *
+     * @return CB_Role
+     */
+    private function addStaticRole(SimpleXMLElement $group)
+    {
+        $properties = $this->getStaticRoleProperties($group);
+        $role = $this->uum->addStaticRole($properties, null, true);
+        $this->setRoleInfo($role, $group);
+
+        return $role;
+    }
+
+    /**
+     * @param CB_Role          $role
+     * @param SimpleXMLElement $group
+     *
+     * @return CB_Role
+     */
+    private function updateStaticRole(CB_Role $role, SimpleXMLElement $group)
+    {
+        $properties = $this->getStaticRoleProperties($group);
+        $this->uum->setStaticRoleProperties($role->getOID(), $properties, true);
+        $this->setRoleInfo($role, $group);
+
+        return $role;
+    }
+
+    /**
+     * @param SimpleXMLElement $group
+     *
+     * @return array
+     */
+    private function getStaticRoleProperties(SimpleXMLElement $group)
+    {
+        $properties = [];
+        $slashId = (string)$group['id'];
+        $properties['slash'] = $slashId;
+
+        $foreignKey = (string)$group['name'];
+        $role = $this->getStaticRoleByForeignKey($foreignKey);
+        if ($role && $slashId !== $role->get('slash')) {
+            // insert temporary key and update after
+            $properties['foreign_key'] = $this->getTemporaryForeignKey();
+            $this->roleForeignKey[$slashId] = $foreignKey;
+        } else {
+            $properties['foreign_key'] = $foreignKey;
+        }
+
+        if (isset($group['description'])) {
+            $properties['description'] = (string)$group['description'];
+        }
+
+        if (isset($group['sortOrder'])) {
+            $properties['list_index'] = (string)$group['sortOrder'];
+        }
+
+        return $properties;
+    }
+
+    /**
+     * @param CB_Role          $role
+     * @param SimpleXMLElement $group
+     */
+    private function setRoleInfo(CB_Role $role, SimpleXMLElement $group)
+    {
+        $roleInfo = $this->uum->getStaticRoleCreationInfo($role->getOID());
+
+        // ctime: required
+        $ctime = $this->convertToTimestamp((string)$group['ctime']);
+        $role->_setPrivately('ctime', $ctime);
+        $roleInfo->set('ctime', $ctime);
+        // mtime: required
+        $mtime = $this->convertToTimestamp((string)$group['mtime']);
+        $role->_setPrivately('mtime', $mtime);
+        $roleInfo->set('mtime', $mtime);
+        $role->updateNow();
+        $roleInfo->updateNow();
+    }
+
+    /**
+     * @param SimpleXMLElement $removeGroupId
+     */
+    private function removeGroup(SimpleXMLElement $removeGroupId)
+    {
+        $role = $this->getStaticRoleBySlashId((string)$removeGroupId);
+        if ($role === false) {
+            // ignore
+            return;
+        }
+
+        $this->log("remove role col_slash={$removeGroupId} start");
+
+        $this->uum->removeStaticRole($role->getOID());
+
+        $this->log("remove role col_slash={$removeGroupId} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $groupUserRelation
+     */
+    private function syncGroupUserRelation(SimpleXMLElement $groupUserRelation)
+    {
+        $this->log("sync roleUserRelation start");
+
+        // relation: minOccurs="1", maxOccurs="unbouded"
+        foreach ($groupUserRelation->relation as $relation) {
+            //GTM-529: remove cache in children method
+            $this->syncGURelation($relation);
+        }
+
+        $this->log("sync roleUserRelation end");
+    }
+
+    /**
+     * @param SimpleXMLElement $relation
+     */
+    private function syncGURelation(SimpleXMLElement $relation)
+    {
+        $this->validateGURelation($relation);
+
+        $this->log("sync role-user relation role's col_slash={$relation['groupId']} start");
+
+        $role = $this->getStaticRoleBySlashId((string)$relation['groupId']);
+        if ($role === false) {
+            $this->onFatalError("UUMSYNC00012",
+                "Error: role col_slash={$relation['groupId']} not found");
+        }
+
+        $userIds = [];
+        foreach ($relation->userId as $userId) {
+            $user = $this->getUserBySlashID((string)$userId);
+            if ($user === false) {
+                $this->onFatalError("UUMSYNC00010",
+                    "Error: user col_slash={$userId} not found");
+            }
+            $userIds[] = $user->getOID();
+        }
+        $this->uum->setRoleUsers($role->getOID(), $userIds, true);
+
+        $this->log("sync role-user relation role's col_slash={$relation['groupId']} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $userGroupRelation
+     */
+    private function syncUserGroupRelation(SimpleXMLElement $userGroupRelation)
+    {
+        $this->log("sync userRoleRelation start");
+
+        // relation: minOccurs="1", maxOccurs="unbouded"
+        foreach ($userGroupRelation->relation as $relation) {
+            $this->syncUGRelation($relation);
+        }
+
+        $this->log("sync userRoleRelation end");
+    }
+
+    /**
+     * @param SimpleXMLElement $relation
+     */
+    private function syncUGRelation(SimpleXMLElement $relation)
+    {
+        $this->validateUGRelation($relation);
+
+        $this->log("sync user-role relation user's col_slash={$relation['userId']} start");
+
+        $user = $this->getUserBySlashID((string)$relation['userId']);
+        if ($user === false) {
+            $this->onFatalError("UUMSYNC00010",
+                "Error: user col_slash={$relation['userId']} not found");
+        }
+
+        $roleIds = [];
+        foreach ($relation->groupId as $groupId) {
+            $role = $this->getStaticRoleBySlashId((string)$groupId);
+            if ($role === false) {
+                $this->onFatalError("UUMSYNC00012",
+                    "Error: role col_slash={$groupId} not found");
+            }
+            $roleIds[] = $role->getOID();
+        }
+        $this->uum->setUserRoles($user->getOID(), $roleIds);
+        $this->log("sync user-role relation user's col_slash={$relation['userId']} end");
+    }
+
+    /**
+     * @param   SimpleXMLElement $organizationSortOrder
+     */
+    private function syncOrganizationSortOrder(
+        SimpleXMLElement $organizationSortOrder
+    ) {
+        $this->log("sync organizationSortOrder start");
+
+        // sortOrder: minOccurs="0" maxOccurs="unbounded"
+        foreach ($organizationSortOrder as $sortOrder) {
+            $this->syncOSortOrder($sortOrder);
+        }
+
+        $this->log("sync organizationSortOrder end");
+    }
+
+    /**
+     * @param   SimpleXMLElement $sortOrder
+     */
+    private function syncOSortOrder(SimpleXMLElement $sortOrder)
+    {
+        $this->validateSortOrder($sortOrder);
+
+        $this->log("sync organization sort order organization's col_slash={$sortOrder['entityId']} start");
+
+        $group = $this->getGroupBySlashID((string)$sortOrder['entityId']);
+        $group->_setPrivately('list_index', (string)$sortOrder['order']);
+        $group->updateNow();
+
+        $this->log("sync organization sort order organization's col_slash={$sortOrder['entityId']} end");
+    }
+
+    /**
+     * @param   SimpleXMLElement $groupSortOrder
+     */
+    private function syncGroupSortOrder(SimpleXMLElement $groupSortOrder)
+    {
+        $this->log("sync roleSortOrder start");
+
+        // sortOrder: minOccurs="0" maxOccurs="unbounded"
+        foreach ($groupSortOrder as $sortOrder) {
+            $this->syncGSortOrder($sortOrder);
+        }
+
+        $this->log("sync roleSortOrder end");
+    }
+
+    /**
+     * @param   SimpleXMLElement $sortOrder
+     */
+    private function syncGSortOrder(SimpleXMLElement $sortOrder)
+    {
+        $this->validateSortOrder($sortOrder);
+
+        $this->log("sync role sort order role's col_slash={$sortOrder['entityId']} start");
+
+        $role = $this->getStaticRoleBySlashId((string)$sortOrder['entityId']);
+        $role->_setPrivately('list_index', (string)$sortOrder['order']);
+        $role->updateNow();
+
+        $this->log("sync role sort order role's col_slash={$sortOrder['entityId']} end");
+    }
+
+    /**
+     * @param SimpleXMLElement $customItems
+     */
+    private function syncCustomItems(SimpleXMLElement $customItems)
+    {
+        $this->log("sync customItems start");
+
+        /* 
+         * カスタマイズ項目の項目コードが変更されて一括で送信されてくるので
+         * 項目コードがDBにあるものとリストのものとコンフリクトを起こす可能性が
+         * ある。
+         * そこで、既存の項目コードを別のコードに置き換えて相互にぶつからない
+         * ようにする。
+         * これは、Slashから送られてくるcustomItemsが常にすべてのカスタマ
+         * イズ項目であることが前提となっている。
+         */
+
+        $itemList = [];
+        $index = 0;
+
+        // いったん送られてきたカスタマイズ項目を処理
+        // customItems: minOccurs="0", maxOccurs="unbounded"
+        foreach ($customItems->customItem as $customItem) {
+            $itemList[] = $this->_getCustomItemProperties($customItem, $index);
+            ++$index;
+        }
+
+        // 現在の項目コードと新規に送信されてきた項目コードをチェックしてかぶらないIDを作成
+        $currentItems = $this->_getCustomItems();
+        foreach ($currentItems as $item) {
+            while (true) {
+                $uuid = cb_create_uuid();
+                if ( ! $this->getCustomItemByCode($uuid)) {
+                    $found = false;
+                    foreach ($itemList as $properties) {
+                        if ($uuid === $properties['id']) {
+                            $found = true;
+                            break;
+                        }
+                    }
+                    if ( ! $found) {
+                        // 項目IDを更新
+                        $item->set('id', $uuid);
+                        $item->updateNow();
+                        break;
+                    }
+                }
+            }
+        }
+
+        foreach ($itemList as $item) {
+            $customItem = $this->syncCustomItem($item);
+
+            // 既存のリストにあるものは除く
+            if (isset($currentItems[$customItem->getOID()])) {
+                unset($currentItems[$customItem->getOID()]);
+            }
+        }
+
+        // $currentItemsに残っているものを削除対象とする
+        if (is_array($currentItems) && count($currentItems)) {
+            foreach ($currentItems as $item) {
+                $this->removeCustomItem($item->getOID(), $item->get('slash'));
+            }
+        }
+
+
+        $this->log("sync customItems end");
+
+        // 次処理するときは新しく取り直すために念のためクリア
+        $this->_customItems = null;
+    }
+
+    /**
+     * @param   array $properties
+     *
+     * @return bool|\GRN_UserItem
+     */
+    private function syncCustomItem(array $properties)
+    {
+
+        $this->log("sync customItem col_slash={$properties['slash']} start");
+
+        $item = $this->getCustomItemBySlashId($properties['slash']);
+        if ($item === false) {
+            $item = $this->addCustomItem($properties);
+        } else {
+            $this->updateCustomItem($item->getOID(), $properties);
+        }
+
+        $this->log("sync customItem col_slash={$properties['slash']} end");
+
+        return $item;
+    }
+
+    /**
+     * @param SimpleXMLElement $customItem
+     * @param                  $index
+     *
+     * @return array
+     */
+    private function _getCustomItemProperties(
+        SimpleXMLElement $customItem,
+        $index
+    ) {
+        $this->validateCustomItem($customItem);
+
+        return [
+            'display_name' => (string)$customItem['name'],
+            'id'           => (string)$customItem['code'],
+            'type'         => 'string',
+            'use'          => '1',
+            'list_index'   => $index,
+            'show'         => ((string)$customItem['published'] === 'true') ? 1
+                : null,
+            'not_modify'   => ((string)$customItem['editable'] === 'true') ? 0
+                : 1,
+            'slash'        => (string)$customItem['id']
+        ];
+    }
+
+    /**
+     * Set search setting initialize
+     *
+     * @param array $properties
+     */
+    private function setSearchSetting(array &$properties)
+    {
+        $properties['search'] = 1;
+    }
+
+    /**
+     * Add custom item
+     *
+     * @param array $properties
+     *
+     * @return CB_Row[]
+     */
+    private function addCustomItem(array $properties)
+    {
+        $this->setSearchSetting($properties);
+
+        return $this->uum->addItem($properties);
+    }
+
+    /**
+     * Update custom item
+     *
+     * @param int   $item_id
+     * @param array $properties
+     */
+    private function updateCustomItem($item_id, array $properties)
+    {
+        $this->uum->setItemProperties($item_id, $properties);
+    }
+
+    /**
+     * @param SimpleXMLElement $item_id
+     * @param                  $slashId
+     */
+    private function removeCustomItem($item_id, $slashId)
+    {
+        $this->log("remove customItem col_slash={$slashId} start");
+
+        $this->uum->removeItem($item_id);
+
+        $this->log("remove customItem col_slash={$slashId} end");
+    }
+
+    private function finalize()
+    {
+        // set user foreign key
+        foreach ($this->userForeignKey as $slashId => $foreignKey) {
+            $user = $this->getUserBySlashID($slashId);
+            $user->_setPrivately('foreign_key', $foreignKey);
+            $user->updateNow();
+        }
+
+        // set primary group
+        foreach ($this->userPrimaryGroup as $userId => $slashId) {
+            $group = $this->getGroupBySlashID($slashId);
+            if ($group === false) {
+                $this->onFatalError(
+                    "UUMSYNC00008",
+                    "Error: primary organization not found, col_slash = [{$slashId}]"
+                );
+            }
+            $groupId = $group->getOID();
+
+            // set null if the user does not belong to the group
+            if ($this->uum->getUserGroupRelation($userId, $groupId) === false) {
+                $groupId = null;
+            }
+
+            $this->uum->setUserPrimaryGroup($userId, $groupId, false, true);
+        }
+
+        // set group foreign key
+        foreach ($this->groupForeignKey as $slashId => $foreignKey) {
+            $group = $this->getGroupBySlashID($slashId);
+            $group->_setPrivately('foreign_key', $foreignKey);
+            $group->updateNow();
+        }
+
+        // set role foreign key
+        foreach ($this->roleForeignKey as $slashId => $foreignKey) {
+            $role = $this->getStaticRoleBySlashId($slashId);
+            $role->_setPrivately('foreign_key', $foreignKey);
+            $role->updateNow();
+        }
+    }
+
+    /**
+     * @param string $message
+     */
+    protected function log($message)
+    {
+        if (is_resource($this->log)) {
+            $date = date("r");
+            $line = "[{$date}] {$message}\n";
+            fwrite($this->log, $line);
+            fflush($this->log);
+        }
+    }
+
+    /**
+     * @param string $errno
+     * @param string $message
+     */
+    private function onTemporaryError($errno, $message)
+    {
+        $this->log($message);
+        cb_throw_error($errno);
+    }
+
+    /**
+     * @param string $errno
+     * @param string $message
+     */
+    private function onFatalError($errno, $message)
+    {
+        $this->log($message);
+        $this->log($this->xmlData);
+        cb_throw_error($errno);
+    }
+
+    private function onXMLError()
+    {
+        $this->dumpXMLErrors();
+        $this->onFatalError("UUMSYNC00019", "Error: XML error");
+    }
+
+    private function dumpXMLErrors()
+    {
+        foreach (libxml_get_errors() as $error) {
+            $this->log($error->message);
+        }
+    }
+
+    /**
+     * @param string $key
+     *
+     * @return CB_User|bool  return FALSE if not exist
+     */
+    private function getUserByForeignKey($key)
+    {
+        return $this->uum->getUserByForeignKey($key);
+    }
+
+    /**
+     * @param string $slashId
+     *
+     * @return CB_User  return FALSE if not exist
+     */
+    private function getUserBySlashID($slashId)
+    {
+        return $this->uum->getUserBySlashID($slashId);
+    }
+
+    /**
+     * @param string $key
+     *
+     * @return CB_Group  return FALSE if not exist
+     */
+    private function getGroupByForeignKey($key)
+    {
+        return $this->uum->getGroupByForeignKey($key);
+    }
+
+    /**
+     * @param string $slashId
+     *
+     * @return CB_Group  return FALSE if not exist
+     */
+    private function getGroupBySlashID($slashId)
+    {
+        return $this->uum->getGroupBySlashID($slashId);
+    }
+
+    /**
+     * @param string $key
+     *
+     * @return CB_Role  return FALSE if not exist
+     */
+    private function getStaticRoleByForeignKey($key)
+    {
+        return $this->uum->getStaticRoleByForeignKey($key);
+    }
+
+    /**
+     * @param string $slashId
+     *
+     * @return CB_Role  return FALSE if not exist
+     */
+    private function getStaticRoleBySlashId($slashId)
+    {
+        return $this->uum->getStaticRoleBySlashId($slashId);
+    }
+
+    /**
+     * @param string $key
+     *
+     * @return GRN_UserItem|bool  return FALSE if not exist
+     */
+    private function getCustomItemByCode($key)
+    {
+        $customItems = $this->_getCustomItems();
+        foreach ($customItems as $item) {
+            if ($key == $item->get('id')) {
+                return $item;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param string $slashId
+     *
+     * @return GRN_UserItem|bool  return FALSE if not exist
+     */
+    private function getCustomItemBySlashID($slashId)
+    {
+        $customItems = $this->_getCustomItems();
+        foreach ($customItems as $item) {
+            if ($slashId == $item->get('slash')) {
+                return $item;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param string $datetime ISO8601
+     *
+     * @return CB_TimeStamp      Timestamp
+     */
+    private function convertToTimestamp($datetime)
+    {
+        $unix_ts = strtotime($datetime);
+        if ($unix_ts === false) {
+            $this->onFatalError("UUMSYNC00007",
+                "Error: invalid xsd:datetime string '{$datetime}'");
+        }
+        $timestamp = new CB_TimeStamp();
+        $timestamp->unix_ts = $unix_ts;
+
+        return $timestamp;
+    }
+
+    /**
+     * @return string
+     */
+    private function getTemporaryForeignKey()
+    {
+        return cb_create_uuid();
+    }
+
+    /**
+     * @param SimpleXMLElement $element
+     * @param string[]         $attributes
+     */
+    private function validateAttributes(SimpleXMLElement $element, $attributes)
+    {
+        foreach ($attributes as $attribute) {
+            if ( ! isset($element[$attribute])) {
+                $this->onFatalError("UUMSYNC00002",
+                    "Error: there is no required attribute '{$attribute}'");
+            }
+        }
+    }
+
+    /**
+     * @param SimpleXMLElement $entity
+     */
+    private function validateEntity(SimpleXMLElement $entity)
+    {
+        $this->validateAttributes($entity, self::$ENTITY_REQUIRED_ATTRIBUTES);
+    }
+
+    /**
+     * @param SimpleXMLElement $userElement
+     */
+    private function validateUser(SimpleXMLElement $userElement)
+    {
+        $this->validateAttributes($userElement,
+            self::$USER_REQUIRED_ATTRIBUTES);
+    }
+
+    /**
+     * @param SimpleXMLElement $localName
+     */
+    private function validateLocalName(SimpleXMLElement $localName)
+    {
+        $this->validateAttributes($localName,
+            self::$LOCALNAME_REQUIRED_ATTRIBUTES);
+    }
+
+    /**
+     * @param SimpleXMLElement $organization
+     */
+    private function validateOrganization(SimpleXMLElement $organization)
+    {
+        $this->validateAttributes($organization,
+            self::$ORGANIZATION_REQUIRED_ATTRIBUTES);
+    }
+
+    /**
+     * @param SimpleXMLElement $relation
+     */
+    private function validateUORelation(SimpleXMLElement $relation)
+    {
+        $this->validateAttributes($relation,
+            self::$UORELATION_REQUIRED_ATTRIBUTES);
+    }
+
+    /**
+     * @param SimpleXMLElement $organizationTitle
+     */
+    private function validateOrganizationTitle(
+        SimpleXMLElement $organizationTitle
+    ) {
+        $this->validateAttributes($organizationTitle,
+            self::$ORGANIZATIONTITLE_REQUIRED_ATTRIBUTES);
+    }
+
+    /**
+     * @param SimpleXMLElement $group
+     */
+    private function validateGroup(SimpleXMLElement $group)
+    {
+        $this->validateAttributes($group, self::$GROUP_REQUIRED_ATTRIBUTES);
+    }
+
+    /**
+     * @param SimpleXMLElement $relation
+     */
+    private function validateGURelation(SimpleXMLElement $relation)
+    {
+        $this->validateAttributes($relation,
+            self::$GURELATION_REQUIRED_ATTRIBUTES);
+    }
+
+    /**
+     * @param SimpleXMLElement $relation
+     */
+    private function validateUGRelation(SimpleXMLElement $relation)
+    {
+        $this->validateAttributes($relation,
+            self::$UGRELATION_REQUIRED_ATTRIBUTES);
+    }
+
+    /**
+     * @param SimpleXMLElement $sortOrder
+     */
+    private function validateSortOrder(SimpleXMLElement $sortOrder)
+    {
+        $this->validateAttributes($sortOrder,
+            self::$SORTORDER_REQUIRED_ATTRIBUTES);
+    }
+
+    /**
+     * @param SimpleXMLElement $customItem
+     */
+    private function validateCustomItem(SimpleXMLElement $customItem)
+    {
+        $this->validateAttributes($customItem,
+            self::$CUSTOMITEM_REQUIRED_ATTRIBUTES);
+    }
+
+    /**
+     * @param SimpleXMLElement $customItemValue
+     */
+    private function validateCustomItemValue(SimpleXMLElement $customItemValue)
+    {
+        $this->validateAttributes($customItemValue,
+            self::$CUSTOMITEM_VALUE_REQUIRED_ATTRIBUTES);
+    }
+
+    /**
+     * @param bool
+     */
+    public function setCommandLine($bool)
+    {
+        $this->commandLine = $bool;
+    }
+
+    private function _getCustomItems()
+    {
+        if (is_null($this->_customItems)) {
+            $this->_customItems = $this->uum->listItems();
+        }
+
+        return $this->_customItems;
+    }
+}

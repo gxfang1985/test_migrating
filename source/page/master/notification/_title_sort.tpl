@@ -1,0 +1,2 @@
+{$title}
+<a class="js_sort" href="javascript:void(0)" data-sort="{$sort}" data-reverse="{$reverse}" role="button" title="{cb_msg module='grn.common' key='sort'}" aria-label="{cb_msg module='grn.common' key='sort'}">{grn_image image=$image}</a>

@@ -1,0 +1,640 @@
+<?php
+
+namespace grn\mail\screen;
+
+use grn\grn\GrnException;
+use grn\grn\Validate;
+use grn\mail\HtmlMailInlineContents;
+use grn\mail\HtmlMailProcessor;
+
+require_once('mail/error_code.csp');
+
+require_once('mail/resources.csp');
+require_once('mail/utility.csp');
+
+class MailView extends MailScreenBase
+{
+    public function fetch()
+    {
+        $input = $this->getInput();
+        $user = $this->getLoginUser();
+        $user_id = $user->getOID();
+
+        if ( ! is_object($user)) {
+            throw new GrnException(E_COMMON_AUTHENTICATION_FAILED);
+        }
+
+        $mail_id = $this->getMailId();
+
+        require_once("grn/smarty.csp");
+        $t = new \GRN_Smarty;
+
+        $mail_app = $this->getMailApp();
+        $app_name = $mail_app->getName();
+        $t->assign('app_name', $app_name);
+
+        // メールの使用が許可されているか
+        $system_config = $this->getSystemConfig();
+        $system_config->getGeneralSetting($general_settings);
+        $disable_mail = $general_settings['disable_mail'];
+        $t->assign('disable_mail', $disable_mail);
+
+        // サイズチェック
+        $size_over = $this->checkMailSize($user);
+        $t->assign('size_over', $size_over);
+
+        // インライン表示設定
+        $inline = $this->checkInlineSetting($user);
+        $t->assign('inline', $inline);
+
+        // 送受信記録機能の使用が許可されているか
+        $t->assign('name_type',
+            ($system_config->canUserUseHistory() ? 'history' : null));
+        $t->assign('name_format', 'full');
+
+        // charset select value
+        $charset_on = @ $input['charset_on'];
+        $t->assign('charset_on', $charset_on);
+
+        $charset_body = '';
+        if (array_key_exists('charset_body', $input)) {
+            $charset_body = $input['charset_body'];
+            $t->assign('charset_body', $charset_body);
+        }
+        $charset_header = '';
+        if (array_key_exists('charset_header', $input)) {
+            $charset_header = $input['charset_header'];
+            $t->assign('charset_header', $charset_header);
+        }
+
+        $folder_logic = $this->getFolderLogic();
+        $mail_logic = $this->getMailLogic();
+        $mail_data = $mail_logic->getMailData($mail_id, true, false, false,
+            $charset_body,
+            $charset_header);
+
+        $category_id = $mail_data['folder_id'];
+        $folder_data = $folder_logic->getFolderData($category_id);
+        $account_id = $folder_data['account_id'];
+
+        // Get mail detail
+        $mail_for_view = $this->getMailForView($mail_data, $account_id,
+            $category_id, $mail_id, $charset_body, $charset_header, $user, $t);
+        $t->assign('mail', $mail_for_view);
+
+        $folder_code = is_array($folder_data) ? $folder_data['code'] : '';
+        $category_for_view = $this->getCategoryForView($folder_data,
+            $account_id, $category_id);
+        $t->assign('category', $category_for_view);
+
+
+        $this->assignMailToAccounts($mail_for_view, $t);
+
+        if ($mail_for_view['draft'] != '1') {
+            $this->assignStatusInfos($mail_data, $t);
+        }
+
+        $delete_info = $this->getDeleteInfo($mail_data, $category_for_view,
+            $account_id, $category_id, $mail_id, $app_name);
+        $t->assign('delete_info', $delete_info);
+
+        if ($mail_for_view['draft'] != '1') {
+            //file delete info
+            if (array_key_exists('attach_file_type', $mail_for_view)
+                && $mail_for_view['attach_file_type'] != 2
+            ) {
+                $file_delete_info = $this->getFileDeleteInfo($mail_for_view,
+                    $app_name);
+                $t->assign('file_delete_info', $file_delete_info);
+            }
+        }
+
+        // star
+        require_once('star/logic.csp');
+        $star_logic = \GRN_Star_StarLogic::getInstance();
+        $use_star = $star_logic->isActive();
+        $use_star = $use_star && ($folder_code != GRN_MAIL_FOLDER_CODE_TRASH);
+        $t->assign('use_star', $use_star);
+        if ($use_star) {
+            $t->assign('star_infos',
+                $star_logic->getStatusByIDs($user, GRN_MAIL_MODULE_ID,
+                    [$mail_id]));
+        }
+
+        $t->assign('is_open_status',
+            $this->getArrayValue(self::IS_OPEN_STATUS, $input));
+        $t->assign('num_of_unread_mails', $this->getNumOfUnreadMails());
+        if ($mail_for_view['draft'] != '1') {
+            return $t->fetch('mail/mail_view_3pane.tpl');
+        } else {
+            return $t->fetch('mail/mail_draft_view_3pane.tpl');
+        }
+    }
+
+    public function sendReadMail($input)
+    {
+        $this->setInput($input);
+        $mail_id = $this->getMailId();
+
+        $account_id = cb_at($input, 'aid');
+        if ( ! Validate::isNumber($account_id)) {
+            throw new GrnException(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+        $user = $this->getLoginUser();
+
+        if ( ! is_object($user)) {
+            cb_throw_error(E_COMMON_AUTHENTICATION_FAILED);
+        }
+
+        $cmd = array_key_exists('cmd', $input) ? $input['cmd'] : '';
+
+        $utility = $this->getUtility();
+
+        if (strcmp($cmd, 'open') === 0)        // 開封返信メールを送信
+        {
+            $send_logic = $utility->getSendLogic();
+            $send_logic->sendResponseOfConfirmationMail($user, $account_id,
+                $mail_id, 'manual');
+        } elseif (strcmp($cmd, 'ignored') === 0) // 送信しない
+        {
+            $mail_logic = $utility->getMailLogic();
+            $mail_data = $mail_logic->getMailData($mail_id, false);
+            if (is_null($mail_data)) {
+                cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+            }
+            if ($mail_data['user_id'] != $user->getOID()) {
+                cb_throw_error(E_GRN_MAIL_MAIL_ACCESS_DENIED);
+            }
+            $mail_logic->setConfirmationStatus($mail_id, 'ignored');
+        }
+    }
+
+    private function getMailForView(
+        $mail_data,
+        $account_id,
+        $category_id,
+        $mail_id,
+        $charset_body,
+        $charset_header,
+        $user,
+        \GRN_Smarty $t
+    ) {
+        $mail_logic = $this->getMailLogic();
+        $system_config = $this->getSystemConfig();
+        $personal_config = $this->getPersonalConfig();
+
+        // 既読処理
+        $mail_logic->readMail($mail_id);
+
+        // 開封確認処理
+        $confirmation_status = $mail_logic->confirmMail($account_id, $mail_id);
+
+        $from = $mail_data['from'];
+        $to = $mail_data['to'];
+        $cc = $mail_data['cc'];
+        $bcc = $mail_data['bcc'];
+
+        $truncated = \GRN_Mail_Utility::truncateMailData($mail_data['data']);
+        $t->assign('truncated', $truncated);
+
+        $send_set = $system_config->canUserUseConfirm()
+                    && ($personal_config->useConfirmMail());
+        $t->assign('send_set', $send_set);
+
+        // メール情報
+        $mail_for_view = [
+            'aid'                   => $account_id, //user_acount_ID
+            'cid'                   => $category_id, //category_ID
+            'mid'                   => $mail_id,
+            'from'                  => $from,
+            'ctime'                 => $mail_data['send_ts'], //送信日時
+            'to'                    => $to,
+            'cc'                    => $cc,
+            'bcc'                   => $bcc,
+            'subject'               => htmlspecialchars_decode($mail_data['subject']),
+            'data'                  => $mail_data['data'],
+            'html_data'             => strlen($mail_data['html_data']) > 0,
+            'sent'                  => $mail_data['sent'],
+            'source_id'             => $mail_data['source_id'],
+            'no_source'             => ! $mail_data['source_flag'],
+            'status'                => $mail_data['status'],
+            'confirmation_request'  => $mail_data['confirmation_request'],
+            'confirmation_response' => $mail_data['confirmation_response'],
+            'confirmation_to'       => $mail_data['confirmation_to'],
+            'give_open_check'       => $mail_data['confirmation_request']
+                                       && $send_set,
+            'draft'                 => $mail_data['draft']
+        ];
+
+        if (strcmp($mail_data['sent'], '0') == 0 && is_null($mail_data['data'])
+            && $mail_for_view['no_source']
+        ) {
+            $t->assign('no_body', true);
+        }
+
+        $can_show_html = true;
+        $system_config->getGeneralSetting($general_settings);
+        if ((strcmp($mail_for_view['sent'], '1') != 0)
+            && $general_settings['mail_display_plaintext']
+        ) {
+            $can_show_html = false;
+        }
+        $t->assign('can_show_html', $can_show_html);
+
+        if ($mail_for_view['html_data']) {
+            $utility = \GRN_Mail_Utility::getInstance();
+            $show_picture = $utility->isHtmlMailShowPicture($user->getOID(),
+                $mail_id, $mail_data['sent']);
+
+            $files = new HtmlMailInlineContents(cb_at($mail_data,
+                'files', []), $mail_id);
+            $htmlMailProcessor = new HtmlMailProcessor();
+            $html
+                = $htmlMailProcessor->process($mail_data['html_data'],
+                $files, $show_picture);
+            $inline_file_ids = $htmlMailProcessor->getInlineFileIds();
+
+            if ($can_show_html) {
+                $mail_for_view['data'] = $html;
+                $t->assign(
+                    "show_display_image_button",
+                    $utility->isShowDisplayImageButton($mail_data['html_data'],
+                        $show_picture)
+                );
+            }
+        } else {
+            $inline_file_ids = [];
+        }
+
+        if ($mail_for_view['draft'] != '1') {
+            // is Content-Type 'message/partial'?
+            $mail_for_view['is_partial']
+                = strncasecmp(ltrim($mail_data['content_type']),
+                    'message/partial', 15) == 0;
+
+            // 開封確認設定使用権限
+            $can_use_confirm = $system_config->canUserUseConfirm();
+            if ($can_use_confirm) {
+                $this->getMailConfirmInfo($mail_for_view, $mail_data, $mail_id,
+                    $confirmation_status, $user);
+            }
+            $t->assign('use_confirm', $can_use_confirm);
+        }
+
+        // 添付ファイル
+        $this->fetchAttachFileInfo($mail_for_view, $mail_data,
+            $inline_file_ids);
+
+        return $mail_for_view;
+    }
+
+    private function checkMailSize($user)
+    {
+        $personal_config = $this->getPersonalConfig();
+        $system_config = $this->getSystemConfig();
+        $user_id = $user->getOID();
+
+        // 総メールサイズ上限を取得
+        $system_config->getSizeUserLimitSetting($size_settings, $user_id);
+
+        // ユーザーの総メールサイズを取得
+        $mail_size = $personal_config->getMailSize(null);
+
+        // 総サイズチェック
+        $size_over = false;
+        if (($size_settings['user_limit_' . $user_id] >= 0)
+            && ($mail_size >= $size_settings['user_limit_' . $user_id] * 1024
+                              * 1024)
+        ) {
+            $size_over = true;
+        }
+
+        return $size_over;
+    }
+
+    private function checkInlineSetting($user)
+    {
+        require_once('grn/ui.csp');
+        $uim = \GRN_UIConfigManager::getInstance();
+        $user_ui_config = $uim->getUserConfig($user);
+        unset($uim);
+
+        $inline = $user_ui_config->getInlineSetting();
+
+        return $inline;
+    }
+
+    private function getMailConfirmInfo(
+        & $mail_for_view,
+        $mail_data,
+        $mail_id,
+        $confirmation_status,
+        $user
+    ) {
+        $mail_logic = $this->getMailLogic();
+        $personal_config = $this->getPersonalConfig();
+
+        $message_id = null;
+        if (is_string($mail_data['message_id'])
+            && (strlen($mail_data['message_id']) > 0)
+        ) {
+            $message_id = $mail_data['message_id'];
+        }
+
+        // 送信開封確認要求メール
+        if ($mail_data['confirmation_request']) {
+            if ( ! isset($mail_for_view['confirm'])) {
+                $mail_for_view['confirm'] = [];
+            }
+
+            // 開封通知メールリスト取得
+            if ( ! is_null($message_id)) {
+                $response_list = $mail_logic->getConfirmResponseDataList($user,
+                    $message_id);
+                if (is_array($response_list) && (count($response_list) > 0)) {
+                    $response_list_for_view = [];
+                    foreach ($response_list as $key => $response_data) {
+                        $response_list_for_view[$key] = [
+                            'mid'     => $response_data['mail_id'],
+                            'from'    => $response_data['from'],
+                            'subject' => $response_data['subject'],
+                            'ctime'   => $response_data['send_ts'],
+                        ];
+                    }
+
+                    $mail_for_view['confirm']['response_mails']
+                        = $response_list_for_view;
+                }
+
+                // 設定取得
+                $personal_config->getConfirmSetting($confirm_settings);
+
+                // 手動返信
+                if ($confirm_settings['response'] == 'manual'
+                    || $confirm_settings['response'] == 'auto'
+                ) {
+                    if (is_null($confirmation_status)
+                        || ($confirmation_status == 'none')
+                        || ($confirmation_status == 'opened')
+                    ) {
+                        // まだ返信してない
+                        $mail_for_view['open'] = '1';
+                    }
+                }
+
+                if (strncasecmp($confirmation_status, 'sent', 4) == 0) {
+                    // 開封確認返信済み
+                    $mail_for_view['open'] = '2';
+                }
+            }
+        } // 開封通知メール
+        elseif ($mail_data['confirmation_response']) {
+            if ( ! isset($mail_for_view['confirm'])) {
+                $mail_for_view['confirm'] = [];
+            }
+
+            // 開封確認要求メールリスト取得
+            if (is_string($mail_data['confirmation_org_message_id'])
+                && (strlen($mail_data['confirmation_org_message_id']) > 0)
+            ) {
+                $request_list_for_view = [];
+                $request_list
+                    = $mail_logic->getConfirmRequestDataList($user,
+                    $mail_data['confirmation_org_message_id'], $mail_id);
+                if (is_array($request_list) && (count($request_list) > 0)) {
+                    foreach ($request_list as $key => $request_data) {
+                        $request_list_for_view[$key] = [
+                            'mid'     => $request_data['mail_id'],
+                            'subject' => $request_data['subject'],
+                        ];
+                    }
+                }
+                $mail_for_view['confirm']['org_mail'] = $request_list_for_view;
+            }
+        }
+    }
+
+    private function getSortKey($folder_code)
+    {
+        $sort = null;
+        $sort_time = null;
+        $reverse = null;
+        $personal_config = $this->getPersonalConfig();
+        $result = $personal_config->getSortCondition($sort, $sort_time,
+            $reverse);
+        assert('$result');
+
+        $this->setReverse($reverse);
+        $sort_key = $sort;
+
+        if ($sort === 'time') {
+            if ($folder_code == GRN_MAIL_FOLDER_CODE_TRASH) {
+                $sort_time = 'dtime';
+            }
+            $sort_key = $sort_time;
+        } elseif ($sort === 'name') {
+            if (($folder_code == GRN_MAIL_FOLDER_CODE_SENTBOX)
+                || ($folder_code == GRN_MAIL_FOLDER_CODE_UNSENT)
+            ) {
+                $sort_key = 'to';
+            } else {
+                $sort_key = 'from';
+            }
+
+            // 表示する形式
+            $name_format = $personal_config->getListNameFormatSetting();
+            if ($name_format == 'name') {
+                $sort_key .= '_name';
+            } elseif ($name_format == 'email') {
+                $sort_key .= '_email';
+            }
+        }
+
+        return $sort_key;
+    }
+
+    private function assignPreviousNextMailInfo(
+        $mail_data,
+        $category_id,
+        $mail_id,
+        $folder_code,
+        $user,
+        $t
+    ) {
+        $mail_logic = $this->getMailLogic();
+
+        // ソート設定をプロファイルからロード
+        $sort_key = $this->getSortKey($folder_code);
+
+        // ソート用比較対象文字列
+        $sort_var = $mail_data['send_ts']->unix_ts;
+        $sort_column = substr($mail_logic->_getSortColumnName($sort_key), 4);
+        if (strcmp($sort_key, 'rtime') == 0 || strcmp($sort_key, 'ctime') == 0
+            || strcmp($sort_key, 'dtime') == 0
+        ) {
+            $sort_var = $mail_data[$sort_column]->unix_ts;
+        } elseif (strcmp($sort_key, 'size') == 0) {
+            $sort_var = $mail_data[$sort_column];
+        } else {
+            $simple_mail_data = $mail_logic->getMailData($mail_id, false, false,
+                false);
+            $sort_var = $simple_mail_data[substr($sort_column, 9)];
+        }
+
+        // 前後の情報取得
+        $pn_ids = $mail_logic->getPreviousNextIDs($user, $category_id, $mail_id,
+            $sort_key,
+            $sort_var, $this->getReverse());
+
+        // previous
+        $previous_navi_params_for_view
+            = $mail_logic->getPreviousNextNaviParams('previous', $pn_ids);
+        if ($previous_navi_params_for_view) {
+            $t->assign('previous_navi_params', $previous_navi_params_for_view);
+        }
+
+        $next_navi_params_for_view
+            = $mail_logic->getPreviousNextNaviParams('next', $pn_ids);
+        if ($next_navi_params_for_view) {
+            $t->assign('next_navi_params', $next_navi_params_for_view);
+        }
+    }
+
+    private function assignMailToAccounts($mail_for_view, $t)
+    {
+        // Cc が表示できるか
+        // Cc にグループリストのみ入っている場合には Cc 欄が表示されてしまうのでそれへの対応
+        $has_cc = false;
+        $cc_count = 0;
+        $cc_list
+            = \GRN_Mail_Utility::static_formatAddressString($mail_for_view['cc'],
+            true, false,
+            true, false, 'array');
+        if (is_array($cc_list) && (count($cc_list) > 0)) {
+            $has_cc = true;
+            $cc_count = count($cc_list);
+        }
+        $t->assign('has_cc', $has_cc);
+        $t->assign('cc_count', $cc_count);
+
+        $to_count = 0;
+        $to_list
+            = \GRN_Mail_Utility::static_formatAddressString($mail_for_view['to'],
+            true, false,
+            true, false, 'array');
+        if (is_array($to_list) && (count($to_list) > 0)) {
+            $to_count = count($to_list);
+        }
+
+        $t->assign('to_count', $to_count);
+
+        $has_bcc = false;
+        $bcc_count = 0;
+        $bcc_list
+            = \GRN_Mail_Utility::static_formatAddressString($mail_for_view['bcc'],
+            true, false,
+            true, false, 'array');
+        if (is_array($bcc_list) && (count($bcc_list) > 0)) {
+            if ($mail_for_view['sent'] == true) {
+                $has_bcc = true;
+            }
+            $bcc_count = count($bcc_list);
+        }
+
+        $t->assign('has_bcc', $has_bcc);
+        $t->assign('bcc_count', $bcc_count);
+    }
+
+    private function assignStatusInfos($mail_data, $t)
+    {
+        $t->assign('status_mail', -1);
+        $system_config = $this->getSystemConfig();
+        $personal_config = $this->getPersonalConfig();
+
+        if ($system_config->canUserUseStatus()
+            && $personal_config->useStatus()
+        ) {
+            $status_infos_for_view = $this->getChangeStatusInfos();
+            $status_infos_for_view[] = [
+                'value' => 0,
+                'label' => cb_msg('grn.mail', 'GRN_MAIL-418')
+            ];
+            foreach ($status_infos_for_view as $status_oid => $status_info) {
+                $status_info['selected'] = ($mail_data['status']
+                                            == $status_oid);
+                if ($status_info['selected'] == true) {
+                    $status_info['selected'] = false;
+                    $temp['value'] = $status_info['value'];
+                    $temp['label'] = $status_info['label'];
+                    $t->assign('status_mail', $temp);
+                }
+                $status_infos_for_view[$status_oid] = $status_info;
+            }
+            $t->assign('status_infos', $status_infos_for_view);
+        }
+    }
+
+    private function getDeleteInfo(
+        $mail_data,
+        $category_for_view,
+        $account_id,
+        $category_id,
+        $mail_id,
+        $app_name
+    ) {
+        $subject = array_key_exists('subject', $mail_data)
+            ? $mail_data['subject'] : '';
+        if (strlen($subject) == 0) {
+            require_once('fw/i18n.csp');
+            require_once('mail/resources.csp');
+            $subject = cb_msg(GRN_MAIL_MODULE_ID, 'no_title');
+        }
+        // get Trash personal setting
+        $personal_config = $this->getPersonalConfig();
+        $use_trash = $personal_config->useTrash();
+        $folder_type = null;
+        if (isset($category_for_view) && is_array($category_for_view)) {
+            $folder_type = $category_for_view['type'];
+        }
+
+        $no_confirm = false;
+        //mail delete info
+        $delete_info = [
+            'title'      => grn_get_page_display_name('mail/delete',
+                ['app_name' => $app_name]),
+            'page'       => 'mail/delete.tpl',
+            'no_confirm' => $no_confirm,
+            'data'       => [
+                'mail'           => [
+                    'aid'     => $account_id,
+                    'cid'     => $category_id,
+                    'mid'     => $mail_id,
+                    'subject' => $subject
+                ],
+                'folder_type'    => $folder_type,
+                'truncate_len'   => GRN_MAIL_SUBJECT_TRUNCATE_WIDTH,
+                'use_garbagebox' => $use_trash
+            ],
+            'handler'    => 'lnk_delete',
+        ];
+
+        return $delete_info;
+    }
+
+    private function getFileDeleteInfo($mail_for_view, $app_name)
+    {
+        $file_delete_info = [
+            'title'      => grn_get_page_display_name('mail/file_delete',
+                ['app_name' => $app_name]),
+            'page'       => 'mail/file_delete_3pane.tpl',
+            'no_confirm' => false,
+            'data'       => [
+                'mail'         => $mail_for_view,
+                'truncate_len' => GRN_MAIL_SUBJECT_TRUNCATE_WIDTH
+            ],
+            'handler'    => 'menu_option_delete_file',
+        ];
+
+        return $file_delete_info;
+    }
+}

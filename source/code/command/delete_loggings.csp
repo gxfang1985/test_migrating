@@ -1,0 +1,125 @@
+<?php
+
+cb_require_role('CommandLine');
+
+require_once('grn/cli.csp');
+
+$summary = "";
+
+$opts = cb_cli_start(
+// Mandatory command-line options
+    [],
+
+    // Optional command-line options
+    [
+        new CB_CLI_BEFORE_OPTION(),
+        new CB_CLI_EXEC_OPTION(),
+        new CB_CLI_MAX_DURATION_OPTION()
+    ]
+);
+require_once('fw/logger.csp');
+$query = CB_LoggerQuery::getInstance();
+
+if (count($opts) == 0) {
+    global $G_container_base;
+    $dbconn = $G_container_base->getInstance('dbconn');
+    $query_all = "SELECT COUNT(col_category) AS c FROM " . CB_LOGGER_TABLENAME;
+    $result = $dbconn->query($query_all);
+    $row = $dbconn->fetch_assoc($result);
+    if ( ! is_array($row) || 0 >= count($row)) {
+        $count = 0;
+    } else {
+        $count = $row['c'];
+    }
+    $summary = "Hit $count record";
+    $summary .= ($count > 1) ? "s." : ".";
+}
+if (array_key_exists(CB_CLI_BEFORE_OPTION, $opts)) {
+    $before = cb_date_convert2timestamp($opts[CB_CLI_BEFORE_OPTION]);
+
+    if ( ! array_key_exists(CB_CLI_EXEC_OPTION, $opts)) {
+        // only count
+        $condition = 'col_timestamp < ' . $before;
+        $count = $query->getCount('col_category', $condition);
+        $summary = "Hit $count record";
+        $summary .= ($count > 1) ? "s." : ".";
+    } else {
+        // max_duration
+        $max_duration = array_key_exists(CB_CLI_MAX_DURATION_OPTION,
+            $opts) ? intval($opts[CB_CLI_MAX_DURATION_OPTION]) * 60 : null;
+        $before_condition = 'col_timestamp < ' . $before;
+        $before_delete_count = $query->getCount('col_category',
+            $before_condition);
+
+        $deleted_record_num = 0;
+        $commit_flag = true;
+
+        global $_cb_cli_starting_timestamp;
+        $start_ts = cb_date_convert2timestamp($_cb_cli_starting_timestamp);
+
+        $result = $query->select('MIN( col_timestamp ) AS min_timestamp');
+        $result = $query->fetch_assoc($result);
+        if (is_array($result)
+            && array_key_exists('min_timestamp', $result)
+            && ! is_null($result['min_timestamp'])
+        ) {
+            $min_timestamp = $result['min_timestamp'];
+
+            $ts = new CB_TimeStamp;
+            $ts->unix_ts = $min_timestamp;
+            $min_ts = new CB_TimeStampEx($ts);
+
+            // Timestampの時間を切り捨てる
+            $min_date = $min_ts->getDate();
+            $min_ts->unix_ts = cb_date_convert2timestamp($min_date->format());
+
+            // ロックがかかってINSERTができなくなるのを防ぐため、削除クエリを短く分断する。
+            // 一番昔のTimestampから指定された日付のTimestampまでインクリメントして1日ずつ削除する。
+
+            while ($before >= $min_ts->unix_ts) {
+                if (is_null($max_duration) !== true
+                    && (time() - $start_ts) > $max_duration
+                ) {
+                    cb_cli_log("Stopped processing by passing the max_duration.");
+                    break;
+                }
+
+                $commit_flag = false;
+
+                $date_condition = "col_timestamp < '" . $min_ts->unix_ts . "'";
+                $condition = $date_condition;
+
+                $query->setCondition($condition);
+                $query->delete();
+
+                $min_date = $min_ts->getDate();
+                $min_date->moveDays(1);
+                $min_ts->unix_ts
+                    = cb_date_convert2timestamp($min_date->format());
+            }
+
+            if ($commit_flag === false) {
+                $tm = CB_TransactionManager::getInstance();
+                $tm->commit();
+            }
+
+            $after_delete_count = $query->getCount('col_category',
+                $before_condition);
+            $deleted_record_num = intval($before_delete_count)
+                                  - intval($after_delete_count);
+
+            $summary = "Deleted $deleted_record_num record";
+            $summary .= ($deleted_record_num > 1) ? "s." : ".";
+        }
+    }
+} else {
+    if (array_key_exists(CB_CLI_EXEC_OPTION, $opts)) {
+        cb_cli_log('Can not be processing because missing the before parameter.');
+        cb_cli_log('Please enter the before parameter.');
+        die();
+    }
+}
+
+cb_cli_end($summary);
+
+

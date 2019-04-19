@@ -1,0 +1,187 @@
+<?php
+require_once(dirname(__DIR__) . '/_api.csp');
+require_once('cbpapi/util.csp');
+require_once('cbpapi/error_code.csp');
+require_once('cbpapi/notification_logic.csp');
+require_once('notification/resources.csp');
+
+function utcToLocal($utc)
+{
+    static $timezone = null;
+    if (is_null($timezone)) {
+        $I18N = CB_I18N::getInstance();
+        $timezone = $I18N->getCurrentTimezone();
+    }
+    $ts = new CB_TimeStampEx();
+    $ts->setTimeZone('UTC');
+    $ts->setDateTime($utc);
+    $ts->setTimeZone($timezone);
+
+    return $ts;
+}
+
+$in = JSON::getInput();
+
+if ( ! isset($in->start)) {
+    throw new APIException('Parameter:start is not specified.', 201);
+}
+$startUTC = CB_ISO8601Util::toUTCDateTime($in->start);
+if ($startUTC === false) {
+    throw new APIException('Parameter:start is invalid format.', 203);
+}
+$start = utcToLocal($startUTC);
+
+if (isset($in->end)) {
+    $endUTC = CB_ISO8601Util::toUTCDateTime($in->end);
+    if ($endUTC === false) {
+        throw new APIException('Parameter:end is invalid format.', 203);
+    }
+    $comp = $startUTC->compare($endUTC);
+    if ($comp == 0) {
+        throw new APIException('Start date is equal to end date.', 205);
+    }
+    if ($comp > 0) {
+        throw new APIException('Start date is greater than end date.', 204);
+    }
+    $end = utcToLocal($endUTC);
+} else {
+    $end = new CB_TimeStampEx();
+}
+
+global $G_container_base;
+$uum =& $G_container_base->getInstance('uum');
+$login =& $uum->getLoginUser();
+
+$app_locator = GRN_ApplicationLocator::instance();
+require_once('notification/application.csp');
+/** @var GRN_Notification_App $notification_app */
+$notification_app =& $app_locator->getInstance(GRN_NOTIFICATION_APP_ID);
+if ( ! is_null($notification_app)) {
+    // 通知更新処理対応アプリケーションの更新処理呼び出し
+    $notification_app->updateApplications($login, true);
+}
+
+$apiLogic = GRN_CBPApi_Notification_Logic::getInstance();
+$items = $apiLogic->getDataList('notify', $login, $start, $end, null);
+
+function safeId($arr, $name)
+{
+    $id = safeMember($arr, $name);
+    if ($id == '') {
+        return null;
+    }
+    if (is_numeric($id)) {
+        return intval($id);
+    }
+
+    return $id;
+}
+
+function contains($text, $subText)
+{
+    return strpos($text, $subText) !== false;
+}
+
+function endsWith($text, $subText)
+{
+    $rpos = strrpos($text, $subText);
+    if ($rpos === false) {
+        return false;
+    }
+
+    return $rpos == (strlen($text) - strlen($subText));
+}
+
+$keyModule = [
+    'phoneMemo'                  => 'phonemessage',
+    'workflow'                   => 'workflow',
+    'message'                    => 'message',
+    'mail'                       => 'mail',
+    'schedule.facility_approval' => 'schedule.facility_approval',
+    'schedule'                   => 'schedule',
+    'bulletin'                   => 'bulletin',
+    'file'                       => 'cabinet',
+    'report'                     => 'report',
+    'space.discussion'           => 'space.discussion',
+    'space.todo'                 => 'space.todo',
+    'space'                      => 'space',
+    'external'                   => null
+];
+$rows = [];
+foreach ($keyModule as $key => $module) {
+    $rows[$key] = [];
+}
+
+//$forDebug = array();
+foreach ($items as $item) {
+    $moduleId = $item['module_id'];
+    $uniqueId = $item['unique_id'];
+    $n = $apiLogic->getNotificationForView($login, $moduleId, $uniqueId,
+        'notify');
+    if (is_null($n)) {
+        continue;
+    }
+    if (safeMember($n, 'is_history') == 'true') {
+        continue;
+    }
+    //$forDebug[] = $n;
+
+    $row = new stdClass();
+    $row->id = safeId($n, 'item');
+    $row->senderId = safeId($n, 'sender_id');
+    $row->senderName = safeMember($n, 'sender_name');
+    $row->receivedAt = safeMember($n, 'receive_datetime', null);
+
+    $status = safeMember($n, 'status');
+    $url = safeMember($n, 'subject_url');
+    if ($status == 'update') {
+        if (endsWith($url, '#follow')) {
+            $row->type = 'comment';
+        } elseif (contains($moduleId, 'space')
+                  && strpos($url, '&cmid=') !== false
+        ) {
+            $row->type = 'comment';
+        } else {
+            $row->type = 'modify';
+        }
+    } else {
+        $row->type = $status;
+    }
+
+    $row->url = $url;
+    if (contains($moduleId, 'workflow')) {
+        $subject = safeMember($n, 'subject');
+        $abstract = safeMember($n, 'abstract');
+        $row->title = "{$abstract}({$subject})";
+        $row->name = $abstract;
+        $row->subject = $subject;
+    } else {
+        $row->title = safeMember($n, 'subject');
+    }
+    if (isset($n['abstract'])) {
+        if (contains($moduleId, 'cabinet')) {
+            $row->fileName = $n['abstract'];
+        } else {
+            $row->body = $n['abstract'];
+        }
+    }
+
+    foreach ($keyModule as $key => $module) {
+        if (is_null($module) || contains($moduleId, $module)) {
+            array_push($rows[$key], $row);
+            break;
+        }
+    }
+}
+
+$result = new stdClass();
+$result->success = true;
+$result->start = $in->start;
+if (isset($in->end)) {
+    $result->end = $in->end;
+}
+foreach ($keyModule as $key => $module) {
+    $result->$key = $rows[$key];
+}
+//$result->forDebug = $forDebug;
+echo json_encode($result);

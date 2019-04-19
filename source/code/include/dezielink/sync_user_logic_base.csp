@@ -1,0 +1,507 @@
+<?php
+
+/**
+ * Dezie/Office Link Sync User Logic Base
+ */
+
+require_once('dezielink/resources.csp');
+require_once('dezielink/inspection.csp');
+
+/**
+ * Class For Dezie/Office Link Sync User Logic Base
+ */
+class GRN_Connector_SyncUserLogicBase
+{
+    protected $_url;
+
+    protected $_logger;
+
+    protected $_charset;
+
+    protected $_user_account;
+
+    protected $_temp_file_name;
+
+    protected $_sync_user_lock_file;
+
+    protected $_logger_message_http_error;
+
+    protected $_logger_message_auth_error;
+
+    protected $_logger_message_connection_error;
+
+    protected $_error_key_http_error;
+
+    protected $_error_key_auth_error;
+
+    protected $_error_key_connection_error;
+
+    protected $_error_key_auth_method_incompatible;
+
+    protected $_error_key_auth_method_disabled;
+
+    public $error_key_sync_user_script_already_running;
+
+    function __construct()
+    {
+        $this->_logger = GRN_Dezielink_Inspection::getInstance();
+    }
+
+    /**
+     * @return string  URL
+     */
+    public function getURL()
+    {
+        return $this->_url;
+    }
+
+    /**
+     * @return string  Lock File Name
+     */
+    public function getLockFile()
+    {
+        return $this->_sync_user_lock_file;
+    }
+
+    /**
+     * Sync Garoon User/Organization Information to Connector Server
+     */
+    public function sync()
+    {
+        $url = $this->_url;
+
+        // set post data
+        $post_data = [
+            'auth'   => $this->getAuth(),
+            'users'  => $this->getXMLUsers(),
+            'groups' => $this->getXMLGroups(),
+            'page'   => GRN_CONNECTOR_SYNC_USER_PAGE
+        ];
+
+        $this->sendRequest($url, $post_data);
+    }
+
+    /**
+     * @param string $url
+     * @param array  $post_params
+     */
+    private function sendRequest($url, $post_params)
+    {
+        global $G_container_base;
+        $http_client = $G_container_base->getInstance('http_client');
+
+        // set request method : POST
+        $http_client->setCurlOption(CURLOPT_POST,
+            GRN_CONNECTOR_SYNC_USER_CURL_OPTION_POST_ENABLED);
+
+        // set post data
+        $http_client->setCurlOption(CURLOPT_POSTFIELDS, $post_params);
+
+        // send request
+        if ($http_client->execute($url)) {
+            // get http result code
+            $status_line = $http_client->getStatusLine();
+            if ($status_line['status-code'] != 200) {
+                // write log
+                $log_params = [
+                    'status_code' => $status_line['status-code'],
+                    'url'         => $url
+                ];
+                $this->_logger->writeInspectionLog(CB_LOGGER_ERROR,
+                    $this->_logger_message_http_error, $log_params);
+                cb_throw_error($this->_error_key_http_error, null,
+                    ['http_error' => $status_line['status-code']]);
+            }
+
+            // read response data
+            $body = $http_client->getBody();
+
+            // parse reponse data to obtain error code
+            $result = $this->parseXML($body);
+
+            if ($result['fault_code'] != 0) {
+                // write log
+                $this->_logger->writeInspectionLog(CB_LOGGER_ERROR,
+                    $this->_logger_message_auth_error, $result);
+                cb_throw_error($this->_error_key_auth_error, $result, $result);
+            }
+        } else {
+            $error = $http_client->getError();
+
+            // write log
+            $error_no = cb_at($error, 'errno');
+            $error_message = cb_at($error, 'message');
+            $log_params = [
+                'error_code'    => $error_no,
+                'error_message' => $error_message
+            ];
+            $this->_logger->writeInspectionLog(CB_LOGGER_ERROR,
+                $this->_logger_message_connection_error, $log_params);
+            cb_throw_error($this->_error_key_connection_error, null,
+                ['msg' => $error_message . ' (code=' . $error_no . ')']);
+        }
+    }
+
+    /**
+     * @return string  XML data of users
+     */
+    private function getXMLUsers()
+    {
+        $uum = cb_lwc_uum();
+
+        // get user list
+        $user_rows = $uum->getUsers();
+
+        $temp_file_name = '';
+        $xml_writer = $this->getXMLWriter($temp_file_name);
+
+        $xml_writer->startElement('users');         //<users>
+
+        foreach (array_keys($user_rows) as $uid) {
+            // SuperAdmin does not write into XML data.
+            if ($uid == GRN_UUM_ADMINISTRATION_USER) {
+                continue;
+            }
+
+            $user =& $user_rows[$uid];
+
+            $xml_writer->startElement('user');        //<user>
+
+            // write user info
+            $xml_writer->startElement('foreign_key');             //<foreign_key>
+            $xml_writer->text($user->get('foreign_key'));
+            $xml_writer->endElement();                              //</foreign_key>
+
+            $xml_writer->startElement('name');                    //<name>
+            $xml_writer->text($user->get('display_name'));
+            $xml_writer->endElement();                              //</name>
+
+            $xml_writer->startElement('password');                //<password>
+            $xml_writer->text('*');
+            $xml_writer->endElement();                              //</password>
+
+            $xml_writer->startElement('email');                   //<email>
+            $xml_writer->text($user->get('email_address'));
+            $xml_writer->endElement();                              //</email>
+
+            // write user groups info
+            $xml_writer->startElement('groups');                  //<groups>
+            $user_groups = $uum->getUserGroupsInfo($uid);
+            foreach (array_keys($user_groups) as $gid) {
+                $xml_writer->startElement('group');                   //<group>
+                $xml_writer->text($user_groups[$gid]['col_foreign_key']);
+                $xml_writer->endElement();                              //</group>
+            }
+            $xml_writer->endElement();                              //</groups>
+
+            $xml_writer->endElement();                  //</user>
+        }
+
+        $xml_writer->endElement();                  //</users>
+
+        $xml_writer->endDocument();
+        $xml_writer->flush();
+        unset($xml_writer);
+
+        $ret = $this->getXMLFromTempFile($temp_file_name);
+
+        return $ret;
+    }
+
+    /**
+     * @return string  XML data of Groups
+     */
+    private function getXMLGroups()
+    {
+        $uum = cb_lwc_uum();
+
+        // get group list
+        $root_groups = $uum->getRootGroups();
+        $group_list = [];
+        foreach (array_keys($root_groups) as $rgid) {
+            $group =& $root_groups[$rgid];
+            $this->getGroupRecursive($group_list, $group, $uum);
+        }
+
+        // write groups info
+        $temp_file_name = '';
+        $xml_writer = $this->getXMLWriter($temp_file_name);
+
+        $xml_writer->startElement('groups');       //<groups>
+        foreach (array_keys($group_list) as $gid) {
+            $group =& $group_list[$gid];
+
+            $xml_writer->startElement('group');       //<group>
+
+            $xml_writer->startElement('foreign_key');     //<foreign_key>
+            $xml_writer->text($group['foreign_key']);
+            $xml_writer->endElement();                      //</foreign_key>
+
+            $xml_writer->startElement('name');            //<name>
+            $name = $group['name'];
+            if ( ! empty($group['path'])) {
+                $name .= ' (' . $group['path'] . ')';
+            }
+
+            $xml_writer->text($name);
+            $xml_writer->endElement();                      //</name>
+
+            $xml_writer->endElement();                  //</group>
+        }
+
+        $xml_writer->endElement();                  //</groups>
+
+        $xml_writer->endDocument();
+        $xml_writer->flush();
+        unset($xml_writer);
+
+        $ret = $this->getXMLFromTempFile($temp_file_name);
+
+        return $ret;
+    }
+
+    /**
+     * @param array    $group_list
+     * @param CB_Group $group
+     * @param CB_Uum   $uum
+     */
+    private function getGroupRecursive(&$group_list, &$group, &$uum)
+    {
+        $PATH_SEPERATOR = ' > ';
+
+        $gid = $group->getOID();
+        $group_list[$gid] = [
+            'foreign_key' => $group->get('foreign_key'),
+            'name'        => $group->get('name'),
+            'path'        => null,
+        ];
+
+        // create path of group
+        $parent = $group->getParent();
+        $pid = $parent ? $parent->getOID() : null;
+
+        if ($pid) {
+            $parent_name = $group_list[$pid]['name'];
+            $parent_path = $group_list[$pid]['path'];
+
+            $path = is_null($parent_path) ? $parent_name
+                : $parent_path . $PATH_SEPERATOR . $parent_name;
+            $group_list[$gid]['path'] .= $path;
+        }
+
+        $children = $uum->getChildGroups($gid);
+        if ($children !== false) {
+            foreach (array_keys($children) as $cgid) {
+                $child =& $children[$cgid];
+                $this->getGroupRecursive($group_list, $child, $uum);
+            }
+        }
+    }
+
+    /**
+     * @param string $temp_file_name
+     *
+     * @return XMLWriter
+     */
+    private function getXMLWriter(&$temp_file_name)
+    {
+        $temp_dir = cb_tmpdir();
+        $temp_file_name = tempnam($temp_dir, $this->_temp_file_name);
+
+        $xml_writer = new XMLWriter();
+        $xml_writer->openUri($temp_file_name);
+        $xml_writer->startDocument('1.0', 'UTF-8');
+
+        $xml_writer->setIndentString(' ');
+        $xml_writer->setIndent(true);
+
+        return $xml_writer;
+    }
+
+    /**
+     * @param string $temp_file_name
+     *
+     * @return string  $ret
+     */
+    private function getXMLFromTempFile($temp_file_name)
+    {
+        $ret = file_get_contents($temp_file_name);
+        unlink($temp_file_name);
+
+        if ($this->_charset != 'UTF-8') {
+            // convert XML encoding to SJIS
+            $ret = mb_convert_encoding($ret, 'SJIS-win', 'UTF-8');
+            $ret = str_replace('<?xml version="1.0" encoding="UTF-8"?>',
+                '<?xml version="1.0" encoding="SHIFT_JIS"?>', $ret);
+        }
+
+        return $ret;
+    }
+
+
+    /**
+     * Parse data to obtain error code
+     *
+     * @param string $data
+     *
+     * @return array  $result
+     */
+    private function parseXML($data)
+    {
+        $result = [];
+
+        if (0 == strlen($data)) {
+            return $result;
+        }
+
+        $properties = null;
+
+        $xml_reader = new XMLReader();
+        $xml_reader->XML($data);
+
+        if ($xml_reader->read()) {
+            if (strcmp($xml_reader->name, 'methodResponse') === 0) {
+                $node_name = '';
+                $msg_type = '';
+                $properties = [];
+                while ($xml_reader->read()
+                       && strcmp($xml_reader->name, 'methodResponse') !== 0) {
+                    $node_type = $xml_reader->nodeType;
+                    switch ($node_type) {
+                        case XMLReader::ELEMENT:
+                            $node_name = $xml_reader->name;
+                            break;
+                        case XMLReader::TEXT:
+                            if (strlen($node_name) > 0) {
+                                if (strcmp($node_name, 'name') == 0) {
+                                    $msg_type = $xml_reader->value;
+                                    $properties[$msg_type] = '';
+                                } elseif (strcmp($node_name, 'int') == 0
+                                          || strcmp($node_name, 'string') == 0
+                                ) {
+                                    $properties[$msg_type] = $xml_reader->value;
+                                }
+                            }
+                            break;
+                        case XMLReader::CDATA:
+                            break;
+                        case XMLReader::END_ELEMENT:
+                            $node_name = '';
+                            break;
+                    }
+                }
+
+                $result = [
+                    'fault_code'   => isset($properties['faultCode'])
+                        ? $properties['faultCode'] : '',
+                    'fault_string' => isset($properties['faultString'])
+                        ? $properties['faultString']
+                        : '',
+                ];
+            }
+        }
+
+        $xml_reader->close();
+
+        return $result;
+    }
+
+    /**
+     * @return string  $cookie_value  Authentication for Sync
+     */
+    private function getAuth()
+    {
+        $COOKIE_MODE_OPEN_AUTH_V2 = 1;
+        $ACCEPT_AUTH_DRIVER_TYPE
+            = 'grn.common.authentication.authenticate.cybozu';
+
+        $auth_method = null;
+        $driver_settings = null;
+
+        require_once("grn/authentication.csp");
+        $authentication_service = GRN_Authentication_Service::getInstance();
+
+        //Get Authentication Method List
+        $auth_method_list
+            = $authentication_service->getAuthenticateMethodList();
+        if ( ! $auth_method_list) {
+            $auth_method_list = [];
+        }
+
+        foreach (array_keys($auth_method_list) as $auth_method_id) {
+            $auth_method_tmp =& $auth_method_list[$auth_method_id];
+
+            // Check driver type
+            $driver_type = $auth_method_tmp->get('driver_type');
+            if (strcmp($ACCEPT_AUTH_DRIVER_TYPE, $driver_type) !== 0) {
+                continue;
+            }
+
+            $driver_type_elements = explode('.', $driver_type);
+
+            // Exclude Special Authentication
+            $loader = new GRN_Authentication_Application_Loader();
+            if ( ! $loader->loadHook($driver_type_elements[4])) {
+                $driver_settings = $auth_method_tmp->get('driver_settings');
+                if ($driver_settings) {
+                    $driver_settings = cb_unserialize($driver_settings,
+                        ["allowed_classes" => false]);
+
+                    if (isset($driver_settings['cookie_mode'])
+                        && $driver_settings['cookie_mode']
+                           == $COOKIE_MODE_OPEN_AUTH_V2
+                    ) {
+                        $auth_method =& $auth_method_tmp;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (is_null($auth_method)) {
+            cb_throw_error($this->_error_key_auth_method_incompatible);
+        }
+
+        if ( ! $auth_method->get('is_active')) {
+            cb_throw_error($this->_error_key_auth_method_disabled, null,
+                ['authentication_method_name' => $auth_method->get('display_name')]);
+        }
+
+        if (is_null($driver_settings)) {
+            $driver_settings = $auth_method->get('driver_settings');
+
+            if ($driver_settings) {
+                $driver_settings = cb_unserialize($driver_settings,
+                    ["allowed_classes" => false]);
+            }
+        }
+
+        if ( ! isset($driver_settings['cookie_mode'])
+             || $driver_settings['cookie_mode'] != $COOKIE_MODE_OPEN_AUTH_V2
+        ) {
+            cb_throw_error($this->_error_key_auth_method_incompatible);
+        }
+
+        //Get Parameter
+        $password = $driver_settings['password'];
+        $domain = $driver_settings['cookie_domain'];
+        $expire_time = $driver_settings['expire_time'];
+        $limit_time = time() + intval($expire_time) * 60;
+
+        if (strlen($domain) > 0 && $domain[0] != '.') {
+            $domain = '.' . $domain;
+        }
+
+        //Create OPEN ver.2 Cookie
+        $account = $this->_user_account;
+        $action = 'login';
+        $text = base64_encode($account) . ":" . $domain . ":" . $action
+                . ":" . $limit_time;
+        $hmac = hash_hmac("sha256", $text, $password);
+        $cookie_value = base64_encode($text) . ":" . $hmac;
+
+        return $cookie_value;
+    }
+}
+
+

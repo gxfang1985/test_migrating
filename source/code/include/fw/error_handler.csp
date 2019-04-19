@@ -1,0 +1,1017 @@
+<?php
+
+/**
+ * Error handlers
+ *
+ * @package fw.core
+ */
+
+/**
+ * The HTTP header string to be issued on errors.
+ */
+define('CB_ERROR_HEADER', 'X-Cybozu-Error: ');
+
+require_once('fw/module.csp');
+require_once('fw/error_trace_log.csp');
+require_once('fw/exitFunctions.csp');
+require_once('grn/ForestServerErrorStatus.csp');
+
+use grn\space\common\exception\GrnException;
+use grn\grn\GrnException as GE;
+use grn\api\RestApiResponse;
+use grn\api\exception\RestApiException;
+
+/**
+ * Implements error handler's main body.
+ * This class/file is loaded lazily upon errors by a small handler
+ * installed at fw/prepend.csp.
+ *
+ * @author  Akimoto, Hiroyuki   2003/06
+ * @author  Yamamoto, Hirotaka  2003/10
+ * @version 2.0
+ * @package fw.core
+ */
+class CB_ErrorHandler extends CB_ModuleBase
+{
+    /**
+     * Return the singleton instance of this class.
+     *
+     * This class must have a singleton to keep hook function list
+     * and to detect nested error handling.
+     */
+    private static $_instance = null;
+
+    /**
+     * @return CB_ErrorHandler
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        parent::__construct('fw.error.hook');
+    }
+
+    /**
+     * Hold hook function names to be executed on errors.
+     *
+     * @access private
+     */
+    var $_hooks = [];
+
+    /**
+     * Add a function to the list of hooks on errors.
+     * The hook function should receive one argument as the error infomation array.
+     * then return NULL or a string that denotes additional information
+     * on errors (that will be shown in error pages as well).
+     *
+     * @param string $func Hook funcion name.
+     */
+    function addHook($func)
+    {
+        // to uniquify triggers, we use array KEYS instead of
+        // VALUES to store trigger function names.
+        $this->_hooks[$func] = 1;
+    }
+
+    /**
+     * Remove a function to the list of hooks on errors.
+     *
+     * @param string $func Hook funcion name.
+     */
+    function removeHook($func)
+    {
+        unset($this->_hooks[$func]);
+    }
+
+    /**
+     * Display error page then exit abnormally.
+     * NEVER RETURNS.
+     *
+     * @param string $error_code The error code.
+     * @param array  $diagnosis  Parameters for diagnosis message.
+     * @param array  $cause      Parameters for cause message.
+     * @param array  $counter    Parameters for counter-measure message.
+     * @param array  $developer  Parameters for developer information.
+     * @param array  $backtrace
+     *                           Backtrace information obtained through debug_backtrace().
+     * @param        $alternative_resources
+     *
+     * @return void
+     */
+    function errorExit(
+        $error_code,
+        $diagnosis,
+        $cause,
+        $counter,
+        $developer,
+        $backtrace,
+        $alternative_resources
+    ) {
+        global $G_state_set;
+
+        // Obtain message, filter, and template.
+        require_once('fw/error_message.csp');
+        $msg = CB_ErrorMessage::getInstance($error_code,
+            $alternative_resources);
+
+        $type = $G_state_set->get('error_page_type');
+        $factory = CB_ErrorMessageFilterFactory::getInstance();
+        $filter = $factory->getFilter($type);
+        $template = "error_${type}.tpl";
+
+        $msgDiag = $filter->filter($msg->formatDiagnosisMessage($diagnosis));
+        $msgCause = $filter->filter($msg->formatCauseMessage($cause));
+        $msgCounter
+            = $filter->filter($msg->formatCounterMeasureMessage($counter));
+        $msgDev
+            = $filter->filter($msg->formatDeveloperInfoMessage($developer));
+
+        $gotten_backtrace = null;
+        $gotten_input = null;
+
+        $is_display_details_mode = cb_is_display_error_details_mode();
+        $is_print_log_mode = cb_is_print_error_trace_log_mode();
+
+        if (cb_is_rest_api()) {
+            if ($is_display_details_mode || $is_print_log_mode) {
+                $gotten_backtrace = $this->get_print_trace($backtrace);
+                $gotten_input = $this->get_print_input();
+                cb_log_error_trace($error_code, $backtrace);
+            }
+
+            $loader = $this->getPluginLoader();
+            $hooks = $loader->loadHooks();
+            foreach ($hooks as $hook) {
+                $this->addHook($hook);
+            }
+
+            $error_info = [
+                'ErrorNumber'         => $error_code,
+                'ErrorDiag'           => $msgDiag,
+                'ErrorCause'          => $msgCause,
+                'ErrorCounterMeasure' => $msgCounter,
+                'ErrorDeveloperInfo'  => $msgDev,
+                'ErrorDetailTable'    => $gotten_backtrace
+            ];
+            foreach (array_keys($this->_hooks) as $func) {
+                call_user_func($func, $error_info);
+            }
+
+            $response_logic = new RestApiResponse();
+            $response_json = $response_logic->buildFailureResponse(
+                $error_code,
+                $msgDiag,
+                $msgCause,
+                $msgCounter,
+                $msgDev,
+                $gotten_backtrace,
+                $gotten_input);
+
+            echo $response_json;
+            $G_state_set->set('error_occurred', true);
+        } elseif (defined('AJAX_REQUEST')) {
+            if ($is_display_details_mode || $is_print_log_mode) {
+                $gotten_backtrace = $this->get_print_trace($backtrace);
+                $gotten_input = $this->get_print_input();
+                cb_log_error_trace($error_code, $backtrace);
+            }
+
+            $loader = $this->getPluginLoader();
+            $hooks = $loader->loadHooks();
+            foreach ($hooks as $hook) {
+                $this->addHook($hook);
+            }
+
+            $error_info = [
+                'ErrorNumber'         => $error_code,
+                'ErrorDiag'           => $msgDiag,
+                'ErrorCause'          => $msgCause,
+                'ErrorCounterMeasure' => $msgCounter,
+                'ErrorDeveloperInfo'  => $msgDev,
+                'ErrorDetailTable'    => $gotten_backtrace
+            ];
+            foreach (array_keys($this->_hooks) as $func) {
+                call_user_func($func, $error_info);
+            }
+
+            // Obtain message, filter, and template.
+            if ( ! headers_sent()) {
+                $this->outputStatusCodeForForest($error_code);
+                header(CB_ERROR_HEADER . $error_code);
+            }
+            $msg = CB_ErrorMessage::getInstance($error_code, null);
+            require_once("grn/JSONResponse.csp");
+            $json = \grn\grn\JSONResponse::create();
+            $json->response([
+                'code'            => $error_code,
+                'diagnosis'       => $msgDiag,
+                'cause'           => $msgCause,
+                'counter_measure' => $msgCounter,
+                'developer_info'  => $msgDev,
+                'backtrace'       => $gotten_backtrace,
+                'input'           => $gotten_input
+            ]);
+
+            $G_state_set->set('copyright_should_be_written', false);
+            $G_state_set->set('html_should_be_closed', false);
+            $G_state_set->set('error_occurred', true);
+        } else {
+            if ($G_state_set->get('error_occurred')) {
+                // infinite error loop
+                if ($is_display_details_mode || $is_print_log_mode) {
+                    foreach (array_keys($backtrace) as $key) {
+                        if (array_key_exists('args', $backtrace[$key])) {
+                            $args = [];
+                            foreach ($backtrace[$key]['args'] as $arg) {
+                                if ( ! is_object($arg)) {
+                                    $args[] = (string)$arg;
+                                } else {
+                                    $args[] = 'Object';
+                                }
+                            }
+                            $backtrace[$key]['args'] = $args;
+                        }
+                    }
+
+                    if ($is_display_details_mode) {
+                        if ($G_state_set->get('command_line')) {
+                            echo "Detected infinite error loop!! show backtrace.\n";
+                            var_dump($backtrace);
+                        } else {
+                            echo "Detected infinite error loop!! show backtrace.<br>";
+                            echo "<pre>";
+                            var_dump($backtrace);
+                            echo "</pre>";
+                        }
+                    }
+
+                    cb_log_error_trace($error_code, $backtrace);
+                }
+
+                exit(CB_EXIT_INFINITE_LOOP);
+            }
+            $G_state_set->set('error_occurred', true);
+
+            $loader = $this->getPluginLoader();
+            $hooks = $loader->loadHooks();
+            foreach ($hooks as $hook) {
+                $this->addHook($hook);
+            }
+
+            // Issue HTTP header to denote the error code
+            if ( ! headers_sent()) {
+                $this->outputStatusCodeForForest($error_code);
+                header(CB_ERROR_HEADER . $error_code);
+            }
+
+            // Cancel bufferred output.
+            while (ob_get_level() > 0) {
+                ob_end_clean();
+            }
+            ob_start();
+
+            // Display error page using Smarty
+            require_once('grn/smarty.csp');
+            $t = new GRN_Smarty(true); // Skip database access
+            $t->skipWarning();  // disable license warning
+
+            $t->assign('ErrorNumber', $error_code);
+            $t->assign('ErrorDiag', $msgDiag);
+            $t->assign('ErrorCause', $msgCause);
+            $t->assign('ErrorCounterMeasure', $msgCounter);
+            $t->assign('ErrorDeveloperInfo', $msgDev);
+
+            if ($is_display_details_mode || $is_print_log_mode) {
+                // get backtrace
+                $gotten_backtrace = $this->get_print_trace($backtrace);
+                if ($is_display_details_mode) {
+                    $t->assign('ErrorDetailTable', $gotten_backtrace);
+                }
+
+                cb_log_error_trace($error_code, $backtrace);
+
+                // get $G_INPUT
+                $gotten_input = $this->get_print_input();
+                $t->assign('ErrorInput', $gotten_input);
+            }
+
+            $error_info = [
+                'ErrorNumber'         => $error_code,
+                'ErrorDiag'           => $msgDiag,
+                'ErrorCause'          => $msgCause,
+                'ErrorCounterMeasure' => $msgCounter,
+                'ErrorDeveloperInfo'  => $msgDev,
+                'ErrorDetailTable'    => $gotten_backtrace
+            ];
+
+            $additional = [];
+            foreach (array_keys($this->_hooks) as $func) {
+                $msg = call_user_func($func, $error_info);
+                if ($msg) {
+                    $additional[] = $filter->filter($msg);
+                }
+            }
+            if (count($additional) > 0) {
+                $t->assign('HaveAdditional', true);
+                $t->assign('AdditionalMessage', $additional);
+            } else {
+                $t->assign('HaveAdditional', false);
+            }
+
+            //Get apiversion of Garoon
+            require_once("util_api/logic.csp");
+            $_common_ini = cb_basedir() . '/common.ini';
+            if (file_exists($_common_ini)) {
+                $config_version_api = new CB_ConfigManager($_common_ini,
+                    'Global');
+                $api_version = $config_version_api->get("API",
+                    "version");
+                if ($api_version !== false) {
+                    $t->assign("apiversion", $api_version);
+                }
+            }
+
+            //Get version of Garoon
+            $_garoon_ini = cb_basedir() . '/garoon.ini';
+            if (file_exists($_garoon_ini)) {
+                $config_version_garoon = new CB_ConfigManager($_garoon_ini,
+                    'Global');
+                $version_garoon = $config_version_garoon->get("System",
+                    "version");
+                if ($version_garoon !== false) {
+                    $t->assign("version", $version_garoon);
+                }
+            }
+
+            if (defined('ON_FOREST')) {
+                $product_type = "2";
+            } else {
+                $product_type = "1";
+            }
+            $t->assign("product_type", $product_type);
+
+            if ($template === 'error_mobile.tpl') {
+                $t->assign('copyright', cb_get_copyright(CB_TYPE_TEXT));
+            }
+
+            //GTM-1452
+            if ($G_state_set->get('kintone_dialog_mode')) {
+                $t->assign('kintone_dialog_mode', true);
+            }
+
+            $t->display($template);
+        }
+        // 単にexitを呼ぶと、常に終了時に呼ぶ処理が呼ばれないので、手動でそれを呼ぶ
+        require('append.csp');
+        exit(CB_EXIT_ERROR);
+    }
+
+    private function dumpObject($obj, $printDetail = false)
+    {
+        if (is_array($obj)) {
+            if ($printDetail) {
+                return var_export($obj, true);
+            } else {
+                return "array(" . count($obj) . ")";
+            }
+        } elseif (is_string($obj)) {
+            return '"' . print_r($obj, true) . '"';
+        } elseif ( ! is_object($obj)) {
+            return var_export($obj, true);
+        } else {
+            $names = explode('\\', get_class($obj));
+
+            return 'object (' . $names[count($names) - 1] . ')';
+        }
+    }
+
+    /**
+     * Get backtrace print
+     *
+     * @param array $backtrace
+     *
+     * @return string
+     */
+    private function get_print_trace($backtrace)
+    {
+        $gottenVarDump = null;
+
+        // バックトレースを出す場合、それを設定
+        //  テンプレート側(error_*.tpl)で、<pre>表示させる
+        foreach (array_keys($backtrace) as $key) {
+            if (array_key_exists('args', $backtrace[$key])) {
+                $args = [];
+                foreach ($backtrace[$key]['args'] as $arg) {
+                    $args[] = $this->dumpObject($arg);
+                }
+                $backtrace[$key]['args'] = $args;
+            }
+        }
+
+        ob_start();
+        $this->print_trace($backtrace);
+
+        return $gottenVarDump = ob_get_clean();
+    }
+
+    /**
+     * backtrace print
+     *
+     * @param array $backtrace
+     */
+    private function print_trace($backtrace)
+    {
+        $space = " ";
+        $end_line = "\n";
+        $max_indentation = 15;
+
+        foreach ($backtrace as $key => $trace) {
+            echo "Stack" . $space . $this->get_backtrace_value($key) . $space
+                 . ":" . $end_line;
+            if (array_key_exists('file', $trace)) {
+                $file = str_replace(cb_basedir(), "", $trace['file']);
+                echo $this->get_backtrace_item("File", $max_indentation,
+                    $space);
+                echo $this->get_backtrace_value($file, $end_line);
+            }
+            if (array_key_exists('line', $trace)) {
+                echo $this->get_backtrace_item("Line", $max_indentation,
+                    $space);
+                echo $this->get_backtrace_value($trace['line'], $end_line);
+            }
+
+            $function = '';
+            $classname = '';
+            $org_classname = '';
+            $type = '';
+            if (array_key_exists('function', $trace)) {
+                $function = $trace['function'];
+            }
+
+            if (array_key_exists('class', $trace)) {
+                $org_classname = $trace['class'];
+                $names = explode('\\', $org_classname);
+                $classname = $names[count($names) - 1];
+            }
+            if (array_key_exists('type', $trace)) {
+                $type = $trace['type'];
+            }
+
+            if ($classname . $type . $function) {
+                echo $this->get_backtrace_item("Function", $max_indentation,
+                    $space);
+                echo $this->get_backtrace_value($classname . $type . $function,
+                    $end_line);
+            }
+
+            if (array_key_exists('args', $trace)) {
+                $ref = null;
+                try {
+                    if (empty($type) && function_exists($function)) {
+                        $ref = new ReflectionFunction($function);
+                    } elseif ( ! empty($type)) {
+                        $ref = new ReflectionMethod($org_classname, $function);
+                    }
+                } catch (\ReflectionException $e) {
+                    // When function/method cannot be got, it is not set.
+                }
+
+                $max_item_length = 0;
+                $argnames = [];
+                if (isset($ref)) {
+                    $params = $ref->getParameters();
+                    $length = count($params);
+                    for ($i = count($trace['args']); $i < $length; $i++) {
+                        unset($params[$i]);
+                    }
+
+                    foreach ($params as $p) {
+                        $argnames[] = $p->name;
+                        if (strlen($p->name) > $max_item_length) {
+                            $max_item_length = strlen($p->name);
+                        }
+                    }
+                } else {
+                    $argnames[] = '';
+                }
+
+                echo $this->get_backtrace_item("Args", $max_indentation,
+                    $space);
+
+                $first_flag = false;
+                foreach ($trace['args'] as $key2 => $arg) {
+                    if (@$argnames[$key2]) {
+                        if ($first_flag) {
+                            echo $end_line;
+                            echo str_repeat($space, $max_indentation);
+                        }
+                        $arg_name
+                            = $this->get_backtrace_value(@$argnames[$key2]);
+                        echo "$" . $arg_name . "";
+                        echo str_repeat($space,
+                            $max_item_length - strlen(@$argnames[$key2]));
+                        echo $space . "=>" . $space . is_object($arg) ? 'Object'
+                            : (string)$arg;
+                        $first_flag = true;
+                    }
+                }
+                echo $end_line;
+            }
+            echo $end_line;
+        }
+    }
+
+    /**
+     * Get G_INPUT print
+     *
+     * @return string
+     */
+    private function get_print_input()
+    {
+        $space = " ";
+        $end_line = "\n";
+        $gottenVarDump = null;
+
+        // $G_INPUT も表示する
+        global $G_INPUT;
+        if ( ! is_array($G_INPUT)) {
+            // for errors before $G_INPUT is initialized
+            $G_INPUT = [];
+        }
+        $maxKeyLength = 0;
+        foreach (array_keys($G_INPUT) as $key) {
+            if ($maxKeyLength < strlen($key)) {
+                $maxKeyLength = strlen($key);
+            }
+        }
+
+        ob_start();
+        foreach ($G_INPUT as $key => $value) {
+            echo $this->get_backtrace_value($this->dumpObject($key));
+            echo str_repeat($space, $maxKeyLength - strlen($key));
+
+            $dump = $this->get_backtrace_value($this->dumpObject($value, true));
+            $dump = str_replace("\n",
+                $end_line . sprintf("%" . ($maxKeyLength + 6) . "s", ""),
+                $dump);
+            echo $space . "=>" . $space;
+            echo $dump . $end_line;
+        }
+
+        return $gottenVarDump = ob_get_clean();
+    }
+
+    /**
+     * get backtrace item
+     *
+     * @param string $item_name
+     * @param int    $max_indentation
+     * @param string $space
+     *
+     * @return string
+     */
+    private function get_backtrace_item($item_name, $max_indentation, $space)
+    {
+        $before_indentation_length = 4;
+        $after_indentation_length = $max_indentation
+                                    - $before_indentation_length
+                                    - strlen($item_name) - 2;
+        $before_indentation = str_repeat($space,
+            $before_indentation_length);
+        $after_indentation = str_repeat($space,
+            $after_indentation_length);
+
+        return $before_indentation . $item_name . $after_indentation . ":"
+               . $space;
+    }
+
+    /**
+     * get backtrace value
+     *
+     * @param string $value
+     * @param string $end_line
+     *
+     * @return string
+     */
+    private function get_backtrace_value($value, $end_line = null)
+    {
+        $value = htmlspecialchars($value);
+
+        return $end_line ? $value . $end_line : $value;
+    }
+
+    /**
+     * PHPのエラーをマップする.
+     * Smartyでのエラーも、PHPエラーとして発生してくる
+     *
+     * PHPのシステムエラーは、ビットマスク状(1,2,4,8,...)になっているので、
+     * これを以下のようにPEARエラーコード(==フレームワークとしてのエラー種別)
+     * にマッピングする。
+     *
+     *  エラー名         PHPでの値       フレームワークエラーコード
+     *  E_ERROR              1<<0                 E_PHP_ERROR
+     *  E_WARNING            1<<1                 E_PHP_WARNING
+     *  E_PARSE              1<<2                 E_PHP_PARSE
+     *  E_NOTICE             1<<3                 E_PHP_NOTICE
+     *  E_CORE_ERROR         1<<4                 E_PHP_CORE_ERROR
+     *  E_CORE_WARNING       1<<5                 E_PHP_CORE_WARNING
+     *  E_COMPILE_ERROR      1<<6                 E_PHP_COMPILE_ERROR
+     *  E_COMPILE_WARNING    1<<7                 E_PHP_COMPILE_WARNING
+     *  E_USER_ERROR         1<<8                 E_PHP_USER_ERROR
+     *  E_USER_WARNING       1<<9                 E_PHP_USER_WARNING
+     *  E_USER_NOTICE        1<<10                E_PHP_USER_NOTICE
+     *  E_RECOVERABLE_ERROR  1<<12                E_PHP_RECOVERABLE_ERROR
+     *  E_DEPRECATED         1<<13                E_PHP_DEPRECATED
+     *  E_USER_DEPRECATED    1<<14                E_PHP_USER_DEPRECATED
+     *  E_ALL                All errors and warnings, as supported.
+     *
+     * PHPシステムエラーの定数名と値については、
+     * PHPソースの Zend/zend_errors.h 参照のこと
+     *
+     * @param string $errno
+     * @param string $errstr
+     * @param string $errfile
+     * @param string $errline
+     */
+    function handlerForPhpError($errno, $errstr, $errfile, $errline)
+    {
+        // レポートするべきエラーの場合にのみ、ハンドルする
+        if ( ! (error_reporting() & $errno)) {
+            return;
+        }
+
+        static $_called = false;
+
+        // エラー処理中に再度エラーが発生
+        if ($_called) {
+            echo "!!Nested Error!! <br>\n Detected in CB_ErrorHandler::handlerForPhpError("
+                 . htmlspecialchars($errno) . ", " . htmlspecialchars($errstr)
+                 . ", " . htmlspecialchars($errfile) . ", "
+                 . htmlspecialchars($errline) . ")";
+            // 単にexitを呼ぶと、常に終了時に呼ぶ処理が呼ばれないので、手動でそれを呼ぶ
+            include('append.csp');
+            exit(CB_EXIT_INFINITE);
+        }
+
+        // フレームワークとしてのエラー番号に変換して投げる
+        $error_code = '';
+        global $G_config_common;
+        switch ($errno) {
+            case E_WARNING:
+
+                if ( ! $G_config_common->get('Global', 'debug')
+                     & ERROR_TRACE_LOG_FLAG_250
+                ) {
+                    if (strpos($errstr, "Illegal string offset") !== false) {
+                        return;
+                    }
+
+                    if (strpos($errstr,
+                            "Creating default object from empty value")
+                        !== false
+                    ) {
+                        return;
+                    }
+
+                    if (strpos($errstr,
+                            "A non-numeric value encountered")
+                        !== false
+                    ) {
+                        return;
+                    }
+                }
+                $error_code = E_PHP_WARNING;
+                break;
+            case E_NOTICE:
+
+                if ( ! $G_config_common->get('Global', 'debug')
+                     & ERROR_TRACE_LOG_FLAG_250
+                ) {
+                    if (strpos($errstr, "Array to string conversion")
+                        !== false
+                    ) {
+                        return;
+                    }
+
+                    if (strpos($errstr,
+                            "Only variable references should be returned by reference")
+                        !== false
+                    ) {
+                        return;
+                    }
+
+                    if (strpos($errstr,
+                            "A non well formed numeric value encountered")
+                        !== false
+                    ) {
+                        return;
+                    }
+                }
+                if (strpos($errstr,
+                        "Only variables should be assigned by reference")
+                    !== false
+                ) {
+                    return;
+                }
+                $error_code = E_PHP_NOTICE;
+                break;
+            case E_USER_ERROR:
+                if (stristr($errstr, 'smarty') != false) {
+                    $error_code = E_SMARTY_USER_ERROR;
+                } else {
+                    $error_code = E_PHP_USER_ERROR;
+                }
+                break;
+            case E_USER_WARNING:
+                if (stristr($errstr, 'smarty') != false) {
+                    $error_code = E_SMARTY_USER_WARNING;
+                } else {
+                    $error_code = E_PHP_USER_WARNING;
+                }
+                break;
+            case E_USER_NOTICE:
+                if (stristr($errstr, 'smarty') != false) {
+                    $error_code = E_SMARTY_USER_NOTICE;
+                } else {
+                    $error_code = E_PHP_USER_NOTICE;
+                }
+                break;
+
+            case E_RECOVERABLE_ERROR:
+                if (stristr($errstr, 'smarty') != false) {
+                    $error_code = E_SMARTY_USER_NOTICE;
+                } else {
+                    $error_code = E_PHP_RECOVERABLE_ERROR;
+                }
+                break;
+            case E_DEPRECATED:
+                if (stristr($errstr, 'smarty') != false) {
+                    $error_code = E_SMARTY_USER_NOTICE;
+                } else {
+                    $error_code = E_PHP_DEPRECATED;
+                }
+                break;
+            case E_USER_DEPRECATED:
+                if (stristr($errstr, 'smarty') != false) {
+                    $error_code = E_SMARTY_USER_NOTICE;
+                } else {
+                    $error_code = E_PHP_USER_DEPRECATED;
+                }
+                break;
+            default:
+                $error_code = E_COMMON_INTERNAL; // *** Framework Internal Error
+        }
+
+        $backtrace = debug_backtrace(false);
+        array_shift($backtrace);  // this handler
+        array_shift($backtrace);  // handler set by set_error_handler()
+
+        $this->logPhpError('php_error', $errstr, $errfile, $errline,
+            $backtrace);
+
+        $this->errorExit($error_code, null, ['msg' => $errstr], null,
+            ['file' => $errfile, 'line' => $errline, 'msg' => $errstr],
+            $backtrace, null);
+    }
+
+    /**
+     * Output status code for Forest
+     *
+     * @param string $error_code The error code.
+     */
+    private function outputStatusCodeForForest($error_code)
+    {
+        if ( ! defined('ON_FOREST')) {
+            return;
+        }
+
+        $statusCode = new \grn\grn\ForestServerErrorStatus($error_code);
+        header("Status: " . $statusCode->getStatusCode() . " Garoon Error");
+    }
+
+    /*
+     * This method is registered to register_shutdown_function.
+     * This method is called When fatal error occured.
+     * See Also: http://wiki.dev.cybozu.co.jp/pages/viewpage.action?pageId=16451827
+     */
+    public function handlerForPhpFatalError()
+    {
+        $e = error_get_last();
+
+        // exit if fatal error does not occur
+        if ( ! is_array($e)
+             || ! array_key_exists($e['type'], cb_get_fatal_errors())
+        ) {
+            return;
+        }
+
+        if (($error_info = cb_detect_error_ini_info()) === false) {
+            return;
+        }
+        $time = $error_info['time'];
+
+        // レポートするべきエラーの場合にのみ、ハンドルする
+        if ( ! (error_reporting() & $e['type'])) {
+            return;
+        }
+
+        $contents = '[' . gmdate("Y-M-d H:i:s", $time) . ']' . "\n";
+        $contents .= '[Domain] : ' . $error_info['domain'] . "\n";
+
+        if (cb_is_forest()) {
+            $contents .= '[Req_id] : ' . cb_get_request_id() . "\n";
+        }
+
+        $contents .= '[Cause]: ' . $e['message'] . "\n";
+        $contents .= '[File] : ' . $e['file'] . "\n";
+        $contents .= '[Line] : ' . $e['line'] . "\n";
+
+        cb_write_error_log('fatal_error_' . $time . '.log', $contents);
+
+        // Issue HTTP header to denote the error code
+        if ( ! headers_sent()) {
+            $fatal_errors = cb_get_fatal_errors();
+            $error_code = array_key_exists($e['type'], $fatal_errors)
+                ? $fatal_errors[$e['type']] : E_COMMON_INTERNAL;
+            $this->outputStatusCodeForForest($error_code);
+            header(CB_ERROR_HEADER . $error_code);
+        }
+    }
+
+    /**
+     * @param Throwable $exception
+     */
+    public function handlerForException(\Throwable $exception)
+    {
+        $stackTrace = $exception->getTrace();
+        array_unshift($stackTrace,
+            ["file" => $exception->getFile(), "line" => $exception->getLine()]);
+
+        if ($exception instanceof GrnException || $exception instanceof GE) {
+            /** @var $exception GrnException|GE */
+            $this->errorExit(
+                $exception->getErrorCode(),
+                $exception->getDiagnosis(),
+                $exception->getCause(),
+                $exception->getCounter(),
+                $exception->getDeveloperInfo(),
+                $stackTrace, null);
+        } elseif ($exception instanceof RestApiException) {
+            /** @var $exception RestApiException */
+            $this->errorExit(
+                $exception->getErrorCode(),
+                $exception->getDiagnosis(),
+                $exception->getCause(),
+                $exception->getCounter(),
+                $exception->getDeveloperInfo(),
+                $stackTrace, null);
+        } elseif ($exception instanceof APIException) {
+            $this->errorExit(
+                'API' . $exception->getErrorCode(),
+                null,
+                null,
+                null,
+                null,
+                $stackTrace,
+                [
+                    0 => $exception->getMessage(),
+                    1 => "",
+                    2 => "",
+                    3 => ""
+                ]
+            );
+        } else {
+            $this->logPhpError('uncaught_exception',
+                $exception->getMessage(), $exception->getFile(),
+                $exception->getLine(), $stackTrace);
+
+            $this->errorExit(
+                E_PHP_UNCAUGHT_EXCEPTION,
+                null,
+                null,
+                null,
+                [
+                    'file' => $exception->getFile(),
+                    'line' => $exception->getLine(),
+                    'msg'  => $exception->getMessage()
+                ],
+                $stackTrace, null);
+        }
+    }
+
+    /**
+     * @param string $filename_prefix
+     * @param string $errstr
+     * @param string $errfile
+     * @param string $errline
+     * @param array  $backtrace
+     */
+    public function logPhpError(
+        $filename_prefix,
+        $errstr,
+        $errfile,
+        $errline,
+        array $backtrace
+    ) {
+        $error_info = cb_detect_error_ini_info();
+        if ( ! $error_info) {
+            return;
+        }
+
+        ob_start();
+        $this->print_trace($backtrace);
+        $backtraceStr = ob_get_clean();
+
+        $date = gmdate("M d Y H:i:s", $error_info["time"]);
+
+        $log_message = "date    : {$date} \n" .
+                       "domain  : {$error_info["domain"]} \n";
+
+        if (cb_is_forest()) {
+            $log_message .= 'req_id  : ' . cb_get_request_id() . "\n";
+        }
+
+        $log_message .= "error   : {$errstr} \n" .
+                        "file    : {$errfile} \n" .
+                        "line    : {$errline} \n" .
+                        "trace   : \n{$backtraceStr}";
+
+        cb_write_error_log(
+            $filename_prefix . "_" . $error_info["time"] . '_'
+            . cb_create_uuid() . '.log', $log_message
+        );
+    }
+}
+
+/**
+ * Interface for error massage filter classes.
+ *
+ * @abstract
+ * @package fw.core
+ */
+class CB_ErrorMessageFilter
+{
+    /**
+     * @param string $msg
+     *
+     * @return string
+     */
+    function filter($msg)
+    {
+    }
+}
+
+/**
+ * Factory of {@link CB_ErrorMessageFilter} objects.
+ *
+ * @package fw.core
+ */
+class CB_ErrorMessageFilterFactory extends CB_ModuleBase
+{
+    /** @var self */
+    private static $_instance = null;
+
+    /**
+     * @return CB_ErrorMessageFilterFactory
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    function __construct()
+    {
+        parent::__construct('fw.error.filter');
+    }
+
+    /**
+     * @param string $type
+     *
+     * @return CB_ErrorMessageFilter
+     */
+    function getFilter($type)
+    {
+        $loader = $this->getPluginLoader();
+        $filter = $loader->loadDriver($type);
+
+        return $filter;
+    }
+}
+
+

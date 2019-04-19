@@ -1,0 +1,1251 @@
+<?php
+
+/**
+ * AzLogger - a unified logging toolkit for azalea applications.
+ *
+ * @package fw.logger
+ * @author  Yamamoto, Hirotaka  2004/02-2006/08
+ * @version 1.1
+ */
+
+require_once('fw/transaction.csp');
+require_once('fw/module.csp');
+require_once('fw/audit_util.csp');
+
+// MyISAM table name for storing log events
+define('CB_LOGGER_TABLENAME', 'tab_cb_logevent');
+
+// priority constants
+define('CB_LOGGER_DEBUG', 10);
+define('CB_LOGGER_INFO', 9);
+define('CB_LOGGER_NOTICE', 8);
+define('CB_LOGGER_WARNING', 6);
+define('CB_LOGGER_ERROR', 4);
+define('CB_LOGGER_CRITICAL', 2);
+
+// config variable names
+define('CB_LOGGER_CONFIG_THRESHOLD', 'threshold');
+define('CB_LOGGER_CONFIG_DBLOGGING', 'db_logging');
+define('CB_LOGGER_CONFIG_TARGET', 'target');
+define('CB_LOGGER_CONFIG_DEBUG', 'debug');
+define('CB_LOGGER_CONFIG_INFO', 'info');
+define('CB_LOGGER_CONFIG_NOTICE', 'notice');
+define('CB_LOGGER_CONFIG_WARNING', 'warning');
+define('CB_LOGGER_CONFIG_ERROR', 'error');
+define('CB_LOGGER_CONFIG_CRITICAL', 'critical');
+
+define('CB_LOGGER_DB', 'db');
+define('CB_LOGGER_SYSLOG', 'syslog');
+
+// Audit log message footer for REST API
+const REST_API_FOOTER = ' by REST API';
+
+/**
+ * Manage logger configuration file.
+ *
+ * @package fw.logger
+ */
+abstract class CB_LoggerConfig
+{
+    /**
+     * @access private
+     */
+    var $_config = null;
+
+    abstract protected function boot();
+
+    /**
+     * @return array   Associative array of default logger configurations.
+     */
+    function getDefaultConfig()
+    {
+        $cfg = $this->_config->getDefaultSection();
+
+        return ($cfg === false) ? [] : $cfg;
+    }
+
+    /**
+     * @return array   Associative array of configuration for named logger.
+     */
+    function getConfig($logger_name)
+    {
+        $cfg = $this->_config->getSection($logger_name);
+
+        return ($cfg === false) ? [] : $cfg;
+    }
+}
+
+/**
+ * Manage logger hierarchy.
+ *
+ * Use the singleton instance of this class that can be obtained by
+ * getInstance().
+ *
+ * @package fw.logger
+ */
+class CB_LoggerManager
+{
+    /**
+     * @return static
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new static();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * @access private
+     */
+    private function __construct()
+    {
+        $this->_factory = CB_LogTargetFactory::getInstance();
+
+        global $G_container_base, $G_state_set;
+        $this->setConfig($G_container_base->getInstance('logger_config'));
+
+        // create the root logger
+        $this->_dbconn = $G_container_base->getInstance('dbconn')->getCopy();
+        $this->_dbconn->query("SET AUTOCOMMIT=1;");
+        $user_name = null;
+        $user_account = null;
+        if ( ! $G_state_set->get('command_line')) {
+            /** @var GRN_Uum $uum */
+            $uum = $G_container_base->getInstance('uum');
+            $user = $uum->getLoginUser();
+            if ($user !== false) {
+                $user_name = $user->get('display_name');
+                $user_account = $user->get('foreign_key');
+            }
+        }
+        $tmp_array = [];
+        $this->_root = new CB_Logger(null, $tmp_array,
+            $user_name, $user_account,
+            $this->_dbconn);
+        $this->_applyConfig($this->_root,
+            $this->_config->getDefaultConfig());
+    }
+
+    /**
+     * cache loggers.
+     *
+     * @access private
+     */
+    var $_loggers = [];
+
+    /**
+     * @access private
+     */
+    var $_root;
+
+    /**
+     * @access private
+     */
+    var $_factory;
+
+    /**
+     * @access private
+     */
+    var $_dbconn;
+
+    /**
+     * @access private
+     */
+    var $_result;
+
+    /**
+     * @return object CB_Logger
+     */
+    function getRootLogger()
+    {
+        return $this->_root;
+    }
+
+    /**
+     * @param string $category Fully qualified category of the logger.
+     *
+     * @return \CB_Logger
+     */
+    function getLogger($category)
+    {
+        $category = strtolower($category);
+
+        // check cached loggers
+        if (array_key_exists($category, $this->_loggers)) {
+            return $this->_loggers[$category];
+        }
+
+        // obtain existing parent
+        $names = explode('.', $category);
+        $to_create = [];
+        $parent = null;
+
+        array_unshift($to_create, array_pop($names));
+        for (; count($names) > 0;) {
+            $full_name = implode('.', $names);
+            if (array_key_exists($full_name, $this->_loggers)) {
+                $parent = $this->_loggers[$full_name];
+                break;
+            }
+            array_unshift($to_create, array_pop($names));
+        }
+        if (is_null($parent)) {
+            $parent = $this->_root;
+            $full_name = null;
+        }
+
+        // create children
+        foreach ($to_create as $child_name) {
+            if (strlen($child_name) == 0) {
+                cb_throw_error(E_COMMON_INVALID_LOGGER_NAME, null,
+                    ['name' => $category]);
+            }
+
+            $parent = $parent->getChild($child_name);
+            if (is_null($full_name)) {
+                $full_name = $child_name;
+            } else {
+                $full_name = $full_name . '.' . $child_name;
+            }
+            $this->_applyConfig($parent,
+                $this->_config->getConfig($full_name));
+            $this->_loggers[$full_name] = $parent;
+        }
+
+        return $parent;
+    }
+
+    /**
+     * @access private
+     */
+    var $_config = null;
+
+    /**
+     * @param object CB_LoggerConfig $config
+     */
+    function setConfig($config)
+    {
+        $this->_config = $config;
+    }
+
+    /**
+     * @access private
+     */
+    var $_priority_table
+        = [
+            CB_LOGGER_CONFIG_DEBUG    => CB_LOGGER_DEBUG,
+            CB_LOGGER_CONFIG_INFO     => CB_LOGGER_INFO,
+            CB_LOGGER_CONFIG_NOTICE   => CB_LOGGER_NOTICE,
+            CB_LOGGER_CONFIG_WARNING  => CB_LOGGER_WARNING,
+            CB_LOGGER_CONFIG_ERROR    => CB_LOGGER_ERROR,
+            CB_LOGGER_CONFIG_CRITICAL => CB_LOGGER_CRITICAL
+        ];
+
+    /**
+     * @param object CB_Logger  $logger
+     * @param array $config
+     *
+     * @access private
+     */
+    function _applyConfig($logger, $config)
+    {
+        foreach ($this->_priority_table as $name => $value) {
+
+            $target_names = [];
+
+            if ($value == CB_LOGGER_DEBUG) {
+                global $G_config_common;
+
+                $debug_target = $G_config_common->get('Global', 'debug_target');
+                if ($debug_target !== false) {
+                    $target_names = explode(',', $debug_target);
+                }
+            } elseif (array_key_exists($name, $config)) {
+                if (strlen(trim($config[$name])) == 0) {
+                    continue;
+                }
+
+                $target_names = explode(',', $config[$name]);
+            }
+
+            foreach ($target_names as $target_name) {
+                $target_name = strtolower(trim($target_name));
+
+                if ($target_name === CB_LOGGER_DB) {
+                    $logger->setDBLogging($value);
+                } else {
+                    $logger->setTarget($target_name,
+                        $this->_factory->getLogTarget($target_name),
+                        $value);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Collection of instances of {@link CB_LogTarget}.
+ *
+ * @package fw.logger
+ */
+class CB_Targets
+{
+    function __construct()
+    {
+
+    }
+
+    var $_db_logging = false;
+
+    var $_targets = [];
+
+    function setDBLogging($db_logging)
+    {
+        $this->_db_logging = $db_logging;
+    }
+
+    function getDBLogging()
+    {
+        return $this->_db_logging;
+    }
+
+    function setTarget($name, $target)
+    {
+        $this->_targets[$name] = $target;
+    }
+
+    function getTarget($name)
+    {
+        $ret = false;
+
+        if (array_key_exists($name, $this->_targets)) {
+            $ret = $this->_targets[$name];
+        }
+
+        return $ret;
+    }
+
+    function processEvent($dbconn, $event)
+    {
+
+        if ($this->_db_logging) {
+            $event->insert($dbconn);
+        }
+
+        foreach ($this->_targets as $target) {
+            $target->processEvent($event);
+        }
+    }
+}
+
+/**
+ * tab_cb_logevent access query generate and execute.
+ *
+ * @package fw.logger
+ * @todo    move package fw.logger -> grn.logger
+ */
+class CB_LoggerQuery
+{
+    /**
+     * @access private
+     */
+    var $_dbconn;
+
+    /**
+     * @access private
+     */
+    var $_condition;
+
+    /**
+     * @access private
+     */
+    var $_order_condition;
+
+    /**
+     * @access private
+     */
+    var $_limit_condition;
+
+    /**
+     * @access privage
+     */
+    var $_force_index;
+
+    /**
+     * @access private
+     */
+    var $_result;
+
+    /**
+     * @access private
+     */
+    var $_is_calc;
+
+    /**
+     * @return CB_LoggerQuery
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new CB_LoggerQuery();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        global $G_container_base;
+        $this->_dbconn = $G_container_base->getInstance('dbconn');
+
+        $this->_condition = null;
+        $this->_order_condition = null;
+        $this->_limit_condition = null;
+        $this->_force_index = null;
+
+        $this->_result = null;
+        $this->_is_calc = false;
+    }
+
+    function queryf($format /* , $parm1, $param2, ... */)
+    {
+        $args = func_get_args();
+        array_shift($args);
+
+        return cb_vqueryf($this->_dbconn, $format, $args);
+    }
+
+    function setCondition($condition)
+    {
+        $this->_condition = $condition;
+    }
+
+    function setOrderCondition($order_condition)
+    {
+        $this->_order_condition = $order_condition;
+    }
+
+    function setLimitCondition($limit_condition)
+    {
+        $this->_limit_condition = $limit_condition;
+    }
+
+    function setForceIndex($force_index)
+    {
+        $this->_force_index = $force_index;
+    }
+
+    function calcFoundRows($is_calc = false)
+    {
+        $this->_is_calc = $is_calc;
+    }
+
+    function select($column = null)
+    {
+        $calc = '';
+        if ($this->_is_calc) {
+            $calc = ' SQL_CALC_FOUND_ROWS ';
+        }
+
+        if (is_null($column)) {
+            $column = '*';
+        }
+
+        $sql = 'SELECT ' . $calc . $column . ' FROM ' . CB_LOGGER_TABLENAME;
+
+        if ( ! is_null($this->_force_index)) {
+            $sql .= ' FORCE INDEX(' . $this->_force_index . ') ';
+        }
+
+        if ( ! is_null($this->_condition)) {
+            $sql .= ' WHERE ' . $this->_condition;
+        }
+        if ( ! is_null($this->_order_condition)) {
+            $sql .= ' ORDER BY ' . $this->_order_condition;
+        }
+        if ( ! is_null($this->_limit_condition)) {
+            $sql .= ' LIMIT ' . $this->_limit_condition;
+        }
+
+        $this->_result = $this->_dbconn->query($sql);
+
+        return $this->_result;
+    }
+
+    function delete()
+    {
+        $sql = 'DELETE FROM ' . CB_LOGGER_TABLENAME;
+        if ( ! is_null($this->_condition)) {
+            $sql .= ' WHERE ' . $this->_condition;
+        }
+
+        return $this->_dbconn->query($sql);
+    }
+
+    function fetch_assoc()
+    {
+        return $this->_dbconn->fetch_assoc($this->_result);
+    }
+
+    function get_found_rows()
+    {
+        return $this->_dbconn->get_found_rows();
+    }
+
+    function getCount($count_column = null, $count_condition = null)
+    {
+        if (is_null($count_column)) {
+            $count_column = '*';
+        } else {
+            $count_column = $this->escape($count_column);
+        }
+        $sql = 'SELECT COUNT(' . $count_column . ') AS c FROM '
+               . CB_LOGGER_TABLENAME;
+
+        if ( ! is_null($count_condition)) {
+            $sql .= ' WHERE ' . $count_condition;
+        }
+
+        $this->_result = $this->_dbconn->query($sql);
+        $row = $this->fetch_assoc();
+        if ( ! is_array($row) || 0 >= count($row)) {
+            $count = 0;
+        } else {
+            $count = $row['c'];
+        }
+
+        return $count;
+    }
+
+    function getDefaultCount($count_column = null)
+    {
+        if (is_null($count_column)) {
+            $count_column = '*';
+        } else {
+            $count_column = $this->escape($count_column);
+        }
+        $query_all = 'SELECT COUNT(' . $count_column . ') FROM '
+                     . CB_LOGGER_TABLENAME;
+        $query_by_fw_schedule = 'SELECT COUNT(' . $count_column . ') FROM '
+                                . CB_LOGGER_TABLENAME
+                                . ' WHERE col_category=\'fw.schedule\'';
+
+        $query = 'SELECT (' . $query_all . ') - ('
+                 . $query_by_fw_schedule . ') AS c';
+        $this->_result = $this->_dbconn->query($query);
+        $row = $this->fetch_assoc();
+        if ( ! is_array($row) || 0 >= count($row)) {
+            $count = 0;
+        } else {
+            $count = $row['c'];
+        }
+
+        return $count;
+    }
+
+    function getLogById($id)
+    {
+        $condition = " _id = '" . $this->escape($id) . "'";
+        $this->setCondition($condition);
+        $this->select();
+
+        return $this->fetch_assoc();
+    }
+
+    function deleteLogById($id)
+    {
+        $condition = " _id = '" . $this->escape($id) . "'";
+        $this->setCondition($condition);
+
+        return $this->delete();
+    }
+
+    function escape($param)
+    {
+        return $this->_dbconn->escape($param);
+    }
+
+    function freeResult()
+    {
+        $this->_dbconn->free_result($this->_result);
+    }
+}
+
+/**
+ * Generate and issue log events as instances of {@link CB_LogEvent}.
+ *
+ * @package fw.logger
+ */
+class CB_Logger
+{
+    // Most useful APIs are listed first.
+
+    /**
+     * @return bool   TRUE if "debug" priority logs will be processed.
+     */
+    function isDebugEnabled()
+    {
+        return $this->isPriorityEnabled(CB_LOGGER_DEBUG);
+    }
+
+    /**
+     * @return bool   TRUE if "info" priority logs will be processed.
+     */
+    function isInfoEnabled()
+    {
+        return $this->isPriorityEnabled(CB_LOGGER_INFO);
+    }
+
+    /**
+     * @return bool   TRUE if "notice" priority logs will be processed.
+     */
+    function isNoticeEnabled()
+    {
+        return $this->isPriorityEnabled(CB_LOGGER_NOTICE);
+    }
+
+    /**
+     * @return bool   TRUE if "warning" priority logs will be processed.
+     */
+    function isWarningEnabled()
+    {
+        return $this->isPriorityEnabled(CB_LOGGER_WARNING);
+    }
+
+    /**
+     * @return bool   TRUE if "error" priority logs will be processed.
+     */
+    function isErrorEnabled()
+    {
+        return $this->isPriorityEnabled(CB_LOGGER_ERROR);
+    }
+
+    /**
+     * @return bool   TRUE if "critical" priority logs will be processed.
+     */
+    function isCriticalEnabled()
+    {
+        return $this->isPriorityEnabled(CB_LOGGER_CRITICAL);
+    }
+
+    /**
+     * Determine if specified priority logs will be logged.
+     *
+     * @param int $priority
+     *
+     * @return bool   TRUE if specified priority logs will be processed.
+     */
+    function isPriorityEnabled($priority)
+    {
+        if (defined('ON_FOREST')) {
+            if ($priority === CB_LOGGER_DEBUG) {
+                return false;
+            }
+
+            return true;
+        }
+
+        return (array_key_exists($priority, $this->_priorities));
+    }
+
+    /**
+     * Issue "debug" log event.
+     *
+     * @param string $msg log message
+     */
+    function debug($msg)
+    {
+        $this->_log(CB_LOGGER_DEBUG, $msg);
+    }
+
+    /**
+     * Issue "info" log event.
+     *
+     * @param string $msg log message
+     */
+    function info($msg)
+    {
+        $this->_log(CB_LOGGER_INFO, $msg);
+    }
+
+    /**
+     * Issue "info" log event with action and target object information.
+     *
+     * @param string $action event action
+     * @param string $object event target object
+     * @param array  $params log params
+     */
+    function infoEx($action, $object, & $params)
+    {
+        /*
+        $this->_log( CB_LOGGER_INFO, $this->_createMessage( $action, $object, $params ),
+                    $action, $object );
+        */
+        $message = '';
+        if (is_string($params)) {
+            $message = $params;
+        } else {
+            $message = $this->_createMessage($action, $object, $params);
+        }
+        $this->_log(CB_LOGGER_INFO, $message, $action, $object);
+    }
+
+    /**
+     * Issue "notice" log event.
+     *
+     * @param string $msg log message
+     */
+    function notice($msg)
+    {
+        $this->_log(CB_LOGGER_NOTICE, $msg);
+    }
+
+    /**
+     * Issue "notice" log event with action and target object information.
+     *
+     * @param string $action event action
+     * @param string $object event target object
+     * @param array  $params log params
+     */
+    function noticeEx($action, $object, & $params, $valuables = null)
+    {
+        $message = '';
+        if (is_string($params)) {
+            $message = $params;
+        } else {
+            $message = $this->_createMessage($action, $object, $params,
+                $valuables);
+        }
+        $this->_log(CB_LOGGER_NOTICE, $message, $action, $object);
+    }
+
+    /**
+     * Issue "warning" log event.
+     *
+     * @param string $msg log message
+     */
+    function warning($msg)
+    {
+        $this->_log(CB_LOGGER_WARNING, $msg);
+    }
+
+    /**
+     * Issue "warning" log event with action and target object information.
+     *
+     * @param string $name   error name
+     * @param array  $params log params
+     */
+    function warningEx($name, & $params)
+    {
+        $message = '';
+        if (is_string($params)) {
+            $message = $params;
+        } else {
+            $message = $this->_createMessage(null, $name, $params);
+        }
+        $this->_log(CB_LOGGER_WARNING, $message);
+    }
+
+    /**
+     * Issue "error" log event.
+     *
+     * @param string $msg        log message
+     * @param string $error_code error code
+     */
+    function error($msg, $error_code = null)
+    {
+        $this->_log(CB_LOGGER_ERROR, $msg, null, null, $error_code);
+    }
+
+    /**
+     * Issue "critical" log event.
+     *
+     * @param string $msg log message
+     */
+    function critical($msg)
+    {
+        $this->_log(CB_LOGGER_CRITICAL, $msg);
+    }
+
+    function createMessage($action, $object, & $params, $valuables)
+    {
+        return $this->_createMessage($action, $object, $params, $valuables);
+    }
+
+    /**
+     * @access private
+     */
+    function _createMessage($action, $object, & $params, $valuables = null)
+    {
+        $temp = [];
+        if (is_array($params)) {
+            foreach ($params as $key => $value) {
+                if (strlen($value) > 0) {
+                    if ( ! is_numeric($value)) {
+                        if (is_array($valuables)
+                            && in_array($key, $valuables)
+                        ) {
+                            $value = "'" . addslashes($value) . "'";
+                        } else {
+                            $value = "'" . mb_substr(addslashes($value), 0, 100)
+                                     . "'";
+                        }
+                    }
+                    $temp[] = $key . ':' . $value;
+                }
+            }
+        }
+        $msg1 = '';
+        if (0 < count($temp)) {
+            $msg1 = ' (' . implode(', ', $temp) . ')';
+        }
+        $msg = '';
+        if ( ! is_null($action)) {
+            $msg .= '[' . $action . '] ';
+        }
+        $msg .= $object . $msg1;
+        if (cb_is_rest_api()) {
+            $msg .= REST_API_FOOTER;
+        }
+
+        return $msg;
+    }
+
+
+    /**
+     * Generic logging.
+     *
+     * @param int    $priority log priority.
+     * @param string $msg      log message
+     * @param string $action   action for inspection.
+     * @param string $object   target object for inspection.
+     */
+    function log($priority, $msg, $action = null, $object = null)
+    {
+        $this->_log($priority, $msg, $action, $object);
+    }
+
+    /**
+     * The fully qualified name of category.
+     *
+     * @access private
+     */
+    var $_category;
+
+    /**
+     * @access private
+     */
+    var $_priorities = [];
+
+    /**
+     * @access private
+     */
+    var $_user_name;
+
+    /**
+     * @access private
+     */
+    var $_user_account;
+
+    /**
+     * @access private
+     */
+    var $_dbconn;
+
+    /**
+     * PROTECTED!  DON'T INSTANTIATE THIS DIRECTLY!
+     * Use CB_LoggerManager::getLogger() to obtain one.
+     *
+     * @param string $category     Fully qualified name of category
+     * @param array               $$priorities     array of log targets for each priority.
+     * @param string $user_name    The user_name.
+     * @param string $user_account The foregin key of the user.
+     * @param object CB_DatabaseConnection $dbconn       Database connection.
+     *
+     * @access private
+     */
+    function __construct(
+        $category,
+        & $priorities,
+        $user_name,
+        $user_account,
+        $dbconn
+    ) {
+        $this->_category = $category;
+        // doesn't inherit configurations.
+        //$this->_priorities = $priorities; //don't use reference
+        $this->_user_name = $user_name;
+        $this->_user_account = $user_account;
+        $this->_dbconn = $dbconn;
+    }
+
+    /**
+     * @access private
+     */
+    var $_recur_target = true;
+
+    /**
+     * (Re)set log target.
+     *
+     * @param string $name     Specify the target name.
+     * @param object CB_LogTarget $target
+     * @param int    $priority The priority of the target.
+     */
+    function setTarget($name, $target, $priority)
+    {
+        $this->_recur_target = false;
+
+        $targets = $this->_getTargets($priority);
+
+        $targets->setTarget($name, $target);
+
+        // use keys instead of direct values to avoid object copy.
+        foreach (array_keys($this->_children) as $sub) {
+            $child = $this->_children[$sub];
+            $child->_recursiveSetTarget($name, $target, $priority);
+        }
+    }
+
+    /**
+     * @access private
+     */
+    function _recursiveSetTarget($name, $target, $priority)
+    {
+        if ( ! $this->_recur_target) {
+            return;
+        }
+
+        $targets = $this->_getTargets($priority);
+
+        $targets->setTarget($name, $target);
+
+        // use keys instead of direct values to avoid object copy.
+        foreach (array_keys($this->_children) as $sub) {
+            $child = $this->_children[$sub];
+            $child->_recursiveSetTarget($name, $target, $priority);
+        }
+    }
+
+    /**
+     * @access private
+     */
+    var $_recur_db_logging = true;
+
+    /**
+     * (Re)set db logging.
+     *
+     * @param string $priority The priority of db logging.
+     */
+    function setDBLogging($priority)
+    {
+        $this->_recur_db_logging = false;
+
+        $targets = $this->_getTargets($priority);
+
+        $targets->setDBLogging(true);
+
+        // use keys instead of direct values to avoid object copy.
+        foreach (array_keys($this->_children) as $sub) {
+            $child = $this->_children[$sub];
+            $child->_recursiveSetDBLogging($priority);
+        }
+    }
+
+    /**
+     * @access private
+     */
+    function _recursiveSetDBLogging($priority)
+    {
+        if ( ! $this->_recur_target) {
+            return;
+        }
+
+        $targets = $this->_getTargets($priority);
+
+        $targets->setDBLogging(true);
+
+        // use keys instead of direct values to avoid object copy.
+        foreach (array_keys($this->_children) as $sub) {
+            $child = $this->_children[$sub];
+            $child->_recursiveSetTarget($target, $priority);
+        }
+    }
+
+    /**
+     * @access private
+     * @return CB_Targets
+     */
+    function _getTargets($priority)
+    {
+        if (array_key_exists($priority, $this->_priorities)) {
+            $targets = $this->_priorities[$priority];
+        } else {
+            $targets = new CB_Targets();
+            $this->_priorities[$priority] = $targets;
+        }
+
+        return $targets;
+    }
+
+    /**
+     * Generic logging.
+     * Use more specific methods such as warning() if possible.
+     *
+     * @param int    $priority   log priority.
+     * @param string $msg        log message
+     * @param string $action     action for inspection.
+     * @param string $object     target object for inspection.
+     * @param string $error_code error code
+     *
+     * @access private
+     */
+    function _log(
+        $priority,
+        $msg,
+        $action = null,
+        $object = null,
+        $error_code = null
+    ) {
+        // threshold check
+        if ( ! $this->isPriorityEnabled($priority)) {
+            return;
+        }
+
+        $event = new CB_LogEvent();
+        $event->set('category', $this->_category);
+        $event->set('priority', $priority);
+        $event->set('msg', $msg);
+        $event->set('user', $this->_user_name);
+        $event->set('account', $this->_user_account);
+        $event->set('remote_host', @$_SERVER['REMOTE_HOST']);
+        $event->set('remote_addr', @$_SERVER['REMOTE_ADDR']);
+        $event->set('action', $action);
+        $event->set('object', $object);
+        $event->set('error_code', $error_code);
+
+        if (defined('ON_FOREST')) {
+            CB_AuditUtil::getInstance()->log($event);
+
+            return;
+        }
+
+        $targets = $this->_getTargets($priority);
+        $targets->processEvent($this->_dbconn, $event);
+
+    }
+
+    /**
+     * @access private
+     */
+    var $_children = [];
+
+    /**
+     * @return CB_Logger
+     */
+    function getChild($sub_category)
+    {
+        if ( ! array_key_exists($sub_category, $this->_children)) {
+            $category = is_null($this->_category)
+                ? $sub_category : $this->_category . '.' . $sub_category;
+            $this->_children[$sub_category] = new CB_Logger($category,
+                $this->_priorities,
+                $this->_user_name,
+                $this->_user_account,
+                $this->_dbconn);
+        }
+
+        return $this->_children[$sub_category];
+    }
+}
+
+/**
+ * Factory of {@link CB_LogTarget}.
+ *
+ * @package fw.logger
+ */
+class CB_LogTargetFactory extends CB_ModuleBase
+{
+    /**
+     * @return CB_LogTargetFactory
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new CB_LogTargetFactory();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        parent::__construct('fw.logger');
+        $this->_loader = $this->getPluginLoader();
+
+        // register embedded NULL log targets.
+        $dummy = null;
+        $this->registerLogTarget('null', $dummy);
+    }
+
+    /**
+     * Registered targets.
+     * This array keeps target objects that will be copied before
+     * returned by getLogTarget() .
+     *
+     * @access private
+     */
+    var $_targets = [];
+
+    /**
+     * @access private
+     */
+    var $_loader;
+
+    /**
+     * Return named {@link CB_LogTarget log target} object.
+     *
+     * If named target is not available, this will throw
+     * E_COMMON_MISSING_LOG_TARGET exception.
+     *
+     * @param string $target_name The name of the target.
+     *
+     * @return object CB_LogTarget
+     */
+    function getLogTarget($target_name)
+    {
+        $target = null;
+        if (array_key_exists($target_name, $this->_targets)) {
+            $target = $this->_targets[$target_name];
+        } else {
+            $target = $this->_loader->loadDriver($target_name);
+            if ($target === false) {
+                cb_throw_error(E_COMMON_MISSING_LOG_TARGET, null, null,
+                    ['target' => $target_name]);
+            }
+            $this->registerLogTarget($target_name, $target);
+        }
+
+        return $target;
+    }
+
+    /**
+     * Register a log target object to the factory.
+     *
+     * @param string $target_name The name of the target.
+     * @param object CB_LogTarget $target_object  Log target object.
+     */
+    function registerLogTarget($target_name, $target_object)
+    {
+        if ( ! is_null($target_object)) {
+            if ( ! is_a($target_object, 'CB_LogTarget')) {
+                cb_throw_error(E_COMMON_INVALID_LOG_TARGET);
+            }
+
+            // register with transaction manager.
+            $tm = CB_TransactionManager::getInstance();
+            $tm->register(CB_TRANSACTION_LEVEL_AUDIT, $target_object);
+        }
+
+        $this->_targets[$target_name] = $target_object;
+    }
+}
+
+/**
+ * Interface for log targets.
+ *
+ * @abstract
+ * @package fw.logger
+ */
+class CB_LogTarget implements CB_Transactional
+{
+    /**
+     * Log targets must have constructors with no arguments.
+     */
+    function __construct()
+    {
+    }
+
+    /**
+     * @param object CB_LogEvent $event
+     */
+    function processEvent($event)
+    {
+    }
+
+    public function commit()
+    {
+        return false;
+    }
+
+    public function abort()
+    {
+    }
+}
+
+/**
+ * Represent a log event.
+ *
+ * @package fw.logger
+ */
+class CB_LogEvent
+{
+    function __construct()
+    {
+        $this->timestamp = new CB_TimeStamp();
+        $this->timestamp->unix_ts = time();
+    }
+
+    var $timestamp = null;
+    var $category = '';
+    var $priority = CB_LOGGER_DEBUG;
+    var $msg = '';
+    var $user = '';
+    var $account = '';
+    var $remote_host = '';
+    var $remote_addr = '';
+    var $action = '';
+    var $object = '';
+    private $error_code = '';
+
+    function set($name, $value)
+    {
+        $this->$name = $value;
+    }
+
+    function &get($name)
+    {
+        return $this->$name;
+    }
+
+    function insert($dbconn)
+    {
+        $format
+            = "INSERT INTO %s VALUES (NULL, %d, '%s', %d, '%s', '%s', '%s', '%s', '%s', '%s', '%s');";
+        $sql = sprintf($format,
+            CB_LOGGER_TABLENAME,
+            $this->timestamp->unix_ts,
+            $dbconn->escape($this->category),
+            (int)$this->priority,
+            $dbconn->escape($this->msg),
+            $dbconn->escape($this->user),
+            $dbconn->escape($this->account),
+            $dbconn->escape($this->remote_host),
+            $dbconn->escape($this->remote_addr),
+            $dbconn->escape($this->action),
+            $dbconn->escape($this->object));
+
+        $dbconn->query($sql);
+    }
+}

@@ -1,0 +1,172 @@
+<?php
+/*
+* Created on 2007-03-30
+*
+* スケジュールフォロー追加
+* 
+* ■受信データ仕様 
+* 名前       | 必須 |   値    | 個数 | 備考
+* ----------------------------|------------------------------------------------------------------------
+* event      |  ○  | 数値    |  1   | ガルーン２のスケジュールID
+* data       |  ○  | 文字列  |  1   | フォローの本文
+* registrant |  ×  | 文字列  |  1   | スケジュールフォロー追加を行うユーザのログインアカウント
+*            |      |         |      | →coopLogin.cspにて、LoginAsを行う
+* app        |  ○  | 固定値  |  1   | "schedule"
+*            |      |         |      | →coopLogin.cspにて、各アプリケーションオブジェクトの生成時使用
+* ■機能
+* ・指定したスケジュールにフォローを追加する
+*/
+
+global $G_INPUT;
+
+// coopLogin.cspのファイル存在
+if ( ! is_file('coopLogin.csp')) {
+    global $G_state_set;
+    $G_state_set->set('copyright_should_be_written', false);
+    $G_state_set->set('html_should_be_closed', false);
+
+    include_once('error_code.csp');
+
+    header("X-Cybozu-Error:" . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Header Data><CR><LF>");
+    print("1," . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Footer Data><CR><LF>");
+    print("ERROR<CR><LF>");
+    cb_safe_exit();
+}
+
+// ログイン認証
+require('coopLogin.csp');
+
+// 受信データチェック
+$error_msg = null;
+
+if ( ! array_key_exists('event', $G_INPUT) || ! is_numeric($G_INPUT['event'])) {
+    $error_msg = 'event';
+} elseif ( ! array_key_exists('data', $G_INPUT)
+           || mb_strlen(cb_trim($G_INPUT['data'])) == 0
+) {
+    $error_msg = 'data';
+}
+
+if ($error_msg) {
+    include_once("error_code.csp");
+    api_response_data(null,
+        E_API_SCHEDULE_PARAM_WRONG . "[" . $error_msg . "]");
+    cb_safe_exit();
+}
+unset($error_msg);
+
+$event_id = @ $G_INPUT['event'];
+$follow = @ $G_INPUT['data'];
+$login = @ $G_login;
+
+//-------------------------------------------------
+//  スケジュールフォロー追加
+//-------------------------------------------------
+
+// イベントの取得
+require_once('fw/string_util.csp');
+require_once('schedule/application.csp');
+$app = GRN_Schedule_Application::getInstance();
+
+$event = &$app->getEvent($login, $event_id, null);
+
+if ( ! $event) {
+    require_once('schedule/error_code.csp');
+    cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+}
+
+// 繰り返し予定、仮予定ははじく
+if (is_a($event, 'GRN_Schedule_RepeatEvent')) {
+    include_once("error_code.csp");
+    api_response_data(null, E_API_SCHEDULE_FOLLOW_ADD_REPEAT_PERMIT);
+    cb_safe_exit();
+}
+if (is_a($event, 'GRN_Schedule_TemporaryEvent')) {
+    include_once("error_code.csp");
+    api_response_data(null, E_API_SCHEDULE_FOLLOW_ADD_ADJUST_PERMIT);
+    cb_safe_exit();
+}
+
+// アクセス権のチェック
+require_once('schedule/access_logic.csp');
+$acc_logic = GRN_Schedule_Access_Logic::getInstance();
+$dynamic_role = $uum->listGrantedRoles();
+$access = $acc_logic->getEventAccess($login, $event,
+    ['read', 'add', 'modify', 'delete'], $dynamic_role);
+
+if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+    require_once('schedule/error_code.csp');
+    cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+}
+
+if ($access['add'] == GRN_SCHD_ACCESS_DENY
+    && $access['modify'] == GRN_SCHD_ACCESS_DENY
+    && $access['delete'] == GRN_SCHD_ACCESS_DENY
+) {
+    require_once('schedule/error_code.csp');
+    cb_throw_error(E_GRN_SCHD_DENYENTRY_EVENTFOLLOW);
+}
+
+// $followの書き込み
+$logic = &$app->_getEventBaseLogic();
+$eventtable = &$logic->_getEventTable();
+$eventrow = &$eventtable->getRow($event_id);
+if ( ! $eventrow) {
+    require_once('schedule/error_code.csp');
+    cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+}
+$followtable = &$logic->_getFollowTable();
+$row = &$followtable->newRow();
+$row->set(GRN_SCHEDULE_EVENT, $eventrow);
+$row->set(GRN_SCHEDULE_FOLLOW, $follow);
+$row->onCreate($login);
+$follow_id = $row->getOID();
+
+// 通知処理
+$b_notify = true;
+$tsex = new CB_TimeStampEx();
+$notify_date = $tsex->getDate();
+$title = '';
+
+unset($tsex);
+$tsex = new CB_TimeStampEx();
+$today = $tsex->getDate();
+$date = $event->getFirstDate($today);
+
+if ($notify_date->compare($date) > 0) {
+    $b_notify = false;
+} else {
+    require_once('schedule/notification.csp');
+    $util = GRN_Schedule_Notify_Logic::getInstance();
+    if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+        $title = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+    } /*    else if( is_a( $event, 'GRN_Schedule_RepeatEvent' ) )
+    {
+        $title = $util->getNotifyTitle( $notify_date, $event->setdatetime, html_entity_decode( $event->getTitle() ) );
+    }*/
+    elseif (is_a($event, 'GRN_Schedule_BannerEvent')) {
+        $title = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+    }
+    /*    else if( is_a( $event, 'GRN_Schedule_TemporaryEvent' ) )
+        {
+            $title = $util->getNotifyTitle( $notify_date, $event->setdatetime, html_entity_decode( $event->getTitle() ) );
+        }*/
+}
+
+if ($b_notify && $event->users && count($event->users) > 0) {
+    $app->setNotify($event->users, $login, $event, $date, $title, $follow,
+        GRN_SCHEDULE_NOTIFY_FOLLOWENTRY, $tsex);
+}
+
+// 通知先の指定がある場合
+if ($b_notify && $event->private && is_array($event->notify_address)
+    && count($event->notify_address) > 0
+) {
+    $app->sendNotificationsToPublic($login, $event, $date, $follow, $tsex,
+        $title, false, false, GRN_SCHEDULE_NOTIFY_FOLLOWENTRY);
+}
+
+api_response_data($follow_id, null);
+

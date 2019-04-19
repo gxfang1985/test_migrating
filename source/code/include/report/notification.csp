@@ -1,0 +1,466 @@
+<?php
+
+/**
+ * Report Notification
+ *
+ * @date    2009/09
+ * @version 1.0
+ * @package grn.report
+ */
+require_once('grn/application.csp');
+
+class GRN_Report_Notification_Listener
+{
+    /**
+     * @access  private
+     */
+    var $_uum = null;
+    /**
+     * @access  private
+     */
+    var $_dbconn = null;
+    /**
+     * @access  private
+     */
+    var $_service = null;
+
+    /**
+     * コンストラクタ
+     */
+    function __construct()
+    {
+        global $G_container_base;
+        $this->_uum = $G_container_base->getInstance('uum');
+        $app_locator = GRN_ApplicationLocator::instance();
+        $this->_dbconn = $app_locator->getConnection('report');
+
+        require_once('grn/notification.csp');
+        $this->_service = GRN_Notification_Service::getInstance();
+    }
+
+    private static $_instance = null;
+
+    /**
+     * シングルトンを取得
+     *
+     * @return GRN_Report_Notification_Listener
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * （永続化レイヤで）ユーザーリストを取得
+     */
+    function _getUsers($uids)
+    {
+        $limit = count($uids);
+        $order_by = 'col_position,_id';
+        foreach ($uids as $key => $value) {
+            $uids[$key] = cb_queryf($this->_dbconn, "'@S'", $value);
+        }
+        $uids = implode(',', $uids);
+        $condition = "_id IN({$uids})";
+
+        return $this->_uum->getUsers(0, $limit, $order_by, $condition);
+    }
+
+    /**
+     * Send Notification
+     *
+     * @param   int          $mode      Notification Mode
+     * @param   array        $uids      Notification UIDs
+     * @param   object CB_User  $user           Notificator
+     * @param   int          $report_id Report ID
+     * @param   CB_TimeStamp $timestamp Timestamp
+     *
+     * @pamra   string          $abstract       Follow Abstract
+     */
+    function sendList(
+        $mode,
+        $uids,
+        & $user,
+        $report_id,
+        $timestamp,
+        $abstract = ''
+    ) {
+        require_once('report/report_logic.csp');
+        $logic = GRN_Report_Report_Logic::getInstance();
+        $report = $logic->getDirect($report_id);
+        $user_id = $user->getOID();
+
+        require_once('report/controller_util.csp');
+        $report_util = GRN_Report_Report_Controller_Utility::getInstance();
+        $subject = $report_util->getSubject($report_id);
+
+        require_once('grn/notification.csp');
+        $notification_data = new GRN_Notification_Data();
+        $notification_data->setModuleId(GRN_REPORT_MODULE_ID);
+        $notification_data->setUniqueId($report_id);
+
+        require_once('report/filerelation_logic.csp');
+        $filerelation_logic = GRN_Report_FileRelation_Logic::getInstance();
+        $file_count
+            = $filerelation_logic->getTotalItemDataFileCount($report_id);
+
+        $org_data = [
+            'rid'  => $report_id,
+            'file' => $file_count
+        ];
+
+        //Set Abstract and/or actionId
+        switch ($mode) {
+            case GRN_REPORT_NOTIFY_FOLLOWENTRY:
+                $org_data['follow'] = true;
+                $notification_data->setAbstractData($abstract);
+                $notification_data->setActionId(GRN_NOTIFICATION_ACTION_UPDATE_ID);
+                break;
+            case GRN_REPORT_NOTIFY_ENTRY:
+                $notification_data->setAbstractData($this->cb_msg('grn.report',
+                    'notify_entry'));
+                $notification_data->setActionId(GRN_NOTIFICATION_ACTION_CREATE_ID);
+                break;
+            case GRN_REPORT_NOTIFY_MODIFY:
+                $notification_data->setAbstractData($this->cb_msg('grn.report',
+                    'notify_modify'));
+                $notification_data->setActionId(GRN_NOTIFICATION_ACTION_UPDATE_ID);
+                break;
+            case GRN_REPORT_NOTIFY_FOLLOWDELETE:
+                $notification_data->setActionId(GRN_NOTIFICATION_ACTION_UPDATE_ID);
+                break;
+            case GRN_REPORT_NOTIFY_DELETE:
+                $notification_data->setActionId(GRN_NOTIFICATION_ACTION_DELETE_ID);
+                break;
+        }
+
+        $notification_data->setOrgData($org_data);
+        $notification_data->setSubjectData($subject);
+        $notification_data->setSenderData($user->get('display_name'), $user_id);
+        $notification_data->setTimeStampData($timestamp);
+
+        //Set Status
+        if ($mode == GRN_REPORT_NOTIFY_ENTRY) {
+            $notification_data->setStatusToUnread();
+        } else {
+            $notification_data->setStatusToUpdate();
+        }
+
+        //Get Old Notifications
+        $users = [];
+        foreach ($uids as $k => $uid) {
+            $member = $this->_uum->getUser($uid);
+
+            //ユーザーが削除されている場合もある
+            if (is_object($member) && is_a($member, 'CB_User')) {
+                $users[$uid] =& $member;
+            } else {
+                unset($uids[$k]);
+            }
+        }
+        $old_notifications
+            = $this->_service->getNotifyDataListPropertiesByUser($users,
+            GRN_REPORT_MODULE_ID, $report_id);
+        if ( ! is_array($old_notifications)
+             || count($old_notifications) === 0
+        ) {
+            $old_notifications = false;
+        }
+
+        //Get Report Members and Notification
+        require_once('report/member_manager.csp');
+        $member_manager = GRN_Report_Member_Manager::getInstance();
+        $members =& $member_manager->getList($report_id);
+        require_once('report/notification_manager.csp');
+        $notification_manager = GRN_Report_Notification_Manager::getInstance();
+        $notification =& $notification_manager->getList($report_id);
+
+        //Determine Notification Type By Each User
+        $delete_uids = [];
+        $add_uids = [];
+        $unread_uids = [];
+        $update_uids = [];
+        foreach ($uids as $uid) {
+            // Not notify to Notificator
+            if ($uid == $user_id) {
+                continue;
+            }
+
+            // Check Report View Right
+            if ( ! in_array($uid, $members)
+                 && ! in_array($uid, $notification)
+            ) {
+                require_once('report/controller_util.csp');
+                $category_util
+                    = GRN_Report_Category_Controller_Utility::getInstance();
+                if ( ! is_null($report['col_category'])
+                     && ! $category_util->checkAccess($report['col_category'],
+                        false, CB_DATABASE_DEFAULT_LOCK, false, $uid)
+                ) {
+                    // Delete Subscribe Data
+                    require_once('report/subscribe_logic.csp');
+                    $subscribe_logic
+                        = GRN_Report_Subscribe_Logic::getInstance();
+                    $subscribe_logic->delete($report_id, $uid);
+                    continue;
+                }
+            }
+
+            switch ($mode) {
+                case GRN_REPORT_NOTIFY_FOLLOWDELETE:
+                    if ( ! $this->_checkConfirmTime($uid, $report,
+                        $notification_data)
+                    ) {
+                        $delete_uids[] = $uid;
+                        continue;
+                    }
+                    break;
+                case GRN_REPORT_NOTIFY_ENTRY:
+                    $add_uids[] = $uid;
+                    break;
+                default:
+                    if ($old_notifications !== false) {
+                        if (array_key_exists($uid, $old_notifications)) {
+                            if (GRN_NOTIFICATION_DATA_STATUS_UNREAD
+                                == $old_notifications[$uid]['col_status']
+                            ) {
+                                $unread_uids[] = $uid;
+                                break;
+                            }
+                        }
+                    }
+                    $update_uids[] = $uid;
+                    break;
+            }
+        }
+
+        if (0 < count($delete_uids)) {
+            $this->_service->deleteNotifyDataListByUser($this->_getUsers($delete_uids),
+                GRN_REPORT_MODULE_ID, $report_id);
+        }
+        if (0 < count($add_uids)) {
+            $this->_service->modifyNotifyDataListByUser($this->_getUsers($add_uids),
+                $notification_data, true);
+        }
+        if (0 < count($unread_uids)) {
+            $notification_data->setStatusToUnread();
+            $this->_service->modifyNotifyDataListByUser($this->_getUsers($unread_uids),
+                $notification_data, true);
+        }
+        if (0 < count($update_uids)) {
+            $notification_data->setStatusToUpdate();
+            $this->_service->modifyNotifyDataListByUser($this->_getUsers($update_uids),
+                $notification_data, true);
+        }
+    }
+
+    /**
+     * Check Notification Data After Deleting Follow
+     *
+     * @access private
+     */
+    function _checkConfirmTime($user_id, & $report, & $notification_data)
+    {
+        $timestamp = 0;
+        // Get Confirm Time
+        $row = $this->_getConfirmData($user_id, $report['_id']);
+        if ($row) {
+            $timestamp = intval($row['col_timestamp']);
+        }
+
+        static $ctime = null;
+        static $mtime = null;
+        static $ftime = null;
+        static $report_creator_id = null;
+        static $report_creator_name = null;
+        static $report_modifier_id = null;
+        static $report_modifier_name = null;
+        static $follow_data = null;
+        static $follow_creator_id = null;
+        static $follow_cname = null;
+        if (is_null($ctime)) {
+            // Get Last Operation Information
+            $ctime = $report['col_ctime'];
+            $mtime = $report['col_mtime'];
+
+            $report_creator_id = $report['col_creator'];
+            $report_creator_name = $report['col_creator_name'];
+
+            $report_modifier_id = $report['col_modifier'];
+            $report_modifier_name = $report['col_modifier_name'];
+
+            // Get Last Follow Information
+            $ftime = 0;
+            if ($report['col_last_follow_id']) {
+                require_once('report/follow_manager_base.csp');
+                $follow_manager_base
+                    = GRN_Report_Follow_Manager_Base::getInstance();
+                $follow
+                    = &$follow_manager_base->getDirect($report['col_last_follow_id']);
+                $ftime = $follow['col_ctime'];
+                $follow_creator_id = $follow['col_creator'];
+                $follow_creator_name = $follow['col_creator_name'];
+                $follow_data = $follow['col_data'];
+            }
+        }
+
+        $action_time = 0;
+        $type = GRN_REPORT_NOTIFY_ENTRY;
+        $sender_name = '';
+        $sender_id = '';
+
+        if ($ctime < $mtime) {
+            if ($mtime < $ftime) {
+                $action_time = $ftime;
+                $notification_data->setAbstractData($follow_data);
+                $sender_id = $follow_creator_id;
+                $sender_name = $follow_creator_name;
+            } else {
+                $action_time = $mtime;
+                $notification_data->setAbstractData($this->cb_msg('grn.report',
+                    'notify_modify'));
+                $sender_id = $report_modifier_id;
+                $sender_name = $report_modifier_name;
+            }
+        } else {
+            if ($ctime < $ftime) {
+                $action_time = $ftime;
+                $notification_data->setAbstractData($follow_data);
+                $sender_id = $follow_creator_id;
+                $sender_name = $follow_creator_name;
+            } else {
+                $action_time = $ctime;
+                $notification_data->setAbstractData($this->cb_msg('grn.report',
+                    'notify_entry'));
+                $sender_id = $report_creator_id;
+                $sender_name = $report_creator_name;
+
+                // Remove Notification if Sender is User
+                if ($sender_id == $user_id) {
+                    return false;
+                }
+            }
+        }
+
+        // Not Notify if already Confirmed
+        if ($action_time <= $timestamp) {
+            $notification_data->setStatusToConfirm();
+        } else {
+            $notification_data->setStatusToUnread();
+        }
+
+        $timestamp = new CB_TimeStamp();
+        $timestamp->unix_ts = $action_time;
+        $notification_data->setTimeStampData($timestamp);
+        $notification_data->setSenderData($sender_name, $sender_id);
+
+        return true;
+    }
+
+    /**
+     * Confirm Notification
+     *
+     * @param  int $user_id   User ID
+     * @param  int $report_id Report ID
+     */
+    function confirm($user_id, $report_id)
+    {
+        $user =& $this->_uum->getUser($user_id);
+        $notification_data = $this->_service->getNotifyDataProperties($user,
+            GRN_REPORT_MODULE_ID, $report_id);
+        if ($notification_data) {
+            if ($notification_data->isStatusUnread()
+                || $notification_data->isStatusUpdated()
+            ) {
+                $notification_data->setStatusToConfirm();
+                $this->_service->modifyNotifyData($user, $notification_data,
+                    true, false);
+            }
+        }
+    }
+
+    /**
+     * Remove Notification from multiple users
+     *
+     * @param  array $uids      User IDs
+     * @param  int   $report_id Report ID
+     */
+    function removeList($uids, $report_id)
+    {
+        foreach ($uids as $key => $value) {
+            $uids[$key] = cb_queryf($this->_dbconn, "'@S'", $value);
+        }
+        $uids = implode(',', $uids);
+        $condition = "_id IN({$uids})";
+        $users = $this->_uum->getUsers(0, -1, 'col_position,_id',
+            $condition);
+
+        if (is_array($users) && 0 < count($users)) {
+            $user = current($users);
+            $notification_data = $this->_service->getNotifyDataProperties($user,
+                GRN_REPORT_MODULE_ID, $report_id);
+            if ($notification_data) {
+                $abstract_data = $notification_data->getAbstractData();
+                $subject_data = $notification_data->getSubjectData();
+                $sender_data = $notification_data->getSenderData();
+                $status_data = $notification_data->getStatusData();
+
+                $timestamp = new CB_TimeStamp();
+                $timestamp->unix_ts = time();
+
+                require_once('grn/notification.csp');
+                $history_data = new GRN_Notification_Data();
+                $history_data->setModuleId(GRN_REPORT_MODULE_ID);
+                $history_data->setUniqueId($report_id);
+                $history_data->setOrgData(['rid' => $report_id]);
+                $history_data->setAbstractData($abstract_data[0]);
+                $history_data->setSubjectData($subject_data[0]);
+                $history_data->setSenderData($sender_data['name'],
+                    $sender_data['id']);
+                $history_data->setTimeStampData($timestamp);
+                $history_data->setStatusToUnread($status_data);
+
+                $this->_service->modifyHistoryDataListByUser($users,
+                    $history_data, true);
+            }
+
+            $this->_service->deleteNotifyDataListByUser($users,
+                GRN_REPORT_MODULE_ID, $report_id);
+        }
+    }
+
+    function removeAll($report_id)
+    {
+        require_once('grn/notification.csp');
+        $this->_service->deleteNotifyDataForAllUser(GRN_REPORT_MODULE_ID,
+            $report_id);
+    }
+
+    function confirmNotification($user_id, $report_id, $ts)
+    {
+        $user = $this->_uum->getUser($user_id);
+        $notification_data = $this->_service->getNotifyDataProperties($user,
+            GRN_REPORT_MODULE_ID, $report_id);
+
+        if ($notification_data) {
+            if ( ! $notification_data->isStatusConfirmed()) {
+                $this->_service->confirmNotifyData($user, GRN_REPORT_MODULE_ID,
+                    $report_id, $ts);
+            }
+        }
+    }
+
+    public static function cb_msg($module, $resourceKey, $args = null)
+    {
+        require_once('fw/i18n.csp');
+
+        return cb_msg($module, $resourceKey, $args, GRN_REPORT_NOTIFY_LOCALE);
+    }
+}
+
+

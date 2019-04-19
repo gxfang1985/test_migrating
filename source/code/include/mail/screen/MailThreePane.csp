@@ -1,0 +1,477 @@
+<?php
+
+namespace grn\mail\screen;
+
+use grn\fts\Application as FtsApplication;
+use grn\grn\access\service\AppAccess;
+use grn\grn\GrnException;
+use grn\grn\Validate;
+use grn\mail\screen\MailView;
+
+require_once('mail/resources.csp');
+
+class MailThreePane extends MailScreenBase
+{
+    private $_account_data;
+    private $_size_error;
+
+    public function fetch()
+    {
+        $input = $this->getInput();
+        $app_name = $this->getMailApp()->getName();
+
+        require_once('grn/smarty.csp');
+        $smarty = new \GRN_Smarty();
+
+        $personal_config = $this->getPersonalConfig();
+        $system_config = $this->getSystemConfig();
+
+        // アカウント設定数を取得する
+        $account_data_count = $personal_config->getAccountDataCount();
+
+        $no_setting = $this->getArrayValue('no_setting', $input);
+        if ($no_setting == '3' || $no_setting == '2' || $no_setting == '1') {
+            $page_title = grn_get_page_display_name(self::PAGE_INDEX);
+        } elseif ($account_data_count == 0) {
+            // サーバー設定数を取得する
+            $server_data_count = $system_config->getServerDataCount();
+            if (($account_data_count == 0) && ($server_data_count == 0)) {
+                $no_setting = '3';
+            } elseif ($account_data_count == 0) {
+                $no_setting = '2';
+            } elseif ($server_data_count == 0) {
+                $no_setting = '1';
+            } else {
+                $no_setting = '0';
+            }
+
+            $page_title = grn_get_page_display_name(self::PAGE_INDEX);
+        } else {
+            $no_setting = '0';
+            $login_user = $this->getLoginUser();
+            $login_user_id = $login_user->getOID();
+
+            $folder_logic = $this->getFolderLogic();
+            $mail_logic = $this->getMailLogic();
+            $recv_logic = $this->getReceiveLogic();
+
+            //アカウントデータリスト
+            $account_list = $this->getAccountList();
+            $account_list_view = $this->getAccountListForView($account_list);
+
+            $received = $this->getArrayValue(self::ARG_RECEIVE, $input);
+            $status_id = $this->getStatusId();
+            $account_id = $this->getAccountId();
+            $category_id = $this->getCategoryId($account_id);
+
+            $session = $this->getSession();
+            $mail_id = $session->get('view_mid');
+            if (Validate::isNumber($mail_id)) {
+                $mail_data = $mail_logic->getMailData($mail_id);
+                $account_id = $mail_data['account_id'];
+                $category_id = $mail_data['folder_id'];
+                $smarty->assign('mail_list_component', new MailList([
+                    self::ARG_MAIL_ID     => $mail_id,
+                    self::ARG_ACCOUNT_ID  => $account_id,
+                    self::ARG_CATEGORY_ID => $category_id
+                ]));
+                $smarty->assign('mail_view_component', new MailView([
+                    self::ARG_MAIL_ID    => $mail_id,
+                    self::IS_OPEN_STATUS => true
+                ]));
+                $smarty->assign('is_open_status', true);
+                $smarty->assign('mail_id', $mail_id);
+                $session->unset_by('view_mid');
+            }
+
+            $folder_data = $this->getFolderData($account_id,
+                $category_id);
+            $category_for_view = $this->getCategoryForView($folder_data,
+                $account_id, $category_id);
+            if ( ! is_null($folder_data)
+                 && strcmp($category_for_view['type'], '5') === 0
+            ) {
+                $category_for_view['title'] = $folder_data['name'];
+            }
+            $smarty->assign('category', $category_for_view);
+
+            $size_over = $this->checkMailSizeOver($user_limit, $mail_size);
+            $this->checkSendAndReceive($smarty, $size_over, $cannot_send,
+                $cannot_recv, $no_account_for_send, $no_account_for_recv,
+                $no_server_for_send, $no_server_for_recv);
+            $this->createNotes($smarty, $size_over, $user_limit, $mail_size);
+            $this->checkExternalNotification($smarty);
+
+            require_once('grn/file.csp');
+            // 全アカウントのフォルダ情報取得
+            $folder_list_for_view = [];
+            $folder_list_for_view['data'] = [];
+            if (is_array($account_list)) {
+                $total_email_usage = 0;
+                foreach ($account_list as $key => $account) {
+                    if ($key == $account_id) {
+                        $temp_cid = $category_id;
+                    } else {
+                        // 受信箱データ取得
+                        $temp_data = $folder_logic->getSpecialFolderData($key,
+                            GRN_MAIL_FOLDER_CODE_INBOX, false);
+                        $temp_cid = $temp_data['id'];
+                    }
+                    $folder_list_for_view['data'][] = [
+                        'aid' => $key,
+                        'cid' => $temp_cid
+                    ];
+                    $total_email_usage = $total_email_usage
+                                         + $account['mail_size'];
+                    $folder_list_for_view['data_balloon'][]
+                        = [
+                        'email' => $account['account_info']->email,
+                        'size'  => grn_get_filesize_format_for_mail($account['mail_size'],
+                            null, 2),
+                        'title' => $account['title']
+                    ];
+                }
+            }
+            $folder_list_for_view['selected'] = $account_id;
+            $has_sibling_folders
+                = $folder_logic->siblingFolderExists($category_id);
+
+            // アカウントごとのフォルダ表示切替のためのフォルダ一覧データ
+            $smarty->assign('folder_list', $folder_list_for_view);
+            //同階層フォルダの有無
+            $smarty->assign('has_sibling_folders', $has_sibling_folders);
+
+            // メールサイズの使用状況
+            if (($user_limit >= 0)) {
+                $percent_usage = round(($total_email_usage / ($user_limit * 1024
+                                                              * 1024)) * 100,
+                    2);
+                $width_percent = round(($percent_usage * 48) / 100,
+                    2);//48 : full
+            } else {
+                $percent_usage = -1;
+                $width_percent = 0;
+            }
+
+            // total user disk size (mail)
+            $temp_total_email_usage = explode(" ",
+                grn_get_filesize_format_for_mail($total_email_usage, null, 2));
+            if (is_array($temp_total_email_usage)) {
+                $temp_total_email_usage = $temp_total_email_usage[0]
+                                          . $temp_total_email_usage[1];
+                $smarty->assign('total_email_usage', $temp_total_email_usage);
+            } else {
+                $smarty->assign('total_email_usage',
+                    grn_get_filesize_format_for_mail($total_email_usage, null,
+                        2));
+            }
+            $smarty->assign('percent_usage', $percent_usage);
+            $smarty->assign('width_percent', $width_percent);
+
+            if (count($account_list_view) > 1) {
+                $smarty->assign('show_another_account', 1);
+            }
+
+            // 開封確認設定使用権限
+            $can_use_confirm = $system_config->canUserUseConfirm();
+            $smarty->assign('use_confirm', $can_use_confirm);
+
+            // ごみ箱を使用する設定
+            $personal_config->getTrashSetting($use_trash, $save_days);
+            //ごみ箱保存日数
+            $smarty->assign('savedays', $save_days);
+
+            //account list (user_account list)
+            $smarty->assign('account_id', $account_id);
+            $smarty->assign('account_list', $account_list_view);
+
+            // メールの使用が許可されているか
+            $system_config->getGeneralSetting($general_settings);
+            $disable_mail = $general_settings['disable_mail'];
+            $smarty->assign('disable_mail', $disable_mail);
+            $smarty->assign("mail_automation_available",
+                $general_settings['automatic_mail']);
+
+            // 一括メール受信が使用不可かどうか
+            if ( ! $system_config->canUserAllReceiveMail()) {
+                $smarty->assign('cannot_all_receive', 1);
+            }
+
+            // folder tree
+            $tree_for_view = $this->getFolderTree($account_id, $category_id);
+            if ($tree_for_view) {
+                $smarty->assign('folder_tree', $tree_for_view);
+            }
+
+            // statuses
+            if ($system_config->canUserUseStatus()
+                && $personal_config->useStatus()
+            ) {
+                $smarty->assign('status_infos', $this->getStatusInfos());
+                $smarty->assign('change_status_infos',
+                    $this->getChangeStatusInfos());
+            } else {
+                $smarty->assign('status_infos', []);
+                $smarty->assign('change_status_infos', []);
+                $smarty->assign('no_status', '1');
+            }
+
+            // ソート設定
+            $this->setSortParameters();
+            $smarty->assign('sort', $this->getSort());
+            $smarty->assign('sort_col', $this->getSort());
+            $smarty->assign('sort_time', $this->getSortTime());
+            $smarty->assign('reverse', $this->getReverse());
+
+            $smarty->assign('status_id', $status_id);
+
+            // データの自動削除
+            $mail_logic->cleanOldMailData($login_user);
+
+            if (FtsApplication::isViewable()) {
+                $smarty->assign('use_fts', true);
+            }
+
+            $folder_code = $this->getArrayValue('code', $folder_data);
+            switch ($folder_code) {
+                case GRN_MAIL_FOLDER_CODE_INBOX:
+                    $page_title = grn_get_page_display_name(self::PAGE_INDEX);
+                    break;
+                case GRN_MAIL_FOLDER_CODE_SENTBOX:
+                    $page_title = grn_get_page_display_name(self::PAGE_OUTBOX);
+                    break;
+                case GRN_MAIL_FOLDER_CODE_UNSENT:
+                    $page_title
+                        = grn_get_page_display_name(self::PAGE_DRAFTBOX);
+                    break;
+                case GRN_MAIL_FOLDER_CODE_TRASH:
+                    $page_title
+                        = grn_get_page_display_name(self::PAGE_GARBAGEBOX);
+                    break;
+                default:
+                    $page_title
+                        = grn_get_page_display_name(self::PAGE_CATEGORY_LIST);
+                    break;
+            }
+
+            $utility = $this->getUtility();
+            $pane_info = $utility->getPaneInfo();
+            $smarty->assign('pane_info', $pane_info);
+
+            $draft_data = $folder_logic->getSpecialFolderData($account_id,
+                GRN_MAIL_FOLDER_CODE_UNSENT);
+            $smarty->assign('draft_folder_id', $draft_data['id']);
+            $trash_data = $folder_logic->getSpecialFolderData($account_id,
+                GRN_MAIL_FOLDER_CODE_TRASH);
+            $smarty->assign('trash_folder_id', $trash_data['id']);
+            $sent_data = $folder_logic->getSpecialFolderData($account_id,
+                GRN_MAIL_FOLDER_CODE_SENTBOX);
+            $smarty->assign('sent_folder_id', $sent_data['id']);
+
+            $smarty->assign('category_id', $category_id);
+
+            // check whether module Messages is active or not for link transfer
+            require_once('grn/application.csp');
+            $locator = \GRN_ApplicationLocator::instance();
+            $link_transfer_mail_to_message = true;
+            if ( ! ($app = $locator->getInstance('message'))) {
+                $link_transfer_mail_to_message = false;
+            } else {
+                $smarty->assign('message_name', $app->getName());
+            }
+
+            if ( ! AppAccess::isAppAvailableExternalAccess('message')) {
+                $link_transfer_mail_to_message = false;
+            }
+
+            $smarty->assign('link_transfer_mail_to_message',
+                $link_transfer_mail_to_message);
+        }
+
+        $smarty->assign('page_title', $page_title);
+
+        $smarty->assign('app_name', $app_name);
+
+        // 0はOK、1はメールサーバーがまだ 2はアカウントがまだ 3は両方まだ
+        $smarty->assign('no_setting', $no_setting);
+
+        $smarty->assign('mail_3pane', true);
+
+        $smarty->assign('navi_num', self::MORE_VIEW_COUNT);
+
+        $smarty->assign('copyright', cb_get_copyright(CB_TYPE_TEXT));
+        $smarty->assign('product_term', cb_get_product_term(CB_TYPE_TEXT));
+
+        return $smarty->fetch('mail/index_3pane.tpl');
+    }
+
+    public function changePane()
+    {
+        $input = $this->getInput();
+        $pane = array_key_exists('pane', $input) ? $input['pane'] : null;
+        if ( ! Validate::isIn($pane, [2, 3])) {
+            return false;
+        }
+
+        $personal_config = $this->getPersonalConfig();
+
+        return $personal_config->setPersonalPane((int)$pane);
+    }
+
+    public function changePaneInfo($input)
+    {
+        $this->setInput($input);
+
+        $pane_info = [];
+        if (Validate::isNumber(@$input['left'])) {
+            $pane_info['left'] = (int)$input['left'];
+        }
+        if (Validate::isNumber(@$input['middle'])) {
+            $pane_info['middle'] = (int)$input['middle'];
+        }
+
+        $personal_config = $this->getPersonalConfig();
+
+        return $personal_config->setPaneInfo($pane_info);
+    }
+
+    public function redirectToIndexFromView()
+    {
+        $input = $this->getInput();
+        $mail_logic = $this->getMailLogic();
+        $mail_id = $this->getArrayValue(self::ARG_MAIL_ID, $input);
+        $mail_data = $mail_logic->getMailData($mail_id);
+
+        $session = $this->getSession();
+        $session->set('view_mid', $mail_id);
+        cb_redirect('mail/index', ['aid' => $mail_data['account_id']]);
+    }
+
+    private function createNotes($smarty, $size_over, $user_limit, $mail_size)
+    {
+        $personal_config = $this->getPersonalConfig();
+        $recv_logic = $this->getReceiveLogic();
+        $account_id = $this->getAccountId();
+        $category_id = $this->getCategoryId($account_id);
+        $app_name = $this->getMailApp()->getName();
+
+        $this->_account_data = $personal_config->getAccountData($account_id,
+            true, false);
+
+        // サイズエラーで受信できなかったメールが存在する
+        $this->_size_error
+            = $recv_logic->getPop3ErrorMailDataCount($account_id);
+        $smarty->assign('size_error', $this->_size_error);
+
+        // メールの総サイズオーバー
+        if ($size_over) {
+            $smarty->assign('size_over', $size_over); // 1:オーバーしている時
+        }
+
+        // メールの総サイズ
+        $smarty->assign('mailbox_size', $user_limit . 'MB');
+        // ユーザーのメール総サイズ
+        $smarty->assign('mail_size', $mail_size);
+
+        // deleted account
+        if ($this->_account_data['deleted']) {
+            $title = '';
+            if ( ! is_null($this->_account_data)) {
+                $title = $this->_account_data['title'];
+            }
+            //mail account delete info
+            $account_delete_info = [
+                'title'      => grn_get_page_display_name('mail/account_delete',
+                    ['app_name' => $app_name]),
+                'page'       => 'mail/account_delete.tpl',
+                'no_confirm' => false,
+                'data'       => [
+                    'set'          => ['title' => $title],
+                    'app_name'     => $app_name,
+                    'account_id'   => $account_id,
+                    'category_id'  => $category_id,
+                    'truncate_len' => GRN_MAIL_SUBJECT_TRUNCATE_WIDTH
+                ],
+                'handler'    => 'btn_account_delete'
+            ];
+            $smarty->assign('account_delete_info', $account_delete_info);
+        }
+        $smarty->assign('account_deleted', $this->_account_data['deleted']);
+    }
+
+    public function checkAccountAfterReceive()
+    {
+        $input = $this->getInput();
+
+        require_once('grn/smarty.csp');
+        $smarty = new \GRN_Smarty();
+
+        $received = $this->getArrayValue(self::ARG_RECEIVE, $input);
+        if ($received == 1 || $received == 2) {
+            //アカウントデータリスト
+            $account_list = $this->getAccountList();
+            $account_list_view = $this->getAccountListForView($account_list);
+
+            $account_id = $this->getAccountId();
+            $category_id = $this->getCategoryId($account_id);
+            $personal_config = $this->getPersonalConfig();
+
+            $size_over = $this->checkMailSizeOver($user_limit, $mail_size);
+            $this->checkSendAndReceive($smarty, $size_over, $cannot_send,
+                $cannot_recv, $no_account_for_send, $no_account_for_recv,
+                $no_server_for_send, $no_server_for_recv);
+
+            $no_setting = '0';
+            if ($received == 1) {
+                // カレントアカウントでの受信
+                if ($cannot_recv) {
+                    if ($no_account_for_recv && $no_server_for_recv) {
+                        $no_setting = '3';
+                    } elseif ($no_account_for_recv) {
+                        $no_setting = '2';
+                    } elseif ($no_server_for_recv) {
+                        $no_setting = '1';
+                    } else {
+                        $no_setting = '0';
+                    }
+                }
+            } elseif ($received == 2) {
+                // 一括受信
+                if ($this->getCanRecvAccountCount() == 0) {
+                    $no_setting = '1';
+                }
+            }
+
+            if ($no_setting != '0') {
+                return ['no_setting' => $no_setting];
+            }
+
+            $this->createNotes($smarty, $size_over, $user_limit, $mail_size);
+
+            $new_mails = 0;
+            if ( ! $size_over) {
+                // 受信できなかったメールが存在する
+                $new_mails = is_array($this->_account_data)
+                    ? $this->_account_data['new_mails'] : 0;
+                if (($new_mails > 0) && ($this->_size_error != $new_mails)) {
+                    $smarty->assign('remaining', 1);
+                }
+            }
+
+            $this->checkExternalNotification($smarty);
+            $mail_logic = $this->getMailLogic();
+            $smarty->assign('account_id', $account_id);
+            $smarty->assign('category_id', $category_id);
+            $smarty->assign('app_name', $this->getMailApp()->getName());
+            $logged_in = $this->getLoginUser();
+
+            return [
+                'notes'            => $smarty->fetch('mail/notes_3pane.tpl'),
+                'numOfRemain'      => $new_mails,
+                'numOfUnreadMails' => $mail_logic->getUnreadMailNum($logged_in)
+            ];
+        }
+
+        return [];
+    }
+}

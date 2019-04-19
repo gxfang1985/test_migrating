@@ -1,0 +1,466 @@
+<?php
+
+/**
+ * Session Manager.
+ *
+ * @package fw.core
+ * @filesource
+ */
+
+require_once('fw/server_file.csp');
+
+define('CB_SESSION_BASE_CATEGORY', '__cybozu');
+
+/**
+ * File store to keep files during a session.
+ *
+ * @package fw.core
+ * @access  private
+ */
+class CB_SessionFile extends CB_ServerFile
+{
+    function __construct($row)
+    {
+        parent::__construct($row);
+    }
+
+    var $col_timestamp = ['type' => 'timestamp', 'notnull' => true];
+    var $idx_timestamp = ['cols' => ['timestamp']];
+
+    function copy($file, $detect_encoding = true)
+    {
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+        $this->set('timestamp', $ts);
+        parent::copy($file);
+    }
+}
+
+/**
+ * Manage multiple {@link CB_Session} objects.
+ *
+ * @package fw.core
+ */
+class CB_SessionManager implements CB_Transactional
+{
+    /** @var CB_SessionHandler $_handler */
+    private $_handler = null;
+
+    /**
+     * Return singleton.
+     *
+     * @return CB_SessionManager
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new CB_SessionManager();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * @param string $page_name
+     *
+     * @return bool
+     */
+    private function inSessionReadOnlyWhiteList($page_name)
+    {
+        return in_array(
+            $page_name, [
+                'mail/portlet/check_mails',
+                'fts/api/search',
+                'fts/api/sql_search',
+                'fts/api/background/search',
+            ]
+        );
+    }
+
+    private function __construct()
+    {
+    }
+
+    /**
+     * cybozu.com環境ではSlashがSession管理をしてくれているのでSessionの再生成はおこなわないが
+     * ケータイは、ガルーン独自で認証を行うため生成する
+     *
+     * @param CB_SessionHandler $handler
+     *
+     * @return bool
+     */
+    private function shouldRegenerateSessionId(CB_SessionHandler $handler)
+    {
+        if (defined("ON_FOREST") && ! cb_is_cellular_page()) {
+            return false;
+        }
+
+        return array_key_exists(session_name(), $_COOKIE)
+               && ! $handler->exist($_COOKIE[session_name()]);
+    }
+
+    /**
+     * Start session.
+     *
+     * @param CB_SessionHandler $handler
+     */
+    public function start(CB_SessionHandler $handler)
+    {
+
+        if ($this->inSessionReadOnlyWhiteList(cb_get_pagename())) {
+            $handler->setReadOnly();
+        }
+
+        $this->_handler = $handler;
+
+        $regenerate = $this->shouldRegenerateSessionId($handler);
+        session_set_save_handler($handler, true);
+
+        // at following cases, force to disable secure flag
+        // - connection is not SSL
+        // - using remote access
+        if ( ! cb_is_https() || cb_is_http_remote_access()) {
+            ini_set('session.cookie_secure', false);
+        }
+
+        // start the session
+        if ( ! session_start()) {
+            die('failed to start session!');
+        }
+        if ($regenerate) {
+            session_regenerate_id(true);
+        }
+
+        // automatic cleanup on a certain chance
+        if (((time() + getmypid()) % 919) === 0) {
+            global $G_state_set;
+            if ( ! $G_state_set->get('error_occurred')) {
+                global $G_config_common;
+                $this->cleanSessionFiles($G_config_common->get('Session',
+                    'file_lifetime'));
+            }
+        }
+
+        // register with transaction manager
+        $tm = CB_TransactionManager::getInstance();
+        $tm->register(CB_TRANSACTION_LEVEL_SESSION, $this);
+    }
+
+    /**
+     * Sessionを一度全て破棄し、その後再スタートする
+     *
+     * @param string $sessionId 特定のsession id で再利用する場合は利用する。
+     */
+    public function restart($sessionId = null)
+    {
+        $this->destroy();
+        if (is_string($sessionId)) {
+            session_id($sessionId);
+        }
+        $handlerClass = get_class($this->_handler);
+        $newHandler = new $handlerClass;
+        $this->start($newHandler);
+    }
+
+    /** @var CB_Session[] */
+    private $_sessions = [];
+
+    /**
+     * Obtain one CB_Session for the named module.
+     */
+    function getSession($module_name)
+    {
+        $module_name = strtolower($module_name);
+
+        if (array_key_exists($module_name, $this->_sessions)) {
+            return $this->_sessions[$module_name];
+        }
+
+        $session = new CB_Session($module_name);
+        $this->_sessions[$module_name] = $session;
+
+        return $session;
+    }
+
+    function cleanSessionFiles($days)
+    {
+        $table = cb_class2table('CB_SessionFile');
+        $rowset = new CB_RowSet($table);
+
+        if ($days < 1) {
+            $days = 1;
+        }
+        $old_timestamp = time() - ($days * 3600 * 24);
+        $rowset->addCondition("col_timestamp < ${old_timestamp}");
+
+        // delete all files created before $days from today.
+        while ( ! is_null($row = $rowset->iterate())) {
+            $row->delete();
+        }
+    }
+
+    public function commit()
+    {
+        foreach ($this->_sessions as $session) {
+            $session->_commit();
+        }
+        $this->_sessions = [];
+
+        // for DB session data
+        global $G_config_common;
+        if (strcasecmp($G_config_common->get('Session', 'handler'),
+                'mysql') === 0
+        ) {
+            session_write_close();
+        }
+
+        return true;
+    }
+
+    public function abort()
+    {
+        $this->_handler->setError();
+        $this->_sessions = [];
+    }
+
+    /**
+     * destroy Session Object.
+     * Don't destroy session cookie.
+     */
+    public function destroyObject()
+    {
+        // destroy all objects
+        $this->_sessions = [];
+        $_SESSION = [];
+        @session_destroy();
+    }
+
+    /**
+     * Destroy session objects.  If $module_name is NULL, all session
+     * objects will be destroyed and the current session ID will be
+     * invalidated.
+     */
+    function destroy($module_name = null)
+    {
+        if ( ! is_null($module_name)) {
+            unset($this->_sessions[$module_name]);
+            if (isset($_SESSION[CB_SESSION_BASE_CATEGORY][$module_name])) {
+                unset($_SESSION[CB_SESSION_BASE_CATEGORY][$module_name]);
+            }
+
+            return;
+        }
+
+        $this->destroyObject();
+
+        //Security setting for cookie
+        require_once('fw/miscFunctions.csp');
+        $cookie_httponly = cb_is_cookie_httponly();
+        $cookie_secure = cb_is_cookie_secure();
+
+        $sn = session_name();
+        $ci = session_get_cookie_params();
+
+        if (array_key_exists('domain', $ci)) {
+            if (array_key_exists('path', $ci)) {
+                @setcookie($sn, '', time() - 3600, $ci['path'], $ci['domain'],
+                    $cookie_secure, $cookie_httponly);
+            } else {
+                @setcookie($sn, '', time() - 3600, '', $ci['domain'],
+                    $cookie_secure, $cookie_httponly);
+            }
+        } elseif (array_key_exists('path', $ci)) {
+            @setcookie($sn, '', time() - 3600, $ci['path'], '', $cookie_secure,
+                $cookie_httponly);
+        } else {
+            @setcookie($sn, '', time() - 3600, '', '', $cookie_secure,
+                $cookie_httponly);
+        }
+        unset($_COOKIE[$sn]);
+
+    }
+}
+
+/**
+ * One session group
+ *
+ * @package fw.core
+ */
+class CB_Session
+{
+    /**
+     * @access private
+     */
+    var $_module_name;
+
+    /**
+     * @access private
+     */
+    var $_values = [];
+
+    /**
+     * @access private
+     */
+    var $_file_table = null;
+
+    /**
+     * DON'T INSTANTIATE THIS DIRECTLY
+     *
+     * @access private
+     */
+    function __construct($module_name)
+    {
+        $this->_module_name = $module_name;
+
+        if (isset($_SESSION)) {
+            if (array_key_exists(CB_SESSION_BASE_CATEGORY, $_SESSION)
+                && array_key_exists($module_name,
+                    $_SESSION[CB_SESSION_BASE_CATEGORY])
+            ) {
+                $this->_values
+                    = $_SESSION[CB_SESSION_BASE_CATEGORY][$module_name];
+            }
+        }
+    }
+
+    function set($name, $value)
+    {
+        $this->_values[$name] = $value;
+    }
+
+    function &get($name)
+    {
+        $value = null;
+        if (array_key_exists($name, $this->_values)) {
+            return $this->_values[$name];
+        }
+
+        return $value;
+    }
+
+    /**
+     * Unset a value from this session object.
+     *
+     * @param string $name
+     */
+    function unset_by($name)
+    {
+        unset($this->_values[$name]);
+    }
+
+    /**
+     * Get all value from this session object.
+     *
+     * @return array
+     */
+    function getValues()
+    {
+        return $this->_values;
+    }
+
+    /**
+     * @access private
+     */
+    function _commit()
+    {
+        $_SESSION[CB_SESSION_BASE_CATEGORY][$this->_module_name]
+            = $this->_values;
+    }
+
+    /**
+     * Save a file into this session object.
+     *
+     * A session file is added at a session.
+     *
+     * @param string $name
+     * @param mixed  $file
+     *
+     * @return string  oid
+     */
+    function &addFile($name, & $file)
+    {
+        if (is_null($this->_file_table)) {
+            $this->_file_table = cb_class2table('CB_SessionFile');
+        }
+
+        $row = $this->_file_table->newRow();
+        $row->copy($file);
+
+        if (array_key_exists($name, $this->_values)
+            && is_array($this->_values[$name])
+        ) {
+            $this->_values[$name][$row->getOID()] = 1;
+        } else {
+            $this->_values[$name] = [$row->getOID() => 1];
+        }
+
+        $ret = $row->getOID();
+
+        return $ret;
+    }
+
+    /**
+     * Return an array of {@link CB_ServerFile} objects that store
+     * files saved by {@link CB_Session::addFile()}.  This may return NULL
+     * when the file has been deleted or the file is not found.
+     *
+     * @param string $name
+     *
+     * @return array (oid => CB_ServerFile)
+     */
+    function getFiles($name)
+    {
+        $ret = [];
+
+        if (is_null($this->_file_table)) {
+            $this->_file_table = cb_class2table('CB_SessionFile');
+        }
+
+        if (array_key_exists($name, $this->_values)
+            && is_array($this->_values[$name])
+        ) {
+            $a = [];
+            foreach (array_keys($this->_values[$name]) as $oid) {
+                $row = $this->_file_table->getRow($oid);
+                if ($row !== false) {
+                    $a[$oid] = 1;
+                    $ret[$oid] = clone $row;
+                }
+            }
+            if (count($a) > 0) {
+                $this->_values[$name] = $a;
+            } else {
+                unset($this->_values[$name]);
+            }
+        }
+
+        return $ret;
+    }
+
+    /**
+     * Unset a saved session file from this session object.
+     *
+     * @param string $name
+     * @param string $oid
+     */
+    function unsetFile($name, $oid)
+    {
+        if (is_null($this->_file_table)) {
+            $this->_file_table = cb_class2table('CB_SessionFile');
+        }
+
+        $row = $this->_file_table->getRow($oid);
+        if ($row !== false) {
+            $row->delete();
+        }
+
+        if (array_key_exists($name, $this->_values)
+            && is_array($this->_values[$name])
+        ) {
+            unset($this->_values[$name][$oid]);
+        }
+    }
+}
+
+

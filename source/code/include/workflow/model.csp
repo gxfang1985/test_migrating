@@ -1,0 +1,406 @@
+<?php
+
+/**
+ * モデルベース
+ *
+ * @author  Hideyasu YOSHIDA 2005/12
+ * @version 1.0
+ * @package grn.workflow
+ */
+
+require_once('workflow/table.csp');
+require_once('workflow/error_code.csp');
+require_once('grn/application.csp');
+
+/**
+ * モデルクラス
+ */
+class GRN_Workflow_Model
+{
+    /**
+     * データベース接続
+     *
+     * @access private
+     */
+    var $_dbconn = null;
+    /**
+     * テーブル名
+     *
+     * @access  private
+     */
+    var $_table_name = null;
+    /**
+     * カラム情報一覧
+     *
+     * @access  private
+     */
+    var $_columns_info = [];
+    /**
+     * 別名一覧
+     *
+     * @access  private
+     */
+    var $_aliases = [];
+
+    /**
+     * コンストラクタ
+     *
+     * @param   string $table_name テーブル名
+     */
+    function __construct($table_name)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $this->_dbconn = $app_locator->getConnection('workflow');
+
+        $this->_table_name = $table_name;
+    }
+
+    /**
+     * カラム情報一覧を取得
+     *
+     * @param   boolean $initial 初期値で埋める
+     *
+     * @return  array   カラム情報一覧（カラム情報の種類とカラム情報一覧）
+     */
+    function getColumnsInfo($initial = true)
+    {
+        $columns_info = $this->_columns_info;
+        if ( ! $initial) {
+            $columns_info['usual'] = array_merge($columns_info['usual'],
+                $columns_info['initial']);
+            unset($columns_info['initial']);
+        }
+
+        return $columns_info;
+    }
+
+    /**
+     * @return string
+     */
+    function getLastInsertId()
+    {
+        return $this->_dbconn->get_insert_id();
+    }
+
+    /**
+     * レコードを追加
+     *
+     * @param   array $properties プロパティ一覧（カラム名とプロパティ）
+     *
+     * @return  string  プライマリID
+     */
+    function &add($properties)
+    {
+        if ( ! is_array($properties) || 0 == count($properties)) {
+            cb_throw_error(E_GRN_WRKF_EMPTY_PROPERTIES);
+        }
+
+        $ret = $this->_insertRecords(array_keys($properties), [$properties]);
+
+        return $ret;
+    }
+
+    /**
+     * レコードを一括追加
+     *
+     * @param   array $columns カラム名一覧
+     * @param   array $records レコード一覧（プロパティのみ）
+     *
+     * @return  string （最後に追加した）プライマリID
+     */
+    function addList($columns, $records)
+    {
+        if ( ! is_array($columns) || 0 == count($columns)) {
+            cb_throw_error(E_GRN_WRKF_EMPTY_COLUMNS);
+        }
+
+        if ( ! is_array($records) || 0 == count($records)) {
+            cb_throw_error(E_GRN_WRKF_EMPTY_RECORDS);
+        }
+
+        return $this->_insertRecords($columns, $records);
+    }
+
+    /**
+     * SELECT句のカラム名一覧を取得
+     * （管理するモデルの）テーブルのプライマリキーを必ず_idとして取得
+     *
+     * @param   array $table_infos   カラム名一覧（テーブル名とカラム名一覧）
+     * @param   array $table_aliases テーブルの別名一覧（テーブル名と別名）
+     *
+     * @return  string  SELECT句のカラム名一覧
+     * @access  private
+     */
+    function _formatColumns($table_infos, $table_aliases)
+    {
+        $values = [];
+        foreach ($table_infos as $table_name => $column_infos) {
+            $table_alias = $table_aliases[$table_name];
+            foreach ($column_infos as $column_name => $column_alias) {
+                $values[$column_alias]
+                    = "{$table_alias}.{$column_name} AS {$column_alias}";
+            }
+        }
+
+        return implode(',', $values);
+    }
+
+    /**
+     * レコードを一括挿入
+     *
+     * @param   array $columns カラム名一覧
+     * @param   array $records レコード一覧（プロパティのみ）
+     *
+     * @return  string  最後に挿入したレコードのプライマリキー
+     * @access  private
+     */
+    function _insertRecords($columns, $records)
+    {
+        $values = [];
+        foreach ($records as $record) {
+            foreach ($record as $key => $value) {
+                if (false === array_search($key, $columns)) {
+                    unset($record[$key]);
+                } else {
+                    if (0 < strlen($value)) {
+                        $record[$key] = cb_queryf($this->_dbconn, "'@S'",
+                            $value);
+                    } else {
+                        $record[$key] = 'null';
+                    }
+                }
+            }
+
+            $sorted_record = [];
+            foreach ($columns as $column) {
+                $sorted_record[$column] = $record[$column];
+            }
+
+            $value = implode(',', $sorted_record);
+            $values[] = "({$value})";
+        }
+
+        $query = sprintf("INSERT INTO %s(%s) VALUES%s",
+            $this->_table_name,
+            implode(',', $columns),
+            implode(',', $values));
+        if (false === $this->_dbconn->query($query)) {
+            $this->_dbconn->throwError(['query' => "failed query on INSERT: {$query}"]);
+        }
+
+        return $this->_dbconn->get_insert_id();
+    }
+
+    /**
+     * レコード一覧を取得
+     *
+     * @param   mixed  $columns     指定のプロパティを取得する場合はカラム名一覧
+     *                              それ以外はプライマリキーと外部キー
+     * @param   string $key         レコード一覧のキー
+     * @param   int    $offset      一覧の先頭オフセット
+     * @param   int    $limit       一覧件数
+     * @param   string $order_by    ソートキー
+     * @param   string $condition   検索条件文
+     * @param   int    $lock        ロックの種類
+     *
+     * @return  array   レコード一覧（経路IDとレコード）
+     * @access  private
+     */
+    function _selectRecords(
+        $columns = null,
+        $key = '_id',
+        $offset = 0,
+        $limit = -1,
+        $order_by = 'col_list_index,_id',
+        $condition = null,
+        $lock = CB_DATABASE_NO_LOCK
+    ) {
+        if ( ! is_array($columns)) {
+            $columns = [];
+        }
+        if (false === array_search($key, $columns)) {
+            $columns[] = $key;
+        }
+        $columns = implode(',', $columns);
+
+        if (0 < strlen($condition)) {
+            $condition = " WHERE ({$condition})";
+        }
+
+        if (0 < strlen($order_by)) {
+            $order_by = " ORDER BY {$order_by}";
+        }
+
+        $query
+            = "SELECT {$columns} FROM {$this->_table_name}{$condition}{$order_by}";
+        $query = $this->_dbconn->select_format($query, $offset, $limit, $lock);
+        $result = $this->_dbconn->query($query);
+        if (false === $result) {
+            $this->_dbconn->throwError(['query' => "failed query on SELECT: {$query}"]);
+        }
+
+        $rows = [];
+        while ($row = $this->_dbconn->fetch_assoc($result)) {
+            $rows[$row[$key]] = $row;
+        }
+
+        return $rows;
+    }
+
+    /**
+     * レコード一覧を取得 （SET NULLカラムを持つテーブルでユーザー削除フラグに対応）
+     *
+     * @param   mixed  $columns     指定のプロパティを取得する場合はカラム名一覧
+     *                              それ以外はプライマリキーと外部キー
+     * @param   string $key         レコード一覧のキー
+     * @param   int    $offset      一覧の先頭オフセット
+     * @param   int    $limit       一覧件数
+     * @param   string $order_by    ソートキー
+     * @param   string $condition   検索条件文
+     * @param   int    $lock        ロックの種類
+     * @param   array  $join_key    tab_cb_user._id に参照を張っているカラム名の配列
+     *
+     * @return  array   レコード一覧（経路IDとレコード）
+     * @access  private
+     */
+    function _selectRecordsLeftJoinUser(
+        $columns = null,
+        $key = '_id',
+        $offset = 0,
+        $limit = -1,
+        $order_by = 'col_list_index,_id',
+        $condition = null,
+        $lock = CB_DATABASE_NO_LOCK,
+        $join_key_array = []
+    ) {
+        if ( ! is_array($columns)) {
+            $columns = [];
+        }
+        if (false === array_search($key, $columns)) {
+            $columns[] = $key;
+        }
+        $main_table = $this->_table_name;
+        $columns_array = $columns;
+        $columns = implode(",{$main_table}.", $columns);
+        $columns = "{$main_table}." . $columns;
+
+        if (0 < strlen($condition)) {
+            $condition = " WHERE ({$condition})";
+        }
+
+        if (0 < strlen($order_by)) {
+            $order_by = " ORDER BY {$order_by}";
+        }
+
+        if ( ! is_array($join_key_array)) {
+            $join_key_array = [];
+        }
+
+        $prefix = "__join_key_";
+        $join = '';
+
+        foreach ($join_key_array as $join_key) {
+            $join_alias = $prefix . $join_key;
+            $join .= "LEFT JOIN tab_cb_user AS {$join_alias} ON ({$main_table}.{$join_key}={$join_alias}._id)";
+            $columns .= ",{$join_alias}.col_deleted AS {$join_alias}_col_deleted";
+        }
+
+        $query
+            = "SELECT {$columns} FROM {$this->_table_name} {$join}{$condition}{$order_by}";
+        $query = $this->_dbconn->select_format($query, $offset, $limit, $lock);
+        $result = $this->_dbconn->query($query);
+        if (false === $result) {
+            $this->_dbconn->throwError(['query' => "failed query on SELECT: {$query}"]);
+        }
+
+        $rows = [];
+        while ($row = $this->_dbconn->fetch_assoc($result)) {
+            $rows[$row[$key]] = $row;
+
+            foreach ($join_key_array as $join_key) {
+                $col_deleted_alias = "{$prefix}{$join_key}_col_deleted";
+                if ( ! empty($rows[$row[$key]][$col_deleted_alias])) {
+                    $rows[$row[$key]][$join_key] = null;
+                }
+                unset($rows[$row[$key]][$col_deleted_alias]);
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
+     * レコードを一括変更
+     *
+     * @param   string $condition  検索条件文
+     * @param   array  $properties プロパティ一覧（カラム名とプロパティ）
+     *
+     * @access  private
+     */
+    function _updateRecords($condition, $properties)
+    {
+        foreach ($properties as $key => $value) {
+            if (array_key_exists($key, $properties) && 0 < strlen($value)) {
+                $properties[$key] = cb_queryf($this->_dbconn, "{$key}='@S'",
+                    $value);
+            } else {
+                $properties[$key] = "{$key}=null";
+            }
+        }
+        $query = sprintf('UPDATE %s SET %s WHERE (%s);',
+            $this->_table_name,
+            implode(',', $properties),
+            $condition);
+        if (false === $this->_dbconn->query($query)) {
+            $this->_dbconn->throwError(['query' => "failed query on UPDATE: {$query}"]);
+        }
+    }
+
+    /**
+     * レコードを一括削除
+     *
+     * @param   string $condition 検索条件文
+     *
+     * @access  private
+     */
+    function _deleteRecords($condition = null)
+    {
+        if (0 < strlen($condition)) {
+            $condition = " WHERE ({$condition})";
+        }
+
+        $query = "DELETE FROM {$this->_table_name}{$condition}";
+        if (false === $this->_dbconn->query($query)) {
+            $this->_dbconn->throwError(['query' => "failed query on DELEET: {$query}"]);
+        }
+    }
+
+    /**
+     * レコード数をカウント
+     *
+     * @param   string $condition 検索条件文
+     *
+     * @access  private
+     */
+    function _countRecord($condition = null, $force_index = null)
+    {
+        if (0 < strlen($condition)) {
+            $condition = " WHERE ({$condition})";
+        }
+        if (0 < strlen($force_index)) {
+            $force_index = " FORCE INDEX ({$force_index})";
+        }
+
+        $query
+            = "SELECT COUNT(*) FROM {$this->_table_name}{$force_index}{$condition};";
+        if ($result = $this->_dbconn->query($query)) {
+            $row = $this->_dbconn->fetch_assoc($result);
+
+            return $row['COUNT(*)'];
+        }
+
+        $this->_dbconn->throwError(['query' => "failed query on SELECT: {$query}"]);
+    }
+}
+
+

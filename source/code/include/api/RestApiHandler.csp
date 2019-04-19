@@ -1,0 +1,283 @@
+<?php
+declare(strict_types=1);
+
+namespace grn\api;
+
+use \FastRoute as FastRoute;
+use grn\api\exception\authentication\LicenceExpiredException;
+use grn\api\exception\request\JsonDecodeFailedException;
+use grn\api\http\HttpHeaders;
+use grn\api\http\HttpMethod;
+use grn\api\exception\authentication\NotAuthenticatedException;
+use grn\api\exception\request\BadRequestException;
+use grn\api\exception\request\MethodNotAllowedException;
+use grn\api\exception\request\UnsupportedMediaTypeException;
+use grn\grn\access\service\AppAccess;
+use grn\grn\access\exception\AppNotAvailableForInternalException;
+
+class RestApiHandler
+{
+    const API_PATH_PREFIX = 'api/';
+
+    /** @var string */
+    protected $uri;
+
+    /** @var string */
+    protected $httpMethod;
+
+    /** @var  array|NULL */
+    private $input;
+
+    /**
+     * RestApiHandler constructor.
+     *
+     * @param string $uri
+     * @param string $method
+     *
+     * @throws exception\request\TooManyRequestsException
+     */
+    public function __construct(string $uri, string $method)
+    {
+        $this->setErrorPageTypeJson();
+        $this->doFilter();
+        $this->uri = $uri;
+        $this->httpMethod = $method;
+    }
+
+    /**
+     * @throws exception\request\TooManyRequestsException
+     */
+    private function doFilter()
+    {
+        if ( ! cb_is_forest()) {
+            return;
+        }
+
+        $concurrency_limit_filter = new RestApiConcurrencyLimitFilter();
+        $concurrency_limit_filter->register();
+    }
+
+    /**
+     * Other state settings will be do at RestApiResponse.
+     * This state setting should be do first because RestApiResponse does not filter the error message.
+     */
+    private function setErrorPageTypeJson()
+    {
+        global $G_state_set;
+        $G_state_set->set('error_page_type', 'json');
+    }
+
+    /**
+     * @return string
+     * @throws AppNotAvailableForInternalException
+     * @throws BadRequestException
+     * @throws MethodNotAllowedException
+     * @throws NotAuthenticatedException
+     * @throws UnsupportedMediaTypeException
+     * @throws \Exception
+     * @throws \grn\grn\access\exception\AppNotAvailableForExternalException
+     */
+    public function execute()
+    {
+        $this->checkHeaders();
+
+        $dispatcher = $this->createDispatcher();
+        $route_info = $dispatcher->dispatch($this->httpMethod, $this->uri);
+
+        $dispatch_result = $route_info[0];
+        $this->validateRouteInfo($dispatch_result);
+
+        if (cb_is_develop_rest_api()) {
+            // @kim-hyunghu TODO It needs to be implemented with the public version of Rest API. Confirm specifications.
+            $accept_language = $_SERVER['HTTP_ACCEPT_LANGUAGE'] ?? null;
+            if ($accept_language) {
+                require_once("fw/i18n.csp");
+                \CB_I18N::getInstance()->forceLocale($accept_language);
+            }
+        } else {
+            $this->checkLicenceAvailability();
+            $this->checkApplicationAvailability();
+        }
+
+        $api_name = $route_info[1];
+        $vars = $route_info[2];
+        $response_entity = $this->callAPI($api_name, $vars);
+
+        $response_logic = new RestApiResponse();
+        $response_json
+            = $response_logic->buildSuccessResponse($response_entity);
+
+        return $response_json;
+    }
+
+    /**
+     * @throws UnsupportedMediaTypeException
+     */
+    private function checkHeaders()
+    {
+        if (HttpMethod::isRequiredContentType($this->httpMethod)
+            && ! HttpHeaders::isAllowedContentType()
+        ) {
+            throw new UnsupportedMediaTypeException();
+        }
+    }
+
+    /**
+     * @throws LicenceExpiredException
+     */
+    private function checkLicenceAvailability()
+    {
+        require_once('grn/license.csp');
+        $license_manager = \GRN_LicenseManager::getInstance();
+        $is_licensed
+                         = $license_manager->hasEffectiveLicense(GRN_LICENSE_SERVICE_EXPIRED_OFFSET);
+        if ( ! $is_licensed) {
+            throw new LicenceExpiredException();
+        }
+    }
+
+    /**
+     * @throws AppNotAvailableForInternalException
+     * @throws \grn\grn\access\exception\AppNotAvailableForExternalException
+     */
+    private function checkApplicationAvailability()
+    {
+        $page_path = strtolower($this->uri);
+        $page_parts = explode('/', $page_path);
+
+        // Example of uri: api/v1/schedule/events/:id
+        // In this case, "schedule" is acquired.
+        if (3 > count($page_parts)) {
+            return;
+        }
+
+        $app_id = $page_parts[2];
+        require_once('grn/application.csp');
+        $locator = \GRN_ApplicationLocator::instance();
+        if ( ! $locator->isActive($app_id)) {
+            cb_throw_error(E_GRN_APPLICATION_NOT_ACTIVE);
+        }
+        AppAccess::checkAccess($app_id);
+    }
+
+    /**
+     * @return FastRoute\Dispatcher\GroupCountBased
+     */
+    private function createDispatcher()
+    {
+        $route_collector = new FastRoute\RouteCollector(
+            new FastRoute\RouteParser\Std(),
+            new FastRoute\DataGenerator\GroupCountBased()
+        );
+        $this->addRoutes($route_collector);
+
+        return new FastRoute\Dispatcher\GroupCountBased($route_collector->getData());
+    }
+
+    /**
+     * @param FastRoute\RouteCollector $route_collector
+     */
+    private function addRoutes(FastRoute\RouteCollector $route_collector)
+    {
+        foreach (Routes::getRoutes() as $version => $route_sets) {
+            foreach ($route_sets as $route_set) {
+                $route_path = self::API_PATH_PREFIX . $version . $route_set[1];
+                $route_collector->addRoute($route_set[0], $route_path,
+                    $route_set[2]);
+            }
+        }
+    }
+
+    /**
+     * @param int $route_result
+     *
+     * @throws BadRequestException
+     * @throws MethodNotAllowedException
+     */
+    private function validateRouteInfo(int $route_result)
+    {
+        if ($route_result === FastRoute\Dispatcher::NOT_FOUND) {
+            throw new BadRequestException();
+        }
+        if ($route_result === FastRoute\Dispatcher::METHOD_NOT_ALLOWED) {
+            throw new MethodNotAllowedException();
+        }
+    }
+
+    /**
+     * @param string $api_name
+     * @param array  $vars
+     *
+     * @return ResponseEntity
+     * @throws BadRequestException
+     * @throws \Exception
+     */
+    public function callAPI(string $api_name, array $vars): ResponseEntity
+    {
+        $api_instance = $this->createApiInstance($api_name);
+
+        $response_entity = $api_instance->execute($vars);
+        $fields = new Fields($this->getFieldsInput());
+        $response_entity->convertToFields($fields);
+
+        return $response_entity;
+    }
+
+    /**
+     * @return string
+     * @throws JsonDecodeFailedException
+     */
+    protected function getFieldsInput(): string
+    {
+        $input = $this->getInput();
+
+        return $input["fields"] ?? "";
+    }
+
+    /**
+     * @param string $api_name
+     *
+     * @return RestApi
+     * @throws BadRequestException
+     * @throws JsonDecodeFailedException
+     */
+    protected function createApiInstance(string $api_name): RestApi
+    {
+        if ( ! is_subclass_of($api_name, RestApi::class, true)) {
+            throw new BadRequestException();
+        }
+
+        /** @var RestApi $api_instance */
+        $api_instance = new $api_name();
+        $api_instance->setHttpMethod($this->httpMethod);
+        $api_instance->setInput($this->getInput());
+
+        return $api_instance;
+    }
+
+    /**
+     * @return array
+     * @throws JsonDecodeFailedException
+     */
+    protected function getInput()
+    {
+        if ( ! is_null($this->input)) {
+            return $this->input;
+        }
+
+        if (HttpMethod::isRequiredContentType($this->httpMethod)) {
+            $input = file_get_contents('php://input');
+            $this->input = json_decode($input, true);
+            if (is_null($this->input)) {
+                throw new JsonDecodeFailedException();
+            }
+
+            return $this->input;
+        } else {
+            global $G_INPUT;
+            $this->input = $G_INPUT;
+
+            return $this->input;
+        }
+    }
+}

@@ -1,0 +1,1179 @@
+<?php
+/**
+ * Util Api Service Logic
+ *
+ * @author   Vu Minh     2010/01
+ * @modified by Vu Minh (CTK) 2010/02
+ */
+define('GRN_UTIL_API_SOAP_NAMESPACE',
+    'http://www.w3.org/2003/05/soap-envelope');
+define('GRN_UTIL_API_SOAP_ROOT', 'Envelope');
+define('GRN_UTIL_API_SOAP_HEADER', 'Header');
+define('GRN_UTIL_API_SOAP_BODY', 'Body');
+define('GRN_UTIL_API_SOAP_ACTION', 'Action');
+define('GRN_UTIL_API_SOAP_SECURITY', 'Security');
+define('GRN_UTIL_API_SOAP_TIMESTAMP', 'Timestamp');
+define('GRN_UTIL_API_SOAP_LOCALE', 'Locale');
+define('GRN_UTIL_API_SOAP_PARAMETERS', 'parameters');
+
+define('GRN_UTIL_MAX_SIZE_LOG_FILE', '1000000');
+
+class GRN_Util_Api_Service
+{
+    const UTIL_LOGIN = 'UtilLogin';
+
+    var $_soap_root;
+    var $_soap_header;
+    var $_soap_body;
+    var $_soap_action;
+    var $_login_token;
+
+    var $_start_time;
+    var $_finish_time;
+    var $_runID;
+    var $_login_account;
+    var $_log_fname;
+    var $_log_flag;
+
+    function __construct()
+    {
+        $this->_prepareDisplay();
+        $this->_login_account = 'unknown';
+        srand(time());
+        $this->_runID = rand(); // runID is used in api running log file
+        $this->_log_flag = null;
+        $this->_log_fname = null;
+    }
+
+    //--- public functions ---
+
+    function set_login_account($login_account)
+    {
+        if ( ! is_null($login_account)) {
+            $this->_login_account = $login_account;
+        }
+    }
+
+    private static $_instance = null;
+
+    /**
+     * @return GRN_Util_Api_Service
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    function import($post_data)
+    {
+        grn_util_api_debug("SOAP request message\n" . $post_data);
+
+        //remove invalid XML characters
+        require_once('fw/string_util.csp');
+        $post_data = cb_remove_invalid_xml_chars($post_data);
+
+        $errorcode = $this->_parseRequest($post_data);
+
+        if ($errorcode) {
+            $this->set_login_account($this->getUsername());
+            $this->save_start_log();
+            cb_throw_error($errorcode);
+        }
+
+        // --- validate SOAP request ---
+
+        if ( ! $this->_soap_root) {
+            $this->_throwErrorMissingElement(GRN_UTIL_API_SOAP_ROOT);
+        } elseif ( ! $this->_soap_header) {
+            $this->_throwErrorMissingElement(GRN_UTIL_API_SOAP_HEADER);
+        } elseif ( ! $this->_soap_body) {
+            $this->_throwErrorMissingElement(GRN_UTIL_API_SOAP_BODY);
+        }
+
+        // check expiration
+        if ($this->isExpired()) {
+            require_once('util_api/error_code.csp');
+            cb_throw_error(E_GRN_UTIL_API_REQUEST_EXPIRED);
+        }
+
+    }
+
+    function getRoot()
+    {
+        return $this->_soap_root;
+    }
+
+    function getUsername()
+    {
+        $retval = null;
+        if (is_null($this->_login_token)) {
+            $this->_parseLoginToken();
+        }
+
+        if (isset($this->_login_token['username'])) {
+            $retval = $this->_login_token['username'];
+        }
+
+        return $retval;
+    }
+
+    function getPassword()
+    {
+        $retval = null;
+        if (is_null($this->_login_token)) {
+            $this->_parseLoginToken();
+        }
+
+        if (isset($this->_login_token['password'])) {
+            $retval = $this->_login_token['password'];
+        }
+
+        return $retval;
+    }
+
+    function getAction()
+    {
+        if (isset($this->_soap_action)) {
+            return $this->_soap_action;
+        }
+
+        $node_action = $this->selectSingleNode($this->_soap_header,
+            GRN_UTIL_API_SOAP_ACTION);
+
+        if (is_null($node_action)) {
+            $this->_throwErrorMissingElement(GRN_UTIL_API_SOAP_ACTION);
+        }
+
+        if (isset($node_action['text'])) {
+            require_once('fw/string_util.csp');
+            $action
+                = grn_util_api_convert_first_char_to_upper(cb_trim($node_action['text']));
+            //Throw error if action name is inappropriate
+            if (preg_match("/[^A-Za-z]+/", $action)
+                || strtolower($action) == "api"
+            ) {
+                require_once('util_api/error_code.csp');
+                cb_throw_error(E_GRN_UTIL_API_UNKNOW_ACTION, null,
+                    ['action' => $action]);
+            }
+            $this->_soap_action = $action;
+
+            return $this->_soap_action;
+        }
+    }
+
+    function getRequestParameters($node_name = null)
+    {
+        $parameters = null;
+
+        if (is_null($node_name)) {
+            $node_name = $this->getAction();
+        }
+
+        $node_body = $this->_soap_body;
+
+        if (isset($node_body['children']) && is_array($node_body['children'])) {
+            $children =& $node_body['children'][0];
+            $child = null;
+            // get element prefix
+            $node_param = $children['node_name'];
+            if (strpos($node_param, ':')) {
+                // get ns prefix
+                $prefix = substr($node_param, 0, strpos($node_param, ':'));
+                // get unqualified name
+                $node_param = substr(strstr($node_param, ':'), 1);
+            }
+            if (0 === strcmp($node_name, $node_param)) {
+                $child =& $children;
+            }
+            $parameters = $this->selectSingleNode($child,
+                GRN_UTIL_API_SOAP_PARAMETERS);
+        }
+
+        if ( ! $parameters) {
+            $this->_throwErrorMissingElement(GRN_UTIL_API_SOAP_PARAMETERS);
+        }
+
+        return $parameters;
+    }
+
+    function isExpired()
+    {
+        require_once('util_api/util.csp');
+
+        $str_expire_datetime = $this->_getExpire();
+        $dt_expire = grn_util_api_parse_ISO8601($str_expire_datetime);
+
+        // convert timezone
+        $tsex_expire = new CB_TimeStampEx();
+        $tsex_expire->setDateTime($dt_expire, 'UTC');
+        $dt_expire = $tsex_expire->getDateTime();
+
+        $tsex_current = new CB_TimeStampEx();
+        $retval = (0 > $tsex_expire->compare($tsex_current));
+
+        return $retval;
+    }
+
+    function selectSingleNode(&$node, $node_name)
+    {
+        assert('is_string( $node_name ) && 0 < strlen( $node_name )');
+
+        $child = null;
+        if ( ! isset($node['children']) || ! is_array($node['children'])) {
+            return $child;
+        }
+
+        $children =& $node['children'];
+        foreach (array_keys($children) as $key) {
+            $child_tmp =& $children[$key];
+            if (0 === strcmp($node_name, $child_tmp['node_name'])) {
+                $child =& $child_tmp;
+                break;
+            }
+        }
+
+        return $child;
+    }
+
+    /**
+     * @return array
+     */
+    function selectNodes(&$node, $node_name)
+    {
+        assert('is_string( $node_name ) && 0 < strlen( $node_name )');
+
+        $child_nodes = null;
+        if ( ! isset($node['children']) || ! is_array($node['children'])) {
+            return $child_nodes;
+        }
+
+        $children =& $node['children'];
+        foreach (array_keys($children) as $key) {
+            $node =& $children[$key];
+
+            if (strcmp($node['node_name'], $node_name) == 0) {
+                $child_nodes[] =& $node;
+            }
+        }
+
+        return $child_nodes;
+    }
+
+    /**
+     * @return array
+     */
+    function selectMultiNodes(&$node, $node_names)
+    {
+        assert('is_array( $node_names ) && 0 < count( $node_names )');
+
+        $child_nodes = null;
+        if ( ! isset($node['children']) || ! is_array($node['children'])) {
+            return $child_nodes;
+        }
+
+        $children =& $node['children'];
+        foreach (array_keys($children) as $key) {
+            $node =& $children[$key];
+            if (($i = array_search($node['node_name'], $node_names))
+                !== false
+            ) {
+                $child_nodes[$node_names[$i]][] =& $node;
+            }
+        }
+
+        return $child_nodes;
+    }
+
+
+    function selectNodesValue(
+        &$node,
+        $node_name,
+        $required = false,
+        $check_empty = true
+    ) {
+        assert('is_string( $node_name ) && 0 < strlen( $node_name )');
+
+        $child_nodes_value = null;
+        if ( ! isset($node['children']) || ! is_array($node['children'])) {
+            if ($required === true && is_null($child_nodes_value)) {
+                require_once('util_api/error_code.csp');
+                cb_throw_error(E_GRN_UTIL_API_MISSING_PARAMETER, null,
+                    ['param' => $node_name], ['param' => $node_name]);
+            }
+
+            return $child_nodes_value;
+        }
+
+        $children =& $node['children'];
+        foreach (array_keys($children) as $key) {
+            $node =& $children[$key];
+
+            if (strcmp($node['node_name'], $node_name) == 0) {
+                if (isset($node['text'])) {
+                    if ($check_empty) {
+                        require_once('util_api/util.csp');
+                        require_once('util_api/error_code.csp');
+                        $value = util_api_trim_check($node['text'],
+                            E_GRN_UTIL_API_EMPTY_PARAMETER_VALUE, $node_name);
+                        $child_nodes_value[] = $value;
+                    } else {
+                        $child_nodes_value[] = cb_trim($node['text']);
+                    }
+                } else {
+                    if ($check_empty) {
+                        require_once('util_api/error_code.csp');
+                        cb_throw_error(E_GRN_UTIL_API_EMPTY_PARAMETER_VALUE,
+                            null, ['param' => $node_name],
+                            ['param' => $node_name]);
+                    }
+                    $child_nodes_value[] = '';
+                }
+            }
+        }
+
+        if ($required === true && is_null($child_nodes_value)) {
+            require_once('util_api/error_code.csp');
+            cb_throw_error(E_GRN_UTIL_API_MISSING_PARAMETER, null,
+                ['param' => $node_name], ['param' => $node_name]);
+        }
+
+        return $child_nodes_value;
+    }
+
+    public function getAttribute(&$node, $name, $required = false)
+    {
+        if (isset($node['attributes']) && is_array($node['attributes'])
+            && array_key_exists($name, $node['attributes'])
+        ) {
+            return $node['attributes'][$name];
+        }
+
+        if ($required) {
+            require_once('util_api/error_code.csp');
+            cb_throw_error(E_GRN_UTIL_API_MISSING_PARAMETER, null,
+                ['param' => $name], ['param' => $name]);
+        }
+
+        return false;
+    }
+
+    public function getFileInfoFromFileType($node)
+    {
+        $values = $this->selectNodesValue($node, 'content', true);
+        $content = $values[0];
+        $name = $this->getAttribute($node, 'name', true);
+
+        return ['content' => $content, 'name' => $name];
+    }
+
+    public function getBuiltinProperties()
+    {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+
+        $builtin_properties = $uum->getDefaultItemProperties();
+        unset($builtin_properties['display_name'],
+            $builtin_properties['display_name_language'],
+            $builtin_properties['foreign_key'],
+            $builtin_properties['nickname'],
+            $builtin_properties['locale'],
+            $builtin_properties['base'],
+            $builtin_properties['usergroups'],
+            $builtin_properties['primary_group'],
+            $builtin_properties['attendee']
+        );
+
+        return $builtin_properties;
+    }
+
+    public function getBuiltinParameters($user_info)
+    {
+        // 組み込み項目を取得する
+        $builtin_properties = $this->getBuiltinProperties();
+
+        $builtin_parameters = [];
+        foreach ($builtin_properties as $id => $properties) {
+            if ( ! $properties['use']) {
+                continue;
+            }
+
+            $required = false;
+            if ($properties['necessary']) {
+                $required = true;
+            }
+
+            if ($properties['type'] === 'file') {
+                $file_node = $this->selectSingleNode($user_info, $id);
+                if ( ! is_null($file_node)) {
+                    $file_info = $this->getFileInfoFromFileType($file_node);
+                    $file = cbpapi_upload_file($file_info);
+                    $builtin_parameters[$id] = $file;
+                } elseif ($required) {
+                    require_once('util_api/error_code.csp');
+                    cb_throw_error(E_GRN_UTIL_API_MISSING_PARAMETER, null,
+                        ['param' => $id], ['param' => $id]);
+                }
+            } else {
+                $value = $this->getAttribute($user_info, $id, $required);
+                if ($value !== false) {
+                    $builtin_parameters[$id] = $value;
+                }
+            }
+        }
+
+        return $builtin_parameters;
+    }
+
+    public function getExtendedProperties()
+    {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $extended = $uum->listItems();
+        $oids = array_keys($extended);
+        $extended_properties = [];
+        foreach ($oids as $oid) {
+            $row = $extended[$oid];
+            $extended_properties[$oid] = [];
+            $extended_properties[$oid]['id'] = $row->get('id');
+            $extended_properties[$oid]['necessary'] = $row->get('necessary');
+            $extended_properties[$oid]['use'] = $row->get('use');
+            $extended_properties[$oid]['type'] = $row->get('type');
+        }
+
+        return $extended_properties;
+    }
+
+    public function getExtendedParameters($user_info)
+    {
+        $extended = $this->getExtendedProperties();
+        $extended_parameters = [];
+        $oids = array_keys($extended);
+        foreach ($oids as $oid) {
+            if ( ! $extended[$oid]['use']) {
+                continue;
+            }
+
+            $required = false;
+            if ($extended[$oid]['necessary']) {
+                $required = true;
+            }
+
+            if ($extended[$oid]['type'] === 'file') {
+                $file_node = $this->selectSingleNode($user_info,
+                    $extended[$oid]['id']);
+                if (is_null($file_node)) {
+                    if ($required) {
+                        require_once('util_api/error_code.csp');
+                        cb_throw_error(E_GRN_UTIL_API_MISSING_PARAMETER, null,
+                            ['param' => $extended[$oid]['id']],
+                            ['param' => $extended[$oid]['id']]);
+                    }
+                } else {
+                    $file_info = $this->getFileInfoFromFileType($file_node);
+                    $file
+                        = cbpapi_upload_file($file_info);
+                    $extended_parameters[$extended[$oid]['id']] = $file;
+                }
+            } else {
+                $value = $this->getAttribute($user_info, $extended[$oid]['id'],
+                    $required);
+                if ($value !== false) {
+                    $extended_parameters[$extended[$oid]['id']] = $value;
+                }
+            }
+        }
+
+        return $extended_parameters;
+    }
+
+    public function getBasicProperties(
+        $request_params,
+        $user_info,
+        $necessaries = ['login_name', 'display_name']
+    ) {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $default_properties = $uum->getDefaultItemProperties();
+        $display_name_language_required
+            = isset($default_properties['display_name_language'])
+            ? $default_properties['display_name_language']['necessary'] : false;
+        $nickname_required = isset($default_properties['nickname'])
+            ? $default_properties['nickname']['necessary'] : false;
+        $basic_properties = [];
+        $values
+            = $this->selectNodesValue($request_params,
+            'login_name', in_array('login_name', $necessaries));
+        if ( ! is_null($values)) {
+            $basic_properties['foreign_key'] = $values[0];
+        }
+        $values = $this->selectNodesValue($request_params, 'display_name',
+            in_array('display_name', $necessaries));
+        if ( ! is_null($values)) {
+            $basic_properties['display_name'] = $values[0];
+        }
+        //GRN2-2869
+        //"display_name_language" don't need
+        /*$values = $this->selectNodesValue($request_params, 'display_name_language', FALSE);
+        if (is_array($values) && count($values) > 0)
+        {
+            $basic_properties['display_name_language'] = $values[0];
+        }*/
+        //GRN2-2869
+        $values = $this->selectNodesValue($request_params, 'nickname',
+            $nickname_required);
+        if (is_array($values) && count($values) > 0) {
+            $basic_properties['nickname'];
+        }
+
+        // 使用の停止
+        $invalid = $this->getAttribute($user_info, 'invalid');
+        if ($invalid === 'true') {
+            $basic_properties['valid'] = false;
+        } elseif ($invalid === 'false') {
+            $basic_properties['valid'] = '1';
+        }
+
+        return $basic_properties;
+    }
+
+    public function getPasswordParameter($request_params, $default_value = null)
+    {
+        $passwd_raw = '';
+        $values = $this->selectNodesValue($request_params, 'password_raw');
+        if (is_array($values) && count($values) > 0) {
+            $passwd_raw = $values[0];
+        } else {
+            if (is_null($default_value)) {
+                // If password_raw is not inputted then a default password will be set
+                require_once('sysapi/logic.csp');
+                $passwd_raw = GRN_SYSAPI_USER_DEFAULT_PASSWORD;
+            } else {
+                $passwd_raw = $default_value;
+            }
+        }
+
+        return $passwd_raw;
+    }
+
+    //--- private functions ---
+
+    function _parseRequest($post_data)
+    {
+        $xml_reader = new XMLReader();
+        // if LIBXML_VERSION >= 2.7.3 then using LIBXML_PARSEHUGE const
+        if (LIBXML_VERSION >= 20703) {
+            $xml_reader->xml($post_data, null, LIBXML_PARSEHUGE);
+        } else {
+            $xml_reader->xml($post_data);
+        }
+
+        $node = null;
+        $root = null;
+        $tree = null;
+        $depth = 0;
+
+        while ($xml_reader->read()) {
+            $type = $xml_reader->nodeType;
+            switch ($type) {
+                case XMLReader::ELEMENT:
+                    unset($node);
+                    $node_name = $xml_reader->name;
+                    $node_localname = $xml_reader->localName;
+                    $node_namespace = $xml_reader->namespaceURI;
+                    $node['node_name'] = $node_name;
+                    $is_empty_element = $xml_reader->isEmptyElement;
+
+                    if ($xml_reader->hasAttributes) {
+                        $xml_reader->moveToFirstAttribute();
+                        do {
+                            $node['attributes'][$xml_reader->name]
+                                = $xml_reader->value;
+                        } while ($xml_reader->moveToNextAttribute());
+                    }
+
+                    if ( ! $tree) {
+                        $root =& $node;
+                        $tree[$depth] =& $node;
+                    } else {
+                        $parent_node =& $tree[$depth];
+                        $parent_node['children'][] =& $node;
+
+                        if ( ! $is_empty_element) {
+                            $tree[++$depth] =& $node;
+                        }
+                    }
+                    break;
+                case XMLReader::TEXT:
+                    $node['text'] = $xml_reader->value;
+                    break;
+                case XMLReader::END_ELEMENT:
+                    unset($tree[$depth--]);
+                    break;
+            }
+
+
+            switch ($node_localname) {
+                case GRN_UTIL_API_SOAP_ROOT:
+                    if (strcmp($node_namespace, GRN_UTIL_API_SOAP_NAMESPACE)
+                        == 0
+                    ) {
+                        $this->_soap_root =& $root;
+                    }
+                    break;
+                case GRN_UTIL_API_SOAP_HEADER:
+                    if (strcmp($node_namespace, GRN_UTIL_API_SOAP_NAMESPACE)
+                        == 0
+                    ) {
+                        $this->_soap_header =& $node;
+                    }
+                    break;
+                case GRN_UTIL_API_SOAP_BODY:
+                    if (strcmp($node_namespace, GRN_UTIL_API_SOAP_NAMESPACE)
+                        == 0
+                    ) {
+                        $this->_soap_body =& $node;
+                    }
+                    break;
+            }
+        }
+
+        if (count(libxml_get_errors()) != 0) {
+            require_once('util_api/error_code.csp');
+
+            return E_GRN_UTIL_API_REQUEST_PARSE_FAILED;
+        }
+
+        $xml_reader->close();
+    }
+
+    function _parseLoginToken()
+    {
+        $login_token = null;
+
+        $node_security = $this->selectSingleNode($this->_soap_header,
+            GRN_UTIL_API_SOAP_SECURITY);
+        $node_token = $this->selectSingleNode($node_security,
+            'UsernameToken');
+
+        if ($node_token) {
+            $token = $this->selectMultiNodes($node_token,
+                ['Username', 'Password']);
+
+            if (isset($token['Username'])) {
+                if (isset($token['Username'][0]['text'])) {
+                    $login_token['username'] = $token['Username'][0]['text'];
+                }
+            } else {
+                $this->_throwErrorMissingElement('Username');
+            }
+
+            if (isset($token['Password'])) {
+                $login_token['password'] = @$token['Password'][0]['text'];
+            } else {
+                $this->_throwErrorMissingElement('Password');
+            }
+        }
+
+        $this->_login_token = $login_token;
+    }
+
+    function _getExpire()
+    {
+        $node_timestamp = $this->selectSingleNode($this->_soap_header,
+            GRN_UTIL_API_SOAP_TIMESTAMP);
+        $node_expires = $this->selectSingleNode($node_timestamp, 'Expires');
+
+        if ( ! $node_expires) {
+            $this->_throwErrorMissingElement('Expires');
+        }
+
+        $retval = $node_expires['text'];
+
+        return $retval;
+    }
+
+    function getLocale()
+    {
+        $node_locale = $this->selectSingleNode($this->_soap_header,
+            GRN_UTIL_API_SOAP_LOCALE);
+
+        if ( ! $node_locale) {
+            return null;
+        }
+
+        $retval = isset($node_locale['text']) ? $node_locale['text'] : null;
+
+        return $retval;
+    }
+
+    function _prepareDisplay()
+    {
+        global $G_state_set;
+
+        $G_state_set->set('copyright_should_be_written', false);
+        $G_state_set->set('html_should_be_closed', false);
+        $G_state_set->set('error_page_type', 'util_api');
+
+        header('Content-type: application/soap+xml; charset="utf-8"');
+    }
+
+    function _throwErrorMissingElement($element)
+    {
+        require_once('util_api/error_code.csp');
+        cb_throw_error(E_GRN_UTIL_API_INVALID_REQUEST, null,
+            ['element' => $element]);
+    }
+
+    function _get_log_option_from_config()
+    {
+        // Get the current API group
+        $page_path = strtolower(cb_get_pagename());
+        $page_parts = explode('/', $page_path);
+        $api_group = $page_parts[0];
+        //$module = $page_parts[1];
+
+        // Check if this api_group turns ON log option
+        global $G_config_common;
+        $flag_turn_on_str = $G_config_common->get('API_log', 'log_groups');
+        if ( ! $flag_turn_on_str) {
+            $this->_log_flag = false;
+
+            return;
+        }
+        $flag_turn_on = preg_split('#[, ]#', $flag_turn_on_str);
+
+        if (in_array($api_group, $flag_turn_on)) {
+            $this->_log_flag = true;
+        } else {
+            $this->_log_flag = false;
+
+            return;
+        }
+
+        if ($this->_log_flag) {
+            $log_dir = $G_config_common->get('API_log', 'log_file_dir');
+            if ( ! $log_dir) {
+                $log_dir = "";
+            }
+
+            $fname = $G_config_common->get('API_log', $api_group . '_log');
+            if ( ! $fname) {
+                $fname = $api_group . '_log.txt';
+            }
+
+            $this->_log_fname = cb_basedir() . "/" . $log_dir . "/" . $fname;
+        }
+    }
+
+    function save_to_log_file($mesg)
+    {
+        if (is_null($this->_log_flag)) {
+            $this->_get_log_option_from_config();
+        }
+
+        if ( ! $this->_log_flag) {
+            return;
+        }
+        if (is_null($this->_log_fname)) {
+            return;
+        }
+
+        $log_file = fopen($this->_log_fname, 'a');
+        fwrite($log_file, $mesg);
+        fclose($log_file);
+    }
+
+    function save_start_log()
+    {
+        // Record runID, userID, function name, start time
+        $this->_start_time = date('d-m-Y H:i:s');
+        $mesg
+            = "$this->_start_time, $this->_login_account, $this->_runID, "
+              . $this->getAction() . ", Start\n";
+        $this->save_to_log_file($mesg);
+    }
+
+    function save_finish_log($exec_result)
+    {
+        // Record runID, userID, function name, finish time, exec_result
+        $this->_finish_time = date('d-m-Y H:i:s');
+        $mesg
+            = "$this->_finish_time, $this->_login_account, $this->_runID, $this->_soap_action, Finish, $exec_result\n";
+        $this->save_to_log_file($mesg);
+    }
+}
+
+//--- UTIL_API functions ---
+
+function grn_util_api_export_wsdl()
+{
+    if (array_key_exists('QUERY_STRING', $_SERVER)
+        && strcmp($_SERVER['QUERY_STRING'], 'WSDL') == 0
+    ) {
+        // export WSDL no need to check ticket
+        cb_prepare_download('', 'text/xml', true, false, false);
+        Header('Content-Disposition: inline; filename="GaroonServices.wsdl"');
+
+        require_once('grn/smarty.csp');
+        $t = new GRN_Smarty();
+
+        // Ignore Licence Warnning
+        $t->skipWarning();
+
+        $t->assign('url_prefix', cb_get_url_prefix());
+
+        $t->display('util_api/wsdl.tpl');
+
+        cb_safe_exit();
+    }
+}
+
+function grn_util_api_service_execute()
+{
+    global $G_INPUT;
+    $post_data = file_get_contents('php://input');
+    if (empty($post_data) && isset($G_INPUT['CBPAPI_REQUEST'])) {
+        $post_data = $G_INPUT['CBPAPI_REQUEST'];
+    }
+
+    $util_api_service = GRN_Util_Api_Service::getInstance();
+    $util_api_service->import($post_data);
+
+    global $G_container_base;
+    /** @var GRN_Uum $uum */
+    $grn_uum = $G_container_base->getInstance('uum');
+    $login_user = $grn_uum->getLoginUser();
+    if (is_a($login_user, 'CB_User')) {
+        $user_info = $grn_uum->getUserInfo($login_user->getOID(),
+            ['col_foreign_key']);
+        $util_api_service->set_login_account($user_info['col_foreign_key']);
+    }
+
+    // Log starting info
+    $util_api_service->save_start_log();
+
+    // Since sysapi and cbpapi use variable name as $sysapi_service, $cbpapi_service, we make it redundant here
+    $sysapi_service = $util_api_service;
+    $cbpapi_service = $util_api_service;
+
+    $action = $util_api_service->getAction();
+
+    $page_path = strtolower(cb_get_pagename());
+    $page_parts = explode('/', $page_path);
+    $api_group = $page_parts[0];
+    $module = $page_parts[1];
+
+    $file = grn_util_api_convert_action2filename($action);
+
+    $file = cb_basedir() . '/code/doc_root/' . $api_group . '/' . $module . '/'
+            . $file . '.csp';
+    if ( ! file_exists($file)) {
+        require_once('util_api/error_code.csp');
+        cb_throw_error(E_GRN_UTIL_API_UNKNOW_ACTION, null,
+            ['action' => $action]);
+    }
+
+    $sandbox_restricted_operation_actions = [
+        'AdminAddOrg',
+        'AdminModifyOrgInfo',
+        'AdminRemoveOrgsByIds',
+        'AdminAddChildrenOfOrg'
+    ];
+
+    if (in_array($action, $sandbox_restricted_operation_actions)) {
+        // This action is restricted when there are sandbox settings.
+        require_once('system/sandbox/misc.csp');
+        \grn\system\sandbox\validateSandboxStatusIsInitial();
+    }
+
+    require($file);
+}
+
+/**
+ * e.g) AddressGetMyAddressGroupVersions -> address_get_my_address_group_versions
+ *
+ * @param string $action
+ *
+ * @return string
+ */
+function grn_util_api_convert_action2filename($action)
+{
+    // lower first char
+    $file = preg_replace_callback(
+        '/^([A-Z])/', function ($matches) {
+        return strtolower($matches[1]);
+    }
+        , $action
+    );
+
+    // lowser and append '_' uppercase chars
+    $file = preg_replace_callback(
+        '/([A-Z])/', function ($matches) {
+        return '_' . strtolower($matches[0]);
+    }
+        , $file
+    );
+
+    return $file;
+}
+
+/**
+ * e.g) utilLogin -> UtilLogin
+ *
+ * @param string $action
+ *
+ * @return string
+ */
+function grn_util_api_convert_first_char_to_upper($action)
+{
+    // upper first char
+    $action = preg_replace_callback(
+        '/^[a-z]/', function ($matches) {
+        return strtoupper($matches[0]);
+    }
+        , $action
+    );
+
+    return $action;
+}
+
+function grn_util_api_response(&$smarty, $file, $page = null)
+{
+    //GRN2-1973
+    $_common_ini = cb_basedir() . '/common.ini';
+    if ( ! file_exists($_common_ini)) {
+        die($_common_ini . ' is missing. Check your configuration!');
+    }
+    $config_version_api = new CB_ConfigManager($_common_ini, 'Global');
+    $api_version = $config_version_api->get("API", "version");
+    if ($api_version !== false) {
+        $smarty->assign("apiversion", $api_version);
+    }
+
+    //Get version of Garoon
+    $_garoon_ini = cb_basedir() . '/garoon.ini';
+    if ( ! file_exists($_garoon_ini)) {
+        die($_garoon_ini . ' is missing. Check your configuration!');
+    }
+    $config_version_garoon = new CB_ConfigManager($_garoon_ini, 'Global');
+    $version_garoon = $config_version_garoon->get("System", "version");
+
+    if ($version_garoon !== false) {
+        $smarty->assign("version", $version_garoon);
+    }
+
+    if (defined('ON_FOREST')) {
+        $product_type = "2";
+    } else {
+        $product_type = "1";
+    }
+    $smarty->assign("product_type", $product_type);
+
+    ob_end_clean();
+
+    if (is_null($page)) {
+        $page_path = strtolower(cb_get_pagename());
+        $page_parts = explode('/', $page_path);
+        $module = $page_parts[1];
+        $api_group = $page_parts[0];
+
+        $page = $api_group . '/' . $module . '/' . basename($file, '.csp')
+                . '.tpl';
+    }
+
+    $response = $smarty->fetch($page);
+
+    if (defined('ON_FOREST')) {
+        $dom = new DOMDocument('1.0', 'UTF-8');
+        $dom->loadXML($response, LIBXML_PARSEHUGE);
+        $response = $dom->saveXML();
+    }
+
+    // write log the response
+    grn_util_api_debug("SOAP response message\n" . $response);
+
+    grn_util_api_save_finish_log("Success");
+
+    echo $response;
+}
+
+function grn_util_api_save_finish_log($exec_result)
+{
+    $util_api_service = GRN_Util_Api_Service::getInstance();
+    $util_api_service->save_finish_log($exec_result);
+}
+
+function grn_util_api_get_namespace($module, $prefix = null)
+{
+    $grn_module = strcmp($module, 'base') == 0 ? 'common' : $module;
+
+    $namespace = cb_msg('grn.' . $grn_module, 'xml_namespace');
+
+    if ( ! is_null($prefix)) {
+        $prefix = empty($prefix) ? $prefix : ':' . $prefix;
+        $namespace = str_replace("xmlns:$module", 'xmlns' . $prefix,
+            $namespace);
+    }
+
+    return $namespace;
+}
+
+function grn_util_api_debug($message, $prefix = '')
+{
+    //GRN2-1974
+    $file_info = grn_util_api_get_debug_file_name();
+    if (is_null($file_info)) {
+        return;
+    }
+
+    $path_full = $file_info['path'];
+    if (strrpos($file_info['path'], '/')) {
+        $path_parent = substr($file_info['path'], 0,
+            strrpos($file_info['path'], '/'));
+        $file_name = substr(strrchr($file_info['path'], '/'), 1);
+    } elseif (strrpos($file_info['path'], '\\')) {
+        $path_parent = substr($file_info['path'], 0,
+            strrpos($file_info['path'], '\\'));
+        $file_name = substr(strrchr($file_info['path'], '\\'), 1);
+    } else {
+        if (strchr($file_info["path"], ":")) {
+            return;
+        }
+        $path_parent = cb_basedir();
+        $path_full = cb_basedir() . '\\' . $file_info["path"];
+        $file_name = $file_info['path'];
+    }
+    $number = count_file_log($path_parent, $file_name);
+    if ($file_info['path'] !== false && $file_info["user_require"] !== false) {
+        if ($file_info["max_size"] === false) {
+            $file_info["max_size"] = GRN_UTIL_MAX_SIZE_LOG_FILE;
+        }
+        if ($file_info["max_size"] == 0) {
+            $file_info["max_size"] = GRN_UTIL_MAX_SIZE_LOG_FILE;
+        }
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login = $uum->getLoginUser();
+        if ($login !== false) {
+            $users_info = $uum->getUserInfo($login->getOID(),
+                ['col_display_name']);
+            $users_require = explode(",", $file_info["user_require"]);
+            $temp = array_flip($users_require);
+            if (array_key_exists($users_info['col_display_name'], $temp)
+                == true
+            ) {
+                if (is_array($message) || is_object($message)) {
+                    ob_start();
+                    print_r($message);
+                    $message = ob_get_contents();
+                    ob_end_clean();
+                }
+                $message = "\n" . date('Y/m/d H:i:s : ') . $prefix . $message
+                           . "\n";
+                if ($number > 0) {
+                    $file_size = filesize($path_full . "_" . $number . ".log");
+                    if ($file_size + strlen($message)
+                        <= $file_info['max_size']
+                    ) {
+                        $log_file = @fopen($path_full . "_" . $number . ".log",
+                            'a');
+                        fputs($log_file, $message);
+                        fclose($log_file);
+                    } else {
+                        $log_file = @fopen($path_full . "_" . ($number + 1)
+                                           . ".log", 'a');
+                        fputs($log_file, $message);
+                        fclose($log_file);
+                    }
+                } else {
+                    $log_file = @fopen($path_full . ".log", 'a');
+                    $file_size = filesize($path_full . ".log");
+                    if ($file_size + strlen($message) <= $file_info['max_size']
+                        || $file_size == 0
+                    ) {
+                        fputs($log_file, $message);
+                        fclose($log_file);
+                    } else {
+                        $log_file = @fopen($path_full . "_1" . ".log", 'a');
+                        fputs($log_file, $message);
+                        fclose($log_file);
+                    }
+                }
+            }
+        }
+    }
+    //GRN2-1974
+}
+
+function grn_util_api_get_debug_file_name()
+{
+    //GRN2-1974
+    global $G_config_common;
+    $log_file['path'] = $G_config_common->get('Global',
+        'util_api_log_file');
+    $log_file['max_size'] = $G_config_common->get('Global',
+        'util_api_log_size');
+    $log_file['user_require'] = $G_config_common->get('Global',
+        'util_api_log_user');
+    //GRN2-1974
+
+    if (empty($log_file['path'])) {
+        return null;
+    } else {
+        return $log_file;
+    }
+}
+
+function grn_util_role_check_for_api($api_group_role)
+{
+    global $G_config_common;
+    $role_info_str = $G_config_common->get('API roles', $api_group_role);
+    if ( ! $role_info_str) {
+        return false;
+    }
+
+    $role_info_str = trim($role_info_str);
+    $roles = preg_split('#[, ]+#', $role_info_str);
+    if (is_array($roles) && count($roles) > 0) {
+        cb_vrequire_role($roles);
+
+        return true;
+    } else {
+        return false;
+    }
+}
+
+//GRN2-1974
+function count_file_log($path, $file_name)
+{
+    $number = 0;
+    $d = dir($path);
+    while ($entry = $d->read()) {
+        if ( ! (($entry == "..") || ($entry == "."))) {
+            $info_file = pathinfo($entry);
+            if ( ! is_null(@ $info_file["extension"])) {
+                if ($info_file["extension"] == "log") {
+                    if (strstr($entry, $file_name)) {
+                        $number_str = substr(strrchr($info_file['filename'],
+                            '_'), 1);
+                        $temp = (int)$number_str;
+                        if ($temp > $number) {
+                            $number = $temp;
+                        }
+                    }
+                }
+
+            }
+        }
+    }
+
+    return $number;
+}
+//GRN2-1974
+

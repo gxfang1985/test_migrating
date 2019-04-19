@@ -1,0 +1,208 @@
+<?php
+
+declare(strict_types=1);
+
+namespace grn\schedule\api\adapter\events;
+
+use GRN_Netmeeting_EventLogic;
+
+require_once('cbpapi/schedule_logic.csp');
+require_once('schedule/application.csp');
+require_once('schedule/event_base_logic.csp');
+require_once('schedule/access_logic.csp');
+require_once('schedule/facility_system_logic.csp');
+require_once('schedule/facility_privilege.csp');
+
+abstract class DeleteEventAdapterAbstract
+{
+    /**
+     * @param \CB_User $user
+     * @param string   $event_id
+     *
+     * @return \GRN_Schedule_EventBase
+     */
+    public function getEvent(
+        \CB_User $user,
+        string $event_id
+    ): \GRN_Schedule_EventBase {
+        $app = \GRN_Schedule_Application::getInstance();
+        $event = $app->getEvent($user, $event_id, null);
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        return $event;
+    }
+
+    /**
+     * @param \GRN_Schedule_EventBase $event
+     */
+    abstract public function checkWhetherEventIsDeletableType(
+        \GRN_Schedule_EventBase $event
+    );
+
+    /**
+     * @param \CB_User                $user
+     * @param \GRN_Schedule_EventBase $event
+     * @param array                   $authorities
+     */
+    public function checkAccess(\CB_User $user, $event, array $authorities)
+    {
+        $uum = cb_lwc_uum();
+        $dynamic_role = $uum->listGrantedRoles();
+        $acc_logic = \GRN_Schedule_Access_Logic::getInstance();
+        $access = $acc_logic->getEventAccess($user, $event, $authorities,
+            $dynamic_role);
+        if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+        }
+        if ($access['delete'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_DELETE);
+        }
+    }
+
+
+    /**
+     * @param \CB_User                $user
+     * @param \GRN_Schedule_EventBase $event
+     */
+    public function checkCanModifyFacility(
+        \CB_User $user,
+        \GRN_Schedule_EventBase $event
+    ) {
+        $facilities = $event->facilities;
+        if ( ! is_array($facilities)) {
+            return;
+        }
+        if (count($facilities) <= 0) {
+            return;
+        }
+
+        $privilege_logic = \GRN_Facility_Privilege_Logic::getInstance();
+        if ($privilege_logic->hasPrivilegeOfFacilities($user, $facilities,
+            'OR')
+        ) {
+            return;
+        }
+
+        $facility_logic = \GRN_Facility_SystemLogic::getInstance();
+        $facility_settings
+            = $facility_logic->getFacilitySetting(array_keys($facilities));
+        foreach ($facilities as $key => $facility) {
+            $facility_id = $facility->getOID();
+            $can_modify_user
+                = $facility_logic->getModifyUserByPriority($facility_settings,
+                $facility_id);
+
+            // 登録者にのみ変更を許可する
+            $is_creator = $this->isCreator($user, $event);
+            if ($can_modify_user === 'creator' && ! $is_creator) {
+                cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+            }
+
+            // 登録者と共有メンバーに変更を許可する
+            $is_attendee = $this->isAttendee($user, $event);
+            if ($can_modify_user === 'member' && ! $is_creator
+                && ! $is_attendee
+            ) {
+                cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+            }
+        }
+    }
+
+
+    /**
+     * @param \CB_User                $user
+     * @param \GRN_Schedule_EventBase $event
+     *
+     * @return bool
+     */
+    public function isAttendee(
+        \CB_User $user,
+        \GRN_Schedule_EventBase $event
+    ): bool {
+        $user_id = $user->getOID();
+        $attendee_ids = $event->users;
+        if ( ! is_array($attendee_ids)) {
+            return false;
+        }
+
+        return array_key_exists($user_id, $attendee_ids);
+    }
+
+
+    /**
+     * @param \CB_User                $user
+     * @param \GRN_Schedule_EventBase $event
+     *
+     * @return bool
+     */
+    public function isCreator(
+        \CB_User $user,
+        \GRN_Schedule_EventBase $event
+    ): bool {
+        $creator = $event->creator;
+        if ( ! is_a($creator, \CB_User::class)) {
+            return false;
+        }
+
+        return $user->getOID() === $creator->getOID();
+    }
+
+
+    /**
+     * @param \GRN_Schedule_EventBase $event
+     */
+    public function deleteNetmeetingReservation($event)
+    {
+        require_once('schedule/netmeeting_event_logic.csp');
+        $vcb_event_logic = GRN_Netmeeting_EventLogic::getInstance();
+
+        if ($vcb_event_logic->isNetmeetingAvailable($event)) {
+            if ($vcb_event_logic->getNetmeetingFacilityById($event)) {
+                $vcb_event_logic->cmmandNetmeetingReservationDelete($event->id);
+            }
+        }
+    }
+
+    /**
+     * @param \GRN_Schedule_EventBase $event
+     *
+     * @return \GRN_Schedule_EventBase
+     */
+    public function convertTimezone($event)
+    {
+        return $event->convertTimezoneOfSetAndEndDateTime();
+    }
+
+    /**
+     * @param \CB_User                $user
+     * @param \GRN_Schedule_EventBase $event
+     *
+     * @return bool
+     */
+    public function removeEvent(\CB_User $user, $event): bool
+    {
+        $app = \GRN_Schedule_Application::getInstance();
+        $event_id = $event->id;
+        $event_type = $event->getEventType();
+
+        $apply = null;
+        if (is_a($event, \GRN_Schedule_RepeatEvent::class)) {
+            $apply = GRN_REPEAT_DELETE_ALL;
+        }
+
+        return $app->deleteEvent($user, $event_id, $event_type, null, $apply);
+    }
+
+    /**
+     * @param \CB_User                $user
+     * @param \GRN_Schedule_EventBase $event
+     */
+    public function sendNotification(\CB_User $user, $event)
+    {
+        $cbpapi_base_logic = \GRN_CBPApi_Schedule_Logic::getInstance();
+        $cbpapi_base_logic->createNotification($user, $event, null, null,
+            GRN_SCHEDULE_NOTIFY_DELETE);
+    }
+}

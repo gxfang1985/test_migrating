@@ -1,0 +1,2015 @@
+<?php
+
+/**
+ * メールフォルダロジック
+ */
+
+require_once('mail/utility.csp');
+require_once('mail/table.csp');
+require_once('grn/application.csp');
+
+define('GRN_MAIL_FOLDER_LISTINDEX_DEFAULT', 2147483646);      // 一般フォルダのデフォルト
+define('GRN_MAIL_FOLDER_LISTINDEX_ROOT', 0);      // ルート
+define('GRN_MAIL_FOLDER_LISTINDEX_INBOX', 1);      // 受信箱
+define('GRN_MAIL_FOLDER_LISTINDEX_SENTBOX', 2);      // 送信箱
+define('GRN_MAIL_FOLDER_LISTINDEX_UNSENT', 3);      // 下書き
+define('GRN_MAIL_FOLDER_MAX_DEPTH', 20);      // フォルダの上限深度
+
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+ * フォルダロジック
+ */
+class GRN_Mail_FolderLogic
+{
+    /**
+     * @static
+     * @return GRN_Mail_FolderLogic
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_Mail_FolderLogic();
+        }
+
+        return $_instance;
+    }
+
+    function __construct()
+    {
+        $this->_utility = GRN_Mail_Utility::getInstance();
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    // メンバ変数
+    /**
+     * @access private
+     */
+    var $_utility = null;
+    var $_folders = [];        // cache
+    var $_folder_tree = [];        // cache
+
+    //////////////////////////////////////////////////////////////////////////
+    // private method
+
+    /**
+     * 指定されたIDでフォルダデータをDBから取得
+     *
+     * @access  public
+     *
+     * @param   string $id データID
+     *
+     * @return  GRN_Mail_Folder|null
+     */
+    public function _getFolderRow($id)
+    {
+        if (is_null($id)) {
+            {
+                $___ret = null;
+
+                return $___ret;
+            }
+        }
+
+        if (array_key_exists($id, $this->_folders)) {
+            return $this->_folders[$id];
+        }
+
+        $table = $this->_utility->getTableInfo(GRN_MAIL_FOLDER_TABLE);
+        $db = $table->getDBConnection();
+        $id = $db->escape($id);
+        $row = $table->getRow($id);
+        if ( ! is_object($row)) {
+            $___ret = null;
+
+            return $___ret;
+        }
+
+        $this->_folders[$id] = $row;
+
+        return $row;
+    }
+
+    /**
+     * 指定されたコードの組み込みフォルダデータをDBから取得
+     *
+     * @access  private
+     *
+     * @param   GRN_Mail_Account $account アカウントデータ
+     * @param   string           $code    組み込みフォルダコード
+     *
+     * @return  GRN_Mail_Folder|null
+     */
+    function _getSpecialFolderRow(& $account, $code)
+    {
+        assert('! is_null( $account )');
+        assert('! is_null( $code )');
+
+        // 指定されたフォルダのサブフォルダ
+        $rowset
+            = new CB_RowSet($this->_utility->getTableInfo(GRN_MAIL_FOLDER_TABLE));
+        $rowset->addCondition($rowset->queryf("col_account = '@S'",
+            $account->getOID()));
+        $rowset->addCondition($rowset->queryf("col_code = '@S'", $code));
+        $rowset->limit(0, 1);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        return $row;
+    }
+
+    /**
+     * 指定された条件のフォルダIDのリストを取得する
+     *
+     * @description 直接クエリを発行する
+     *
+     * @param string|null   $user_id          ユーザーID or null
+     * @param string[]|null $account_ids      アカウントIDのリスト or null
+     * @param string[]|null $codes            フォルダコードのリスト or null
+     * @param bool          $is_check_deleted ユーザーの削除フラグを確認する場合は TRUE
+     *
+     * @return string[]|null フォルダIDのリスト or null
+     */
+    function getFolderIds(
+        $user_id,
+        $account_ids,
+        $codes,
+        $is_check_deleted = true
+    ) {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('mail');
+
+        $conditions = [];
+        if (is_string($user_id) && (strlen($user_id) > 0)) {
+            $conditions[] = sprintf("col_user='%s'", $db->escape($user_id));
+            if ($is_check_deleted) {
+                $from = 'tab_' . GRN_MAIL_FOLDER_TABLE
+                        . ' AS f INNER JOIN tab_cb_user AS u ON f.col_user = u._id '
+                        . 'AND u.col_deleted IS NULL';
+            } else {
+                $from = 'tab_' . GRN_MAIL_FOLDER_TABLE . ' AS f ';
+            }
+        } else {
+            global $G_container_base;
+            /** @var GRN_Uum $uum */
+            $uum = $G_container_base->getInstance('uum');
+            $login = $uum->getLoginUser();
+            $user_id = $login->getOID();
+            $from = 'tab_' . GRN_MAIL_FOLDER_TABLE;
+        }
+
+        if (is_array($account_ids)) {
+            foreach ($account_ids as $account_id) {
+                $conditions[] = sprintf("col_account='%s'",
+                    $db->escape($account_id));
+            }
+        }
+
+        if (is_array($codes)) {
+            foreach ($codes as $code) {
+                $conditions[] = sprintf("col_code='%s'", $db->escape($code));
+            }
+        }
+
+        $columns = ['f._id'];
+        $query = sprintf('SELECT %s FROM %s WHERE %s',
+            implode(',', $columns), $from, implode(' and ', $conditions));
+        $query = $db->select_format($query);
+        $result = $db->query($query);
+
+        $folder_ids = [];
+        if (cb_is_db_result($result)) {
+            $n = $db->num_rows($result);
+            for ($i = 0; $i < $n; $i++) {
+                $row = $db->fetch_assoc($result);
+                if ( ! is_array($row)) {
+                    continue;
+                }
+
+                $folder_ids[$row['_id']] = $row['_id'];
+            }
+
+            return $folder_ids;
+        }
+
+        return null;
+    }
+
+    /**
+     * フォルダ名を取得
+     *
+     * @access      private
+     * @description 組み込みフォルダの場合はリソースから取得する
+     *
+     * @param GRN_Mail_Folder $folder_row
+     *
+     * @return string folder name
+     */
+    function _getFolderName(& $folder_row)
+    {
+        if ($folder_row->isSpecialFolder()) {
+            $folder_name = cb_msg(GRN_MAIL_MODULE_ID, $folder_row->get('code'));
+        } else {
+            $folder_name = $folder_row->get('name');
+        }
+
+        return $folder_name;
+    }
+
+    /**
+     * フォルダデータを追加
+     *
+     * @access  private
+     *
+     * @param   CB_User              $user       ユーザーデータ
+     * @param   GRN_Mail_Account     $account    アカウントデータ
+     * @param   GRN_Mail_Folder|null $parent     親フォルダデータ（nullの場合はトップレベル）
+     * @param   array                $properties フォルダプロパティ
+     *
+     * @return  GRN_Mail_Folder フォルダデータ
+     */
+    function _addFolderData(& $user, & $account, & $parent, & $properties)
+    {
+        // フォルダデータテーブル
+        $table = $this->_utility->getTableInfo(GRN_MAIL_FOLDER_TABLE);
+
+        // データ追加
+        /** @var GRN_Mail_Folder $row */
+        $row = $table->newRow();
+        if ( ! is_object($row)) {
+            // データ追加失敗
+            {
+                $___ret = null;
+
+                return $___ret;
+            }
+        }
+
+        if ( ! is_null($parent)) {
+            // 移動先フォルダの階層の深さを取得
+            $parent_depth = $parent->getDepth();
+            if ($parent_depth >= GRN_MAIL_FOLDER_MAX_DEPTH) {
+                // 階層上限エラー
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_ADD_BECAUSE_OF_FOLDER_DEPTH);
+            }
+        }
+
+        $row->initialize($user, $account, $parent, $properties);
+
+        return $row;
+    }
+
+    /**
+     * 組み込みフォルダデータを追加
+     *
+     * @access  private
+     *
+     * @param   CB_User              $user    ユーザーデータ
+     * @param   GRN_Mail_Account     $account アカウントデータ
+     * @param   string               $code    組み込みフォルダコード
+     * @param   GRN_Mail_Folder|null $parent  親フォルダオブジェクト（nullの場合はトップレベル）
+     *
+     * @return  GRN_Mail_Folder フォルダデータ
+     */
+    function _addSpecialFolder(& $user, & $account, $code, & $parent)
+    {
+        assert('! is_null( $user )');
+        assert('! is_null( $account )');
+        assert('! is_null( $code )');
+
+        $properties = [
+            'code' => $code,
+        ];
+
+        if ($code == GRN_MAIL_FOLDER_CODE_ROOT) {
+            $properties['list_index'] = GRN_MAIL_FOLDER_LISTINDEX_ROOT;
+            $properties['subscribed'] = 0;
+        } elseif ($code == GRN_MAIL_FOLDER_CODE_INBOX) {
+            $properties['list_index'] = GRN_MAIL_FOLDER_LISTINDEX_INBOX;
+            $properties['subscribed'] = 1;
+        } elseif ($code == GRN_MAIL_FOLDER_CODE_SENTBOX) {
+            $properties['list_index'] = GRN_MAIL_FOLDER_LISTINDEX_SENTBOX;
+            $properties['subscribed'] = 1;
+        } elseif ($code == GRN_MAIL_FOLDER_CODE_UNSENT) {
+            $properties['list_index'] = GRN_MAIL_FOLDER_LISTINDEX_UNSENT;
+            $properties['subscribed'] = 0;
+        } else {
+            // ごみ箱は一番下に来るようにするためlist_indexは指定しない
+            $properties['subscribed'] = 0;
+        }
+
+        // データ追加
+        $ret = $this->_addFolderData($user, $account, $parent, $properties);
+
+        return $ret;
+    }
+
+    /**
+     * initialize special folders
+     *
+     * @param   CB_User     $user       CB_User
+     * @param   string|null $account_id account id (default: null)
+     */
+    function initSpecialFolders(& $user, $account_id = null)
+    {
+        if (is_null($account_id)) {
+            $personal_config = $this->_utility->getPersonalConfig($user);
+            $account = $personal_config->_getDefaultAccountRow(true,
+                true);
+        } else {
+            $system_config = $this->_utility->getSystemConfig();
+            $account = $system_config->_getAccountRow($account_id);
+        }
+
+        $this->_initSpecialFolders($user, $account);
+    }
+
+    /**
+     * @param string $account_id
+     *
+     * @return bool
+     */
+    private function existsAnyFolder($account_id)
+    {
+        $db = cb_get_app_db('mail');
+
+        $query = "SELECT 1 FROM tab_grn_mail_folder"
+                 . " WHERE col_account = '@S'"
+                 . " LIMIT 1 LOCK IN SHARE MODE";
+        $query = $db->format($query, [$account_id]);
+
+        $result = $db->query($query);
+        $row = $db->fetch_array($result);
+        $db->free_result($result);
+
+        return $row !== false;
+    }
+
+    /**
+     * 組み込みフォルダ初期化
+     *
+     * @access  private
+     *
+     * @param   CB_User          $user    ユーザーデータ
+     * @param   GRN_Mail_Account $account アカウントデータ
+     */
+    function _initSpecialFolders(& $user, & $account)
+    {
+        if (is_null($user) || is_null($account)) {
+            return;
+        }
+
+        assert('! is_null( $user )');
+        assert('! is_null( $account )');
+
+        $account_id = $account->getOID();
+
+        // 初期化済みフラグ
+        static $_initialized = [];
+        if (array_key_exists($account_id, $_initialized)) {
+            return;
+        }
+        $_initialized[$account_id] = true;
+
+        if ($this->existsAnyFolder($account_id)) {
+            return;
+        }
+
+        // ルート追加
+        $parent = null;
+        $root = $this->_addSpecialFolder($user, $account,
+            GRN_MAIL_FOLDER_CODE_ROOT, $parent);
+
+        // 受信箱追加
+        $inbox = $this->_addSpecialFolder($user, $account,
+            GRN_MAIL_FOLDER_CODE_INBOX, $root);
+
+        // 送信箱追加
+        $sentbox = $this->_addSpecialFolder($user, $account,
+            GRN_MAIL_FOLDER_CODE_SENTBOX, $root);
+
+        // 下書き追加
+        $unsent = $this->_addSpecialFolder($user, $account,
+            GRN_MAIL_FOLDER_CODE_UNSENT, $root);
+
+        // ごみ箱追加
+        $trash = $this->_addSpecialFolder($user, $account,
+            GRN_MAIL_FOLDER_CODE_TRASH, $root);
+    }
+
+    /**
+     * フォルダの移動
+     *
+     * @param GRN_Mail_Folder $folder フォルダデータ
+     * @param GRN_Mail_Folder $parent 移動先フォルダデータ（null不可）
+     */
+    function _moveFolderData(& $folder, & $parent)
+    {
+        assert('is_object( $folder )');
+        assert('is_object( $parent )');
+
+        if ( ! is_object($folder)) {
+            // フォルダが見つからない
+            cb_throw_error(E_GRN_MAIL_FOLDER_DATA_NOT_FOUND);
+        }
+
+        if ( ! is_object($parent)) {
+            // 移動先フォルダが見つからない
+            cb_throw_error(E_GRN_MAIL_DESTINATION_FOLDER_DATA_NOT_FOUND);
+        }
+
+        if ($folder->isSpecialFolder()) {
+            // 組み込みフォルダは移動不可
+            cb_throw_error(E_GRN_MAIL_CANNOT_MOVE_FOLDER_DATA);
+        }
+
+        if ( ! $parent->isRoot() && $parent->isSpecialFolder()) {
+            // ルート以外の組み込みフォルダへは移動不可
+            cb_throw_error(E_GRN_MAIL_CANNOT_MOVE_FOLDER_DATA);
+        }
+
+
+        // 移動先フォルダの階層の深さを取得
+        $parent_depth = $parent->getDepth();
+
+        // サブフォルダの最大深度を取得
+        $sub_folders = [];
+        $max_depth = $folder->getMaxDescendantDepth($sub_folders);
+        if ($parent_depth + $max_depth > GRN_MAIL_FOLDER_MAX_DEPTH) {
+            // 階層上限エラー
+            cb_throw_error(E_GRN_MAIL_FAILED_TO_MOVE_BECAUSE_OF_FOLDER_DEPTH);
+        }
+
+        $old_parent = $folder->get('parent');
+        if ( ! is_object($old_parent)) {
+            // フォルダが見つからない
+            cb_throw_error(E_GRN_MAIL_DESTINATION_FOLDER_DATA_NOT_FOUND);
+        }
+
+        if (array_key_exists($parent->getOID(), $sub_folders)
+            || ($old_parent->getOID() == $parent->getOID())
+        ) {
+            // 移動先フォルダがサブフォルダに含まれている場合はエラー
+            cb_throw_error(E_GRN_MAIL_DESTINATION_FOLDER_IS_SUBFOLDER);
+        }
+
+        // フォルダのアカウント取得
+        $old_account = $folder->get('account');
+        if ( ! is_object($old_account)) {
+            // フォルダが見つからない
+            cb_throw_error(E_GRN_MAIL_FOLDER_DATA_NOT_FOUND);
+        }
+
+        // 移動先のアカウント取得
+        $account = $parent->get('account');
+        if ( ! is_object($account)) {
+            // フォルダが見つからない
+            cb_throw_error(E_GRN_MAIL_DESTINATION_FOLDER_DATA_NOT_FOUND);
+        }
+
+        // 移動先のフォルダ一覧RowSetを取得
+        $list_index = GRN_MAIL_FOLDER_LISTINDEX_UNSENT + 1;
+        $rowset = $parent->getSubFolderRowSet();
+        /** @var GRN_Mail_Folder $row */
+        while ( ! is_null($row = $rowset->iterate())) {
+            if ($row->isSpecialFolder()) {
+                continue;
+            }
+
+            // 兄弟フォルダの順番をセットし直す
+            $row->set('list_index', $list_index);
+            $list_index++;
+        }
+
+        // 最後尾に追加
+        $folder->set('parent', $parent);
+        $folder->set('list_index', $list_index);
+
+        // 異なるアカウントへの移動の場合、自分のサブフォルダも全て移動する
+        if ($old_account->getOID() != $account->getOID()) {
+            $folder->setNewAccountToAllDescendants($account);
+        }
+    }
+
+    /**
+     * フォルダ情報ツリーの取得
+     *
+     * @access private
+     *
+     * @param  array                $folder_tree フォルダ情報ツリーを受け取る配列
+     * @param  GRN_Mail_Account     $account     アカウントオブジェクト
+     * @param  GRN_Mail_Folder|null $parent      基点となるフォルダオブジェクト（nullの場合はルートも含む）
+     * @param  bool                 $b_detail    詳細情報取得フラグ
+     * @param  bool                 $b_data_num  データ数取得フラグ
+     * @param  array                $folder_list
+     *
+     * @return  bool サブフォルダの有無
+     */
+    function _getFolderDataTree(
+        & $folder_tree,
+        & $account,
+        & $parent,
+        $b_detail,
+        $b_data_num,
+        & $folder_list
+    ) {
+        assert('is_array( $folder_tree )');
+        assert('is_object( $account )');
+
+        if (is_null($parent)) {
+            // ルートフォルダデータをDBから取得
+            $root_row = $this->_getSpecialFolderRow($account,
+                GRN_MAIL_FOLDER_CODE_ROOT);
+            if (is_null($root_row)) {
+                return false;
+            }
+
+            // ルートフォルダ情報
+            // 未読メール件数は1クエリで取得するようにしたため、ここは FALSE
+            $folder_tree[$root_row->getOID()]
+                = $root_row->getDataProperties($b_detail, false);
+
+            // さらにサブフォルダ
+            $folder_tree[$root_row->getOID()]['children'] = [];
+            $this->_getFolderDataTree($folder_tree[$root_row->getOID()]['children'],
+                $account, $root_row, $b_detail, $b_data_num, $folder_list);
+
+            return true;
+        } else {
+            // サブフォルダのデータオブジェクト一覧を取得
+            $row_list =& $parent->getSubFolderRowList();
+
+            if (count($row_list) > 0) {
+                foreach (array_keys($row_list) as $key) {
+                    $folder_row = $row_list[$key];
+                    // 未読メール件数は1クエリで取得するようにしたため、ここは FALSE
+                    $folder_tree[$folder_row->getOID()]
+                        = $folder_row->getDataProperties($b_detail, false);
+
+                    $folder_list[] = $folder_row->getOID();
+
+                    // さらにサブフォルダ
+                    $folder_tree[$folder_row->getOID()]['children'] = [];
+                    $this->_getFolderDataTree($folder_tree[$folder_row->getOID()]['children'],
+                        $account, $folder_row, $b_detail, $b_data_num,
+                        $folder_list);
+                }
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * match $haystack with $needle
+     *
+     * @access   private
+     *
+     * @param    string $expr           matching condition
+     *                                  'CO': included, 'NCO': excluded, 'SA': same as,
+     *                                  'NSA': different from, 'BE': begin with
+     * @param    string $haystack
+     * @param    string $needle
+     *
+     * @return   bool TRUE: matched
+     */
+    function _matchFilterString($expr, $haystack, $needle)
+    {
+        switch ($expr) {
+            case 'CO': // included
+                if (@ mb_strpos($haystack, $needle) !== false) {
+                    return true;
+                }
+                break;
+            case 'NCO': // excluded
+                if (@ mb_strpos($haystack, $needle) === false) {
+                    return true;
+                }
+                break;
+            case 'SA': // same as
+                if (strcmp($haystack, $needle) == 0) {
+                    return true;
+                }
+                break;
+            case 'NSA': // different from
+                if (strcmp($haystack, $needle) != 0) {
+                    return true;
+                }
+                break;
+            case 'BE': // begin with
+                $pos = @ mb_strpos($haystack, $needle);
+                if (is_int($pos)) {
+                    if ($pos == 0) {
+                        return true;
+                    }
+                }
+                break;
+        }
+
+        return false;
+    }
+
+    /**
+     * match $haystack with $needle
+     *
+     * @access   private
+     *
+     * @param    string $expr           matching condition
+     *                                  'CO': included, 'NCO': excluded, 'SA': same as,
+     *                                  'NSA': different from, 'BE': begin with
+     * @param    int    $haystack       int value
+     * @param    int    $needle
+     *
+     * @return   bool TRUE: matched
+     */
+    function _matchFilterInt($expr, $haystack, $needle)
+    {
+        if ( ! is_numeric($haystack) || ! is_numeric($needle)) {
+            return false;
+        }
+
+        $haystack = (int)$haystack;
+        $needle = (int)$needle;
+        switch ($expr) {
+            case 'EQ': // equal
+                if ($haystack == $needle) {
+                    return true;
+                }
+                break;
+            case 'NEQ': // not equal
+                if ($haystack != $needle) {
+                    return true;
+                }
+                break;
+            case 'GT': // greater than
+                if ($haystack > $needle) {
+                    return true;
+                }
+                break;
+            case 'GE': // greater or equal
+                if ($haystack >= $needle) {
+                    return true;
+                }
+                break;
+            case 'LT': // less than
+                if ($haystack < $needle) {
+                    return true;
+                }
+                break;
+            case 'LE': // less or equal
+                if ($haystack <= $needle) {
+                    return true;
+                }
+                break;
+        }
+
+        return false;
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    // public method
+
+    /**
+     * 指定されたIDのフォルダが存在するかチェック
+     *
+     * @param   string $folder_id フォルダID
+     *
+     * @return   bool
+     */
+    function folderExists($folder_id)
+    {
+        assert('! is_null( $folder_id )');
+
+        $rowset
+            = new CB_RowSet($this->_utility->getTableInfo(GRN_MAIL_FOLDER_TABLE));
+        $rowset->addCondition($rowset->queryf("_id = '@S'", $folder_id));
+        $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+        $result = $rowset->iterate();
+        $rowset->destroy();
+
+        return ($result['count'] > 0);
+    }
+
+    /**
+     * 指定されたIDが特殊フォルダのコードであればフォルダIDへ変換する
+     *
+     * @param   string $account_id
+     * @param   string $code
+     *
+     * @return  string  フォルダID（$codeが特殊フォルダのコードでなければそのまま$codeを返す）
+     */
+    function translateFolderId($account_id, $code)
+    {
+        assert('! is_null( $account_id )');
+        if (is_null($code) || (strlen($code) <= 0)) {
+            return $code;
+        }
+
+        // メールアカウントデータを取得
+        $system_config = $this->_utility->getSystemConfig();
+        $account = $system_config->_getAccountRow($account_id);
+        if ( ! is_object($account)) {
+            return $code;
+        }
+
+        $row = $this->_getSpecialFolderRow($account, $code);
+        if ( ! is_object($row)) {
+            return $code;
+        }
+
+        return $row->getOID();
+    }
+
+    /**
+     * 指定されたIDのフォルダ情報を取得
+     *
+     * @param   string $folder_id     フォルダデータID
+     * @param   bool   $b_detail      詳細情報取得フラグ
+     * @param   bool   $b_throw_error エラー発生時に例外をスローするか(default:TRUE)
+     *
+     * @return  array|null フォルダ情報の配列 or null
+     */
+    function &getFolderData($folder_id, $b_detail = true, $b_throw_error = true)
+    {
+        assert('! is_null( $folder_id )');
+
+        // フォルダデータをDBから取得
+        $row = $this->_getFolderRow($folder_id);
+        if (is_null($row)) {
+            if ($b_throw_error) {
+                cb_throw_error(E_GRN_MAIL_FOLDER_DATA_NOT_FOUND);
+            } else {
+                $row = null;
+
+                return $row;
+            }
+        }
+
+        // フォルダデータオブジェクトからフォルダ情報を取得
+        $ret = $row->getDataProperties($b_detail);
+
+        return $ret;
+    }
+
+    /**
+     * 組み込みフォルダ情報を取得
+     *
+     * @param   string $account_id アカウントID
+     * @param   string $code       組み込みフォルダコード
+     * @param   bool   $b_detail   詳細情報取得フラグ
+     *
+     * @return  array   フォルダ情報の配列
+     */
+    function getSpecialFolderData($account_id, $code, $b_detail = true)
+    {
+        // メールアカウントデータを取得
+        $system_config = $this->_utility->getSystemConfig();
+        $account = $system_config->_getAccountRow($account_id);
+        if ( ! is_object($account)) {
+            // アカウントが見つからない
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+
+        // 組み込みフォルダ初期化
+        $user = $account->get('user');
+        $this->_initSpecialFolders($user, $account);
+
+        // フォルダデータをDBから取得
+        $row = $this->_getSpecialFolderRow($account, $code);
+        if (is_null($row)) {
+            cb_throw_error(E_GRN_MAIL_FOLDER_DATA_NOT_FOUND);
+        }
+
+        // フォルダデータオブジェクトからフォルダ情報を取得
+        return $row->getDataProperties($b_detail);
+    }
+
+    /**
+     * get folder name
+     *
+     * @param    string $folder_id folder id
+     *
+     * @return   string|null if specified folder doesn't exist, return FALSE.
+     */
+    function getFolderName($folder_id)
+    {
+        $row = $this->_getFolderRow($folder_id);
+        if ( ! is_object($row)) {
+            return null;
+        }
+
+        return $this->_getFolderName($row);
+    }
+
+    /**
+     * サブフォルダの数を取得する
+     *
+     * @param   string $folder_id フォルダID
+     *
+     * @return  int
+     */
+    function getSubFolderCount($folder_id)
+    {
+        // フォルダデータをDBから取得
+        $row = $this->_getFolderRow($folder_id);
+
+        return is_object($row) ? $row->getSubFolderCount() : 0;
+    }
+
+    /**
+     * 指定されたフォルダの兄弟フォルダが存在するか（特殊フォルダを除く）
+     *
+     * @param   string $folder_id フォルダID
+     *
+     * @return  bool
+     */
+    function siblingFolderExists($folder_id)
+    {
+        // フォルダデータをDBから取得
+        $row = $this->_getFolderRow($folder_id);
+        if ( ! is_object($row)) {
+            return false;
+        }
+
+        $parent = $row->get('parent');
+        if (is_null($parent)) {
+            return false;
+        }
+
+        $count = $parent->getSubFolderCount();
+        if ($parent->isRoot()) {
+            return $count > 5;
+        }
+
+        return $count > 1;
+    }
+
+    /**
+     * フォルダの追加
+     *
+     * @param string   $account_id アカウントID
+     * @param string   $parent_id  親フォルダデータID（nullの場合はルート直下）
+     * @param string   $name
+     * @param string   $memo
+     * @param int|null $list_index
+     *
+     * @return  string  フォルダID
+     */
+    function addFolderData(
+        $account_id,
+        $parent_id,
+        $name,
+        $memo,
+        $list_index = null
+    ) {
+        // メールアカウントデータを取得
+        $system_config = $this->_utility->getSystemConfig();
+        $account = $system_config->_getAccountRow($account_id);
+        if ( ! is_object($account)) {
+            // アカウントが見つからない
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+
+        $user = $account->get('user');
+
+        // 組み込みフォルダ初期化
+        $this->_initSpecialFolders($user, $account);
+
+        if (is_null($parent_id)) {
+            // ルートフォルダを取得
+            $parent = $this->_getSpecialFolderRow($account,
+                GRN_MAIL_FOLDER_CODE_ROOT);
+        } else {
+            // 親フォルダデータを取得
+            $parent = $this->_getFolderRow($parent_id);
+        }
+
+        if ( ! is_null($parent)
+             && ($parent->isInbox() || $parent->isSentBox()
+                 || $parent->isUnsent()
+                 || $parent->isTrash())
+        ) {
+            // ルートフォルダを取得
+            $parent = $this->_getSpecialFolderRow($account,
+                GRN_MAIL_FOLDER_CODE_ROOT);
+        }
+
+        if (is_null($parent) || $account_id != $parent->getId('account')) {
+            // 親フォルダが見つからない
+            cb_throw_error(E_GRN_MAIL_PARENT_FOLDER_DATA_NOT_FOUND);
+        }
+
+        $properties = [
+            'name'       => $name,
+            'memo'       => $memo,
+            'subscribed' => 1,
+        ];
+
+        if ( ! is_null($list_index)) {
+            $properties['list_index'] = $list_index;
+        } else {
+            $properties['list_index'] = GRN_MAIL_FOLDER_LISTINDEX_DEFAULT;
+        }
+
+        // データ追加
+        $row = $this->_addFolderData($user, $account, $parent, $properties);
+        if ( ! is_object($row)) {
+            // データ追加失敗
+            cb_throw_error(E_GRN_MAIL_FAILED_TO_ADD_FOLDER_DATA);
+        }
+
+        // ログインユーザー取得
+        $login = $this->_utility->getLoginUser();
+        if ($login) {
+            $account->onUpdate($login, null, false);
+        }
+
+        // write log create folder
+        require_once('mail/inspection.csp');
+        $inspection = GRN_Mail_Inspection::getInstance();
+        if ($inspection->isEnabled()) {
+            $properties = [
+                'account_id'       => $account_id,
+                'folder_id'        => $row->getOID(),
+                'folder_name'      => $properties['name'],
+                'parent_folder_id' => $row->getId('parent'),
+                'memo'             => $properties['memo']
+            ];
+            $inspection->writeInspectionLog('create', 'folder', $properties);
+        }
+
+        return $row->getOID();
+    }
+
+    /**
+     * フォルダの変更
+     *
+     * @param   string      $folder_id     フォルダデータID
+     * @param   string|null $new_parent_id 移動先フォルダデータID（nullの場合はルート直下）
+     * @param   string      $name          名前
+     * @param   string      $memo          メモ
+     * @param   int|null    $list_index    並び順 or null（nullの場合は変更しない）
+     *
+     * @return  string  フォルダID
+     */
+    function modifyFolderData(
+        $folder_id,
+        $new_parent_id,
+        $name,
+        $memo,
+        $list_index = null
+    ) {
+        // フォルダデータをDBから取得
+        $row = $this->_getFolderRow($folder_id);
+        if (is_null($row)) {
+            // フォルダが見つからない
+            cb_throw_error(E_GRN_MAIL_FOLDER_DATA_NOT_FOUND);
+        }
+        $account_id = $row->getId('account');
+        $parent_id = $row->getId('parent');
+        // 組み込みフォルダはメモの変更のみ
+        if ( ! $row->isSpecialFolder()) {
+            // 現在の親フォルダIDを取得
+            if ($parent_id === false) {
+                // フォルダが見つからない
+                cb_throw_error(E_GRN_MAIL_FOLDER_DATA_NOT_FOUND);
+            }
+
+            if (is_null($new_parent_id)) {
+                // ルートフォルダを取得
+                $account = $row->get('account');
+                $new_parent = $this->_getSpecialFolderRow($account,
+                    GRN_MAIL_FOLDER_CODE_ROOT);
+            } else {
+                // 移動先フォルダデータを取得
+                $new_parent = $this->_getFolderRow($new_parent_id);
+                if ($row->getOID() == $new_parent->getOID()) {
+                    cb_throw_error(E_GRN_MAIL_DESTINATION_FOLDER_DATA_NOT_FOUND);
+                }
+                // 移動するフォルダのユーザーと移動先のフォルダのユーザーが同じかどうか
+                if ($row->getId('user') != $new_parent->getId('user')) {
+                    cb_throw_error(E_GRN_MAIL_DESTINATION_FOLDER_DATA_NOT_FOUND);
+                }
+            }
+
+            if (is_null($new_parent)) {
+                // 移動先フォルダが見つからない
+                cb_throw_error(E_GRN_MAIL_DESTINATION_FOLDER_DATA_NOT_FOUND);
+            }
+            if ($parent_id !== $new_parent->getOID()) {
+                $old_account_id = $row->getId('account');
+
+                // フォルダの移動
+                $this->_moveFolderData($row, $new_parent);
+                $parent_id = $new_parent->getOID();
+                $account_id = $row->getId('account');
+
+                if ($old_account_id !== $account_id) {
+                    $sub_folders = [];
+                    $row->getMaxDescendantDepth($sub_folders);
+
+                    // Reset mail size
+                    $login_user = cb_get_login_user();
+                    $folder_ids = array_keys($sub_folders);
+                    $folder_ids[] = $folder_id;
+                    $size
+                        = $this->getTotalMailSizeByFolderIds($login_user,
+                        $folder_ids);
+                    if ($size > 0) {
+                        $personal_config
+                            = $this->_utility->getPersonalConfig($login_user);
+                        $old_mail_size
+                            = $personal_config->getMailSize($old_account_id);
+                        $old_mail_size = bcsub($old_mail_size, $size);
+                        $personal_config->setAccountMailSize($old_account_id,
+                            $old_mail_size);
+
+                        $mail_size = $personal_config->getMailSize($account_id);
+                        $mail_size = bcadd($mail_size, $size);
+                        $personal_config->setAccountMailSize($account_id,
+                            $mail_size);
+                    }
+                }
+            }
+
+            $row->set('name', $name);
+
+            if ( ! is_null($list_index)) {
+                $row->set('list_index', $list_index);
+            }
+        }
+
+        $row->set('memo', $memo);
+
+        $account = $row->get('account');
+        // ログインユーザー取得
+        $login = $this->_utility->getLoginUser();
+        if ($login) {
+            $account->onUpdate($login, null, false);
+        }
+
+        //log
+        require_once('mail/inspection.csp');
+        $inspection = GRN_Mail_Inspection::getInstance();
+        if ($inspection->isEnabled()) {
+            $properties = [
+                'account_id'       => $account_id,
+                'folder_id'        => $folder_id,
+                'folder_name'      => $name,
+                'parent_folder_id' => $parent_id,
+                'memo'             => $memo
+            ];
+            $inspection->writeInspectionLog('modify', 'folder', $properties);
+        }
+        $ts = new CB_TimeStamp;
+        $ts->unix_ts = time();
+        $row->set('mtime', $ts);
+        $row->updateNow();
+
+        return $row->getOID();
+    }
+
+    /**
+     * 削除するフォルダとそのサブフォルダのオブジェクト一覧を取得する
+     *
+     * @param   array           $delete_folders 削除対象のフォルダオブジェクトを受け取る
+     * @param   GRN_Mail_Folder $folder         フォルダデータ
+     * @param   bool            $force_delete   強制削除（ごみ箱に移動しない）
+     * @param   bool            $b_sub_folder   サブフォルダも対象とするか
+     *
+     * @return  bool 全て削除できたかどうか
+     */
+    function _deleteFolderData(
+        & $delete_folders,
+        & $folder,
+        $force_delete = false,
+        $b_sub_folder = true
+    ) {
+        assert('is_array( $delete_folders )');
+
+        if ( ! is_object($folder)) {
+            return true;
+        }
+
+        $mail_logic = $this->_utility->getMailLogic();
+
+        // 古い順
+        $sort = 'timestamp';
+        $reverse = true;
+
+        // フォルダ内データ全削除
+        $user = $folder->get('user');
+        $num = $mail_logic->getMailDataCount($user,
+            $folder->getOID());
+        $deleted_count = $mail_logic->deleteMailDataList($folder->getOID(),
+            $force_delete, true, $sort, $reverse);
+
+        // 全てのメールデータを削除できなかったら抜ける
+        if ($num > $deleted_count) {
+            return false;
+        }
+
+        // サブフォルダ処理
+        if ($b_sub_folder) {
+            // サブフォルダオブジェクトリストを取得（逆順）
+            $sub_folders =& $folder->getSubFolderRowList(true);
+            foreach (array_keys($sub_folders) as $key) {
+                $sub_folder = $sub_folders[$key];
+
+                // サブフォルダを処理する
+                if ( ! $this->_deleteFolderData($delete_folders, $sub_folder,
+                    $force_delete, $b_sub_folder)
+                ) {
+                    return false;
+                }
+            }
+        }
+
+        // 削除するフォルダを登録
+        $delete_folders[$folder->getOID()] = $folder;
+
+        return true;
+    }
+
+    /**
+     * 指定されたIDリストのフォルダを削除
+     *
+     * @param string $folder_id      フォルダデータID
+     * @param bool   $force_delete   強制削除（ごみ箱に移動しない）
+     * @param bool   $b_sub_folder   サブフォルダも対象とするか
+     * @param bool   $mail_data_only メールデータのみ対象とするか（TRUEの場合フォルダを削除しない）
+     * @param bool   $folder_log
+     *
+     * @return bool 全て削除できたかどうか
+     */
+    function deleteFolderData(
+        $folder_id,
+        $force_delete = false,
+        $b_sub_folder = true,
+        $mail_data_only = false,
+        $folder_log = true
+    ) {
+        assert('! is_null( $folder_id )');
+
+        // フォルダデータをDBから取得
+        $row = $this->_getFolderRow($folder_id);
+        if ( ! is_object($row)) {
+            return true;
+        }
+
+        // 削除対象のフォルダオブジェクトを受け取る配列
+        /** @var GRN_Mail_Folder[] $delete_folders */
+        $delete_folders = [];
+        $account = $row->get('account');
+
+        if ( ! $this->_deleteFolderData($delete_folders, $row, $force_delete)) {
+            // まだ残っている
+            return false;
+        }
+
+        if ( ! $mail_data_only) {
+            foreach (array_keys($delete_folders) as $key) {
+                // フォルダデータを削除
+                $delete_folder = $delete_folders[$key];
+                //log
+                if ($folder_log) {
+                    require_once('mail/inspection.csp');
+                    $inspection = GRN_Mail_Inspection::getInstance();
+                    if ($inspection->isEnabled()) {
+                        $properties = [
+                            'account_id'  => $row->getId('account'),
+                            'folder_id'   => $folder_id,
+                            'folder_name' => $row->get('name')
+                        ];
+                        $inspection->writeInspectionLog('delete', 'folder',
+                            $properties);
+                    }
+                }
+                if ( ! $delete_folder->delete()) {
+                    cb_throw_error(E_GRN_MAIL_FAILED_TO_DELETE_FOLDER_DATA);
+                }
+
+                $this->_folders[$key] = null;
+            }
+        }
+
+        // ログインユーザー取得
+        $login = $this->_utility->getLoginUser();
+        if ($login) {
+            $account->onUpdate($login, null, false);
+        }
+
+        return true;
+    }
+
+    /**
+     * サブフォルダの順番を設定する
+     *
+     * @param  string      $account_id アカウントID（$parent_idがnullのときのみ使用）
+     * @param  string|null $parent_id  親フォルダID or null（nullの場合はルート）
+     * @param  array       $folder_ids サブフォルダIDの配列、格納された順番にフォルダを配置する
+     *
+     * @return bool 成否
+     */
+    function changeFolderOrder($account_id, $parent_id, & $folder_ids)
+    {
+        assert('is_array( $folder_ids )');
+
+        // メールアカウントデータを取得
+        $system_config = $this->_utility->getSystemConfig();
+        $account = $system_config->_getAccountRow($account_id);
+        if ( ! is_object($account)) {
+            // アカウントが見つからない
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+
+        if (is_null($parent_id)) {
+            // ルートから
+            $parent = $this->_getSpecialFolderRow($account,
+                GRN_MAIL_FOLDER_CODE_ROOT);
+            $parent_id = $parent->getOID();
+        } else {
+            // 指定されたフォルダから
+            $parent = $this->_getFolderRow($parent_id);
+            if ( ! is_a($parent, 'GRN_Mail_Folder')
+                 || $parent->getId('account') != $account_id
+            ) {
+                cb_throw_error(E_GRN_MAIL_FOLDER_DATA_NOT_FOUND);
+            }
+        }
+
+        $user = null;               // 更新情報を記録しないためにnullを渡す
+        $list_index = GRN_MAIL_FOLDER_LISTINDEX_UNSENT + 1;
+        foreach ($folder_ids as $id) {
+            // フォルダデータを取得
+            $row = $this->_getFolderRow($id);
+            if ( ! is_object($row)) {
+                // 見つからないデータは無視
+                continue;
+            }
+
+            $folder_parent = $row->get('parent');
+            if (is_null($folder_parent)
+                || ($folder_parent->getOID() !== $parent_id)
+            ) {
+                // ルートまたは親フォルダが一致しない場合は対象外
+                continue;
+            }
+
+            if ( ! $row->isSpecialFolder()) {
+                // 一般フォルダ（組み込みフォルダの順番は変更できない）
+                $list_index++;
+                $row->set('list_index', $list_index);
+                $row->updateNow();
+            }
+            //log
+            require_once('mail/inspection.csp');
+            $inspection = GRN_Mail_Inspection::getInstance();
+            if ($inspection->isEnabled()) {
+                $properties = [
+                    'account_id'       => $row->getId('account'),
+                    'folder_id'        => $id,
+                    'folder_name'      => $row->get('name'),
+                    'parent_folder_id' => $folder_parent->getOID(),
+                    'list_index'       => $list_index
+                ];
+                $inspection->writeInspectionLog('move', 'folder', $properties);
+            }
+        }
+        // ログインユーザー取得
+        $login = $this->_utility->getLoginUser();
+        if ($login) {
+            $account->onUpdate($login, null, false);
+        }
+
+        return true;
+    }
+
+    /**
+     * フォルダの購読設定
+     *
+     * @param string $account_id        アカウントID
+     * @param array  $subscribe_folders 購読するフォルダIDの配列
+     *
+     * @return bool
+     */
+    function subscribeFolders($account_id, & $subscribe_folders)
+    {
+        // メールアカウントデータを取得
+        $system_config = $this->_utility->getSystemConfig();
+        $account = $system_config->_getAccountRow($account_id);
+        if ( ! is_object($account)) {
+            // アカウントが見つからない
+            return false;
+        }
+
+        // アカウントの全フォルダ購読設定解除
+        $account->unsubscribeAllFolders();
+
+        if (is_array($subscribe_folders)) {
+            foreach (array_keys($subscribe_folders) as $key) {
+                $folder_id = $subscribe_folders[$key];
+
+                // フォルダデータを取得
+                $row = $this->_getFolderRow($folder_id);
+                if ( ! is_object($row)) {
+                    // 見つからないデータは無視
+                    continue;
+                }
+
+                // 購読設定
+                if ( ! $row->subscribe(true)) {
+                    // データ設定失敗
+                    cb_throw_error(E_GRN_MAIL_FAILED_TO_SET_FOLDER_SUBSCRIBE_DATA);
+                }
+            }
+        }
+    }
+
+    /**
+     * フォルダの購読設定
+     *
+     * @param string $account_id  アカウントID
+     * @param string $folder_id   フォルダID
+     * @param bool   $b_subscribe 購読するか否か
+     *
+     * @return bool
+     */
+    function subscribeFolder($account_id, $folder_id, $b_subscribe)
+    {
+        assert('! is_null( $account_id )');
+        assert('! is_null( $folder_id )');
+        assert('! is_null( $b_subscribe )');
+
+        // メールアカウントデータを取得
+        $system_config = $this->_utility->getSystemConfig();
+        $account = $system_config->_getAccountRow($account_id);
+        if ( ! is_object($account)) {
+            // アカウントが見つからない
+            return false;
+        }
+
+        // フォルダデータを取得
+        $row = $this->_getFolderRow($folder_id);
+        if ( ! is_object($row)) {
+            cb_throw_error(E_GRN_MAIL_FOLDER_DATA_NOT_FOUND);
+        }
+
+        // 購読設定
+        if ( ! $row->subscribe($b_subscribe)) {
+            // データ設定失敗
+            cb_throw_error(E_GRN_MAIL_FAILED_TO_SET_FOLDER_SUBSCRIBE_DATA);
+        }
+    }
+
+    /**
+     * アカウントのフォルダデータツリーの取得
+     *
+     * @param array[]     $folder_tree フォルダ情報ツリーを受け取る配列
+     * @param CB_User     $user        ユーザー
+     * @param string      $account_id  アカウントID
+     * @param string|null $parent_id   基点となるフォルダID or null（nullの場合はルート）
+     * @param bool        $b_detail    詳細情報取得フラグ
+     * @param bool        $b_data_num  データ数取得フラグ
+     *
+     * @return bool 成否
+     *
+     * $folder_tree[フォルダID]['name']             フォルダ名
+     *                        ['code']             フォルダコード
+     *                        ['subscribed']       購読フラグ
+     *                        ['children_num']     下位層フォルダ数
+     *                        ['children']         下位層フォルダ
+     */
+    function getFolderDataTree(
+        & $folder_tree,
+        & $user,
+        $account_id,
+        $parent_id = null,
+        $b_detail = false,
+        $b_data_num = false
+    ) {
+        assert('is_object( $user )');
+        assert('! is_null( $account_id )');
+
+        // メールアカウントデータを取得
+        $system_config = $this->_utility->getSystemConfig();
+        $account = $system_config->_getAccountRow($account_id);
+        if ( ! is_object($account)) {
+            // アカウントが見つからない
+            return false;
+        }
+
+        // キャッシュチェック
+        $cache_key = is_null($parent_id) ? 0 : $parent_id;
+        if (array_key_exists($account_id, $this->_folder_tree)
+            && array_key_exists($cache_key, $this->_folder_tree[$account_id])
+        ) {
+            $folder_tree = $this->_folder_tree[$account_id][$cache_key];
+
+            return true;
+        }
+
+        $account_user = $account->get('user');
+        if ( ! is_object($account_user)
+             || ($account_user->getOID() != $user->getOID())
+        ) {
+            // アカウントのユーザーと一致しない
+            return false;
+        }
+
+        // 組み込みフォルダ初期化
+        $this->_initSpecialFolders($account_user, $account);
+
+        if (is_null($parent_id)) {
+            // ルートから
+            $parent = null;
+        } else {
+            // 指定されたフォルダから
+            $parent = $this->_getFolderRow($parent_id);
+            if (is_null($parent)) {
+                cb_throw_error(E_GRN_MAIL_FOLDER_DATA_NOT_FOUND);
+            }
+        }
+
+        // キャッシュ生成
+        if ( ! array_key_exists($account_id, $this->_folder_tree)) {
+            $this->_folder_tree[$account_id] = [];
+        }
+        if ( ! array_key_exists($cache_key, $this->_folder_tree[$account_id])) {
+            $this->_folder_tree[$account_id][$cache_key] = [];
+        }
+
+        $folder_list = [];
+
+        // フォルダツリー
+        $this->_getFolderDataTree($this->_folder_tree[$account_id][$cache_key],
+            $account, $parent, $b_detail, $b_data_num, $folder_list);
+
+        $mail_num_list = $this->getMailNum($folder_list, true);
+
+        $this->_setUnreadMailNum($this->_folder_tree[$account_id][$cache_key],
+            $mail_num_list);
+        $folder_tree = $this->_folder_tree[$account_id][$cache_key];
+
+        return true;
+    }
+
+    function _setUnreadMailNum(& $folder_tree, $mail_num_list)
+    {
+        if (is_array($folder_tree) && count($folder_tree) > 0) {
+            foreach (array_keys($folder_tree) as $key) {
+                if (array_key_exists($key, $mail_num_list)) {
+                    $folder_tree[$key]['unread_num'] = $mail_num_list[$key];
+                    unset($mail_num_list[$key]);
+                } else {
+                    $folder_tree[$key]['unread_num'] = 0;
+                }
+
+                $this->_setUnreadMailNum($folder_tree[$key]['children'],
+                    $mail_num_list);
+            }
+        }
+    }
+
+    /**
+     * アカウントの指定されたフォルダのサブフォルダデータリストの取得（1階層のみ）
+     *
+     * @param   string      $account_id            アカウントID
+     * @param   string|null $parent_id             親フォルダID or null（nullの場合はルート）
+     * @param   bool        $hidden_special_folder 組み込みフォルダを表示しないフラグ
+     * @param   bool        $b_detail              詳細情報取得フラグ
+     *
+     * @return  array|null フォルダデータリスト or null
+     *
+     * $folder_tree[フォルダID]['name']             フォルダ名
+     *                         ['code']             フォルダコード
+     *                         ['subscribed']       購読フラグ
+     */
+    function getFolderDataList(
+        $account_id,
+        $parent_id,
+        $hidden_special_folder = false,
+        $b_detail = false
+    ) {
+        assert('! is_null( $account_id )');
+
+        // メールアカウントデータを取得
+        $system_config = $this->_utility->getSystemConfig();
+        $account = $system_config->_getAccountRow($account_id);
+        if ( ! is_object($account)) {
+            // アカウントが見つからない
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+
+        // 組み込みフォルダ初期化
+        $user = $account->get('user');
+        $this->_initSpecialFolders($user, $account);
+
+        if (is_null($parent_id)) {
+            // ルートフォルダを取得
+            $root = $this->_getSpecialFolderRow($account,
+                GRN_MAIL_FOLDER_CODE_ROOT);
+            $parent_id = $root->getOID();
+        }
+
+        // メールデータリスト取得
+        $data_list = [];
+        $rowset
+            = new CB_RowSet($this->_utility->getTableInfo(GRN_MAIL_FOLDER_TABLE));
+        if (is_null($rowset)) {
+            return $data_list;
+        }
+
+        $rowset->addCondition($rowset->queryf("col_parent = '@S'", $parent_id));
+        $rowset->addOrderColumn('col_list_index');            // ソート
+        $rowset->addOrderColumn(null);                        // OID順
+
+        // フォルダデータ一覧ループ
+        while ( ! is_null($row = &$rowset->iterate())) {
+            /** @var GRN_Mail_Folder $row */
+            if ( ! $hidden_special_folder || ! $row->isSpecialFolder()) {
+                // データプロパティ取得
+                $data_list[$row->getOID()] = $row->getDataProperties($b_detail);
+            }
+        }
+
+        return $data_list;
+    }
+
+    /**
+     * 指定されたフォルダのメール件数を取得
+     *
+     * @param    array $folder_list   フォルダID が value となる配列
+     * @param    bool  $b_unread_only 未読のみを取得するフラグ
+     *
+     * @return   array ret[フォルダID] => 未読メール件数
+     */
+    function getMailNum($folder_list, $b_unread_only)
+    {
+        assert('is_array( $folder_list )');
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('mail');
+
+        $escaped_folder_list = [];
+        foreach ($folder_list as $id) {
+            $escaped_folder_list[] = "'" . $dbconn->escape($id) . "'";
+        }
+
+        global $G_container_base;
+        /** @var GRN_Uum $uum */
+        $uum = $G_container_base->getInstance('uum');
+        $login = $uum->getLoginUser();
+        $suffix = grn_mail_get_personal_suffix($login->getOID());
+        $table_name = grn_mail_get_personal_tablename($login->getOID(),
+            'tab_' . GRN_MAIL_MESSAGE_TABLE);
+        $query = 'SELECT col_folder,COUNT(*) count FROM ' . $table_name
+                 . ' force index(idx_folder_rts_n) WHERE col_folder IN ('
+                 . implode(',', $escaped_folder_list) . ')';
+        if ($b_unread_only) {
+            $query .= ' AND col_read_ts = \'0\'';
+        }
+        $query .= ' GROUP BY col_folder';
+
+        $result = $dbconn->query($query);
+        if ($result === false) {
+            $dbconn->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+
+        $mail_num_list = [];
+
+        while ($row = $dbconn->fetch_assoc($result)) {
+            $mail_num_list[$row['col_folder']] = $row['count'];
+        }
+
+        foreach ($folder_list as $folder_id) {
+            if ( ! array_key_exists($folder_id, $mail_num_list)) {
+                $mail_num_list[$folder_id] = 0;
+            }
+        }
+
+        return $mail_num_list;
+    }
+
+    /**
+     * メール振り分け先のフォルダ情報を取得
+     *
+     * @param   GRN_Mail_Account $account                  アカウントデータ
+     * @param   GRN_Mail_Message $mail                     メールデータ
+     * @param   array            $all_headers              メールの全ヘッダデータ(array of {@link CB_MailAddress})
+     * @param   GRN_Mail_Status  $status                   自動設定するステータス設定を受け取る
+     * @param   bool             $not_save_address_history 送受信記録に保存しないかどうかを受け取る
+     *
+     * @return  GRN_Mail_Folder フォルダ情報
+     */
+    function &filterMail(
+        & $account,
+        & $mail,
+        $all_headers,
+        & $status,
+        & $not_save_address_history
+    ) {
+        assert('is_object( $account )');
+        assert('is_object( $mail )');
+
+        $user = $account->get('user');
+        assert('is_object( $user )');
+        $personal_config = $this->_utility->getPersonalConfig($user);
+        $b_trash = $personal_config->useTrash();
+
+        // 振り分け設定データ
+        $rowset
+            = new CB_RowSet($this->_utility->getTableInfo(GRN_MAIL_FILTER_TABLE));
+        $rowset->addCondition($rowset->queryf("col_account = '@S'",
+            $account->getOID()));
+        $rowset->addOrderColumn("col_list_index");
+        $rowset->addOrderColumn(null);
+
+        /** @var GRN_Mail_Filter $filter */
+        while ( ! is_null($filter = $rowset->iterate())) {
+            /** @var GRN_Mail_Folder $folder */
+            $folder = $filter->get('folder');
+            if (is_object($folder)) {
+                if ($folder->isTrash() && ! $b_trash) {
+                    // ごみ箱を使用しない設定の場合は無視
+                    continue;
+                }
+
+                // 条件
+                $or = $filter->get('or');
+                $condition_rows =& $filter->getConditionRowList();
+
+                $matched = false;
+                foreach (array_keys($condition_rows) as $condition_key) {
+                    $matched = false;
+                    $condition_row = $condition_rows[$condition_key];
+                    switch ($condition_row->get('type')) {
+                        case 'SB': // subject
+                            $subject = $mail->get('subject');
+                            if (is_null($subject)) {
+                                $subject = '';
+                            }
+
+                            $matched
+                                = $this->_matchFilterString($condition_row->get('expr'),
+                                $subject,
+                                $condition_row->get('string'));
+                            break;
+
+                        case 'FR': // from
+                            $from = $mail->get('from');
+                            if (is_null($from)) {
+                                $from = '';
+                            }
+
+                            $matched
+                                = $this->_matchFilterString($condition_row->get('expr'),
+                                $from,
+                                $condition_row->get('string'));
+                            break;
+
+                        case 'TO': // to
+                            $to = $mail->get('to');
+                            if (is_null($to)) {
+                                $to = '';
+                            }
+
+                            $matched
+                                = $this->_matchFilterString($condition_row->get('expr'),
+                                $to,
+                                $condition_row->get('string'));
+                            break;
+
+                        case 'CC': // cc
+                            $cc = $mail->get('cc');
+                            if (is_null($cc)) {
+                                $cc = '';
+                            }
+
+                            $matched
+                                = $this->_matchFilterString($condition_row->get('expr'),
+                                $cc,
+                                $condition_row->get('string'));
+                            break;
+
+                        case 'HD': // header
+                            if (is_array($all_headers)) {
+                                foreach ($all_headers as $header) {
+                                    if ( ! is_a($header, 'CB_MailHeader')
+                                         || is_array($header->value)
+                                         || is_object($header->value)
+                                    ) {
+                                        continue;
+                                    }
+
+                                    if ($this->_matchFilterString($condition_row->get('expr'),
+                                        $header->name . ': '
+                                        . strval($header->value),
+                                        $condition_row->get('string'))
+                                    ) {
+                                        $matched = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            break;
+
+                        case 'SZ': // size
+                            $size = $mail->get('size');
+                            if (is_null($size)) {
+                                $size = 0;
+                            }
+
+                            $temp = $condition_row->get('string');
+                            if (is_numeric($temp)) {
+                                $temp = intval($condition_row->get('string'))
+                                        * 1024; // Byte -> KB
+                                $matched
+                                    = $this->_matchFilterInt($condition_row->get('expr'),
+                                    $size,
+                                    $temp);
+                            }
+                            break;
+
+                    } // end of switch( $condition['type'] )
+
+                    if ( ! $matched && ! $or) {
+                        // in case of "以下の全ての条件を満たす"
+                        break;
+                    } elseif ($matched && $or) {
+                        // in case of "以下のいずれかの条件を満たす"
+
+                        // 自動ステータス設定を返す
+                        $status = $filter->get('status');
+
+                        // 送受信記録に保存しない設定を返す
+                        $not_save_address_history
+                            = intval($filter->get('not_save_address_history'))
+                              == 1;
+
+                        return $folder;
+                    }
+                } // end of foreach( $conditions as $condition )
+
+                if ($matched) {
+                    // 自動ステータス設定を返す
+                    $status = $filter->get('status');
+
+                    // 送受信記録に保存しない設定を返す
+                    $not_save_address_history
+                        = intval($filter->get('not_save_address_history')) == 1;
+
+                    return $folder;
+                }
+            }
+        }
+
+        // 受信箱
+        $ret = $this->_getSpecialFolderRow($account,
+            GRN_MAIL_FOLDER_CODE_INBOX);
+
+        return $ret;
+    }
+
+    /**
+     * @param CB_User $user
+     * @param string  $account_id
+     *
+     * @return array
+     */
+    function getRootFolders(&$user, $account_id)
+    {
+        $folders = [];
+
+        // --- get root folder
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('mail');
+        //  $user は CB_User なので、UUMが削除フラグチェック済み。 
+        $query = 'SELECT _id FROM tab_grn_mail_folder'
+                 . ' WHERE col_user="' . $user->getOID() . '" AND col_account="'
+                 . $db->escape($account_id) . '"'
+                 . ' AND col_code="root";';
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $root = $db->fetch_assoc($result);
+
+        $db->free_result($result);
+        if ( ! $root) {
+            return $folders;
+        }
+
+        //--- get root folders
+
+        $folders = $this->getChildren($user, $account_id, $root['_id']);
+
+        return $folders;
+    }
+
+    /**
+     * @param CB_User $user
+     * @param string  $account_id
+     * @param string  $parent_id
+     *
+     * @return array
+     */
+    function getChildren(&$user, $account_id, $parent_id)
+    {
+        $children = [];
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('mail');
+        $query
+            = 'SELECT _id, col_name, col_code, col_subscribed FROM tab_grn_mail_folder'
+              . ' WHERE col_user="' . $user->getOID()
+              . '" AND col_account="' . $db->escape($account_id)
+              . '" AND col_parent="' . $db->escape($parent_id) . '"'
+              . ' ORDER BY col_list_index, col_ctime;';
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        require_once('mail/utility.csp');
+        $utility = GRN_Mail_Utility::getInstance();
+        $mail_logic = $utility->getMailLogic();
+        $unread_mail_info = $mail_logic->getUnreadMailNum($user);
+
+        while ($row = $db->fetch_assoc($result)) {
+            $folder_name = '';
+            // normal folder
+            if ( ! $row['col_code']) {
+                $folder_name = $row['col_name'];
+            } else // inbox, outbox, draft, trash
+            {
+                $folder_name = cb_msg(GRN_MAIL_MODULE_ID, $row['col_code']);
+            }
+
+            // get unread mail
+            $unread = array_key_exists($row['_id'],
+                $unread_mail_info) ? $unread_mail_info[$row['_id']] : 0;
+            $row_for_view = [
+                'id'        => $row['_id'],
+                'type'      => $row['col_code'],
+                'name'      => $folder_name,
+                'subscribe' => $row['col_subscribed'],
+                'unread'    => $unread
+            ];
+            $children[$row['_id']] = $row_for_view;
+        }
+
+        $db->free_result($result);
+
+        return $children;
+    }
+
+    /**
+     * @param $folder_id
+     *
+     * @return array
+     */
+    function &getAncestors($folder_id)
+    {
+        $folders = $this->_utility->getTableInfo('grn_mail_folder');
+        $folders->setLock(CB_DATABASE_NO_LOCK);
+        $row = $folders->getRow($folder_id);
+
+        $ret = [];
+        while ($row) {
+            $ret[$row->getOID()] = $row;
+            $row = $row->get('parent');
+        }
+
+        $folders->setLock(CB_DATABASE_DEFAULT_LOCK);
+
+        $ret = array_reverse($ret, true);
+
+        return $ret;
+    }
+
+    /**
+     * @param CB_User $user
+     * @param string  $account_id
+     * @param string  $folder_id
+     *
+     * @return array|bool
+     */
+    function getFolderInfo($user, $account_id, $folder_id)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('mail');
+
+        $query = 'SELECT _id, col_code,col_name FROM tab_grn_mail_folder'
+                 . ' WHERE col_user="' . $user->getOID() . '" AND col_account="'
+                 . $db->escape($account_id) . '" AND _id="'
+                 . $db->escape($folder_id) . '"';
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $row = $db->fetch_assoc($result);
+        $db->free_result($result);
+
+        if ( ! $row) {
+            return false;
+        }
+
+        $folder_info = [
+            'id'   => $row['_id'],
+            'code' => $row['col_code'],
+            'name' => $row['col_name']
+        ];
+
+        return $folder_info;
+    }
+
+    /**
+     * @param CB_User $user
+     * @param string  $account_id
+     * @param string  $parent_id
+     *
+     * @return int
+     */
+    function childrenCount(&$user, $account_id, $parent_id)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('mail');
+
+        $query = 'SELECT count(*) as result FROM tab_grn_mail_folder'
+                 . ' WHERE col_user="' . $user->getOID() . '" AND col_account="'
+                 . $db->escape($account_id) . '" AND col_parent="'
+                 . $db->escape($parent_id) . '"';
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $row = $db->fetch_assoc($result);
+        $db->free_result($result);
+
+        $count = ($row['result'] > 0) ? $row['result'] : 0;
+
+        return $count;
+    }
+
+    /**
+     * Get the size of mails in folders
+     *
+     * @param CB_User $user
+     * @param array   $folder_ids
+     *
+     * @return int
+     */
+    public function getTotalMailSizeByFolderIds($user, $folder_ids)
+    {
+        $table_name = grn_mail_get_personal_tablename($user->getOID(),
+            GRN_MAIL_MESSAGE_TABLE);
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection(GRN_MAIL_APP_ID);
+        $query = 'SELECT SUM(col_size) AS s FROM '
+                 . CB_DATABASE_TABLE_PREFIX . $table_name . ' AS m, '
+                 . CB_DATABASE_TABLE_PREFIX . 'cb_user AS u';
+        $query .= " WHERE m.col_user = u._id AND u.col_deleted IS NULL AND m.col_user = '@S' AND m.col_folder IN (@A);";
+        $query = cb_queryf($db, $query, $user->getOID(), $folder_ids);
+        $result = $db->query($query);
+        $row = $db->fetch_assoc($result);
+        $db->free_result($result);
+        if ( ! $row) {
+            $size = 0;
+        } else {
+            $size = cb_at($row, 's', 0);
+        }
+
+        return $size;
+    }
+
+    /**
+     * initialize special folders for all accounts
+     *
+     * @param   CB_User $user CB_User
+     */
+    public function initSpecialFoldersForAllAccounts($user)
+    {
+        $personal_config = $this->_utility->getPersonalConfig($user);
+        $account_list = $personal_config->getAccountDataList();
+        if (is_array($account_list)) {
+            foreach (array_keys($account_list) as $account_id) {
+                $account = $personal_config->getAccountData($account_id, false, true);
+                $this->initSpecialFolders($user, $account['id']);
+            }
+        }
+    }
+}

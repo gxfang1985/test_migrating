@@ -1,0 +1,365 @@
+<?php
+
+namespace grn\fts;
+
+require_once('grn/controller.csp');
+
+class SearchUtil
+{
+    private static $notIndexExntensions
+        = [
+            'img'  => true,
+            'jpg'  => true,
+            'jpeg' => true,
+            'png'  => true,
+            'gif'  => true,
+            'zip'  => true,
+            'gz'   => true
+        ];
+
+    /** @var string */
+    private static $highlightSearchPre = null;
+    /** @var string */
+    private static $highlightSearchPost = null;
+
+    const HIGHLIGHT_REPLACE_PRE = '<span class="search-listKeyword-grn">';
+    const HIGHLIGHT_REPLACE_POST = '</span>';
+    const HIGHLIGHT_FRAGSIZE = 200;
+    const HIGHLIGHT_PHRASE_LIMIT = 100;
+    const TIME_ALLOWED_MILLISECONDS = 20000;
+
+    /**
+     * @param SearchDocumentInterface $document
+     *
+     * @return string
+     */
+    public function getSnippet(SearchDocumentInterface $document)
+    {
+        $highlights = $document->getHighlights();
+        if (isset($highlights[0])) {
+            return $highlights[0];
+        } else {
+            return '';
+        }
+    }
+
+    /**
+     * @param \CB_User $user
+     *
+     * @return string|bool return FALSE if the modifier id deleted.
+     */
+    public function getDisplayName(\CB_User $user)
+    {
+        $userId = $user->getOID();
+        $usersInfo = $this->getUsersInfo([$userId], $user);
+        if (isset($usersInfo[$userId]) && is_array($usersInfo[$userId])) {
+            $loginUser = cb_get_login_user();
+            $userInfo = $usersInfo[$userId];
+
+            return $this->getUserNameText($loginUser, $userId, $userInfo);
+        }
+
+        return false;
+    }
+
+    /**
+     * @param \CB_User $loginUser
+     * @param string   $userId
+     * @param array    $userInfo
+     *
+     * @return string
+     */
+    protected function getUserNameText(\CB_User $loginUser, $userId, $userInfo)
+    {
+        return \GRN_ControllerUtil::getUserNameText($loginUser->getOID(),
+            $userId, [$userId => $userInfo]);
+    }
+
+    /**
+     * @param string[] $userIds
+     * @param \CB_User $user
+     *
+     * @return array
+     */
+    protected function getUsersInfo(array $userIds, \CB_User $user)
+    {
+        return \GRN_ControllerUtil::getUserInfoToShowUserName($userIds, $user);
+    }
+
+    /**
+     * @param \CB_User|null $modifier
+     * @param string        $displayName This is overwritten by the current display name when the $modifier is not a deleted modifier.
+     *
+     * @return \grn\fts\ModifierView
+     */
+    public function getModifierView($modifier, $displayName)
+    {
+        if ($modifier instanceof \CB_User) {
+            $currentDisplayName = $this->getDisplayName($modifier);
+            if ($currentDisplayName !== false) {
+                $displayName = $currentDisplayName;
+            }
+        }
+        $profileUrl = $this->getModifierProfileUrl($modifier);
+
+        return new ModifierView($displayName, $profileUrl);
+    }
+
+    /**
+     * @param \CB_User|null $user
+     *
+     * @return string|null
+     */
+    public function getModifierProfileUrl($user)
+    {
+        if ( ! ($user instanceof \CB_User) || $user->get('deleted')) {
+            return null;
+        }
+
+        return $this->getPopupUserProfileURL($user);
+    }
+
+    protected function getPopupUserProfileURL(\CB_User $user)
+    {
+        return \GRN_ControllerUtil::getPopupUserProfileURLById($user->getOID());
+    }
+
+    /**
+     * @return string
+     */
+    public function getUserIcon()
+    {
+        return cb_get_app_path() . '/grn/image/cybozu/user20.gif';
+    }
+
+    /**
+     * @return string
+     */
+    public function getLoginUserIcon()
+    {
+        return cb_get_app_path() . '/grn/image/cybozu/loginuser20.gif';
+    }
+
+    /**
+     * @return string
+     */
+    public function getDeletedUserIcon()
+    {
+        return cb_get_app_path() . '/grn/image/cybozu/deleteuser20.gif';
+    }
+
+    /**
+     * @param string $str
+     *
+     * @return string
+     */
+    public static function queryPhrase($str)
+    {
+        return \SolrUtils::queryPhrase($str);
+    }
+
+    /**
+     * @static
+     *
+     * @param string $text
+     *
+     * @return string
+     */
+    public static function truncateLongText($text)
+    {
+        return mb_substr($text, 0, FullIndexer::LONGTEXT_MAX_LENGTH);
+    }
+
+    /**
+     * @static
+     *
+     * @param string           $id
+     * @param string           $fileName
+     * @param string|null|bool $fileIdentifier
+     *
+     * @return \grn\fts\SearchEntry
+     */
+    public static function createBaseFileEntry($id, $fileName, $fileIdentifier)
+    {
+        $validate = self::validateFileIdentifier($id, $fileName,
+            $fileIdentifier);
+        $searchEntry = new SearchEntry($id);
+        $searchEntry->addValue(Fields::fileName(), $fileName);
+        $extension = FileIcon::extractExtension($fileName);
+        $searchEntry->addValue(Fields::fileExtension(), $extension);
+
+        // for performance, don't queue file-contents which can't be extracted to text.
+        if (self::isIndexExtension(strtolower($extension)) && $validate) {
+            $searchEntry->setFileIdentifier($fileIdentifier);
+        }
+
+        return $searchEntry;
+    }
+
+    /**
+     * @static
+     *
+     * @param string $extension
+     *
+     * @return bool
+     */
+    private static function isIndexExtension($extension)
+    {
+        return ! array_key_exists($extension, self::$notIndexExntensions);
+    }
+
+    /**
+     * @param $id
+     * @param $fileName
+     * @param $fileIdentifier
+     *
+     * @return bool
+     */
+    private static function validateFileIdentifier(
+        $id,
+        $fileName,
+        $fileIdentifier
+    ) {
+        if (defined('ON_FOREST')) {
+            return self::validateFileIdentifierOnForest($id, $fileIdentifier);
+        } else {
+            return self::validateFileIdentifierOnpremise($id, $fileName,
+                $fileIdentifier);
+        }
+    }
+
+    /**
+     * @param $id
+     * @param $fileIdentifier
+     *
+     * @return bool
+     */
+    private static function validateFileIdentifierOnForest($id, $fileIdentifier)
+    {
+        if ( ! empty($fileIdentifier)) {
+            return true;
+        }
+        require_once('fw/cydec.csp');
+        $util = \CB_CyDECUtil::getInstance();
+        syslog(LOG_ERR,
+            "Couldn't get blob id!! [domain: {$util->getDomainID()}, indexId: {$id}]");
+
+        return false;
+    }
+
+    /**
+     * @param $id
+     * @param $fileName
+     * @param $fileIdentifier
+     *
+     * @return bool
+     */
+    private static function validateFileIdentifierOnpremise(
+        $id,
+        $fileName,
+        $fileIdentifier
+    ) {
+        if ( ! empty($fileIdentifier)) {
+            return true;
+        }
+        syslog(LOG_ERR,
+            "Couldn't get file path!! [indexId: {$id}, fileName: {$fileName}]");
+
+        return false;
+    }
+
+    /**
+     * @param string $appName
+     * @param string $objectName
+     * @param string $fileId
+     *
+     * @return string
+     */
+    public static function getFilePath($appName, $objectName, $fileId)
+    {
+        $dir1 = '0';
+        $dir2 = '0';
+
+        $len = strlen($fileId);
+        if ($len > 6) {
+            $limit = $len - 6;
+            $dir1 = substr($fileId, 0, $limit);
+            $dir2 = substr($fileId, $limit, 3);
+            $file = substr($fileId, $limit + 3, 3);
+        } elseif ($len > 3) {
+            $limit = $len - 3;
+            $dir2 = substr($fileId, 0, $limit);
+            $file = substr($fileId, $limit, 3);
+        } else {
+            $file = $fileId;
+        }
+        global $G_config_common;
+        $dir = $G_config_common->get('Files', 'dir');
+
+        $dir .= "/${appName}/${objectName}/${dir1}/${dir2}";
+
+        return "${dir}/${file}";
+    }
+
+    /**
+     * @param \CB_User $user
+     *
+     * @return void
+     */
+    public static function loginSpecifiedUser(\CB_User $user)
+    {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $uum->loginAs($user);
+    }
+
+    /**
+     * This function checks the ids for creating index id.
+     * It should not occur the error in normal operation.
+     *
+     * @static
+     *
+     * @param array $ids
+     */
+    public static function validateIds(array $ids)
+    {
+        foreach ($ids as $id) {
+            if (is_null($id)) {
+                continue;
+            }
+            if ( ! is_numeric($id) || (int)$id < 0
+                 || (is_string($id)
+                     && ! ctype_digit($id))
+            ) {
+                // Todo create an appropriate error
+                cb_throw_error();
+            }
+        }
+    }
+
+    /**
+     * @static
+     * @return string
+     */
+    public static function getHighlightSearchPre()
+    {
+        if (is_null(self::$highlightSearchPre)) {
+            self::$highlightSearchPre = cb_create_uuid();
+        }
+
+        return self::$highlightSearchPre;
+    }
+
+    /**
+     * @static
+     * @return string
+     */
+    public static function getHighlightSearchPost()
+    {
+        if (is_null(self::$highlightSearchPost)) {
+            self::$highlightSearchPost = cb_create_uuid();
+        }
+
+        return self::$highlightSearchPost;
+    }
+}

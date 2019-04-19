@@ -1,0 +1,620 @@
+<?php
+
+namespace grn\schedule;
+
+use grn\grn\access\service\AppAccess;
+
+class EventMemberListUtil
+{
+    const MEMBER_TYPE_USER = 'user';
+    const MEMBER_TYPE_ORGANIZATION = 'org';
+    const MEMBER_TYPE_FACILITY = 'facility';
+
+    /**
+     * Get members of the given group.
+     * This function also does evaluate access right for members.
+     *
+     * @param \CB_User   $user
+     * @param            $group_type
+     * @param            $group_id
+     * @param array|null $options
+     *
+     * @return array
+     */
+    public static function getGroupMembersId(
+        \CB_User $user,
+        $group_type,
+        $group_id,
+        array $options = null
+    ) {
+        if ($options == null) {
+            $options = [];
+        }
+
+        $default_options = [
+            'authorities'   => ['read'],
+            'dynamic_roles' => null,
+            'limit'         => EventListView::MEMBERS_LIMIT
+        ];
+
+        $options = array_merge($default_options, $options);
+
+        if ($options['limit'] < 1) {
+            return [];
+        }
+
+        global $G_container_base;
+        /** @var \GRN_Uum $uum */
+        $uum = $G_container_base->getInstance('uum');
+
+        require_once('schedule/access_logic.csp');
+        $access_logic = \GRN_Schedule_Access_logic::getInstance();
+
+        $offset = 0;
+        $limit = $options['limit'];
+
+        $members_result = [];
+
+        // ----------------------------
+        // check availability for group
+        // ----------------------------
+        switch ($group_type) {
+            case EventMemberParamUtil::TYPE_ORGANIZATION:
+                $group = $uum->getGroup($group_id);
+
+                if ( ! $group) {
+                    cb_throw_error(E_GRN_SCHD_NOT_FOUND_GROUP);
+                }
+
+                $having_access = $access_logic->evaluateAccess(
+                    $user, $group, $options['authorities'],
+                    $options['dynamic_roles']
+                );
+
+                if ( ! $having_access) {
+                    cb_throw_error(E_GRN_SCHD_ACCESSDENY_VIEW);
+                };
+
+                break;
+
+            case EventMemberParamUtil::TYPE_MYGROUP:
+                if ( ! $uum->getMyGroup($group_id)) {
+                    cb_throw_error(E_GRN_SCHD_NOT_FOUND_GROUP);
+                }
+                break;
+
+            case EventMemberParamUtil::TYPE_FACILITY:
+                require_once('schedule/facility_system_logic.csp');
+                $facility_logic = \GRN_Facility_SystemLogic::getInstance();
+
+                if ($group_id
+                    && ! $facility_logic->getFacilityGroup($group_id)
+                ) {
+                    cb_throw_error(E_GRN_SCHD_NOT_FOUND_GROUP);
+                }
+                break;
+        }
+
+        // -----------------
+        // get group members
+        // -----------------
+        do {
+            $member_type = EventMemberParamUtil::TYPE_USER;
+
+            switch ($group_type) {
+                case EventMemberParamUtil::TYPE_ORGANIZATION:
+                    $member_ids = $uum->getGroupUsersId($group_id, $offset,
+                        $limit + 1);
+                    break;
+
+                case EventMemberParamUtil::TYPE_MYGROUP:
+                    $member_ids = $uum->getMyGroupUsersId($group_id, $offset,
+                        $limit + 1, null, $user->getOID());
+                    $facility_ids = $uum->getMyGroupFacilitiesId($group_id,
+                        $offset, $limit + 1, null, $user->getOID());
+                    break;
+
+                case EventMemberParamUtil::TYPE_FACILITY:
+                    require_once('schedule/facility_system_logic.csp');
+                    $facility_logic = \GRN_Facility_SystemLogic::getInstance();
+
+                    $facilities = [];
+
+                    if ($group_id) {
+                        // get facilities belong to group
+                        $facilities
+                            = $facility_logic->getGroupFacilitiesInfo($group_id,
+                            $offset, $limit + 1);
+                    } else {
+                        // get all facilities if system allows
+                        require_once('schedule/system_logic.csp');
+                        $system_logic
+                            = \GRN_Schedule_SystemLogic::getInstance();
+
+                        if ($system_logic->getAllowAllFacilities()) {
+                            $facilities
+                                = $facility_logic->getOrderedFacilityPartInfoList($offset,
+                                $limit + 1);
+                        }
+                    }
+
+                    $member_ids = array_keys($facilities);
+                    $member_type = EventMemberParamUtil::TYPE_FACILITY;
+                    break;
+
+                case EventMemberParamUtil::TYPE_RECENT_USERS:
+                    $member_ids = $uum->getFrequentUsersId($user->getOID());
+                    break;
+
+                case EventMemberParamUtil::TYPE_RECENT_FACILITIES:
+                    require_once('schedule/facility_system_logic.csp');
+                    $facility_history
+                        = \GRN_Facility_HistoryManager::getInstance();
+                    $member_ids
+                        = $facility_history->getFacilityHistory($user->getOID());
+                    $member_type = EventMemberParamUtil::TYPE_FACILITY;
+                    break;
+
+                default:
+                    return [];
+            }
+
+            if ( ! is_array($member_ids)) {
+                $member_ids = [];
+            }
+
+            $has_more = count($member_ids) > $limit;
+
+            if ($has_more) {
+                array_pop($member_ids);
+            }
+
+            // evaluate access right
+
+            $candidates = array_map(
+                function ($id) use ($member_type) {
+                    return ['id' => $id, 'type' => $member_type];
+                }, $member_ids
+            );
+
+            if (isset($facility_ids) && is_array($facility_ids)) {
+                $facility_type = EventMemberParamUtil::TYPE_FACILITY;
+                $facility_candidates = array_map(
+                    function ($id) use ($facility_type) {
+                        return ['id' => $id, 'type' => $facility_type];
+                    }, $facility_ids
+                );
+                $candidates = array_merge($candidates,
+                    $facility_candidates);
+            }
+
+            $filtered_members = self::filterMembersForView(
+                $user, $candidates,
+                $options['authorities'], $options['dynamic_roles']
+            );
+
+            $members_result = array_merge($members_result, $filtered_members);
+
+            // find more if possible
+            $next = count($members_result) < $limit
+                    && count($filtered_members) != count($candidates)
+                    && $has_more;
+
+            if ($next) {
+                $offset += $limit;
+            }
+
+        } while ($next);
+
+        // if the given group is an organization, add it to the beginning of the member list
+        if ($group_type == EventMemberParamUtil::TYPE_ORGANIZATION) {
+            $organization = [
+                'id'   => $group_id,
+                'type' => self::MEMBER_TYPE_ORGANIZATION
+            ];
+
+            $filtered = self::filterMembersForView(
+                $user, [$organization],
+                $options['authorities'], $options['dynamic_roles']
+            );
+
+            if (count($filtered) > 0) {
+                array_unshift($members_result, $filtered[0]);
+            }
+        }
+
+        return array_slice($members_result, 0, $limit);
+    }
+
+    /**
+     * Get member given by its type and ID.
+     * Error is thrown if the object is not found or the given $user does not have permission
+     *
+     * @param \CB_User   $user
+     * @param            $type
+     * @param            $id
+     * @param array|null $options
+     *
+     * @return bool|\CB_User|\GRN_Facility_Facility|\CB_Group|false
+     */
+    public static function getMember(
+        \CB_User $user,
+        $type,
+        $id,
+        array $options = null
+    ) {
+        if ($options == null) {
+            $options = [];
+        }
+
+        $default_options = [
+            'authorities'   => ['read'],
+            'dynamic_roles' => null
+        ];
+
+        $options = array_merge($default_options, $options);
+
+        global $G_container_base;
+        /** @var \GRN_Uum $uum */
+        $uum = $G_container_base->getInstance('uum');
+
+        $member_object = false;
+
+        switch ($type) {
+            case EventMemberParamUtil::TYPE_USER:
+                $member_object = $uum->getUser($id);
+
+                if ( ! $member_object) {
+                    cb_throw_error(E_GRN_USER_NOT_FOUND);
+                }
+
+                break;
+
+            case EventMemberParamUtil::TYPE_FACILITY:
+                require_once('schedule/facility_system_logic.csp');
+                $facility_logic = \GRN_Facility_SystemLogic::getInstance();
+
+                $member_object = $facility_logic->getFacility($id);
+
+                if ( ! $member_object) {
+                    cb_throw_error(E_GRN_FCLT_NOTFOUND_FACILITY);
+                }
+
+                break;
+
+            case EventMemberParamUtil::TYPE_ORGANIZATION:
+
+                $member_object = $uum->getGroup($id);
+
+                if ( ! $member_object) {
+                    cb_throw_error(E_GRN_SCHD_NOT_FOUND_GROUP);
+                }
+
+                break;
+
+            default:
+                cb_throw_error(E_GRN_USER_NOT_FOUND);
+        }
+
+        $member = ['id' => $id, 'type' => $type];
+        $members_result = self::filterMembersForView(
+            $user, [$member],
+            $options['authorities'], $options['dynamic_roles']
+        );
+
+        if (empty($members_result)) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_VIEW);
+        }
+
+        return $member_object;
+    }
+
+    /**
+     * Filter the members that could be displayed on the view.
+     *
+     * Structure of the $members array is as follows
+     * <code>
+     * $members = [
+     *   ['type' => 'user', 'id' => 10],
+     *   ['type' => 'user', 'id' => 22],
+     *   ['type' => 'org', 'id' => 7],
+     *   ['type' => 'org', 'id' => 9],
+     *   ['type' => 'facility', 'id' => 5],
+     *   ['type' => 'facility', 'id' => 3]
+     * ];
+     * </code>
+     *
+     * @param \CB_User $user
+     * @param array    $members       List of users, organizations, facilities
+     * @param array    $authorities   read|add|write|delete
+     * @param array    $dynamic_roles Roles
+     *
+     * @return array The evaluated members
+     */
+    public static function filterMembersForView(
+        \CB_User $user,
+        array $members,
+        $authorities = ['read'],
+        $dynamic_roles = null
+    ) {
+        require_once('schedule/system_logic.csp');
+        $system_logic = \GRN_Schedule_SystemLogic::getInstance();
+
+        if ($system_logic->getShowOrganize() == 0) {
+            $members = array_filter(
+                $members, function ($member) {
+                return cb_at($member, 'type') != self::MEMBER_TYPE_ORGANIZATION;
+            });
+        }
+
+        return self::filterByAccessList($user, $members, $authorities,
+            $dynamic_roles);
+    }
+
+    /**
+     * Get members info.
+     * Non-existent members will be not included in the result.
+     *
+     * @param \CB_User $user    User
+     * @param array    $members List of users, organizations, facilities
+     *
+     * @return array
+     */
+    public static function getMembersInfoForView(\CB_User $user, array $members)
+    {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+
+        // get users info
+
+        $user_ids = self::listIdOf($members, self::MEMBER_TYPE_USER);
+        require_once('grn/controller.csp');
+        $users_info = \GRN_ControllerUtil::getUserInfoToShowUserName($user_ids,
+            $user);
+
+        // get groups info
+
+        $group_ids = self::listIdOf($members, self::MEMBER_TYPE_ORGANIZATION);
+        $groups_info = $uum->getGroupListByIds($group_ids);
+
+        // get facilities info
+
+        $facility_ids = self::listIdOf($members, self::MEMBER_TYPE_FACILITY);
+        require_once('schedule/facility_system_logic.csp');
+
+        $facility_logic = \GRN_Facility_SystemLogic::getInstance();
+        $facilities_info = $facility_logic->getFacilitiesInfo($facility_ids);
+
+        // merge info
+
+        $members_result = [];
+
+        foreach ($members as $member) {
+            $member_id = cb_at($member, 'id');
+            $member_type = cb_at($member, 'type');
+
+            switch ($member_type) {
+                case self::MEMBER_TYPE_USER:
+                    if ( ! array_key_exists($member_id, $users_info)) {
+                        $member = null;
+                        break;
+                    }
+
+                    $member['name'] = \GRN_ControllerUtil::getUserNameText(
+                        $user->getOID(), $member_id, $users_info
+                    );
+                    $member['url']
+                        = \GRN_ControllerUtil::getPopupUserProfileURL($users_info[$member_id]);
+
+                    $member['user_status'] = 'active';
+
+                    if ($users_info[$member_id]['col_valid'] !== null) {
+                        $member['user_status'] = 'inactive';
+                    }
+
+                    break;
+
+                case self::MEMBER_TYPE_ORGANIZATION:
+                    if ( ! array_key_exists($member_id, $groups_info)) {
+                        $member = null;
+                        break;
+                    }
+
+                    /** @var $group \CB_Row */
+                    $group = $groups_info[$member_id];
+                    $member['name'] = $group->get('name');
+                    break;
+
+                case self::MEMBER_TYPE_FACILITY:
+                    if ( ! array_key_exists($member_id, $facilities_info)) {
+                        $member = null;
+                        break;
+                    }
+
+                    $member['name'] = $facilities_info[$member_id]['col_name'];
+                    $member['url']
+                        = \GRN_ControllerUtil::getPopupFacilityDetailURL($member_id);
+                    break;
+            }
+
+            if ($member) {
+                $members_result[] = $member;
+            }
+        }
+
+        return $members_result;
+    }
+
+    public static function filterByAccessList(
+        \CB_User $user,
+        array $members,
+        $authorities = ['read'],
+        $dynamic_roles = null
+    ) {
+        $candidates = self::evaluateAccess($user, $members, $authorities,
+            $dynamic_roles);
+
+        $filtered = array_filter(
+            $candidates, function ($candidate) use ($authorities) {
+            if ( ! isset($candidate['authorities'])) {
+                return false;
+            }
+
+            foreach ($authorities as $auth_name) {
+                if ($candidate['authorities'][$auth_name]
+                    == GRN_SCHD_ACCESS_DENY
+                ) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        );
+
+        return array_values($filtered);
+    }
+
+    public static function evaluateAccess(
+        \CB_User $user,
+        array $members,
+        $authorities = ['read'],
+        $dynamic_roles = null
+    ) {
+        if ($dynamic_roles == null) {
+            $dynamic_roles = self::_getDefaultDynamicRoles();
+        }
+
+        // if the required properties are not set, the member will be removed
+        $members = array_filter(
+            $members, function ($member) {
+            return cb_at($member, 'id') && cb_at($member, 'type');
+        }
+        );
+        require_once("schedule/resources.csp");
+        // evaluate users
+
+        $user_ids_to_evaluate = self::listIdOf($members,
+            self::MEMBER_TYPE_USER);
+
+        $app_user_ids
+            = AppAccess::filterUserIdsInternalAccessByAppId($user_ids_to_evaluate,
+            GRN_SCHEDULE_APPLICATION_ID);
+
+        $user_ids_to_evaluate = array_filter(
+            $user_ids_to_evaluate, function ($id) use ($app_user_ids) {
+            return array_search($id, $app_user_ids) !== false;
+        }
+        );
+
+        self::_evaluateAccessMembers(
+            $user, $members, $user_ids_to_evaluate,
+            self::MEMBER_TYPE_USER, $authorities, $dynamic_roles
+        );
+
+        // evaluate organizations
+
+        $org_ids_to_evaluate = self::listIdOf($members,
+            self::MEMBER_TYPE_ORGANIZATION);
+
+        self::_evaluateAccessMembers(
+            $user, $members, $org_ids_to_evaluate,
+            self::MEMBER_TYPE_ORGANIZATION, $authorities, $dynamic_roles
+        );
+
+        // evaluate facilities
+
+        $facility_ids_to_evaluate = self::listIdOf($members,
+            self::MEMBER_TYPE_FACILITY);
+
+        self::_evaluateAccessMembers(
+            $user, $members, $facility_ids_to_evaluate,
+            self::MEMBER_TYPE_FACILITY, $authorities, $dynamic_roles
+        );
+
+        return $members;
+    }
+
+    public static function listIdOf(array $members, $filter_type = null)
+    {
+        $member_ids = [];
+        foreach ($members as $member) {
+            $id = cb_at($member, 'id');
+
+            if ($filter_type !== null
+                && cb_at($member, 'type') !== $filter_type
+            ) {
+                continue;
+            }
+
+            $member_ids[$id] = $id;
+        }
+
+        return $member_ids;
+    }
+
+    private static function _getDefaultDynamicRoles()
+    {
+        global $G_container_base;
+
+        return $G_container_base->getInstance('uum')->listGrantedRoles();
+    }
+
+    private static function _evaluateAccessMembers(
+        $user,
+        &$members,
+        $objects,
+        $object_type,
+        $authorities,
+        $dynamic_roles
+    ) {
+        require_once('schedule/access_logic.csp');
+        $access_logic = \GRN_Schedule_Access_Logic::getInstance();
+
+        $object_type_for_access = $object_type == self::MEMBER_TYPE_ORGANIZATION
+            ? 'group' : $object_type;
+
+        $access_list = $access_logic->getEvaluateAccessesListById(
+            $user, $objects, $object_type_for_access, $authorities,
+            $dynamic_roles
+        );
+
+        if ($object_type == self::MEMBER_TYPE_FACILITY) {
+            // if the object is a facility,
+            // it requires to evaluate the facility group to which the facility belongs
+
+            $facility_ids_to_evaluate = $objects;
+            $facility_group_access_list
+                = $access_logic->getFacilityGroupAccessList(
+                $user, $facility_ids_to_evaluate, $authorities, $dynamic_roles
+            );
+
+            foreach (array_keys($access_list) as $facility_id) {
+                foreach ($authorities as $auth_name) {
+                    if (array_key_exists($facility_id,
+                            $facility_group_access_list)
+                        && array_key_exists($auth_name,
+                            $facility_group_access_list[$facility_id])
+                        && $facility_group_access_list[$facility_id][$auth_name]
+                           == GRN_SCHD_ACCESS_DENY
+                    ) {
+                        $access_list[$facility_id][$auth_name]
+                            = GRN_SCHD_ACCESS_DENY;
+                    }
+                }
+            }
+        }
+
+        // add evaluation result to members corresponding to the object type
+        foreach (array_keys($members) as $index) {
+            $member = $members[$index];
+
+            if (cb_at($member, 'type') != $object_type) {
+                continue;
+            }
+
+            $members[$index]['authorities'] = cb_at($access_list,
+                $member['id']);
+        }
+    }
+}

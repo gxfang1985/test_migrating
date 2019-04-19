@@ -1,0 +1,744 @@
+<?php
+
+/**
+ * Profiles.
+ *
+ * Profiles are to manage miscellaneous configurations for the system,
+ * users, and so on.
+ *
+ * @package     fw.profile
+ */
+
+require_once('fw/persistent.csp');
+require_once('fw/transaction.csp');
+require_once('fw/module.csp');
+
+class CB_ProfileManagerFactory
+{
+    /**
+     * @access private
+     */
+    var $_managers = [];
+
+    /**
+     * @return CB_ProfileManagerFactory
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new CB_ProfileManagerFactory();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * Return profile manager object specified by $profile_key.
+     *
+     * @param string $profile_key
+     *
+     * @return CB_ProfileManager
+     */
+    function getProfileManager($profile_key)
+    {
+        if (array_key_exists($profile_key, $this->_managers)) {
+            return $this->_managers[$profile_key];
+        } else {
+            $manager = new CB_ProfileManager($profile_key);
+            $this->_managers[$profile_key] = $manager;
+
+            return $manager;
+        }
+    }
+
+    /**
+     * clear cache
+     */
+    function clear()
+    {
+        $this->_managers = [];
+    }
+}
+
+/**
+ * Manage a {@link CB_Profile} object list.
+ * Use {@link CB_ProfileManagerFactory::getProfileManager} to
+ * obtain a specific list of profiles.
+ *
+ * @package fw.profile
+ */
+class CB_ProfileManager
+{
+    /**
+     * @access private
+     */
+    var $_profile_key = null;
+    /**
+     * @access private
+     */
+    var $_profile_key_name = null;
+    /**
+     * @access private
+     */
+    var $_config_apps = null;
+    /**
+     * @access private
+     */
+    var $_profiles = [];
+    /**
+     * @access private
+     */
+    var $_profile_key_id = 0;
+
+    /**
+     * @access private
+     */
+    var $_table_suffix = null;
+
+    /**
+     * Constructor.
+     *
+     * @access private
+     *
+     * @param string $profile_key
+     */
+    function __construct($profile_key)
+    {
+        $this->_profile_key = trim($profile_key);
+        $this->_profile_key_name = str_replace(':', '', $this->_profile_key);
+        $tmp = explode(':', $profile_key);
+        $this->_table_suffix = $this->_profile_key_name;
+        if (is_array($tmp) && count($tmp) == 2 && is_numeric($tmp[1])) {
+            $this->_profile_key_id = $tmp[1];
+
+            $user_tables = cb_get_user_tables();
+            $partition_id = (int)((int)$tmp[1] % $user_tables);
+
+            $this->_table_suffix = CB_DATABASE_USER_TABLE_PREFIX
+                                   . $partition_id;
+        }
+        unset($tmp);
+
+        global $G_config_grn;
+        $this->config_apps
+            = new CB_LWContainerDirectoryConfig($G_config_grn->get('Application',
+            'ini_dir'));
+    }
+
+    /**
+     * Return profile object for the named module.
+     *
+     * @param string $module_name
+     *
+     * @return CB_Profile
+     */
+    function getProfile($module_name)
+    {
+        assert('! is_null( $module_name )');
+        $module_name = strtolower($module_name);
+
+        if (array_key_exists($module_name, $this->_profiles)) {
+            return $this->_profiles[$module_name];
+        }
+
+        $dbconn = grn_profile_get_connection($this->_profile_key_id);
+
+        $table_name = 'tab_cb_profiledata' . CB_PERSISTENT_NAMESEPARATOR
+                      . $this->_table_suffix;
+
+        $this->_profiles[$module_name] = new CB_Profile($dbconn, $table_name,
+            $module_name, $this->_profile_key_id);
+
+        return $this->_profiles[$module_name];
+    }
+}
+
+/**
+ * Represent a node in a specific profile list.  Nodes may have
+ * any number of attributes that may be created/updated/removed.
+ * Use {@link CB_ProfileManager::getProfile} to obtain a node.
+ *
+ * @package fw.profile
+ */
+class CB_Profile
+{
+    /**
+     * @access private
+     * @var CB_DatabaseConnection
+     */
+    var $_dbconn = null;
+
+    /**
+     * @access private
+     */
+    var $_table_name = null;
+
+    /**
+     * @access private
+     */
+    var $_module_name = null;
+
+    /**
+     * @access private
+     */
+    var $_profile_key = null;
+
+    /**
+     * @access private
+     */
+    var $_cached = [];
+
+    /**
+     * @access private
+     */
+    var $_is_all_cached = false;
+
+    function __construct($dbconn, $table_name, $module_name, $profile_key)
+    {
+        $this->_dbconn = $dbconn;
+        $this->_table_name = $table_name;
+        $this->_module_name = $module_name;
+        $this->_profile_key = $profile_key;
+    }
+
+    /**
+     * Create an attribute.
+     *
+     * @param string $name
+     * @param mixed  $value
+     *
+     * @return bool
+     */
+    function createAttribute($name, $value)
+    {
+        assert('strlen( $name ) !== 0');
+        $ret = $this->_createAttributeDB($name, $value);
+        if ($ret) {
+            $this->_cached[$name] = $value;
+        }
+
+        return $ret;
+    }
+
+    /**
+     * Create attributes.
+     *
+     * @param array $values
+     *
+     * @return bool
+     */
+    function createAttributes($values)
+    {
+        foreach ($values as $key => $value) {
+            $ret = $this->createAttribute($key, $value);
+            if ($ret === false) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    function _createAttributeDB($name, $value)
+    {
+        $columns = 'col_key, col_module, col_name, col_value';
+        $value = serialize($value);
+        $values = sprintf("'%s','%s','%s','%s'",
+            $this->_dbconn->escape($this->_profile_key),
+            $this->_dbconn->escape($this->_module_name),
+            $this->_dbconn->escape($name),
+            $this->_dbconn->escape($value));
+        $query = sprintf('INSERT INTO %s (%s) VALUES(%s)', $this->_table_name,
+                $columns, $values)
+                 . " ON DUPLICATE KEY UPDATE col_value=VALUES(col_value)";
+        $this->_dbconn->query($query);
+
+        return true;
+    }
+
+    /**
+     * Update a named attribute value.
+     *
+     * @param string $name
+     * @param mixed  $value
+     *
+     * @return bool
+     */
+    function updateAttribute($name, $value)
+    {
+        assert('strlen( $name ) !== 0');
+
+        $ret = $this->_updateAttributeDB($name, $value);
+        if ($ret) {
+            $this->_cached[$name] = $value;
+        }
+
+        return $ret;
+    }
+
+    /**
+     * Update attribute values.
+     *
+     * @param array $values
+     *
+     * @return bool
+     */
+    function updateAttributes($values)
+    {
+        foreach ($values as $key => $value) {
+            $ret = $this->updateAttribute($key, $value);
+            if ($ret === false) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    function _updateAttributeDB($name, $value)
+    {
+        if (($oid = $this->_getAttributesIdDB($name)) !== false) {
+            $value = serialize($value);
+            $set = sprintf("col_value='%s'",
+                $this->_dbconn->escape($value));
+            $condition = sprintf("_id = %s", $oid);
+            $query = sprintf('UPDATE %s SET %s WHERE %s',
+                $this->_table_name, $set, $condition);
+            $this->_dbconn->query($query);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Return a named attribute value.
+     *
+     * @param string $name
+     * @param mixed  $value
+     *
+     * @return bool
+     */
+    function getAttribute($name, &$value)
+    {
+        assert('strlen( $name ) !== 0');
+        $attributes = $this->getAttributes();
+        if (array_key_exists($name, $attributes)) {
+            $value = $attributes[$name];
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Return attribute values in this profile module.
+     *
+     * @return array
+     */
+    function getAttributes()
+    {
+        if ($this->_is_all_cached) {
+            return $this->_cached;
+        }
+
+        $attributes = false;
+        if ($attributes === false) {
+            $attributes = $this->_getAttributesDB();
+        }
+
+        $this->_cached = $attributes;
+        $this->_is_all_cached = true;
+
+        return $attributes;
+    }
+
+    function _getAttributesIdDB($name)
+    {
+        $condition
+            = sprintf("col_key='%s' AND col_module='%s' AND col_name='%s'",
+            $this->_dbconn->escape($this->_profile_key),
+            $this->_dbconn->escape($this->_module_name),
+            $this->_dbconn->escape($name));
+        $query = sprintf('SELECT _id FROM %s WHERE %s', $this->_table_name,
+            $condition);
+        $query = $this->_dbconn->select_format($query, 0, -1,
+            CB_DATABASE_NO_LOCK);
+        $result = $this->_dbconn->query($query);
+        $row = $this->_dbconn->fetch_assoc($result);
+        $this->_dbconn->free_result($result);
+        if (is_array($row)) {
+            return $row['_id'];
+        } else {
+            return false;
+        }
+    }
+
+    function _getAttributesDB()
+    {
+        $condition = sprintf("col_key='%s' AND col_module='%s'",
+            $this->_dbconn->escape($this->_profile_key),
+            $this->_dbconn->escape($this->_module_name));
+        $query = sprintf('SELECT col_name,col_value FROM %s WHERE %s',
+            $this->_table_name, $condition);
+        $query = $this->_dbconn->select_format($query, 0, -1,
+            CB_DATABASE_NO_LOCK);
+        $result = $this->_dbconn->query($query);
+        $n = $this->_dbconn->num_rows($result);
+        $attributes = [];
+        for ($i = 0; $i < $n; $i++) {
+            $row = $this->_dbconn->fetch_assoc($result);
+            $attributes[$row['col_name']] = cb_unserialize($row['col_value'],
+                [
+                    "allowed_classes" => [
+                        "CB_Date",
+                        "CB_DateTime",
+                        "CB_DateTimeEx",
+                        "CB_Time",
+                        "CB_TimeEx",
+                        "CB_TimeStamp",
+                        "CB_TimeStampEx"
+                    ]
+                ]
+            );
+        }
+        $this->_dbconn->free_result($result);
+
+        return $attributes;
+    }
+
+    /**
+     * Remove named attribute.
+     *
+     * @param string $name
+     *
+     * @return bool
+     */
+    function removeAttribute($name)
+    {
+        assert('strlen( $name ) !== 0');
+        $ret = $this->_removeAttributeDB($name);
+        if ($ret) {
+            unset($this->_cached[$name]);
+        }
+
+        return $ret;
+    }
+
+    /**
+     * Remove all attributes in this profile module.
+     *
+     * @return bool
+     */
+    function removeAttributes()
+    {
+        $ret = $this->_removeAttributesDB();
+        if ($ret) {
+            $this->_cached = [];
+        }
+
+        return $ret;
+    }
+
+    function _removeAttributeDB($name)
+    {
+        $condition
+            = sprintf("col_key='%s' AND col_module='%s' AND col_name='%s'",
+            $this->_dbconn->escape($this->_profile_key),
+            $this->_dbconn->escape($this->_module_name),
+            $this->_dbconn->escape($name));
+        $query = sprintf('DELETE FROM %s WHERE %s', $this->_table_name,
+            $condition);
+        $this->_dbconn->query($query);
+
+        return true;
+    }
+
+    function _removeAttributesDB()
+    {
+        $condition = sprintf("col_key='%s' AND col_module='%s'",
+            $this->_dbconn->escape($this->_profile_key),
+            $this->_dbconn->escape($this->_module_name));
+        $query = sprintf('DELETE FROM %s WHERE %s', $this->_table_name,
+            $condition);
+        $this->_dbconn->query($query);
+
+        return true;
+    }
+}
+
+/**
+ * Return system profile object for the named module.
+ *
+ * @param string $module_name
+ *
+ * @return CB_Profile
+ */
+function cb_get_system_profile($module_name)
+{
+    $factory = CB_ProfileManagerFactory::getInstance();
+    $pm = $factory->getProfileManager('system');
+    $ret = $pm->getProfile($module_name);
+
+    return $ret;
+}
+
+/**
+ * Return user profile object for the named module.
+ *
+ * @param CB_Row $user
+ * @param string $module_name
+ *
+ * @return CB_Profile
+ */
+function cb_get_user_profile($user, $module_name)
+{
+    $factory = CB_ProfileManagerFactory::getInstance();
+    $pm = $factory->getProfileManager('user:' . $user->getOID());
+    $ret = $pm->getProfile($module_name);
+
+    return $ret;
+}
+
+function cb_drop_profile_table($profile_key, $nocache = false)
+{
+    $tm = grn_profile_get_table_manager($profile_key);
+    $factory = CB_ProfileManagerFactory::getInstance();
+    $pm = $factory->getProfileManager($profile_key);
+
+    $table = $tm->getTableInfo('cb_profiledata' . CB_PERSISTENT_NAMESEPARATOR
+                               . $pm->_table_suffix);
+
+    $rowset = new CB_RowSet($table);
+    $rowset->addCondition('col_key=' . $pm->_profile_key_id);
+
+    $rowset->deleteAllMatched();
+}
+
+/**
+ * @param string|null $uid
+ *
+ * @return CB_DatabaseConnection
+ */
+function grn_profile_get_connection($uid = null)
+{
+    global $G_container_base;
+    if ( ! is_numeric($uid) || $uid < 1) {
+        $dbconn = $G_container_base->getInstance('dbconn');
+
+        return $dbconn;
+    }
+
+    global $G_config_common;
+    $connection_name = false;
+    $connections = $G_config_common->getSection('Profile');
+
+    if ($connections === false) {
+        $dbconn = $G_container_base->getInstance('dbconn');
+
+        return $dbconn;
+    }
+
+    if (array_key_exists('connection', $connections)) {
+        $connection_name = $connections['connection'];
+    } else {
+        foreach ($connections as $key => $connection) {
+            // ex)connection1-1000 or connection1-
+            $match = preg_match("/connection[0-9]+\-[0-9]*\z/", $key);
+
+            if ($match === 0 || $match === false) {
+                continue;
+            }
+
+            $between = substr($key, strlen('connection'));
+            list($begin, $end) = explode('-', $between);
+
+            if ( ! empty($end)) {
+                if ($begin <= $uid && $uid <= $end) {
+                    $connection_name = $connection;
+                    break;
+                }
+            } else {
+                if ($begin <= $uid) {
+                    $connection_name = $connection;
+                    break;
+                }
+            }
+        }
+    }
+
+    if ($connection_name === false) {
+        $connection_name = 'dbconn';
+    }
+
+    $dbconn = $G_container_base->getInstance($connection_name);
+
+    return $dbconn;
+}
+
+function grn_profile_get_table_manager($uid = null)
+{
+    global $G_container_base;
+    if ( ! is_numeric($uid) || $uid < 1) {
+        $tm = $G_container_base->getInstance('table_manager');
+
+        return $tm;
+    }
+
+    $match = preg_match("/user:[0-9]+/", $uid);
+    if ($match === 0 || $match === false) {
+        $tm = $G_container_base->getInstance('table_manager');
+
+        return $tm;
+    }
+    list($dummy, $uid) = explode(':', $uid);
+
+    global $G_config_common;
+    $table_manager_name = false;
+    $table_managers = $G_config_common->getSection('Profile');
+
+    if ($table_managers === false) {
+        $tm = $G_container_base->getInstance('table_manager');
+
+        return $tm;
+    }
+
+    if (array_key_exists('table_manager', $table_managers)) {
+        $table_manager_name = $table_managers['table_manager'];
+    } else {
+        foreach ($table_managers as $key => $table_manager) {
+            // ex)table_manager1-1000 or table_manager1-
+            $match = preg_match("/table_manager[0-9]+\-[0-9]*\z/", $key);
+
+            if ($match === 0 || $match === false) {
+                continue;
+            }
+
+            $between = substr($key, strlen('table_manager'));
+            list($begin, $end) = explode('-', $between);
+
+            if ( ! empty($end)) {
+                if ($begin <= $uid && $uid <= $end) {
+                    $table_manager_name = $table_manager;
+                    break;
+                }
+            } else {
+                if ($begin <= $uid) {
+                    $table_manager_name = $table_manager;
+                    break;
+                }
+            }
+        }
+    }
+
+    if ($table_manager_name === false) {
+        $table_manager_name = 'table_manager';
+    }
+
+    $table_manager = $G_container_base->getInstance($table_manager_name);
+
+    return $table_manager;
+}
+
+/**
+ * @param array $profile_sections
+ * @param int   $uid
+ *
+ * @return null|string
+ */
+function _getProfileConnectionNameOfIdInRanges(
+    array $profile_sections,
+    int $uid
+) {
+    foreach ($profile_sections as $key => $connection) {
+        $match = preg_match("/connection[0-9]+\-[0-9]*\z/", $key);
+
+        if ($match === 0 || $match === false) {
+            continue;
+        }
+
+        $between = substr($key, strlen('connection'));
+        list($begin, $end) = explode('-', $between);
+
+        if ( ! empty($end)) {
+            if ($begin <= $uid && $uid <= $end) {
+                return $connection;
+            }
+        } else {
+            if ($begin <= $uid) {
+                return $connection;
+            }
+        }
+    }
+
+    return null;
+}
+
+/**
+ * @return CB_DatabaseConnection[]
+ */
+function get_profile_get_connections()
+{
+    global $G_config_common;
+    global $G_container_base;
+    $connections = $G_config_common->getSection('Profile');
+
+    if ($connections === false) {
+        $dbconn = $G_container_base->getInstance('dbconn');
+
+        return [$dbconn];
+    }
+
+    if (array_key_exists('connection', $connections)) {
+        $dbconn = $G_container_base->getInstance($connections['connection']);
+
+        return [$dbconn];
+    }
+
+    $is_dbconn_required_implicitly = false;
+    foreach ($connections as $key => $connection_name) {
+        // ex)connection1-1000 or connection1-
+        $match = preg_match("/connection[0-9]+\-[0-9]*\z/", $key);
+
+        if ($match === 0 || $match === false) {
+            continue;
+        }
+        $connection_names[] = $connection_name;
+
+        $between = substr($key, strlen('connection'));
+        list($begin, $end) = explode('-', $between);
+
+        $sections = $connections;
+        unset($sections[$key]);
+        if ( ! $is_dbconn_required_implicitly && $begin != 1) {
+            $left = $begin - 1;
+            $is_dbconn_required_implicitly
+                = is_null(_getProfileConnectionNameOfIdInRanges($sections,
+                $left));
+        }
+
+        if ( ! $is_dbconn_required_implicitly && ! empty($end)) {
+            $right = $end + 1;
+            $is_dbconn_required_implicitly
+                = is_null(_getProfileConnectionNameOfIdInRanges($sections,
+                $right));
+        }
+    }
+
+    if ($is_dbconn_required_implicitly
+        && ! in_array('dbconn', $connection_names)
+    ) {
+        $connection_names[] = 'dbconn';
+    }
+
+    $ret_val = [];
+    foreach ($connection_names as $connection_name) {
+        $ret_val[] = $G_container_base->getInstance($connection_name);
+    }
+
+    return $ret_val;
+}
+

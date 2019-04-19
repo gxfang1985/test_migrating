@@ -1,0 +1,263 @@
+<?php
+
+namespace grn\fts;
+
+use grn\fts\exception\AllResultException;
+use grn\cydec\common\ShardLogic;
+use grn\fts\exception\NoResultException;
+use grn\fts\exception\NoServerConnectionException;
+use grn\fts\exception\SearchException;
+
+class SearchLogic implements SearchLogicInterface
+{
+    const DEF_TYPE_NORMALIZE = 'normalizeQParser';
+
+    /**
+     * Search documents without considering access controll.
+     *
+     * @param SearchQueryInterface $query
+     *
+     * @throws exception\NoServerConnectionException
+     * @throws exception\SearchException
+     * @return SearchResponseInterface
+     */
+    public function search(SearchQueryInterface $query)
+    {
+        $logger = new SearchLogger();
+        $client = $this->getSolrClient();
+        try {
+            $solrQuery = $this->buildSolrQuery($query);
+        } catch (NoResultException $e) {
+            return new SearchResponse([], $query->getStart(), false);
+        }
+
+        if ($logger->isLoggingQuery()) {
+            $logger->logQuery($solrQuery->toString(false));
+        }
+
+        try {
+            $queryResponse = $client->query($solrQuery);
+        } catch (\SolrClientException $e) {
+            throw new NoServerConnectionException("SolrClient::query failed", 0,
+                $e);
+        } catch (\SolrServerException $e) {
+            $message = $e->getMessage();
+            if (strpos($message, "org.apache.solr.search.SyntaxError") === 0) {
+                return new SearchResponse([], $query->getStart(), false);
+            }
+            throw new NoServerConnectionException("SolrClient::query failed", 0,
+                $e);
+        }
+        /* @var $queryResponse \SolrQueryResponse */
+
+        if ( ! $queryResponse->success()) {
+            throw new SearchException("search query failed");
+        }
+
+        $object = $queryResponse->getResponse();
+        if ( ! $object->offsetExists(SearchConstants::RESPONSE_KEY)) {
+            return new SearchResponse([], $query->getStart(), false);
+        }
+        $processingTime
+            = $object->offsetGet(SearchConstants::RESPONSE_HEADER_KEY)
+                     ->offsetGet(SearchConstants::QUERY_TIME) ?: 0;
+        if ($logger->isLoggingResponse()) {
+            $responseText
+                = json_encode($object->offsetGet(SearchConstants::RESPONSE_KEY));
+            $logger->logResponse($responseText, $processingTime);
+        }
+        if ( ! $object->offsetExists(SearchConstants::RESPONSE_HIGHLIGHTING_KEY)) {
+            throw new SearchException("response missing expected parameter '"
+                                      . SearchConstants::RESPONSE_HIGHLIGHTING_KEY
+                                      . "' " . print_r($object, true));
+        }
+        $response = $object->offsetGet(SearchConstants::RESPONSE_KEY);
+        /* @var $response \SolrObject */
+        $highlighting
+            = $object->offsetGet(SearchConstants::RESPONSE_HIGHLIGHTING_KEY);
+        /* @var $highlighting \SolrObject */
+
+        if ( ! $response->offsetExists(SearchConstants::RESPONSE_DOCS_KEY)) {
+            throw new SearchException("response missing expected parameter '"
+                                      . SearchConstants::RESPONSE_DOCS_KEY
+                                      . "'");
+        }
+        $docs = $response->offsetGet(SearchConstants::RESPONSE_DOCS_KEY);
+        if ($docs === false) {
+            return new SearchResponse([], $query->getStart(), false);
+        }
+        /* @var $docs \SolrObject[] */
+
+        $documents = [];
+        foreach ($docs as $doc) {
+            if ( ! $doc->offsetExists(SearchFields::ID_FIELD)) {
+                throw new SearchException("doc missing expected parameter '"
+                                          . SearchFields::ID_FIELD . "' "
+                                          . print_r($doc, true));
+            }
+            $id = $doc->offsetGet(SearchFields::ID_FIELD);
+            if ( ! $highlighting->offsetExists($id)) {
+                throw new SearchException("highlighting missing expected parameter '"
+                                          . SearchFields::ID_FIELD . "' "
+                                          . print_r($highlighting, true));
+            }
+            $object = $highlighting->offsetGet($id);
+            if ( ! $object->offsetExists(SearchFields::TEXT_FIELD)) {
+                throw new SearchException("highlight missing expected parameter '"
+                                          . SearchFields::TEXT_FIELD . "' "
+                                          . print_r($object, true));
+            }
+            $highlights = $object->offsetGet(SearchFields::TEXT_FIELD);
+            $document = new SearchDocument($id, $highlights);
+            if ($doc->offsetExists(SearchFields::FILE_ID)) {
+                $document->setFileId($doc->offsetGet(SearchFields::FILE_ID));
+                if ($object->offsetExists(SearchFields::FILE_NAME)) {
+                    $document->setFileNameHighlights($object->offsetGet(SearchFields::FILE_NAME));
+                }
+            }
+            $documents[] = $document;
+        }
+
+        $numChecked = $query->getStart() + count($documents);
+        $continuable = true;
+        if (count($documents) < $query->getSize()) {
+            $continuable = false;
+        }
+        $searchResponse = new SearchResponse($documents, $numChecked,
+            $continuable, $processingTime);
+
+        return $searchResponse;
+    }
+
+    /**
+     * @return \SolrClient
+     * @throws NoServerConnectionException
+     */
+    protected function getSolrClient()
+    {
+        $logic = new ShardLogic();
+        $util = \CB_CyDECUtil::getInstance();
+        $location = $logic->getShardLocation($util->getConfig('fts.json'), 0);
+        $domainId = $util->getDomainID();
+        $identifier = $this->getIdentifier();
+        $options = [
+            'hostname' => $location->getHost(),
+            'port'     => $location->getPort(),
+            'path'     => "solr/{$domainId}_{$identifier}",
+            'timeout'  => Application::getClientTimeout()
+        ];
+        $client = new \SolrClient($options);
+        if ( ! defined('ON_FOREST')) {
+            // alive monitoring for solr server
+            try {
+                $client->ping();
+            } catch (\SolrClientException $e) {
+                throw new NoServerConnectionException("Failed to ping", 0, $e);
+            } catch (\SolrServerException $e) {
+                throw new NoServerConnectionException("Failed to ping", 0, $e);
+            }
+        }
+
+        return $client;
+    }
+
+    /**
+     * @param SearchQueryInterface $query
+     *
+     * @return \SolrQuery
+     * @throws NoResultException
+     */
+    private function buildSolrQuery(SearchQueryInterface $query)
+    {
+        $normalizedKeyword = $this->getNormalizer()
+                                  ->normalizeKeyword($query->getKeyword());
+        if (strlen($normalizedKeyword) === 0) {
+            throw new NoResultException("no valid keyword: "
+                                        . $query->getKeyword());
+        }
+
+        $solrQuery = new \SolrQuery("text:" . $normalizedKeyword);
+
+        $dateLower = $query->getDateLower();
+        if ($dateLower !== SearchQueryInterface::DATE_NOT_SPECIFIED) {
+            $solrQuery->addFilterQuery(SearchFields::MTIME
+                                       . ":[{$dateLower} TO *]");
+        }
+        $dateUpper = $query->getDateUpper();
+        if ($dateUpper !== SearchQueryInterface::DATE_NOT_SPECIFIED) {
+            $solrQuery->addFilterQuery(SearchFields::MTIME
+                                       . ":[* TO {$dateUpper}]");
+        }
+
+        $solrQuery->setRows((int)$query->getSize());
+        $solrQuery->setStart((int)$query->getStart());
+
+        $sortOrder = $query->getSortOrder();
+        if ($sortOrder !== SortOrder::SCORE) {
+            $solrQuery->addSortField(SortOrder::getField($sortOrder)->solr());
+        }
+
+        foreach ($query->getFilters() as $filter) {
+            try {
+                $queryStr = $filter->getQuery(FtsProduct::solr());
+            } catch (NoResultException $e) {
+                throw new NoResultException("no result remain", 0, $e);
+            } catch (AllResultException $e) {
+                continue;
+            }
+            $solrQuery->addFilterQuery($queryStr);
+        }
+
+        // for performance, specify fields to be included in solr's responses.
+        $solrQuery->addField(SearchFields::ID_FIELD);
+        $solrQuery->addField(SearchFields::FILE_ID);
+        $solrQuery->addField(SearchFields::FILE_NAME);
+
+        // highlight settings.
+        $solrQuery->setHighlight(true);
+        $solrQuery->addHighlightField(SearchFields::FILE_NAME);
+        $solrQuery->addHighlightField(SearchFields::TEXT_FIELD);
+        $solrQuery->addParam('hl.useFastVectorHighlighter', 'true');
+        // If setting html tags to highlight-pre and highlight-post, it is impossible to escape response values.
+        // Then, set temporary tokens at first and replace them after escaping.
+        $solrQuery->addParam('hl.tag.pre', SearchUtil::getHighlightSearchPre());
+        $solrQuery->addParam('hl.tag.post',
+            SearchUtil::getHighlightSearchPost());
+        // Because highliting can be very slow, set hl.phraseLimit.
+        $solrQuery->addParam('hl.phraseLimit',
+            SearchUtil::HIGHLIGHT_PHRASE_LIMIT);
+        // The defType parameter can be used to specify the query parser to use with this request.
+        $solrQuery->addParam('defType', self::DEF_TYPE_NORMALIZE);
+        $solrQuery->setHighlightFragsize(SearchUtil::HIGHLIGHT_FRAGSIZE);
+
+        $solrQuery->setTimeAllowed(SearchUtil::TIME_ALLOWED_MILLISECONDS);
+
+        return $solrQuery;
+    }
+
+    /**
+     * @return Normalizer|CyDECNormalizer
+     */
+    private function getNormalizer()
+    {
+        if (defined('ON_FOREST')) {
+            return new CyDECNormalizer();
+        }
+
+        return new Normalizer();
+    }
+
+    /**
+     * @return string
+     */
+    private function getIdentifier()
+    {
+        if (defined('ON_FOREST')) {
+            return 'garoon';
+        } else {
+            global $G_config_common;
+
+            return $G_config_common->get('Global', 'app_name');
+        }
+    }
+}

@@ -1,0 +1,224 @@
+<?php
+
+$logic = _grn_get_privilege_logic();
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty;
+
+    global $G_container_base;
+    /** @var GRN_Uum $uum */
+    $uum = $G_container_base->getInstance('uum');
+    $org_ids = null;
+    $org = null;
+    if (array_key_exists('oid', $G_INPUT) && is_array($G_INPUT['oid'])
+        && count($G_INPUT['oid']) > 0
+    ) {
+        foreach ($G_INPUT['oid'] as $key) {
+            $org_ids[$key] = $key;
+        }
+        unset($G_INPUT['oid']);
+    } else {
+        // 組織の指定がない場合は、すべて未所属
+        $org_ids = [];
+    }
+
+    $primary_org_id = -1;
+    if (array_key_exists('primary_org', $G_INPUT)
+        && $G_INPUT['primary_org'] > 0
+    ) {
+        $primary_org_id = $G_INPUT['primary_org'];
+        $primary_group = $uum->getGroupInfo($primary_org_id);
+        if ( ! $primary_group) {
+            $primary_org_id = -1;
+        }
+    }
+
+    // 組み込み項目を取得する
+    $item_values = $uum->getDefaultItemProperties();
+    $builtin_items = [];
+    foreach ($item_values as $id => $properties) {
+        if ( ! $properties['use']) {
+            continue;
+        }
+        $builtin_items[$id]['display_name'] = $uum->getRealDefaultItemName($id);
+        $builtin_items[$id]['necessary'] = $properties['necessary'];
+        $builtin_items[$id]['type'] = $properties['type'];
+        $builtin_items[$id]['use'] = $properties['use'];
+    }
+
+    // カスタマイズ項目を取得する
+    $extended = $uum->listItems();
+    $extended_items = [];
+    $oids = array_keys($extended);
+    foreach ($oids as $oid) {
+        $row =& $extended[$oid];
+        $id = $row->get('id');
+        $extended_items[$id]['display_name'] = $row->get('display_name');
+        $extended_items[$id]['necessary'] = $row->get('necessary');
+        $extended_items[$id]['type'] = $row->get('type');
+        $extended_items[$id]['use'] = $row->get('use');
+        $extended_items[$id]['extended'] = 1;
+    }
+
+    require_once('SmartyValidate.class.php');
+    SmartyValidate::connect($t);
+
+    $target_name = 'system/user/org_user_add';
+    SmartyValidate::register_form($target_name);
+
+    if (SmartyValidate::is_valid($G_INPUT, $target_name)) {
+        require_once('grn/uum_util.csp');
+        $uum_util = GRN_UumUtil::getInstance();
+        $properties_map = $uum_util->getPropertiesForAddUser();
+        $basic_properties = [];
+        foreach ($properties_map as $view_name => $uum_name) {
+            if (array_key_exists($view_name, $G_INPUT)) {
+                $basic_properties[$uum_name] = $G_INPUT[$view_name];
+                unset($G_INPUT[$view_name]);
+            }
+        }
+
+        // 使用の停止
+        if (array_key_exists('invalid', $G_INPUT)
+            && $G_INPUT['invalid'] === '1'
+        ) {
+            $basic_properties['valid'] = false;
+        }
+
+        // ユーザー追加
+        $user = $uum->addUser($basic_properties);
+        $user_id = $user->getOID();
+
+        // パスワード
+        if (array_key_exists('password', $G_INPUT)) {
+            $password = $G_INPUT['password'];
+            unset($G_INPUT['password']);
+        } else {
+            $password = '***************';
+        }
+        /*
+        require_once( 'grn/system_logic.csp' );
+        $system = GRN_System::getInstance();
+        $password_length = $system->getPasswordLength();
+        if( strlen( $password ) < $password_length )
+        {
+            cb_throw_error( E_GRN_PASSWORD_INVALID_LENGTH, null, 
+                            array( 'length' => $password_length ), 
+                            array( 'length' => $password_length ) );
+        }
+        */
+
+        if ($uum_util->isValidPassword($password)) {
+            $uum->changePassword($user_id, null, $password, true, true);
+        }
+
+        // 表示優先度
+        if (array_key_exists('position', $G_INPUT)) {
+            $uum->setUserProperties($user_id,
+                ['position' => $G_INPUT['position']]);
+            unset($G_INPUT['position']);
+        }
+
+        require_once('grn/controller.csp');
+        // 入力データからデータを取得
+        $properties = grn_wash_input_data($builtin_items, $extended_items,
+            'extended_');
+
+        // 組み込み項目のプロパティを変更する
+        $controller_util = new GRN_ControllerUtil();
+        $controller_util->setBuiltinItemProperties($builtin_items, $user,
+            $properties);
+
+        // カスタマイズ項目のプロパティを変更する
+        $controller_util->setExtendedItemProperties($extended_items, $user,
+            $properties);
+
+        // 組織へ追加
+        if (is_array($org_ids) && count($org_ids) > 0) {
+            $groups = $uum->getGroupInfoList($org_ids);
+            if (is_array($groups) && count($groups) > 0) {
+                $uum->setUserGroups($user_id, array_keys($groups));
+            }
+        }
+
+        // 優先する組織の設定
+        if ($primary_org_id > 0) {
+            $uum->setUserPrimaryGroup($user_id, $primary_org_id);
+        }
+
+        $uum->execInspection('user', 'create', [
+            'uid'     => $user_id,
+            'name'    => $user->get('display_name'),
+            'account' => $user->get('foreign_key')
+        ]);
+
+        // Set the locale of the user
+        require_once("fw/i18n/locale.csp");
+        $locale_id = @$G_INPUT["locale"];
+        CB_LocaleManager::setUserLocaleSetting($user_id, $locale_id);
+
+        // Set a base of the user
+        require_once('fw/i18n/base.csp');
+        $base_id = (isset($G_INPUT['base']) && $G_INPUT['base'] > 0)
+            ? $G_INPUT['base'] : null;
+        CB_BaseManager::setUserBaseSetting($user_id, $base_id);
+
+        SmartyValidate::unregister_form($target_name);
+        cb_redirect('system/user/org_list', ['oid' => $primary_org_id]);
+    } else {
+        foreach (array_keys($builtin_items) as $item_id) {
+            if (array_key_exists($item_id, $G_INPUT)) {
+                if ('file' != $builtin_items[$item_id]['type']) {
+                    $builtin_items[$item_id]['value'] = $G_INPUT[$item_id];
+                }
+            }
+        }
+        foreach (array_keys($extended_items) as $item_id) {
+            $extended_items_key = 'extended_' . $item_id;
+            if (array_key_exists($extended_items_key, $G_INPUT)) {
+                if ('file' != $extended_items[$item_id]['type']) {
+                    $extended_items[$item_id]['value']
+                        = $G_INPUT[$extended_items_key];
+                }
+            }
+        }
+
+        $session_name = 'grn.system.user_add.org_user_belong';
+        $primary_group = @ $G_INPUT['primary_org'];
+        $org_id = @ $G_INPUT['poid'];
+        $t->setPageInfo($target_name);
+        $t->assign('org_id', $org_id);
+        if (array_key_exists('password', $G_INPUT)) {
+            $user_info['password'] = $G_INPUT['password'];
+        }
+        if (array_key_exists('retype', $G_INPUT)) {
+            $user_info['retype'] = $G_INPUT['retype'];
+        }
+        if (array_key_exists('position', $G_INPUT)) {
+            $user_info['position'] = $G_INPUT['position'];
+        }
+        if (array_key_exists('invalid', $G_INPUT)) {
+            $user_info['valid'] = ($G_INPUT['invalid'] === '1') ? 0 : 1;
+        } else {
+            $user_info['valid'] = 1;
+        }
+        $t->assign('user', $user_info);
+        $t->assign('builtin_items', $builtin_items);
+        $t->assign('extended_items', $extended_items);
+
+        if (isset($G_INPUT["locale"])) {
+            $selected_locale = $G_INPUT["locale"];
+        }
+        $selected_base = isset($G_INPUT['base']) ? $G_INPUT['base'] : null;
+
+        $selected_language = isset($G_INPUT["display_name_language"])
+            ? $G_INPUT["display_name_language"] : null;
+
+        include('_org_user_add.csp');
+
+        $t->display($target_name . '.tpl');
+    }
+
+}
+

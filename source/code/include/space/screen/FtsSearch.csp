@@ -1,0 +1,497 @@
+<?php
+
+namespace grn\space\screen;
+
+use grn\fts\Application as FtsApplication;
+use grn\fts\filter\LanguageFilter;
+use grn\fts\SearchQueryInterface;
+use grn\fts\SearchTarget;
+use grn\fts\SortOrder;
+use grn\space\common\data\bean\Category;
+use grn\space\common\data\bean\Authority;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\exception\GrnDataNotFoundException;
+use grn\space\common\utility\IconUtility;
+use grn\space\logic\SpaceLogic;
+use grn\space\service\SpaceService;
+
+require_once('grn/smarty.csp');
+
+/**
+ * Class FtsSearch
+ *
+ */
+class FtsSearch extends GenericScreenBase
+{
+    const TEMPLATE_PATH = 'space/search.tpl';
+
+    /** @var string */
+    private $text = '';
+    /** @var \grn\fts\SortOrder */
+    private $sortOrder;
+    /** @var bool */
+    private $fileOnly = false;
+    /** @var string */
+    private $fileType = '';
+    /** @var bool */
+    private $titleFilter = false;
+    /** @var string */
+    private $modifier = '';
+    /** @var string */
+    private $dateLower = SearchQueryInterface::DATE_NOT_SPECIFIED;
+    /** @var string */
+    private $dateUpper = SearchQueryInterface::DATE_NOT_SPECIFIED;
+    /** @var string */
+    private $searchRange = SearchTarget::ALL;
+    /** @var string */
+    private $spaceId = null;
+    /** @var string */
+    private $categoryId = null;
+    /** @var string[] */
+    private $spaceApplications = [];
+    /** @var bool */
+    private $fromTodo = false;
+    /** @var string */
+    private $language = LanguageFilter::ALL;
+    /** @var string */
+    private $target = SearchTarget::CURRENT;
+
+    /**
+     * @param array $input
+     */
+    public function __construct(array $input)
+    {
+        $this->sortOrder = new SortOrder;
+        $this->parseInput($input);
+    }
+
+    /**
+     * @throws \grn\space\common\exception\GrnDataNotFoundException
+     * @return string
+     */
+    public function fetch()
+    {
+        $smarty = new \GRN_Smarty();
+        $smarty->assign('text', $this->getText());
+        $smarty->assign('sortByDatetime',
+            $this->getSortOrder() === SortOrder::DATETIME);
+        $smarty->assign('fileOnly', $this->getFileOnly());
+        $smarty->assign('fileType', $this->getFileType());
+        $smarty->assign('titleFilter', $this->getTitleFilter());
+        $smarty->assign('modifier', $this->getModifier());
+        $smarty->assign('loginUserId', $this->getLoginUserId());
+        $smarty->assign('language', $this->getLanguage());
+        $smarty->assign('target', $this->getTarget());
+        $smarty->assign('is_elasticsearch',
+            FtsApplication::getFtsEngine()->isElasticsearch());
+
+        $dateLower = $this->getDateLower();
+        if ($dateLower !== SearchQueryInterface::DATE_NOT_SPECIFIED) {
+            $smarty->assign('dateLower', $dateLower);
+        }
+        $dateUpper = $this->getDateUpper();
+        if ($dateUpper !== SearchQueryInterface::DATE_NOT_SPECIFIED) {
+            $smarty->assign('dateUpper', $dateUpper);
+        }
+
+        $searchRange = $this->getSearchRange();
+        if ($searchRange === SearchTarget::MYSPACE) {
+            $smarty->assign(
+                'site_position',
+                [
+                    [
+                        'page' => parent::URL_INDEX,
+                        'name' => grn_get_page_display_name('space/index')
+                    ],
+                    [
+                        'page' => '',
+                        'name' => grn_get_current_page_display_name()
+                    ]
+                ]
+            );
+        } elseif ($searchRange === SearchTarget::INNERSPACE) {
+            $spaceId = $this->getSpaceId();
+            $spaceService = SpaceService::getInstance();
+            if ( ! $spaceService->hasSpaceAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+                $spaceId, $this->getLoginUserId())
+            ) {
+                throw new GrnDataNotFoundException(ErrorCode::GRN_INVALID_SPACE_ID);
+            }
+
+            $space = $spaceService->getSpace($spaceId, $this->getLoginUserId());
+            if ($space->isExpired()) {
+                throw new GrnDataNotFoundException(ErrorCode::GRN_SPACE_EXPIRED);
+            }
+            $smarty->assign("site_position", $this->getSitePosition());
+            $smarty->assign('spaceId', $spaceId);
+            $smarty->assign('space', $space);
+        } else {
+            $categoryId = $this->getCategoryId();
+            if (strlen($categoryId) > 0) {
+                try {
+                    $spaceService = SpaceService::getInstance();
+                    $spaceService->getSpaceCategory($categoryId,
+                        $this->getLoginUserId());
+                } catch (GrnDataNotFoundException $e) {
+                    $e->setErrorCode(ErrorCode::GRN_INVALID_CATEGORY_ID);
+                    throw  $e;
+                }
+            } else {
+                /* set root category */
+                $categoryId = Category::ROOT_ID;
+            }
+            $smarty->assign('categoryId', $categoryId);
+            $sitePosition = $this->createCategorySitePosition($categoryId);
+            $sitePosition[] = ["name" => grn_get_current_page_display_name()];
+            $smarty->assign('site_position', $sitePosition);
+        }
+        $smarty->assign('page_title', grn_get_current_page_display_name());
+        $smarty->assign('searchRange', $this->getSearchRange());
+        $smarty->assign('spaceApplications', $this->getSpaceApplications());
+        $smarty->assign('from_todo', $this->getFromTodo());
+
+        $smarty->assign('runBackgroundSearch',
+            FtsApplication::isBackgroundSearchModeEnabled());
+
+        return $smarty->fetch(self::TEMPLATE_PATH);
+    }
+
+    /**
+     * @param array $input
+     */
+    private function parseInput(array $input)
+    {
+        if (isset($input['text'])) {
+            $this->setText($input['text']);
+        }
+        if (isset($input['sortOrder'])) {
+            $this->setSortOrder($input['sortOrder']);
+        }
+        if (isset($input['fileOnly']) && $input['fileOnly']) {
+            $this->setFileOnly(true);
+        }
+        if (isset($input['fileType'])) {
+            $this->setFileType($input['fileType']);
+        }
+        if (isset($input['titleFilter']) && $input['titleFilter']) {
+            $this->setTitleFilter(true);
+        }
+        if (isset($input['modifier'])) {
+            $this->setModifier($input['modifier']);
+        }
+        if (isset($input['dateLower'])) {
+            $this->setDateLower($input['dateLower']);
+        }
+        if (isset($input['dateUpper'])) {
+            $this->setDateUpper($input['dateUpper']);
+        }
+        if (isset($input['searchRange'])) {
+            $this->setSearchRange($input['searchRange']);
+        }
+        if (isset($input['spid'])) {
+            $this->setSpaceId($input['spid']);
+        }
+        if (isset($input['cid'])) {
+            $this->setCategoryId($input['cid']);
+        }
+        if (isset($input['discussion']) && $input['discussion']) {
+            $this->addSpaceApplication('discussion');
+        }
+        if (isset($input['todo']) && $input['todo']) {
+            $this->addSpaceApplication('todo');
+        }
+        if (isset($input['from_todo']) && $input['from_todo']) {
+            $this->setFromTodo(true);
+        }
+        if (isset($input['language'])) {
+            $this->setLanguage($input['language']);
+        }
+        if (isset($input['target'])) {
+            $this->setTarget($input['target']);
+        }
+    }
+
+    /**
+     * @return array
+     * @throws GrnDataNotFoundException
+     * @throws \Exception
+     */
+    public function getSitePosition()
+    {
+        $spaceId = $this->getSpaceId();
+        $spaceLogic = SpaceLogic::getInstance();
+        try {
+            $space = $spaceLogic->getSpace($spaceId,
+                \CB_I18N::getInstance()->getCurrentLanguage());
+        } catch (GrnDataNotFoundException $e) {
+            $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+            throw $e;
+        }
+        IconUtility::constructionSpaceIconPath($space);
+        $sitePosition
+            = $this->createCategorySitePosition($space->getCategoryId());
+        $sitePosition[] = [
+            "page"     => parent::URL_TOP,
+            "name"     => $space->getSpaceName(),
+            "spid"     => $spaceId,
+            "icon"     => [
+                "image"  => $space->getDisplayIconPath(),
+                "direct" => true,
+                "class"  => "breadcrumb-icon",
+            ],
+            "isHidden" => ! $space->isPublic(),
+        ];
+        if ($this->getFromTodo()) {
+            $sitePosition[] = [
+                "page" => "space/application/todo/index",
+                "name" => grn_get_page_display_name("space/todo/index"),
+                "spid" => $spaceId,
+            ];
+        }
+        $sitePosition[] = [
+            "name" => cb_plain_msg('grn.space', 'search')
+        ];
+
+        return $sitePosition;
+    }
+
+    /**
+     * @param string $text
+     */
+    public function setText($text)
+    {
+        $this->text = $text;
+    }
+
+    /**
+     * @return string
+     */
+    public function getText()
+    {
+        return $this->text;
+    }
+
+    /**
+     * @param string $sortOrder
+     */
+    public function setSortOrder($sortOrder)
+    {
+        $this->sortOrder->setSortType($sortOrder);
+    }
+
+    /**
+     * @return string
+     */
+    public function getSortOrder()
+    {
+        return $this->sortOrder->getSortType();
+    }
+
+    /**
+     * @param string $dateLower
+     */
+    public function setDateLower($dateLower)
+    {
+        $this->dateLower = $dateLower;
+    }
+
+    /**
+     * @return string
+     */
+    public function getDateLower()
+    {
+        return $this->dateLower;
+    }
+
+    /**
+     * @param string $dateUpper
+     */
+    public function setDateUpper($dateUpper)
+    {
+        $this->dateUpper = $dateUpper;
+    }
+
+    /**
+     * @return string
+     */
+    public function getDateUpper()
+    {
+        return $this->dateUpper;
+    }
+
+    /**
+     * @param string $modifier
+     */
+    public function setModifier($modifier)
+    {
+        $this->modifier = $modifier;
+    }
+
+    /**
+     * @return string
+     */
+    public function getModifier()
+    {
+        return $this->modifier;
+    }
+
+    /**
+     * @param boolean $fileOnly
+     */
+    public function setFileOnly($fileOnly)
+    {
+        $this->fileOnly = $fileOnly;
+    }
+
+    /**
+     * @return boolean
+     */
+    public function getFileOnly()
+    {
+        return $this->fileOnly;
+    }
+
+    /**
+     * @param string $fileType
+     */
+    public function setFileType($fileType)
+    {
+        $this->fileType = $fileType;
+    }
+
+    /**
+     * @return string
+     */
+    public function getFileType()
+    {
+        return $this->fileType;
+    }
+
+    /**
+     * @param string $searchRange
+     */
+    public function setSearchRange($searchRange)
+    {
+        $this->searchRange = $searchRange;
+    }
+
+    /**
+     * @return string
+     */
+    public function getSearchRange()
+    {
+        return $this->searchRange;
+    }
+
+    /**
+     * @param string $spaceId
+     */
+    public function setSpaceId($spaceId)
+    {
+        $this->spaceId = $spaceId;
+    }
+
+    /**
+     * @return string
+     */
+    public function getSpaceId()
+    {
+        return $this->spaceId;
+    }
+
+    /**
+     * @param string $categoryId
+     */
+    public function setCategoryId($categoryId)
+    {
+        $this->categoryId = $categoryId;
+    }
+
+    /**
+     * @return string
+     */
+    public function getCategoryId()
+    {
+        return $this->categoryId;
+    }
+
+    /**
+     * @param string $app
+     */
+    public function addSpaceApplication($app)
+    {
+        $this->spaceApplications[$app] = true;
+    }
+
+    /**
+     * @return string[]
+     */
+    public function getSpaceApplications()
+    {
+        return $this->spaceApplications;
+    }
+
+    /**
+     * @param boolean $fromTodo
+     */
+    public function setFromTodo($fromTodo)
+    {
+        $this->fromTodo = $fromTodo;
+    }
+
+    /**
+     * @return boolean
+     */
+    public function getFromTodo()
+    {
+        return $this->fromTodo;
+    }
+
+    /**
+     * @param string $language
+     */
+    public function setLanguage($language)
+    {
+        $this->language = $language;
+    }
+
+    /**
+     * @return string
+     */
+    public function getLanguage()
+    {
+        return $this->language;
+    }
+
+    /**
+     * @return string
+     */
+    public function getTarget()
+    {
+        return $this->target;
+    }
+
+    /**
+     * @param string $target
+     */
+    public function setTarget($target)
+    {
+        $this->target = $target;
+    }
+
+    /**
+     * @return boolean
+     */
+    public function getTitleFilter()
+    {
+        return $this->titleFilter;
+    }
+
+    /**
+     * @param boolean $titleFilter
+     */
+    public function setTitleFilter($titleFilter)
+    {
+        $this->titleFilter = $titleFilter;
+    }
+}

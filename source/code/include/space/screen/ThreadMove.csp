@@ -1,0 +1,331 @@
+<?php
+
+namespace grn\space\screen;
+
+use grn\space\common\utility\ValidateUtility;
+use grn\space\common\data\bean\Application;
+use grn\space\data\condition\FolderSearchCondition;
+use grn\space\service\SpaceService;
+use grn\space\service\DiscussionService;
+use grn\space\common\data\bean\Authority;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\utility\IconUtility;
+use grn\space\common\exception\GrnInvalidArgumentException;
+use grn\space\common\exception\GrnInvalidPermissionException;
+use grn\space\common\exception\GrnDataNotFoundException;
+use grn\space\utility\FolderUtility;
+
+/**
+ * Class ThreadMove
+ *
+ */
+class ThreadMove extends SpaceBase
+{
+    private $folderId;
+
+    /**
+     * @return string
+     */
+    public function getFolderId()
+    {
+        return $this->folderId;
+    }
+
+    /**
+     * @param $folderId
+     */
+    public function setFolderId($folderId)
+    {
+        $this->folderId = $folderId;
+    }
+
+    /**
+     * (non-PHPdoc)
+     *
+     * @see grn\space\screen.GenericScreenBase::fetch()
+     */
+    public function fetch()
+    {
+        $input = $this->getInput();
+        require_once("grn/smarty.csp");
+        $smarty = new \GRN_Smarty();
+
+        $smarty->assign('thread_move_list_component',
+            new ThreadMoveList($input));
+
+        $spaceId = $this->getSpaceId();
+        $loginId = $this->getLoginUserId();
+        $folderId = cb_at($input, self::ARG_SPACE_FOLDER_ID);
+        $this->setFolderId($folderId);
+
+        $spaceService = SpaceService::getInstance();
+        if ( ! $spaceService->hasSpaceAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $spaceId, $loginId)
+        ) {
+            throw new GrnDataNotFoundException(ErrorCode::GRN_INVALID_SPACE_ID);
+        }
+
+        $isSpaceMember = $spaceService->isSpaceMember($loginId,
+            $spaceId, $loginId);
+        $isSpaceAdminOrOperator = $this->isSpaceAdminOrOperator($spaceService,
+            $spaceId, $loginId);
+
+        if ( ! $isSpaceMember && ! $isSpaceAdminOrOperator) {
+            throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_MOVE_PERMISSION);
+        }
+
+        $isSpaceOperator = $this->isSpaceOperator($spaceService, $spaceId,
+            $loginId);
+
+        $conditions = new FolderSearchCondition();
+        $conditions->setSpaceId($spaceId);
+        $folderCollection
+            = $spaceService->getFolderListByCondition($conditions);
+        FolderUtility::addUncategorizedFolder($folderCollection);
+
+        $treeJson = FolderUtility::buildJsonFolderTreeInfo($folderCollection);
+
+        $smarty->assign("folder_tree", $this->getCategoryTreeArray($treeJson));
+        $smarty->assign("folder_collection", $folderCollection);
+
+        $smarty->assign('space', $this->getSpace());
+        $smarty->assign('spaceId', $spaceId);
+
+        $limit = $this->getUserConfig()->getListMax();
+        $smarty->assign('number_on_page', $limit);
+
+        $smarty->assign('isSpaceMember', $isSpaceMember);
+        $smarty->assign('isSpaceAdminOrOperator', $isSpaceAdminOrOperator);
+        $smarty->assign('isSpaceOperator', $isSpaceOperator);
+
+        return $smarty->fetch("space/thread_move.tpl");
+    }
+
+    /**
+     * @param $input
+     *
+     * @throws GrnDataNotFoundException
+     * @throws GrnInvalidArgumentException
+     * @throws GrnInvalidPermissionException
+     */
+    public function post($input)
+    {
+        $loginId = $this->getLoginUserId();
+        $spaceService = SpaceService::getInstance();
+
+        $sendNotification = cb_at($input, self::SEND_NOTIFY) == 1 ? true
+            : false;
+
+        // check source
+        $source = cb_at($input, 'source');
+        if ( ! is_array($source)) {
+            throw new GrnInvalidArgumentException(ErrorCode::GRN_SPACE_ID_IS_NOT_FOUND);
+        }
+        $source_space_id = cb_at($source, 'spid');
+        if ( ! ValidateUtility::isNumber($source_space_id,
+            ValidateUtility::DISABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            throw new GrnInvalidArgumentException(ErrorCode::GRN_SPACE_ID_IS_NOT_FOUND);
+        }
+        $space = $spaceService->getSpace($source_space_id, $loginId);
+        if ($space->isExpired()) {
+            throw new GrnInvalidArgumentException(ErrorCode::GRN_SPACE_EXPIRED);
+        }
+        $source_folder_id = cb_at($source, 'did');
+        $source_folder_id = $source_folder_id === '-1' ? null
+            : $source_folder_id;
+        if ( ! ValidateUtility::isNumber($source_folder_id,
+            ValidateUtility::ENABLE_EMPTY, ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            throw new GrnInvalidArgumentException(ErrorCode::GRN_FOLDER_INVALID_ID);
+        }
+
+        $sourceFolder = $spaceService->verifySpaceFolder(
+            $source_space_id, $source_folder_id, $this->getLoginUserId(),
+            $this->getLanguageCode()
+        );
+
+        $listItem = cb_at($input, 'listItem');
+        if ( ! is_array($listItem) || (count($listItem) == 0)) {
+            throw new GrnInvalidArgumentException(ErrorCode::GRN_INVALID_THREAD_ID);
+        }
+
+        // verify discussion list before move
+        $discussionService = DiscussionService::getInstance();
+        $rootCategory = $discussionService->getApplicationRootCategory(
+            $source_space_id, Application::APPLICATION_CODE_DISCUSSION,
+            $this->getLanguageCode()
+        );
+        $threadCollection
+            = $discussionService->verifyThreadListWithFolderId($rootCategory,
+            $source_folder_id, $listItem);
+        if ($threadCollection->count() < count($listItem)) {
+            throw new GrnInvalidArgumentException(ErrorCode::GRN_INVALID_THREAD_ID);
+        }
+
+        foreach ($threadCollection as $thread) {
+            /** @var \grn\space\data\bean\Thread $thread */
+            if ($thread->isSystemUse()) {
+                throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_MOVE_PERMISSION);
+            }
+        }
+
+        // check target
+        $target = cb_at($input, 'target');
+        if ( ! is_array($target)) {
+            throw new GrnInvalidArgumentException(ErrorCode::GRN_SPACE_ID_IS_NOT_FOUND);
+        }
+        $target_space_id = cb_at($target, 'spid');
+        if ( ! ValidateUtility::isNumber($target_space_id,
+            ValidateUtility::DISABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            throw new GrnInvalidArgumentException(ErrorCode::GRN_SPACE_ID_IS_NOT_FOUND);
+        }
+        $space_target = $spaceService->getSpace($target_space_id, $loginId);
+        if ($space_target->isExpired()) {
+            throw new GrnInvalidArgumentException(ErrorCode::GRN_SPACE_EXPIRED);
+        }
+        $target_folder_id = cb_at($target, 'did');
+        $target_folder_id = $target_folder_id === '-1' ? null
+            : $target_folder_id;
+        if ( ! ValidateUtility::isNumber($target_folder_id,
+            ValidateUtility::ENABLE_EMPTY, ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            throw new GrnInvalidArgumentException(ErrorCode::GRN_FOLDER_INVALID_ID);
+        }
+
+        $targetFolder = $spaceService->verifySpaceFolder(
+            $target_space_id, $target_folder_id, $this->getLoginUserId(),
+            $this->getLanguageCode()
+        );
+
+        // check right before move discussion
+        if ($source_space_id == $target_space_id) {
+            // move to other folder in space
+            $isSourceSpaceMember = $spaceService->isSpaceMember($loginId,
+                $source_space_id, $loginId);
+            $isSpaceAdminOrOperator
+                = $this->isSpaceAdminOrOperator($spaceService,
+                $source_space_id, $loginId);
+
+            if ( ! $isSourceSpaceMember && ! $isSpaceAdminOrOperator) {
+                throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_MOVE_PERMISSION);
+            }
+        } else {
+            // move to another space
+            // whether login user is space administrator of current space or not
+            if ( ! $this->isSpaceOperator($spaceService, $source_space_id,
+                $loginId)
+            ) {
+                throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_SOURCE_SPACE_ADMINISTRATOR);
+            }
+
+            // whether login user is space member of destination space or not
+            if ( ! $spaceService->isSpaceMember($loginId, $target_space_id,
+                $loginId)
+            ) {
+                throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_TARGET_SPACE_MEMBER);
+            }
+        }
+
+        // move discussion to target
+        $discussionService->moveThreadList(
+            $threadCollection, $source_space_id, $sourceFolder,
+            $target_space_id, $targetFolder, $sendNotification
+        );
+    }
+
+    /**
+     * @param $treeJson
+     *
+     * @return array
+     */
+    public function getCategoryTreeArray($treeJson)
+    {
+        return [
+            "tree_name"       => "folder_tree",
+            "link_url"        => "space/thread_move",
+            "link_url_params" => [],
+            "selected_oid"    => $this->getFolderId(),
+            "oid_key"         => "spid",
+            "json_template"   => "space/encoded_json.tpl",
+            "root_caption"    => null,
+            "root_subscribed" => false,
+            "no_root"         => true,
+            "on_select"       => 'grn.component.space.thread_move.folder_tree.handleSelectFolder',
+            "set_tree_height" => true,
+            "root"            => $treeJson
+        ];
+    }
+
+    /**
+     * (non-PHPdoc)
+     *
+     * @see grn\space\screen.GenericScreenBase::getTitle()
+     */
+    public function getTitle()
+    {
+        return grn_get_page_display_name("space/move_thread");
+    }
+
+    /**
+     * (non-PHPdoc)
+     *
+     * @see grn\space\screen.GenericScreenBase::getSitePosition()
+     */
+    public function getSitePosition()
+    {
+        $sitePosition = $this->createCategorySitePosition($this->getSpace()
+                                                               ->getCategoryId());
+        $sitePosition[] = [
+            "name"     => $this->getSpace()->getSpaceName(),
+            "page"     => "space/top",
+            "spid"     => $this->getSpace()->getId(),
+            "icon"     => [
+                "image"  => $this->getSpace()->getDisplayIconPath(),
+                "direct" => true,
+                "class"  => "breadcrumb-icon",
+            ],
+            "isHidden" => ! $this->getSpace()->isPublic(),
+        ];
+        $sitePosition[] = [
+            "name" => grn_get_page_display_name("space/move_thread"),
+        ];
+
+        return $sitePosition;
+    }
+
+    /**
+     * @param $input
+     *
+     * @throws GrnDataNotFoundException
+     * @throws GrnInvalidArgumentException
+     * @throws \Exception
+     */
+    protected function setInput($input)
+    {
+        parent::setInput($input);
+
+        if (cb_at($input, 'use_ajax')) {
+            return;
+        }
+
+        $this->checkArgFromInput([self::ARG_SPACE_ID], $input);
+
+        //Set up Space because it is used in $this->getSitePosition which is called before $this->fetch is called.
+        $spaceService = SpaceService::getInstance();
+        try {
+            $space = $spaceService->getSpace($this->getSpaceId(),
+                $this->getLoginUserId(), $this->getLanguageCode());
+        } catch (GrnDataNotFoundException $e) {
+            $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+            throw $e;
+        }
+        global $G_config_common;
+        IconUtility::constructionSpaceIconPath($space,
+            $G_config_common->get('Global', 'app_path'));
+        $this->setSpace($space);
+    }
+}

@@ -1,0 +1,297 @@
+<?php
+
+namespace grn\fts\elasticsearch;
+
+use Elasticsearch\ClientBuilder;
+use Elasticsearch\Common\Exceptions\BadRequest400Exception;
+use Elasticsearch\Common\Exceptions\ElasticsearchException;
+use grn\fts\Application;
+use grn\fts\exception\AllResultException;
+use grn\fts\exception\NoResultException;
+use grn\fts\exception\NoServerConnectionException;
+use grn\fts\exception\SearchException;
+use grn\fts\Fields;
+use grn\fts\filter\QueryStringFilter;
+use grn\fts\filter\RangeFilter;
+use grn\fts\FtsProduct;
+use grn\fts\SearchDocument;
+use grn\fts\SearchLogger;
+use grn\fts\SearchLogicInterface;
+use grn\fts\SearchQueryInterface;
+use grn\fts\SearchResponse;
+use grn\fts\SearchUtil;
+use grn\fts\SortOrder;
+
+class SearchLogic implements SearchLogicInterface
+{
+    /**
+     * @param bool $titleOnly
+     *
+     * @return array
+     */
+    private function getQueryFields($titleOnly)
+    {
+        if ($titleOnly) {
+            return [Fields::title()];
+        }
+
+        return [
+            Fields::data(),
+            Fields::description(),
+            Fields::title(),
+            Fields::fileName(),
+            Fields::from(),
+            Fields::to(),
+            Fields::cc(),
+            Fields::bcc()
+        ];
+    }
+
+    /**
+     * @param SearchQueryInterface $query
+     *
+     * @throws SearchException
+     * @throws NoServerConnectionException
+     *
+     * @return SearchResponse
+     */
+    public function search(SearchQueryInterface $query)
+    {
+        $logger = new SearchLogger();
+        $client = $this->getEsClient();
+        try {
+            $es_query = $this->buildEsQuery($query);
+        } catch (NoResultException $e) {
+            return new SearchResponse([], $query->getStart(), false);
+        }
+
+        if ($logger->isLoggingQuery()) {
+            $logger->logQuery(json_encode($es_query));
+        }
+
+        try {
+            $es_query['client'] = [
+                'timeout'         => Application::getClientTimeout(),
+                'connect_timeout' => 30
+            ];
+            $search_response = $client->search($es_query);
+        } catch (ElasticsearchException $e) {
+            if ($this->isQueryParseError($e)) {
+                return new SearchResponse([], $query->getStart(), false);
+            }
+            throw new SearchException("search query failed", 0, $e);
+        }
+
+        $total_hits = $search_response['hits']['total'];
+        if ($total_hits == 0) {
+            return new SearchResponse([], $query->getStart(), false);
+        }
+
+        $processing_time_ms = $search_response['took'];
+
+        if ($logger->isLoggingResponse()) {
+            $logger->logResponse(json_encode($search_response),
+                $processing_time_ms);
+        }
+
+        $docs = $search_response['hits']['hits'];
+        $documents = [];
+        $query_fields = $this->getQueryFields($query->isTitleOnly());
+        foreach ($docs as $doc) {
+            $highlights = [];
+            if (isset($doc['highlight'])) {
+                foreach ($query_fields as $field) {
+                    if (isset($doc['highlight'][$field->es()])) {
+                        $highlights[] = $doc['highlight'][$field->es()][0];
+                        break;
+                    }
+                }
+            }
+
+            $document = new SearchDocument($doc['_id'], $highlights);
+            if (isset($doc['_source'][Fields::fileId()->es()])) {
+                $document->setFileId($doc['_source'][Fields::fileId()->es()]);
+                if (isset($doc['highlight'][Fields::fileName()->es()])) {
+                    $document->setFileNameHighlights($doc['highlight'][Fields::fileName()
+                                                                             ->es()]);
+                }
+            }
+            $documents[] = $document;
+        }
+
+        $num_checked = $query->getStart() + count($documents);
+        $continuable = true;
+        if (count($documents) < $query->getSize()) {
+            $continuable = false;
+        }
+        $searchResponse = new SearchResponse($documents, $num_checked,
+            $continuable, $processing_time_ms);
+
+        return $searchResponse;
+    }
+
+    /**
+     * @return \Elasticsearch\Client
+     */
+    protected function getEsClient()
+    {
+        $client_builder = ClientBuilder::create();
+        $elasticsearch_config = Application::getElasticsearchConfig();
+
+        if ($elasticsearch_config !== false
+            && array_key_exists('host', $elasticsearch_config)
+            && array_key_exists('port', $elasticsearch_config)
+        ) {
+            $host = $elasticsearch_config['host'];
+            $port = $elasticsearch_config['port'];
+            $hosts = [];
+            $hosts[] = ['host' => $host, 'port' => $port];
+            $client_builder->setHosts($hosts);
+        }
+
+        $client = $client_builder->build();
+
+        return $client;
+    }
+
+    /**
+     * @param SearchQueryInterface $query
+     *
+     * @throws NoResultException
+     * @throws NoServerConnectionException
+     *
+     * @return array
+     */
+    private function buildEsQuery(SearchQueryInterface $query)
+    {
+        if (strlen($query->getKeyword()) === 0) {
+            throw new NoResultException("no valid keyword: "
+                                        . $query->getKeyword());
+        }
+
+        $params = [
+            'index'   => \CB_CyDECUtil::getInstance()->getDomainID()
+                         . '_garoon',
+            'size'    => (int)$query->getSize(),
+            'from'    => (int)$query->getStart(),
+            'timeout' => SearchUtil::TIME_ALLOWED_MILLISECONDS . "ms"
+        ];
+
+        $sortOrder = $query->getSortOrder();
+        if ($sortOrder !== SortOrder::SCORE) {
+            $sort_field = SortOrder::getField($sortOrder);
+            $params['sort'] = $sort_field->es() . ":desc";
+        } else {
+            $params['sort'] = "_score:desc";
+        }
+
+        $es = FtsProduct::elasticsearch();
+
+        $query_fields = $this->getQueryFields($query->isTitleOnly());
+        $keyword_filter = new QueryStringFilter($query_fields,
+            $query->getKeyword());
+
+        $filters = [];
+        $mtime_filter = $this->createMtimeFilter($query);
+        if ( ! is_null($mtime_filter)) {
+            $filters[] = $mtime_filter->getQuery($es);
+        }
+
+        foreach ($query->getFilters() as $filter) {
+            try {
+                $filters[] = $filter->getQuery($es);
+            } catch (NoResultException $e) {
+                throw new NoResultException('no result remain', 0, $e);
+            } catch (AllResultException $e) {
+                continue;
+            }
+        }
+
+        $highlight = [
+            'pre_tags'            => [SearchUtil::getHighlightSearchPre()],
+            'post_tags'           => [SearchUtil::getHighlightSearchPost()],
+            'fragment_size'       => SearchUtil::HIGHLIGHT_FRAGSIZE,
+            'phrase_limit'        => SearchUtil::HIGHLIGHT_PHRASE_LIMIT,
+            'number_of_fragments' => 1,
+            'fields'              => [],
+            'highlight_query'     => ['bool' => ['must' => $keyword_filter->getQuery($es)]],
+        ];
+
+        foreach ($query_fields as $field) {
+            $highlight['fields'][$field->es()]
+                = ['fragment_size' => SearchUtil::HIGHLIGHT_FRAGSIZE];
+        }
+
+        $params['body'] = [
+            'query'     => [
+                'bool' => [
+                    'must'   => $keyword_filter->getQuery($es),
+                    'filter' => $filters
+                ]
+            ],
+            'highlight' => $highlight,
+        ];
+
+        $params['_source'] = [Fields::fileId()->es()];
+
+        return $params;
+    }
+
+    /**
+     * @param SearchQueryInterface $query
+     *
+     * @return RangeFilter|null
+     */
+    private function createMtimeFilter(SearchQueryInterface $query)
+    {
+        $date_condition = [];
+        $date_lower = $query->getDateLower();
+        if ($date_lower !== SearchQueryInterface::DATE_NOT_SPECIFIED) {
+            $date_condition["gte"] = $date_lower;
+        }
+        $date_upper = $query->getDateUpper();
+        if ($date_upper !== SearchQueryInterface::DATE_NOT_SPECIFIED) {
+            $date_condition["lte"] = $date_upper;
+        }
+        if ( ! empty($date_condition)) {
+            return new RangeFilter(Fields::mtime(), $date_condition);
+        }
+
+        return null;
+    }
+
+    /**
+     * @param ElasticsearchException $e
+     *
+     * @return bool
+     */
+    private function isQueryParseError(ElasticsearchException $e)
+    {
+        if ( ! $e instanceof BadRequest400Exception) {
+            return false;
+        }
+
+        // Note: We can't use the $e->getMessage() method here.
+        // The method will return the combined value of the 'type' and 'reason' property values of the 'root_cause' property in the response.
+        // But when the Elasticsearch cluster has multiple nodes, the value could be different even if the parameters is the same.
+
+        /** @var BadRequest400Exception $e */
+        $e = $e->getPrevious();
+        $message = json_decode($e->getMessage(), true);
+
+        if ( ! isset($message['error']['caused_by'])) {
+            return false;
+        }
+
+        // Find the 'parse_exception' type recursively
+        $error = $message['error'];
+        while (isset($error['caused_by']['type'])) {
+            if ($error['caused_by']['type'] === 'parse_exception') {
+                return true;
+            }
+            $error = $error['caused_by'];
+        }
+
+        return false;
+    }
+}

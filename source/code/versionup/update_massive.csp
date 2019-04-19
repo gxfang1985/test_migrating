@@ -1,0 +1,507 @@
+<?php
+
+error_reporting(E_ALL);
+assert_options(ASSERT_ACTIVE, 1);
+assert_options(ASSERT_CALLBACK,
+    create_function('$file, $line, $expr',
+        'cb_throw_error(E_PHP_ASSERTION, null, null, null,
+array("file"=>$file, "line"=>$line, "expr"=>$expr));'));
+
+cb_require_role('CommandLine');
+
+if (@$argv[1] == '-' && @$argv[2] == '--help') {
+    echo "Usage: ${argv[0]} file [app_id] [cgi-bin] [web_root] [exec_local]\n";
+    echo "       file: update archive-file.\n";
+    echo "       use_installed_mysql: using for installed MySQL.\n";
+    echo "       app_id: application identifer.\n";
+    echo "       cgi-bin: cgi directory.\n";
+    echo "       web_root: webroot directory.\n";
+    echo "       exec_local: execute local.csp";
+    exit(1);
+}
+
+cb_export_log('Started updating.');
+
+if (isset($argv[1])) {
+    $G_archive_file = $argv[1];
+} else {
+    $G_archive_file = dirname(__FILE__) . "/archive.tar.gz";
+}
+
+//  $argv[2] 
+if (array_key_exists('use_installed_mysql', $G_INPUT)) {
+    define('USE_INSTALLED_MYSQL', 1);
+}
+
+if (isset($argv[3])) {
+    $G_appid = $argv[3];
+} else {
+    global $G_config_common;
+    $G_appid = $G_config_common->get('Global', 'app_name');
+}
+
+if (isset($argv[4])) {
+    $G_cgi_dir = $argv[4];
+} else {
+    $G_cgi_dir = dirname(cb_basedir());
+}
+
+if (isset($argv[5])) {
+    $G_web_dir = $argv[5];
+} else {
+    //TODO: ....
+    //cb_tmpdir() is dummy.....
+    $G_web_dir = cb_tmpdir();
+}
+
+if (isset($argv[6])) {
+    $G_exec_local = true;
+} else {
+    $G_exec_local = false;
+}
+
+///////////////////////////////////////////////////////////
+// versionup script.
+//
+// process exitcode:
+//  0: success
+// 10: can't vesionup
+//
+// deployment:
+// [archive]
+//     plugin ------ 00fw.csp
+//                +- 01grn.csp
+//                +- 25mail.csp
+//
+//     module ------ fw ---- 2.0.0 --- script ----- local
+//                |       |         |            +- remote
+//                |       |         +- resource --- cgi-bin
+//                |       |                      +- web_root
+//                |       +- 2.0.1
+//                +- grn --- 2.0.0
+//                |       +- 2.0.1
+//                +- mail -- 2.0.0
+//                        +- 2.0.1
+//     versionup.ini
+//     [version]
+//      fw      = 2.0.9
+//      grn     = 2.0.1
+//      ...
+// 
+///////////////////////////////////////////////////////////
+$extract_dir = cb_tmpdir() . '/update';
+$info = null;
+cb_filesystem_filter($extract_dir, 'rmdir', 'unlink', false, false, $info);
+cb_mkdir($extract_dir, 0700)
+|| die("failed to make directory: ${extract_dir} ");
+
+require_once('Archive/Tar.php');
+$tar = new Archive_Tar($G_archive_file, 'gz');
+$ret = $tar->extract($extract_dir);
+if ( ! $ret) {
+    cb_throw_error();
+}
+$G_module_basedir = $extract_dir . '/archive';
+$G_update_config = new CB_ConfigManager($G_module_basedir . '/versionup.ini');
+
+$plugin_dir = $G_module_basedir . '/plugin';
+$dir = @opendir($plugin_dir);
+$scripts = null;
+while (($file = readdir($dir)) !== false) {
+    if (preg_match('/^([0-9][0-9])(.*)\\.csp$/', $file, $regs)) {
+        $scripts[intval($regs[1])] = [
+            'id'     => $regs[1],
+            'module' => $regs[2],
+            'file'   => $file
+        ];
+    }
+}
+ksort($scripts);
+closedir($dir);
+
+require_once('_update_after.csp');
+$file_update_after = $extract_dir . '/update_after.ini';
+$G_module_updater_after = new CB_ModuleUpdaterAfterInstall($file_update_after);
+
+foreach ($scripts as $script) {
+    @include($plugin_dir . '/' . $script['file']);
+}
+
+cb_export_log('Finished updating.');
+cb_safe_exit(0);
+
+class CB_ModuleUpdater
+{
+    var $_id = null;
+    var $_cgi_dir = null;
+    var $_web_dir = null;
+    var $_app_id = null;
+
+    var $_owner = null;
+    var $_module_dir = null;
+    var $_module_id = null;
+    var $_config = null;
+
+    function __construct($app_id, $cgi_dir, $web_dir, $file, $module_id)
+    {
+        $this->_cgi_dir = $cgi_dir;
+        $this->_web_dir = $web_dir;
+        $this->_app_id = $app_id;
+
+        $this->_config = new CB_ConfigManager($file);
+        $this->_owner = fileowner($file);
+        $this->_id = $module_id;
+        $this->_module_dir = cb_update_module_basedir($module_id);
+    }
+
+    function getModuleId()
+    {
+        return $this->_id;
+    }
+
+    function getCurrentVersion()
+    {
+        return $this->_config->get('Global', 'version');
+    }
+
+    function listMustInstallVersion($version)
+    {
+        $dir = @opendir($this->_module_dir);
+        $list = null;
+        while (($file = readdir($dir)) !== false) {
+            if (($file !== '.' && $file !== '..')
+                && is_dir($this->_module_dir . "/$file")
+            ) {
+                $real = $this->getRealVersion($file);
+                $list[$real] = $file;
+            }
+        }
+        ksort($list);
+        @closedir($dir);
+
+        $installed = $this->getRealVersion($this->getCurrentVersion());
+        $installing = $this->getRealVersion($version);
+
+        $versions = [];
+        foreach (array_keys($list) as $k) {
+            if ($k > $installed && $k <= $installing) {
+                $versions[] = $list[$k];
+            }
+        }
+
+        return $versions;
+    }
+
+    function doInstall($version)
+    {
+        if ($this->getCurrentVersion() === $version) {
+            return true;
+        }
+
+        $lwc = new CB_ConfigManager($this->_cgi_dir . '/' . $this->_app_id
+                                    . '/lwc.ini');
+        $host = $lwc->get('dbconn', 'prop:_host');
+        preg_match("/val:([^:]*)(:([0-9]+))?/", $host, $matched);
+        $host = $matched[1];
+
+        // timezone info factory
+        $lwc->set('timezoneinfo_factory', 'class',
+            'CB_TimeZoneInfoPHPFactory'); //multi timezone using timezone data
+
+        $lwc->save();
+
+        unset($lwc);
+
+        $versions = $this->listMustInstallVersion($version);
+
+        foreach ($versions as $v) {
+            $script_dir = $this->_module_dir . "/$v/scripts";
+
+            /////////////////////////
+            // run local scripts.
+            //////////////////////////
+            global $G_exec_local;
+            if ($G_exec_local === true) {
+                $script = $script_dir . '/local.csp';
+                if (is_file($script)) {
+                    @include($script);
+                }
+            }
+
+            /////////////////////////
+            // run remote scripts.
+            //////////////////////////
+            $script = $script_dir . '/remote.csp';
+            if (is_file($script)) {
+                @include($script);
+            }
+
+            /////////////////////
+            // resource update.
+            /////////////////////
+            unset($info);
+            $resource_dir = $this->_module_dir . "/$v/resource";
+
+            // cgi-bin update.
+            $info['source'] = $resource_dir . "/cgi-bin";
+            $info['dest'] = $this->_cgi_dir . '/' . $this->_app_id;
+            cb_filesystem_filter($resource_dir . "/cgi-bin",
+                '_cb_copy_dir_handler', '_cb_copy_file_handler', true, true,
+                $info);
+
+            // web_root update.
+            $info['source'] = $resource_dir . "/web_root";
+            $info['dest'] = $this->_web_dir . '/' . $this->_app_id;
+            cb_filesystem_filter($resource_dir . "/web_root",
+                '_cb_copy_dir_handler', '_cb_copy_file_handler', true, true,
+                $info);
+        }
+
+        return true;
+    }
+
+    function getRealVersion($version)
+    {
+        preg_match('/([0-9]+)\.([0-9]+)\.([0-9]+)/', $version, $regs);
+
+        return $regs[1] * 10E4 + $regs[2] * 10E2 + $regs[3];
+    }
+}
+
+function _cb_copy_file_handler($file, &$info)
+{
+    assert('isset( $info[ \'source\' ] ) && isset( $info[ \'dest\' ] )');
+    $source = $info['source'];
+    $dest = $info['dest'];
+    $owner = $info['owner'];
+
+    $target = str_replace($source, $dest, $file);
+    @copy($file, $target);
+
+    chown($target, $owner);
+    chgrp($target, $owner);
+
+    $mode = 0644;
+    if (preg_match('/.*\.so|.*\.cgi|.*\.exe|.*\.dll/i', $file, $matched)) {
+        $mode = 0755;
+    }
+    chmod($target, $mode);
+}
+
+function _cb_copy_dir_handler($file, &$info)
+{
+    assert('isset( $info[ \'source\' ] ) && isset( $info[ \'dest\' ] )');
+    $source = $info['source'];
+    $dest = $info['dest'];
+    $owner = $info['owner'];
+
+    $target = str_replace($source, $dest, $file);
+    if ( ! is_dir($target)) {
+        cb_mkdir($target, 0755) || die("failed to make directory: ${dest} ");
+        chown($target, $owner);
+        chgrp($target, $owner);
+        chmod($target, 0755);
+    }
+}
+
+function cb_filesystem_filter(
+    $dir,
+    $dir_func,
+    $file_func,
+    $is_root,
+    $prev,
+    &$info
+) {
+    if ($dh = @opendir($dir)) {
+        if ($prev && ! $is_root) {
+            if ( ! is_null($info)) {
+                @call_user_func($dir_func, $dir, $info);
+            } else {
+                @call_user_func($dir_func, $dir);
+            }
+        }
+
+        while ($r = @readdir($dh)) {
+            if (($r != '.') && ($r != '..')) {
+                $child = "$dir/$r";
+                if (is_dir($child)) {
+                    cb_filesystem_filter($child, $dir_func, $file_func, false,
+                        $prev, $info);
+                } else {
+                    if ( ! is_null($file_func)) {
+                        if ( ! is_null($info)) {
+                            @call_user_func($file_func, $child, $info);
+                        } else {
+                            @call_user_func($file_func, $child);
+                        }
+                    }
+                }
+            }
+        }
+
+        @closedir($dh);
+
+        if ( ! $prev && ! $is_root) {
+            if ( ! is_null($dir_func)) {
+                if ( ! is_null($info)) {
+                    @call_user_func($dir_func, $dir, $info);
+                } else {
+                    @call_user_func($dir_func, $dir);
+                }
+            }
+        }
+    }
+}
+
+function cb_update_module_basedir($id)
+{
+    global $G_module_basedir;
+
+    return $G_module_basedir . "/module/$id";
+}
+
+function cb_export_log($msg, $errflg = false)
+{
+    $outmsg = date("Ymd H:i:s");
+
+    if ($errflg == true) {
+        $outmsg .= ' [ERROR] ';
+    } else {
+        $outmsg .= ' [INFO] ';
+    }
+
+    $outmsg .= $msg . "\n";
+
+    echo $outmsg;
+    if (ob_get_level() > 0) {
+        ob_flush();
+    }
+}
+
+/**
+ * @param CB_DatabaseConnection $db
+ * @param string                $query
+ * @param string                $error_log
+ * @param string|null           $success_log
+ */
+function execSQL(&$db, $query, $error_log, $success_log = null)
+{
+    if ($res = $db->query($query) === false) {
+        cb_export_log($error_log, true);
+        $db->throwServerError($query);
+    }
+    if ( ! is_null($success_log)) {
+        cb_export_log($success_log, false);
+    }
+}
+
+/**
+ * @param string $file
+ * @param string $item
+ * @param string $value
+ */
+function write_ini_item($file, $item, $value)
+{
+    $configs = parse_ini_file($file);
+    $configs[$item] = $value;
+
+    $fp = fopen($file, "w");
+    foreach ($configs as $k => $v) {
+        fwrite($fp, "$k = $v\n");
+    }
+    fclose($fp);
+}
+
+/**
+ * @param string $file
+ * @param string $item
+ */
+function remove_ini_item($file, $item)
+{
+    $configs = parse_ini_file($file);
+    unset($configs[$item]);
+
+    $fp = fopen($file, "w");
+    foreach ($configs as $k => $v) {
+        fwrite($fp, "$k = $v\n");
+    }
+    fclose($fp);
+}
+
+/**
+ * Copy a table from the master database to other slave databases.
+ *
+ * @param string $tableName
+ * @param string $orderByColumn
+ */
+function __copyTable($tableName, $orderByColumn = '_id')
+{
+    global $G_container_base;
+    $db = $G_container_base->getInstance('dbconn');
+
+    $result
+        = $db->query("SELECT * FROM {$tableName} ORDER BY {$orderByColumn};");
+    $insertQueries = [];
+    while ($row = $db->fetch_assoc($result)) {
+        $setQuery = [];
+        foreach ($row as $column => $value) {
+            if ( ! is_null($value)) {
+                $setQuery[] = " {$column}='{$db->escape($value)}' ";
+            }
+        }
+        $insertQueries[] = "INSERT INTO {$tableName} SET " . implode(",",
+                $setQuery) . ";";
+    }
+
+    $result = $db->query("SHOW CREATE TABLE {$tableName};");
+    $row = $db->fetch_assoc($result);
+    $db->free_result($result);
+    $createTableQuery = $row["Create Table"];
+
+    foreach (__getSlaveConnections() as $slaveConnection) {
+        $result = $slaveConnection->query("SHOW TABLES LIKE '{$tableName}';");
+        $row = $slaveConnection->fetch_assoc($result);
+        $slaveConnection->free_result($result);
+
+        if ( ! $row) {
+            execSQL(
+                $slaveConnection,
+                $createTableQuery,
+                "Failed to create table '{$tableName}' on {$slaveConnection->getDatabaseName()} {$slaveConnection->getHostName()}",
+                "Successed to create table '{$tableName}' on {$slaveConnection->getDatabaseName()} {$slaveConnection->getHostName()}"
+            );
+            foreach ($insertQueries as $insertQuery) {
+                $slaveConnection->query($insertQuery);
+            }
+            $slaveConnection->commit();
+        }
+    }
+    cb_export_log("Finish copying {$tableName}");
+}
+
+/**
+ * @return CB_DatabaseConnection[]
+ */
+function __getSlaveConnections()
+{
+    global $G_container_base;
+    global $G_config_common;
+    require_once('fw/lwc.csp');
+    $config = new CB_LWContainerFileConfig($G_config_common->get('LWC',
+        'config'));
+    $lwc_config = $config->listConfigs();
+    $connections = [];
+    foreach ($lwc_config as $section_name) {
+        $section = $config->getConfig($section_name);
+        if (array_key_exists('class', $section)
+            && strcmp('CB_DatabaseConnection', $section['class']) === 0
+        ) {
+            if ($section_name !== 'dbconn') {
+                $connections[] = $G_container_base->getInstance($section_name);
+            }
+        }
+    }
+
+    return $connections;
+}
+

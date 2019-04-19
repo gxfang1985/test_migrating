@@ -1,0 +1,153 @@
+<?php
+
+$event_id = array_key_exists('event', $G_INPUT) ? $G_INPUT['event'] : null;
+$user_id = array_key_exists('uid', $G_INPUT) ? $G_INPUT['uid'] : null;
+$group_id = array_key_exists('gid', $G_INPUT) ? $G_INPUT['gid'] : null;
+$str_date = array_key_exists('date', $G_INPUT) ? $G_INPUT['date'] : null;
+$referer_key = array_key_exists('referer_key', $G_INPUT)
+    ? $G_INPUT['referer_key'] : null;
+$date = new CB_Date();
+if ( ! $date->parse($str_date)) {
+    $date = null;
+}
+
+if (strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST') == 0) {
+    // イベントの取得
+    require_once('fw/string_util.csp');
+    require_once('schedule/application.csp');
+    $app = GRN_Schedule_Application::getInstance();
+
+    // -------- 
+    // brabrabra after success
+    // --------
+    $follow = array_key_exists('data', $G_INPUT) ? $G_INPUT['data'] : '';
+    if (mb_strlen(cb_trim($follow)) == 0) {
+        cb_throw_error(E_GRN_SCHD_NOTINPUT_EVENTFOLLOW);
+    }
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+
+    $login = $uum->getLoginUser();
+
+    $event = $app->getEvent($login, $event_id, $date);
+    if ( ! $event) {
+        cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+    }
+
+    // アクセス権のチェック
+    require_once('schedule/access_logic.csp');
+    $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+    $dynamic_role = $uum->listGrantedRoles();
+    $access = $acc_logic->getEventAccess($login, $event,
+        ['read', 'add', 'modify', 'delete'], $dynamic_role);
+
+    if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+    }
+
+    if ($access['add'] == GRN_SCHD_ACCESS_DENY
+        && $access['modify'] == GRN_SCHD_ACCESS_DENY
+        && $access['delete'] == GRN_SCHD_ACCESS_DENY
+    ) {
+        cb_throw_error(E_GRN_SCHD_DENYENTRY_EVENTFOLLOW);
+    }
+
+    $event_id = $app->writeFollow($login, $follow, $event_id, $date);
+    $event->id = $event_id;
+
+    // ----- GRN2-4506 -----
+    // 通知のタイムゾーン対応のために、setdatetimeなどを変換する。
+    if ($event instanceof GRN_Schedule_RepeatEvent) {
+        require_once('fw/i18n.csp');
+        if ($event->setdatetime instanceof CB_DatetimeEx) {
+            // 通常予定の繰り返しは、そのまま変換する
+            $settimestamp = new CB_TimeStampEx(null, $event->timezone);
+            $settimestamp->setDateTime($event->setdatetime,
+                CB_I18N::getInstance()->getCurrentTimezone());
+            $event->setdatetime = $settimestamp->getDateTime();
+            if (isset($event->enddatetime)) {
+                $endtimestamp = new CB_TimeStampEx(null, $event->timezone);
+                $endtimestamp->setDateTime($event->enddatetime,
+                    CB_I18N::getInstance()->getCurrentTimezone());
+                $event->enddatetime = $endtimestamp->getDateTime();
+            } else {
+                $event->enddateitme = $event->setdatetime;
+            }
+        } elseif ($event->setdatetime instanceof CB_Date) {
+            // 終日予定の場合、イベントとユーザーのタイムゾーンの時差を見る。
+            // その時差によって、終日予定が1日早くなっているかどうか確認する。
+            $dateTimeZoneEvent = new DateTimeZone($event->timezone);
+            $dateTimeZoneUser = new DateTimeZone(CB_I18N::getInstance()
+                                                        ->getCurrentTimezone());
+            $dateTimeEvent = new DateTime("now", $dateTimeZoneEvent);
+            $dateTimeUser = new DateTime("now", $dateTimeZoneUser);
+            $timeOffset = $dateTimeZoneEvent->getOffset($dateTimeUser);
+            if ($timeOffset <= 0) {
+                // イベントのタイムゾーンがユーザーのタイムゾーンと同じか、遅い場合。
+                // 開始日はイベントのタイムゾーンと同じなので、そのまま。終了日を同日にしておく。
+                $event->enddatetime = $event->setdatetime;
+            } else {
+                // イベントのタイムゾーンがユーザーのタイムゾーンより早い場合。
+                // イベントのタイムゾーンの開始日は1日後となるので、変更する。
+                // enddatetimeはsetdatetimeの1日後になっているため、それを利用する。
+                $event->setdatetime = $event->enddatetime;
+            }
+        }
+    } elseif ($event instanceof GRN_Schedule_NormalEvent) {
+        // 通常予定（終日以外）も、イベントのタイムゾーンに変更する
+        if ($event->setdatetime instanceof CB_DateTimeEx) {
+            require_once('fw/i18n.csp');
+            $settimestamp = new CB_TimeStampEx(null, $event->timezone);
+            $settimestamp->setDateTime($event->setdatetime,
+                CB_I18N::getInstance()->getCurrentTimezone());
+            $event->setdatetime = $settimestamp->getDateTime();
+            if (isset($event->enddatetime)) {
+                $endtimestamp = new CB_TimeStampEx(null, $event->timezone);
+                $endtimestamp->setDateTime($event->enddatetime,
+                    CB_I18N::getInstance()->getCurrentTimezone());
+                $event->enddatetime = $endtimestamp->getDateTime();
+            } else {
+                $event->enddatetime = $event->setdatetime;
+            }
+        }
+    }
+    // ----- GRN2-4506 -----
+
+    $tsex = new CB_TimeStampEx();
+    $notify_date = $tsex->getDate();
+
+    if ($notify_date->compare($date) <= 0) {
+        if ($event->users && count($event->users) > 0) {
+            $title = _schedule_command_view_getNotifyTitle($event);
+            $app->setNotify($event->users, $login, $event, $date, $title,
+                $follow, GRN_SCHEDULE_NOTIFY_FOLLOWENTRY, $tsex);
+        }
+        // 通知先の指定がある場合
+        if ($event->private && is_array($event->notify_address)
+            && count($event->notify_address) > 0
+        ) {
+            $title = _schedule_command_view_getNotifyTitle($event);
+            $app->sendNotificationsToPublic($login, $event, $date, $follow,
+                $tsex, $title, false, false, GRN_SCHEDULE_NOTIFY_FOLLOWENTRY);
+        }
+    }
+
+}
+cb_redirect('schedule/view', [
+    'bdate'       => $date->format(),
+    'event'       => $event_id,
+    'uid'         => $user_id,
+    'gid'         => $group_id,
+    'referer_key' => $referer_key
+]);
+
+
+function _schedule_command_view_getNotifyTitle($event)
+{
+    require_once('schedule/notification.csp');
+    $util = GRN_Schedule_Notify_Logic::getInstance();
+
+    return $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+}
+

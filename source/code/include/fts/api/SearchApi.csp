@@ -1,0 +1,297 @@
+<?php
+
+namespace grn\fts\api;
+
+use grn\fts\AccessControlledSearchLogic;
+use grn\fts\Application;
+use grn\fts\DocumentConverter;
+use grn\fts\DocumentConverterInterface;
+use grn\fts\ErrorCode;
+use grn\fts\exception\NoServerConnectionException;
+use grn\fts\exception\SearchException;
+use grn\fts\FtsProduct;
+use grn\fts\ModifierView;
+use grn\fts\SearchDocumentInterface;
+use grn\fts\SearchLogic;
+use grn\fts\SearchQueryBuilder;
+use grn\fts\SearchResponseInterface;
+use grn\fts\SearchTarget;
+use grn\fts\SearchUtil;
+use grn\space\common\data\bean\Authority as SpaceAuthority;
+
+require_once('grn/uum_util_search.csp');
+require_once('fw/cydec.csp');
+
+class SearchApi
+{
+    /** @var SearchApiParameter */
+    protected $parameter;
+
+    /** @var string */
+    protected $json;
+
+    /** @var bool */
+    private static $limitFlag = false;
+
+    /**
+     * @param ApiValidator $validator
+     */
+    public function __construct($validator = null)
+    {
+        if (is_null($validator)) {
+            $validator = new ApiValidator();
+        }
+
+        try {
+            $validator->validateHeader();
+        } catch (SearchException $e) {
+            $this->errorLog($e);
+            cb_throw_error(ErrorCode::FTS_ERROR);
+        }
+
+        try {
+            $input = $validator->validateInput();
+            $this->parameter = new SearchApiParameter($input);
+            $validator->validateParameter($this->parameter);
+        } catch (SearchException $e) {
+            $this->errorLog($e);
+            cb_throw_error(ErrorCode::FTS_ERROR);
+        }
+    }
+
+    public function run($run_background_search = false)
+    {
+        $this->hasKeywordValidation();
+        if ($run_background_search
+            || Application::getFtsEngine()->isElasticsearch()
+        ) {
+            $fts_product = FtsProduct::elasticsearch();
+            $search_logic = new \grn\fts\elasticsearch\SearchLogic();
+        } else {
+            $fts_product = FtsProduct::solr();
+            $search_logic = new SearchLogic();
+        }
+        $logic = new AccessControlledSearchLogic($search_logic);
+        $this->setAppsAccessMode($logic);
+        $query = SearchQueryBuilder::build($this->parameter, $fts_product);
+
+        try {
+            $response = $logic->search($query);
+        } catch (SearchException $e) {
+            $this->errorLog($e);
+            cb_throw_error(ErrorCode::FTS_ERROR);
+        } catch (NoServerConnectionException $e) {
+            $this->errorLog($e);
+            cb_throw_error(ErrorCode::NO_SERVER_CONNECTION);
+        }
+        /* @var SearchResponseInterface $response */
+
+        $this->parseResponse($response);
+        $this->display();
+    }
+
+    private function hasKeywordValidation()
+    {
+        if (strlen($this->parameter->getKeyword()) === 0) {
+            $this->errorLog(new SearchException('keyword is required parameter'));
+            cb_throw_error(ErrorCode::FTS_ERROR);
+        }
+    }
+
+    /**
+     * @param \grn\fts\SearchResponseInterface $response
+     */
+    public function parseResponse(SearchResponseInterface $response)
+    {
+        $result = [];
+        $result['continuable'] = $response->getContinuable();
+
+        $docs = [];
+        $documents = $response->getDocuments();
+        $converter = new DocumentConverter();
+        foreach ($documents as $document) {
+            $docs[] = $this->convertDocument($converter, $document);
+        }
+        $result['docs'] = $docs;
+
+        $result['numChecked'] = $response->getNumChecked();
+        $result['numFetched'] = $response->getNumFetched();
+        $result['limitFlag'] = self::getLimitFlag();
+
+        $value = [];
+        $value['result'] = $result;
+        $value['succes'] = true;
+
+        $this->json = json_encode($value,
+            JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP);
+    }
+
+
+    /**
+     * @param \grn\fts\DocumentConverterInterface $converter
+     * @param \grn\fts\SearchDocumentInterface    $document
+     *
+     * @return array
+     */
+    private function convertDocument(
+        DocumentConverterInterface $converter,
+        SearchDocumentInterface $document
+    ) {
+        $documentView = $converter->convert($document);
+        $doc = [];
+        $doc['snippet'] = $this->formatSnippet($documentView->getSnippet());
+        $doc['title'] = $this->htmlEscape($documentView->getTitle());
+        $doc['titleIcon'] = $documentView->getTitleIcon();
+        $doc['url'] = $documentView->getUrl();
+
+        $modifierView = $documentView->getModifierView();
+        if ( ! is_null($modifierView)) {
+            $modifier = [];
+            if ($modifierView instanceof ModifierView) {
+                $modifier['displayName']
+                    = $this->htmlEscape($modifierView->getDisplayName());
+                $modifier['profileUrl'] = $modifierView->getProfileUrl();
+            } else {
+                $modifier['displayName'] = $this->htmlEscape($modifierView);
+            }
+            $doc['modifier'] = $modifier;
+        }
+
+        $modifiedTime = new \CB_TimeStamp();
+        $modifiedTime->unix_ts = $documentView->getModifiedTime();
+        $doc['modifiedTime'] = cb_date_format('DateTimeFull_YMD_HM',
+            $modifiedTime);
+
+        if ($document->isFile()) {
+            $fileView = $documentView->getFileView();
+            $file = [];
+            $fileTitle = $fileView->getTitle();
+            $file['title'] = $this->htmlEscape($fileTitle);
+            $file['iconUrl'] = $fileView->getIconUrl();
+            $file['downloadUrl'] = $fileView->getDownloadUrl();
+            $file['size'] = $fileView->getSize();
+            $snippetTitle = $fileView->getSnippetTitle();
+            if ( ! is_null($snippetTitle)) {
+                $snippetTitle = $this->formatSnippet($snippetTitle);
+                $matches = [];
+                preg_match('#' . SearchUtil::HIGHLIGHT_REPLACE_PRE . '(.*)'
+                           . SearchUtil::HIGHLIGHT_REPLACE_POST . '#',
+                    $snippetTitle, $matches);
+                $fileTitle = str_replace($matches[1],
+                    SearchUtil::HIGHLIGHT_REPLACE_PRE . $matches[1]
+                    . SearchUtil::HIGHLIGHT_REPLACE_POST, $fileTitle);
+                $file['snippetTitle'] = $fileTitle;
+            }
+            $doc['file'] = $file;
+        }
+
+        if ($document->isSpace() && is_null($this->parameter->getSpaceId())) {
+            // スペース内検索の時、もしくはスペースのメモが検索結果の時は表示しない。
+            $spaceView = $documentView->getSpaceView();
+            if ( ! is_null($spaceView)) {
+                $space = [];
+                $space['name'] = $this->htmlEscape($spaceView->getName());
+                $space['iconUrl'] = $spaceView->getIconUrl();
+                $space['spaceUrl'] = $spaceView->getSpaceUrl();
+                $doc['space'] = $space;
+            }
+        }
+
+        $addressView = $documentView->getAddressView();
+        if ( ! is_null($addressView)) {
+            $address = [];
+            $address['name'] = $this->htmlEscape($addressView->getName());
+            $address['historyUrl'] = $addressView->getHistoryUrl();
+            $doc['address'] = $address;
+        }
+
+        return $doc;
+    }
+
+    /**
+     * Escape snippet and replace temporary highlight tokens to html tags.
+     *
+     * @param string $string
+     *
+     * @return string
+     */
+    private function formatSnippet($string)
+    {
+        $escapedString = $this->htmlEscape($string);
+
+        return $this->replaceHightlightTokens($escapedString);
+    }
+
+    /**
+     * @param string $string
+     *
+     * @return string
+     */
+    private function htmlEscape($string)
+    {
+        return htmlspecialchars($string, ENT_QUOTES);
+    }
+
+    /**
+     * @param $string
+     *
+     * @return string
+     */
+    private function replaceHightlightTokens($string)
+    {
+        $ret = str_replace(SearchUtil::getHighlightSearchPre(),
+            SearchUtil::HIGHLIGHT_REPLACE_PRE, $string);
+
+        return str_replace(SearchUtil::getHighlightSearchPost(),
+            SearchUtil::HIGHLIGHT_REPLACE_POST, $ret);
+    }
+
+    public function display()
+    {
+        global $G_state_set;
+        $G_state_set->set('copyright_should_be_written', false);
+        $G_state_set->set('html_should_be_closed', false);
+        header('Content-Type: application/json;charset=UTF-8');
+        echo $this->json;
+    }
+
+    protected function errorLog(\Exception $e)
+    {
+        $util = \CB_CyDECUtil::getInstance();
+        $log = $util->getLog('fts');
+        $logs = [];
+        $date = date('r');
+        $logs[] = "[{$date}]";
+        do {
+            $logs[]
+                = "file:{$e->getFile()}, line:{$e->getLine()}, message:{$e->getMessage()}, code:{$e->getCode()}";
+        } while ($e = $e->getPrevious());
+        @file_put_contents($log, implode(PHP_EOL, $logs) . PHP_EOL,
+            FILE_APPEND);
+    }
+
+    private function setAppsAccessMode(AccessControlledSearchLogic $logic)
+    {
+        if ($this->parameter->getSearchRange() === SearchTarget::INNERSPACE) {
+            $logic->setSpaceAccessMode(SpaceAuthority::AUTHORITY_CODE_READ_DETAIL);
+        } else {
+            $logic->setSpaceAccessMode(SpaceAuthority::AUTHORITY_CODE_READ_SUMMARY);
+        }
+    }
+
+    /**
+     * @param boolean $limitFlag
+     */
+    public static function setLimitFlag($limitFlag)
+    {
+        self::$limitFlag = $limitFlag;
+    }
+
+    /**
+     * @return boolean
+     */
+    public static function getLimitFlag()
+    {
+        return self::$limitFlag;
+    }
+}

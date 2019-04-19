@@ -1,0 +1,384 @@
+<?php
+
+namespace grn\versionup\v6_5_800;
+
+use grn\versionup\AbstractUpdater;
+use grn\bulletin\NotificationSchedulingEvent;
+use grn\versionup\AlterTable;
+
+class Updater extends AbstractUpdater
+{
+    protected function before()
+    {
+        $this->createFolderTableOfSpace();
+        $this->createAutoScheduleTable();
+        $this->createAutoScheduleSettingTable();
+        if (cb_is_forest()) {
+            $this->createForestAliveStatus();
+        } else {
+            $this->createAuthenticationMultiRepositoryRelation();
+        }
+    }
+
+    protected function middleAlterTables()
+    {
+        $this->modifyIndexOfScheduleEventMember();
+        $this->addFolderColumnOfSpaceThread();
+    }
+
+    public function middleUpdateData()
+    {
+        $this->deleteUnusedSyncProfileData();
+        $this->deleteUnusedTimezoneProfileData();
+        $this->registerTimedBulletinSchedEvent();
+        $this->deleteAppMenuCacheProfileData();
+
+        if (cb_is_forest()) {
+            $this->deleteDezieLinkProfileData();
+            $this->deleteInvalidPhoneMessageProfileData();
+        }
+    }
+
+    protected function after()
+    {
+        $this->dropCacheInfoTable();
+    }
+
+    /**
+     * GTM-2149
+     */
+    private function dropCacheInfoTable()
+    {
+        $db = cb_get_master_db();
+        $db->query("DROP TABLE IF EXISTS tab_grn_cacheinfo");
+        $this->log("Succeeded to drop tab_grn_cacheinfo table");
+    }
+
+    /**
+     * GTM-2153
+     */
+    private function deleteUnusedSyncProfileData()
+    {
+        $this->deleteUnusedSyncSystemProfileData();
+        $this->deleteUnusedSyncUserProfileData();
+
+        $this->log("Succeeded to delete unused sync profile data");
+    }
+
+    private function deleteUnusedSyncSystemProfileData()
+    {
+        $db = cb_get_master_db();
+        $db->query(
+            "DELETE FROM tab_cb_profiledata___system WHERE col_module = 'grn.common.application' AND col_name = 'sync'"
+        );
+
+        $db->query("DELETE FROM tab_cb_profiledata___system WHERE col_module = 'grn.common.license.sync'");
+    }
+
+    private function deleteUnusedSyncUserProfileData()
+    {
+        require_once("fw/profile.csp");
+        $profile_connections = get_profile_get_connections();
+        $user_tables = cb_get_user_tables();
+
+        foreach ($profile_connections as $db) {
+            for ($table_num = 0; $table_num < $user_tables; $table_num++) {
+                $db->query("DELETE FROM tab_cb_profiledata___p" . $table_num
+                           . " WHERE col_module = 'grn.sync'");
+            }
+        }
+    }
+
+    /**
+     * GTM-2086
+     */
+    private function deleteDezieLinkProfileData()
+    {
+        $db = cb_get_master_db();
+        $db->query("DELETE FROM tab_cb_profiledata___system WHERE col_module = 'grn.dezielink.system'");
+    }
+
+    /**
+     * GTM-2179
+     */
+    private function deleteUnusedTimezoneProfileData()
+    {
+        $db = cb_get_master_db();
+
+        $query = "DELETE FROM tab_cb_profiledata___system"
+                 . " WHERE col_module = 'fw.datetime' AND col_name = 'tzdata_version'";
+
+        $db->query($query);
+
+        $this->log("Succeeded to delete unused timezone profile data");
+    }
+
+    /**
+     * GTM-2208
+     */
+    public function deleteInvalidPhoneMessageProfileData()
+    {
+        require_once("fw/profile.csp");
+        $profile_connections = get_profile_get_connections();
+        $user_tables = cb_get_user_tables();
+
+        $new_values = [
+            'forward_email'       => false,
+            'forward_user_email'  => false,
+            'other_email_address' => "",
+        ];
+
+        foreach ($profile_connections as $connection) {
+            for ($table_num = 0; $table_num < $user_tables; $table_num++) {
+                $invalid_profile_ids
+                    = $this->findInvalidPhoneMessageProfileData($table_num,
+                    $connection);
+
+                if (empty($invalid_profile_ids)) {
+                    continue;
+                }
+
+                foreach ($invalid_profile_ids as $name => $ids) {
+                    $update_query = $connection->format(
+                        "UPDATE tab_cb_profiledata___p" . $table_num
+                        . " SET col_value = '@S' WHERE _id IN (@A)",
+                        [serialize($new_values[$name]), $ids]
+                    );
+                    $connection->query($update_query);
+                }
+            }
+        }
+    }
+
+    /**
+     * @param int                    $table_num
+     * @param \CB_DatabaseConnection $connection
+     *
+     * @return array
+     */
+    private function findInvalidPhoneMessageProfileData(
+        $table_num,
+        \CB_DatabaseConnection $connection
+    ) {
+        $select_query
+            = "SELECT _id, col_value, col_name FROM tab_cb_profiledata___p"
+              . $table_num . " " .
+              "WHERE `col_module` = 'grn.phonemessage' " .
+              "AND `col_name` IN ('forward_email', 'forward_user_email', 'other_email_address')";
+
+        $ret = $connection->query($select_query);
+
+        $invalid_profile_ids = [];
+        while ($row = $connection->fetch_assoc($ret)) {
+            $value = $row['col_value'];
+            // Note that 'b:0;' will be serialized to FALSE
+            if ($value !== 'b:0;' && @unserialize($value) === false) {
+                $name = $row['col_name'];
+                if ( ! array_key_exists($name, $invalid_profile_ids)) {
+                    $invalid_profile_ids[$name] = [];
+                }
+                $invalid_profile_ids[$name][] = $row['_id'];
+            }
+        }
+        $connection->free_result($ret);
+
+        return $invalid_profile_ids;
+    }
+
+    /**
+     * GTM-2137
+     */
+    private function registerTimedBulletinSchedEvent()
+    {
+        require_once('fw/basic_date.csp');
+        $article_start_timestamp = new \CB_TimeStamp();
+
+        $db = cb_get_app_db('bulletin');
+        $query = cb_queryf(
+            $db,
+            "SELECT _id, col_start_timestamp FROM tab_grn_bulletin_articleentity WHERE col_start_timestamp > '@S';",
+            time()
+        );
+        $result = $db->query($query);
+        while ($row = $db->fetch_assoc($result)) {
+            $article_id = $row['_id'];
+            $start_timestamp = $row['col_start_timestamp'];
+            if ($article_id && $start_timestamp) {
+                $article_start_timestamp->unix_ts = $start_timestamp;
+                $scheduling_event
+                    = new NotificationSchedulingEvent();
+                $scheduling_event->registerEvent($article_id,
+                    $article_start_timestamp);
+            }
+        }
+        $db->free_result($result);
+
+        $this->log("Succeeded to register scheduling event of timed bulletin");
+    }
+
+    /**
+     * GRB-17626
+     */
+    public function deleteAppMenuCacheProfileData()
+    {
+        require_once("fw/profile.csp");
+        $profile_connections = get_profile_get_connections();
+        $user_tables = cb_get_user_tables();
+
+        foreach ($profile_connections as $db) {
+            for ($table_num = 0; $table_num < $user_tables; $table_num++) {
+                $db->query(
+                    "DELETE FROM tab_cb_profiledata___p" . $table_num
+                    . " WHERE col_module = 'grn.common.ui' AND col_name IN( 'grn.common.appmenu.ja', 'grn.common.appmenu.zh', 'grn.common.appmenu.en' )"
+                );
+            }
+        }
+
+        $this->log("Succeeded to delete application menu cache data");
+    }
+
+    /**
+     * GTM-2253
+     */
+    private function modifyIndexOfScheduleEventMember()
+    {
+        $db = cb_get_app_db('schedule');
+
+        $alter_table = new AlterTable($db, 'tab_grn_schedule_eventmember');
+        $alter_table->dropIndex("cni_event", ["col_event"]);
+        $alter_table->dropIndex("cni_user", ["col_user"]);
+        $alter_table->execute();
+
+        $this->log("Succeeded to delete indexes on tab_grn_schedule_eventmember");
+
+        $columns = ["col_event_type_simple", "col_user", "col_event"];
+        $alter_table->addIndex("idx_event_type_simple_user_event", $columns);
+        $alter_table->execute();
+
+        $this->log("Succeeded to add a index on tab_grn_schedule_eventmember");
+    }
+
+    /**
+     * GTM-2201
+     */
+    private function createFolderTableOfSpace()
+    {
+        $db = cb_get_app_db('space');
+        $db->query("CREATE TABLE IF NOT EXISTS `tab_grn_space_space_folder` (
+                      `_id` bigint(20) NOT NULL AUTO_INCREMENT,
+                      `col_folder_code` varchar(128) NOT NULL,
+                      `col_folder_name` varchar(128) NOT NULL,
+                      `col_memo` longtext,
+                      `col_display_order` int(11) NOT NULL,
+                      `col_space` bigint(20) NOT NULL,
+                      PRIMARY KEY (`_id`),
+                      CONSTRAINT `cns_grn_space_space_folder_space` FOREIGN KEY (`col_space`) REFERENCES `tab_grn_space_space` (`_id`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci ROW_FORMAT=DYNAMIC;");
+        $this->log("Succeeded to create the tab_grn_space_space_folder table.");
+    }
+
+    /**
+     * GTM-2201
+     */
+    private function addFolderColumnOfSpaceThread()
+    {
+        $db = cb_get_app_db('space');
+
+        $alter_table = new AlterTable($db, 'tab_grn_space_thread');
+        $alter_table->addColumn("col_folder", "bigint(20)");
+        $alter_table->addForeignKey(
+            "cns_grn_space_thread_folder", ["col_folder"],
+            "tab_grn_space_space_folder", ["_id"]
+        );
+        $alter_table->execute();
+
+        $this->log("Succeeded to add the col_folder column on tab_grn_space_thread.");
+    }
+
+    /**
+     * GTM-2136
+     */
+    private function createAutoScheduleTable()
+    {
+        $db = cb_get_app_db('workflow');
+        $db->query("CREATE TABLE IF NOT EXISTS `tab_grn_workflow_auto_schedule` (
+                     `col_petition_id` bigint(20) NOT NULL,
+                     `col_schedule_type` tinyint(1) NOT NULL,
+                     `col_appointment_type` char(100) DEFAULT NULL,
+                     `col_schedule_timezone` varchar(100) DEFAULT NULL,
+                     `col_schedule_start_item` bigint(20) DEFAULT NULL,
+                     `col_schedule_end_item` bigint(20) DEFAULT NULL,
+                     `col_schedule_id` bigint(20) DEFAULT NULL,
+                      PRIMARY KEY (`col_petition_id`),
+                      CONSTRAINT `cns_grn_workflow_auto_schedule_pid` FOREIGN KEY (`col_petition_id`) REFERENCES `tab_grn_workflow_petition` (`_id`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci ROW_FORMAT=DYNAMIC;");
+        $this->log("Succeeded to create the tab_grn_workflow_auto_schedule table.");
+    }
+
+    /**
+     * GTM-2136
+     */
+    private function createAutoScheduleSettingTable()
+    {
+        $db = cb_get_app_db('workflow');
+        $db->query("CREATE TABLE IF NOT EXISTS `tab_grn_workflow_auto_schedule_setting` (
+                    `col_form` bigint(20) NOT NULL,
+                    `col_active` tinyint(1) NOT NULL,
+                    `col_schedule_type` tinyint(1) NOT NULL,
+                    `col_appointment_type` char(100) DEFAULT NULL,
+                    `col_schedule_start_item` bigint(20) DEFAULT NULL,
+                    `col_schedule_end_item` bigint(20) DEFAULT NULL,
+                    `col_creator` bigint(20) DEFAULT NULL,
+                    `col_creator_foreign_key` char(255) DEFAULT NULL,
+                    `col_creator_name` char(100) DEFAULT NULL,
+                    `col_ctime` int(11) DEFAULT NULL,
+                    `col_modifier` bigint(20) DEFAULT NULL,
+                    `col_modifier_foreign_key` char(255) DEFAULT NULL,
+                    `col_modifier_name` char(100) DEFAULT NULL,
+                    `col_mtime` int(11) DEFAULT NULL,
+                    PRIMARY KEY (`col_form`),
+                    KEY `cns_grn_workflow_auto_schedule_setting_creator` (`col_creator`),
+                    KEY `cns_grn_workflow_auto_schedule_setting_modifier` (`col_modifier`),
+                    CONSTRAINT `cns_grn_workflow_auto_schedule_setting_creator` FOREIGN KEY (`col_creator`) REFERENCES `tab_cb_user` (`_id`) ON DELETE SET NULL,
+                    CONSTRAINT `cns_grn_workflow_auto_schedule_setting_form` FOREIGN KEY (`col_form`) REFERENCES `tab_grn_workflow_form` (`_id`) ON DELETE CASCADE,
+                    CONSTRAINT `cns_grn_workflow_auto_schedule_setting_modifier` FOREIGN KEY (`col_modifier`) REFERENCES `tab_cb_user` (`_id`) ON DELETE SET NULL
+                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci ROW_FORMAT=DYNAMIC;");
+        $this->log("Succeeded to create the tab_grn_workflow_auto_schedule_setting table.");
+    }
+
+    /**
+     * GTM-2205
+     */
+    private function createAuthenticationMultiRepositoryRelation()
+    {
+        $query
+            = <<< SQL
+CREATE TABLE IF NOT EXISTS `tab_grn_authentication_multi_repository_relation` (
+  `col_parent` bigint(20) NOT NULL,
+  `col_child` bigint(20) NOT NULL,
+  PRIMARY KEY (`col_parent`, col_child),
+  KEY `cni_child` (`col_child`),
+  CONSTRAINT `cns_tab_grn_authentication_multi_repository_relation_parent` FOREIGN KEY (`col_parent`) REFERENCES `tab_grn_authentication_repository` (`_id`) ON DELETE CASCADE,
+  CONSTRAINT `cns_tab_grn_authentication_multi_repository_relation_child` FOREIGN KEY (`col_child`) REFERENCES `tab_grn_authentication_repository` (`_id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci ROW_FORMAT=DYNAMIC;
+SQL;
+        cb_get_master_db()->query($query);
+        $this->log("Succeeded to create tab_grn_authentication_multi_repository_relation table");
+    }
+
+    /**
+     * GTM-2393
+     */
+    private function createForestAliveStatus()
+    {
+        $query
+            = <<< SQL
+CREATE TABLE IF NOT EXISTS `tab_grn_forest_alive_status` (
+  `col_status` tinyint(1) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci ROW_FORMAT=DYNAMIC;
+SQL;
+
+        cb_get_master_db()->query($query);
+        $this->log("Succeeded to create tab_grn_forest_alive_status table");
+    }
+}

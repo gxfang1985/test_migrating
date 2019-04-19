@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="{$encoding}"?>
+<methodResponse>
+  <params>
+    <param>
+      <value>
+        <struct>
+          <member>
+            <name>apiver</name>
+            <value><double>{$api_ver}</double></value>
+          </member>
+          <member>
+            <name>productname</name>
+            <value><string>{cb_msg module='grn.cbapi' key='GRN_CBAPI-4' replace='true'} {$productname}</string></value>
+          </member>
+          <member>
+            <name>productver</name>
+            <value><string>{$productver}</string></value>
+          </member>
+{if GRN_CBAPI_VERSION_1_02 <= $api_ver }
+          <member>
+            <name>corp_name</name>
+            <value><string>{$corp_name}</string></value>
+          </member>
+{/if}
+          <member>
+            <name>url_list</name>
+            <value>
+              <array>
+                <data>
+{foreach from=$products item=product}
+                  <value>
+                    <struct>
+                      <member>
+                        <name>url</name>
+                        <value><string>{$product.url|escape}</string></value>
+                      </member>
+{if GRN_CBAPI_VERSION_1_02 <= $api_ver }
+                      <member>
+                        <name>top_page_url</name>
+                        <value><string>{$product.top_page_url|escape}</string></value>
+                      </member>
+{/if}
+{if $product.session}
+                      <member>
+                        <name>sessionname</name>
+                        <value><string>{$product.session}</string></value>
+                      </member>
+{/if}
+                      <member>
+                        <name>browsertype</name>
+                        <value><string>{$product.type}</string></value>
+                      </member>
+{if GRN_CBAPI_VERSION_1_02 <= $api_ver }
+                      <member>
+                        <name>appver</name>
+                        <value><string>{$product.appver}</string></value>
+                      </member>
+{/if}
+                    </struct>
+                  </value>
+{/foreach}
+                </data>
+              </array>
+            </value>
+          </member>
+          <member>
+            <name>charset</name>
+            <value><string>{$charset}</string></value>
+          </member>
+          <member>
+            <name>currentlocale</name>
+            <value><string>{$currentlocale}</string></value>
+          </member>
+          <member>
+            <name>locale_list</name>
+            <value>
+              <array>
+                <data>
+{foreach from=$local item=item}
+                  <value><string>{$item}</string></value>
+{/foreach}
+                </data>
+              </array>
+            </value>
+          </member>
+          <member>
+            <name>docroot</name>
+            <value><string>{$app_path|escape}</string></value>
+          </member>
+          <member>
+            <name>ext_list</name>
+            <value>
+              <array>
+                <data>
+{foreach from=$ext_list item=item}
+                  <value><string>{$item}</string></value>
+{/foreach}
+                </data>
+              </array>
+            </value>
+          </member>
+        </struct>
+      </value>
+    </param>
+  </params>
+</methodResponse>

@@ -1,0 +1,195 @@
+<?php
+
+use grn\mail\HtmlMailInlineContents;
+use grn\mail\HtmlMailProcessor;
+
+global $G_INPUT;
+$uum = cb_lwc_uum();
+$user = $uum->getLoginUser();
+if ( ! is_object($user)) {
+    cb_throw_error(E_COMMON_AUTHENTICATION_FAILED);
+}
+
+// Copyrightを表示しない
+global $G_state_set;
+$G_state_set->set('copyright_should_be_written', false);
+
+// Smarty をインスタンス化
+require_once("grn/smarty.csp");
+$t = new GRN_Smarty;
+
+require_once('mail/utility.csp');
+$utility = GRN_Mail_Utility::getInstance();
+$mail_logic = $utility->getMailLogic();
+
+require_once('grn/ui.csp');
+$uim = GRN_UIConfigManager::getInstance();
+$system_ui_config = $uim->getSystemConfig();
+$user_ui_config = $uim->getUserConfig($user);
+unset($uim);
+
+// インライン表示設定
+$inline = $user_ui_config->getInlineSetting();
+$t->assign('inline', $inline);
+
+$pids = @ $G_INPUT['pids'];
+
+if ( ! is_string($pids) || (strlen($pids) == 0)) {
+    cb_throw_error(E_GRN_MAIL_FILE_DATA_NOT_FOUND);
+}
+
+$pid_array = explode('.', $pids);
+$pids_count = count($pid_array);
+if ($pids_count < 2) {
+    cb_throw_error(E_GRN_MAIL_FILE_DATA_NOT_FOUND);
+}
+
+reset($pid_array);
+$mail_id = current($pid_array);
+$mail_data = $mail_logic->getMailData($mail_id, false);
+$is_received = true;
+if (array_key_exists('sent', $mail_data) && $mail_data['sent']) {
+    $is_received = false;
+}
+
+$file_name = null;
+$mail_source = null;
+$including_mail_source = null;
+$including_mail_data = null;
+
+if ($pids_count == 2) {
+    // メール → RFC822
+    $part_no = intval($pid_array[1]);
+    $file_body = $mail_logic->getMailFileBody($mail_id, $part_no);
+    if ( ! is_object($file_body)) {
+        cb_throw_error(E_GRN_MAIL_FILE_DATA_NOT_FOUND);
+    }
+
+    if ($mail_data['sent']) {
+        // 送信メール
+        $mail_source = $file_body->getPath();
+        $is_file_path = true;
+    } else {
+        // 受信メール
+        $mail_source = $file_body->getContent();
+        $is_file_path = false;
+    }
+
+    // メールをパーズ
+    $including_mail_data =& $mail_logic->parseIncludingMailData($mail_source,
+        null, $including_mail_source, $is_file_path);
+} else {
+    // RFC822 → RFC822
+    $parent_pid_array = $pid_array;
+    $part_no = intval(array_pop($parent_pid_array));
+    $parent_pids = implode('.', $parent_pid_array);
+
+    // セッションファイルに保存されているメールソースを読み込む
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session = $session_manager->getSession(GRN_MAIL_BREVITY_CODE
+                                            . '_rfc822_'
+                                            . $parent_pids);
+
+    // 指定したセクションに関連付けられている連想配列を取得する。
+    // (キー=ID 値=CB_ServerFile のもの)
+    $ids = $session->getFiles('temp_files');
+    foreach (array_keys($ids) as $id) {
+        $temp_file = $ids[$id];
+
+        // $draft_file は CB_ServerFile と同じメソッドを持つので、
+        // fopen したり削除したりすることができる。
+
+        $mail_source = $temp_file->getPath();
+        break;
+    }
+
+    // 最後尾のIDが内包メールのパートID
+    $including_mail_data =& $mail_logic->parseIncludingMailData($mail_source,
+        $part_no, $including_mail_source, true);
+}
+$including_message = CB_MailParser::static_parse($including_mail_source, 'var');
+$t->assign('message', $including_message);
+
+if (is_null($including_mail_data) || is_null($mail_source)) {
+    cb_throw_error(E_GRN_MAIL_FILE_DATA_NOT_FOUND);
+}
+
+// セッションに関連付けてファイルを保存する
+$mail_logic->createRfc822SourceFile($mail_id, $pids, $including_mail_source,
+    $file_name);
+
+//------------------
+
+//----ダミーデータ----
+
+// メール情報
+$mail_for_view = [
+    'mid'       => $mail_id,
+    'from'      => $including_mail_data['from'],
+    'date'      => $including_mail_data['send_ts'], //送信日時
+    'to'        => $including_mail_data['to'],
+    'cc'        => $including_mail_data['cc'],
+    'subject'   => $including_mail_data['subject'],
+    'data'      => $including_mail_data['data'],
+    'html_data' => strlen($including_mail_data['html_data']) > 0,
+];
+
+if (strlen($including_mail_data['html_data']) > 0) {
+    $files = new HtmlMailInlineContents(cb_at($including_mail_data,
+        'files', []), $mail_id, $pids);
+    $htmlMailProcessor = new HtmlMailProcessor();
+    $htmlMailProcessor->process($including_mail_data['html_data'], $files,
+        true);
+    $inline_file_ids = $htmlMailProcessor->getInlineFileIds();
+} else {
+    $inline_file_ids = [];
+}
+
+// 添付ファイル
+if (array_key_exists('files', $including_mail_data)) {
+    $mail_for_view['attach_files'] = [];
+    $mail_for_view['inline_files'] = [];
+    foreach ($including_mail_data['files'] as $key => $file) {
+        if (in_array($file['fid'], $inline_file_ids)) {
+            $mail_for_view['inline_files'][$key] = $file;
+        } else {
+            $mail_for_view['attach_files'][$key] = $file;
+        }
+    }
+
+    $mail_for_view['attach_file_type'] = 1;
+    $mail_for_view['receive'] = $is_received;
+}
+
+
+$t->assign(
+    'attach_file', [
+        'fid' => 1,
+    ]
+);
+
+// set_data
+$t->assign('mail', $mail_for_view);
+
+$t->assign('pids', $pids);
+
+// page title
+$page_title = grn_get_current_page_display_name(['app_name' => $G_mail_name]);
+$t->assign('page_title', $page_title);
+
+// site position
+$t->assign(
+    'site_position', [
+        [
+            'page' => '',
+            'name' => $page_title
+        ]
+    ]
+);
+
+// Smarty実行
+$doc_name = cb_get_pagename();
+$t->display("{$doc_name}.tpl");
+
+

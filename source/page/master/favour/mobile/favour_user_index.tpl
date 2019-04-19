@@ -1,0 +1,2 @@
+{capture name='list_title'}{cb_msg module="grn.favour" key="favour_mobile-1" replace='true'}{grn_favour_app_name}{cb_msg module='grn.favour' key='favour_mobile-3' replace='true'}{/capture}
+{include file='grn/mobile_userinfo_index.tpl' request_page='favour/mobile/ajax/user_list'}

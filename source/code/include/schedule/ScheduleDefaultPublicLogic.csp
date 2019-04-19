@@ -1,0 +1,719 @@
+<?php
+
+namespace grn\schedule;
+
+use grn\grn\MemberLogic;
+use grn\schedule\dao\ScheduleDefaultPublicDAO;
+
+require_once("fw/session_manager.csp");
+require_once("grn/logger.csp");
+require_once("grn/error_code.csp");
+require_once("schedule/resources.csp");
+require_once("schedule/error_code.csp");
+require_once("schedule/system_logic.csp");
+
+class ScheduleDefaultPublicLogic
+{
+    private static $instance = null;
+
+    const ARG_USER = "user";
+    const ARG_ORGANIZATION = "group";
+    const ARG_STATIC_ROLE = "role";
+    const ARG_ORDER = "order";
+
+    const COLUMN_TARGET = "col_target";
+    const COLUMN_USER = "col_user";
+    const COLUMN_GROUP = "col_group";
+    const COLUMN_ROLE = "col_role";
+    const COLUMN_ORDER = "col_order";
+    const DEFAULT_ORDER = "2147483647";
+
+    const EXPORT_CSV_FILENAME = "default_public.csv";
+    const SESSION_KEY_TARGET_IDS = "target_ids";
+    const CSV_MINIMUM_COLUMNS_LENGTH = 2;
+
+    const AUDIT_LOG_NAME = "default_public_destination";
+
+    /**
+     * Constructor
+     */
+    private function __construct()
+    {
+
+    }
+
+    /**
+     * Get Instance(Singleton pattern)
+     *
+     * @return ScheduleDefaultPublicLogic $instance
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$instance)) {
+            $c = __CLASS__;
+            self::$instance = new $c;
+        }
+
+        return self::$instance;
+    }
+
+    /**
+     * 公開先初期値を登録する
+     *
+     * @param string $user_id
+     * @param string $session_name
+     *
+     * @return boolean
+     */
+    public function add($user_id, $session_name)
+    {
+        $session_manager = \CB_SessionManager::getInstance();
+        $session = $session_manager->getSession($session_name);
+        $target_ids = $session->get(self::SESSION_KEY_TARGET_IDS);
+
+        if ( ! ($user_id && is_array($target_ids) && count($target_ids) > 0)) {
+            return false;
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance("uum");
+
+        $log_params = [];
+        $log_params[] = "target_uid:'{$user_id}'";
+        foreach (array_keys($target_ids) as $target_id) {
+            $ids = explode(":", $target_id);
+            if (count($ids) < 2) {
+                continue;
+            }
+            $id = $ids[1];
+            switch ($ids[0]) {
+                case MemberLogic::TYPE_USER :
+                    if ($target = $uum->getUser($id)) {
+                        $data_array
+                            = [ScheduleDefaultPublicLogic::ARG_USER => $id];
+                        $this->setDefaultPublicWithUser($user_id, $data_array);
+                        $log_params[] = "uid:'{$id}'";
+                    }
+                    break;
+
+                case MemberLogic::TYPE_ORGANIZATION :
+                    if ($target = $uum->getGroup($id)) {
+                        $data_array
+                            = [ScheduleDefaultPublicLogic::ARG_ORGANIZATION => $id];
+                        $this->setDefaultPublicWithUser($user_id, $data_array);
+                        $log_params[] = "gid:'{$id}'";
+                    }
+                    break;
+
+                case MemberLogic::TYPE_STATIC_ROLE :
+                    if ($target = $uum->getStaticRole($id)) {
+                        if ($id == GRN_UUM_ADMINISTRATION_ROLE) {
+                            cb_throw_error(E_GRN_USER_ROLE_ADMINISTRATORS_DISABLED);
+                        }
+                        $data_array
+                            = [ScheduleDefaultPublicLogic::ARG_STATIC_ROLE => $id];
+                        $this->setDefaultPublicWithUser($user_id, $data_array);
+                        $log_params[] = "rid:'{$id}'";
+                    }
+                    break;
+            }
+        }
+
+        // Audit Log
+        if (count($log_params) > 1) {
+            $action = "create";
+            $object = self::AUDIT_LOG_NAME;
+            $param = implode(", ", $log_params);
+            $log_string = "[$action] $object ($param)";
+            $this->noticeEx($action, $object, $log_string);
+        }
+
+        return true;
+    }
+
+    /**
+     * メンバーのTYPEとIDを取得して返す
+     *
+     * @param array $target_ids
+     *
+     * @return array
+     */
+    public function getPickoutMemberTypeIdFromParam(array $target_ids)
+    {
+        return MemberLogic::getInstance()
+                          ->getPickoutMemberTypeIdFromParam($target_ids);
+    }
+
+    /**
+     * すべての公開先初期値を取得する
+     *
+     * @return array
+     */
+    public function getDefaultPublicAll()
+    {
+        return ScheduleDefaultPublicDAO::getInstance()->selectAll();
+    }
+
+    /**
+     * ユーザーIDの配列から、登録されている公開先初期値数を取得する
+     *
+     * @param array $user_ids
+     *
+     * @return array [ user_id=>count ]
+     */
+    public function getDefaultPublicCountByUserIds(array $user_ids)
+    {
+        return ScheduleDefaultPublicDAO::getInstance()
+                                       ->selectCountByUserIds($user_ids);
+    }
+
+    /**
+     * ユーザーIDから、登録されている公開先初期値を取得する
+     *
+     * @param string      $user_id
+     * @param string|null $access_plugin
+     * @param boolean     $allowed_role_check
+     * @param boolean     $show_group_role_check
+     *
+     * @return array
+     */
+    public function getDefaultPublicByUserId(
+        $user_id,
+        $access_plugin = null,
+        $allowed_role_check = false,
+        $show_group_role_check = false
+    ) {
+        $default_public_list = [];
+        $selected_data_list = ScheduleDefaultPublicDAO::getInstance()
+                                                      ->selectByUserId($user_id);
+
+        $user_ids = [];
+        $group_ids = [];
+        $static_role_ids = [];
+
+        $is_allowed_role = true;
+        if ($allowed_role_check) {
+            $is_allowed_role = MemberLogic::getInstance()->isAllowedRole();
+        }
+        $show_group_role = true;
+        if ($show_group_role_check) {
+            $show_group_role = ScheduleMemberLogic::getInstance()
+                                                  ->isAllowSettingGroupRoleToWatchers();
+        }
+
+        foreach ($selected_data_list as $data) {
+            if (isset($data[self::COLUMN_USER])) {
+                $id = $data[self::COLUMN_USER];
+                $type_id_array = [];
+                $type_id_array[MemberLogic::MEMBER_TYPE]
+                    = MemberLogic::TYPE_USER;
+                $type_id_array[MemberLogic::MEMBER_ID] = $id;
+                $default_public_list[MemberLogic::PREFIX_USER . $id]
+                    = $type_id_array;
+                $user_ids[$id] = $id;
+            } elseif ($show_group_role && isset($data[self::COLUMN_GROUP])) {
+                $id = $data[self::COLUMN_GROUP];
+                $type_id_array
+                    = [];
+                $type_id_array[MemberLogic::MEMBER_TYPE]
+                    = MemberLogic::TYPE_ORGANIZATION;
+                $type_id_array[MemberLogic::MEMBER_ID]
+                    = $id;
+                $default_public_list[MemberLogic::PREFIX_ORGANIZATION . $id]
+                    = $type_id_array;
+                $group_ids[$id]
+                    = $id;
+            } elseif ($show_group_role && $is_allowed_role
+                      && isset($data[self::COLUMN_ROLE])
+            ) {
+                $id = $data[self::COLUMN_ROLE];
+                $type_id_array
+                    = [];
+                $type_id_array[MemberLogic::MEMBER_TYPE]
+                    = MemberLogic::TYPE_STATIC_ROLE;
+                $type_id_array[MemberLogic::MEMBER_ID]
+                    = $id;
+                $default_public_list[MemberLogic::PREFIX_STATIC_ROLE . $id]
+                    = $type_id_array;
+                $static_role_ids[$id]
+                    = $id;
+            }
+        }
+
+        if ($access_plugin) {
+            $access_eval_user_ids = MemberLogic::getInstance()
+                                               ->getAccessEvalUsersWithAllowAppId($user_ids,
+                                                   $access_plugin);
+            $access_eval_group_ids = MemberLogic::getInstance()
+                                                ->getAccessEvalGroups($group_ids,
+                                                    $access_plugin);
+            $access_eval_role_ids = MemberLogic::getInstance()
+                                               ->getAccessEvalRoles($static_role_ids,
+                                                   $access_plugin);
+
+            foreach (
+                $default_public_list as $default_public_key => $default_public
+            ) {
+                $id = $default_public[MemberLogic::MEMBER_ID];
+                $type = $default_public[MemberLogic::MEMBER_TYPE];
+                switch ($type) {
+                    case MemberLogic::TYPE_USER :
+                        if ( ! isset($access_eval_user_ids[$id])) {
+                            unset($default_public_list[$default_public_key]);
+                        }
+                        break;
+                    case MemberLogic::TYPE_ORGANIZATION :
+                        if ( ! isset($access_eval_group_ids[$id])) {
+                            unset($default_public_list[$default_public_key]);
+                        }
+                        break;
+                    case MemberLogic::TYPE_STATIC_ROLE :
+                        if ( ! isset($access_eval_role_ids[$id])) {
+                            unset($default_public_list[$default_public_key]);
+                        }
+                        break;
+                }
+            }
+        }
+
+        return $default_public_list;
+    }
+
+    /**
+     *
+     * @param string $user_id
+     * @param string $order
+     *
+     * @return boolean
+     */
+    public function modifyOrder($user_id, $order)
+    {
+        $target_ids = explode(":", $order);
+        if ( ! (is_array($target_ids) && count($target_ids) > 0)) {
+            return false;
+        }
+
+        $count = 1;
+        $type_id_array = $this->getPickoutMemberTypeIdFromParam($target_ids);
+        $log_params = [];
+        $log_params[] = "target_uid:'{$user_id}'";
+        foreach ($type_id_array as $key => $type_id) {
+            $member_id = $type_id[MemberLogic::MEMBER_ID];
+            $member_type = $type_id[MemberLogic::MEMBER_TYPE];
+            $data_array = [];
+            switch ($member_type) {
+                case MemberLogic::TYPE_USER :
+                    $data_array[self::ARG_USER] = $member_id;
+                    $log_params[] = "uid:'{$member_id}'";
+                    break;
+                case MemberLogic::TYPE_ORGANIZATION :
+                    $data_array[self::ARG_ORGANIZATION] = $member_id;
+                    $log_params[] = "gid:'{$member_id}'";
+                    break;
+                case MemberLogic::TYPE_STATIC_ROLE :
+                    $data_array[self::ARG_STATIC_ROLE] = $member_id;
+                    $log_params[] = "rid:'{$member_id}'";
+                    break;
+                default :
+                    cb_throw_error();
+            }
+            $data_array[self::ARG_ORDER] = $count;
+            $this->setDefaultPublicWithOrder($user_id, $data_array);
+            $count++;
+        }
+        // Audit Log
+        $action = "order";
+        $object = self::AUDIT_LOG_NAME;
+        $param = implode(", ", $log_params);
+        $log_string = "[$action] $object ($param)";
+        $this->noticeEx($action, $object, $log_string);
+
+        return true;
+    }
+
+    /**
+     * ユーザーの公開先初期値を順番変更する
+     *
+     * @param string $user_id
+     * @param array  $data_array
+     *
+     * @return string
+     */
+    public function setDefaultPublicWithUser($user_id, array $data_array)
+    {
+        return ScheduleDefaultPublicDAO::getInstance()
+                                       ->insert($user_id, $data_array);
+    }
+
+    /**
+     * ユーザーの公開先初期値を登録する
+     *
+     * @param string $user_id
+     * @param array  $data_array
+     *
+     * @return boolean
+     */
+    public function setDefaultPublicWithOrder($user_id, array $data_array)
+    {
+        return ScheduleDefaultPublicDAO::getInstance()
+                                       ->updateOrder($user_id, $data_array);
+    }
+
+    /**
+     * ユーザーの公開先初期値を削除する
+     *
+     * @param string $user_id
+     *
+     * @return boolean
+     */
+    public function removeAll($user_id)
+    {
+        ScheduleDefaultPublicDAO::getInstance()->deleteByUserId($user_id);
+
+        // Audit Log
+        $params = ["target_uid" => $user_id, "target" => self::ARG_USER];
+        $this->noticeEx("delete_all", self::AUDIT_LOG_NAME, $params);
+
+        $params = [
+            "target_uid" => $user_id,
+            "target"     => self::ARG_ORGANIZATION
+        ];
+        $this->noticeEx("delete_all", self::AUDIT_LOG_NAME, $params);
+
+        $params = ["target_uid" => $user_id, "target" => self::ARG_STATIC_ROLE];
+        $this->noticeEx("delete_all", self::AUDIT_LOG_NAME, $params);
+
+        return true;
+    }
+
+    /**
+     * ユーザーの公開先初期値を削除する
+     *
+     * @param string $user_id
+     * @param array  $target_ids
+     *
+     * @return boolean
+     */
+    public function removeMulti($user_id, $target_ids)
+    {
+        if ( ! (is_array($target_ids) && count($target_ids) > 0)) {
+            return false;
+        }
+
+        foreach ($target_ids as $target_id) {
+            $member_info = explode(":", $target_id);
+            if (count($member_info) < 2) {
+                continue;
+            }
+            $member_id = $member_info[1];
+            $member_type = $member_info[0];
+            $log_params = [];
+            $log_params[] = "target_uid:'{$user_id}'";
+            switch ($member_type) {
+                case MemberLogic::TYPE_USER :
+                    $this->removeDefaultPublicWithTypeId($user_id,
+                        [self::ARG_USER => $member_id]);
+                    $log_params[] = "uid:'{$member_id}'";
+                    break;
+                case MemberLogic::TYPE_ORGANIZATION :
+                    $this->removeDefaultPublicWithTypeId($user_id,
+                        [self::ARG_ORGANIZATION => $member_id]);
+                    $log_params[] = "gid:'{$member_id}'";
+                    break;
+                case MemberLogic::TYPE_STATIC_ROLE :
+                    $this->removeDefaultPublicWithTypeId($user_id,
+                        [self::ARG_STATIC_ROLE => $member_id]);
+                    $log_params[] = "rid:'{$member_id}'";
+                    break;
+                default :
+                    cb_throw_error();
+            }
+            // Audit Log
+            $action = "delete";
+            $object = self::AUDIT_LOG_NAME;
+            $param = implode(", ", $log_params);
+            $log_string = "[$action] $object ($param)";
+            $this->noticeEx($action, $object, $log_string);
+        }
+
+        return true;
+    }
+
+    /**
+     * ユーザー公開先初期値を削除する
+     *
+     * @param string $user_id
+     * @param string $type
+     *
+     * @return boolean
+     */
+    public function removeByUserIdAndType($user_id, $type)
+    {
+        return ScheduleDefaultPublicDAO::getInstance()
+                                       ->deleteByUserIdAndType($user_id, $type);
+    }
+
+    /**
+     * ユーザーの公開先初期値を削除する
+     *
+     * @param string $user_id
+     * @param array  $data_array
+     *
+     * @return boolean
+     */
+    public function removeDefaultPublicWithTypeId($user_id, array $data_array)
+    {
+        return ScheduleDefaultPublicDAO::getInstance()
+                                       ->deleteByUserIdAndTypeId($user_id,
+                                           $data_array);
+    }
+
+    /**
+     * 公開先初期値の書き出し
+     *
+     * @param array   $input_array
+     * @param boolean $isCommandLine
+     *
+     * @return string
+     */
+    public function exportToCSV(array $input_array, $isCommandLine = false)
+    {
+        $charset = \cb_at($input_array, "charset");
+        if ( ! $charset) {
+            global $G_config_common;
+            $charset = $G_config_common->get("I18N",
+                "default_external_encoding");
+        }
+
+        require_once("fw/csv.csp");
+        if ($isCommandLine) {
+            $csvWriter = new \CB_CSVWriter($charset);
+        } else {   // make temporary file.
+            $temp_filename = tempnam(\cb_tmpdir(), "sc_");
+            $csvWriter = new \CB_CSVWriter($charset, $temp_filename);
+        }
+
+        $item_name = \cb_at($input_array, "item_name");
+        if ($item_name) {
+            require_once("fw/i18n.csp");
+            $header = [];
+            $header[] = cb_msg("grn.schedule", "default_public_csv_target");
+            $header[] = cb_msg("grn.schedule", "default_public_csv_type");
+            $args = 3;
+            for ($i = 1; $i <= $args; $i++) {
+                $header[] = cb_msg("grn.schedule", "default_public_csv_code")
+                            . ($i);
+            }
+            $header[] = cb_msg("grn.schedule", "default_public_valist");
+            $csvWriter->writeLine($header);
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance("uum");
+        $users_info = $uum->getUsersInfo();
+        $groups_info = $uum->getGroupInfoList();
+        $list_static_roles = $uum->listStaticRoles();
+
+        $default_public_list = [];
+        foreach ($this->getDefaultPublicAll() as $default_public) {
+            $target_id = $default_public[self::COLUMN_TARGET];
+            $user_id = $default_public[self::COLUMN_USER];
+            $group_id = $default_public[self::COLUMN_GROUP];
+            $role_id = $default_public[self::COLUMN_ROLE];
+            if ($default_public[self::COLUMN_USER]) {
+                $default_public_list[$target_id][self::ARG_USER][$user_id]
+                    = $users_info[$user_id]["col_foreign_key"];
+            } elseif ($default_public[self::COLUMN_GROUP]) {
+                $default_public_list[$target_id][self::ARG_ORGANIZATION][$group_id]
+                    = $groups_info[$group_id]["col_foreign_key"];
+            } elseif ($default_public[self::COLUMN_ROLE]) {
+                $default_public_list[$target_id][self::ARG_STATIC_ROLE][$role_id]
+                    = $list_static_roles[$role_id]->get("foreign_key");
+            }
+        }
+
+        foreach ($default_public_list as $target_id => $default_public) {
+            if (isset($default_public[self::ARG_USER])) {
+                $line = [];
+                $line[] = $users_info[$target_id]["col_foreign_key"];
+                $line[] = self::ARG_USER;
+                foreach ($default_public[self::ARG_USER] as $foreign_key) {
+                    $line[] = $foreign_key;
+                }
+                $csvWriter->writeLine($line);
+            }
+            if (isset($default_public[self::ARG_ORGANIZATION])) {
+                $line = [];
+                $line[] = $users_info[$target_id]["col_foreign_key"];
+                $line[] = self::ARG_ORGANIZATION;
+                foreach (
+                    $default_public[self::ARG_ORGANIZATION] as $foreign_key
+                ) {
+                    $line[] = $foreign_key;
+                }
+                $csvWriter->writeLine($line);
+            }
+            if (isset($default_public[self::ARG_STATIC_ROLE])) {
+                $line = [];
+                $line[] = $users_info[$target_id]["col_foreign_key"];
+                $line[] = self::ARG_STATIC_ROLE;
+                foreach ($default_public[self::ARG_STATIC_ROLE] as $foreign_key) {
+                    $line[] = $foreign_key;
+                }
+                $csvWriter->writeLine($line);
+            }
+        }
+
+        // close temporary file.
+        $csvWriter->close();
+
+        // Audit Log
+        $log_params = [];
+        $this->noticeEx("export", self::AUDIT_LOG_NAME, $log_params);
+
+        $data = "";
+        if ( ! $isCommandLine) {
+            // make the temporary file downloaded
+            cb_prepare_download(self::EXPORT_CSV_FILENAME, "application/csv",
+                false);
+            $fp = fopen($temp_filename, "rb");
+            if (($fileSize = filesize($temp_filename)) > 0) {
+                $data = fread($fp, $fileSize);
+            }
+            fclose($fp);
+
+            // delete temporary file
+            unlink($temp_filename);
+        }
+
+        return $data;
+    }
+
+    /**
+     * 公開先初期値の読み込み
+     *
+     * @param array  $input_array
+     * @param string $file_path
+     */
+    public function importFromCSV(array $input_array, $file_path)
+    {
+        $charset = \cb_at($input_array, "charset");
+        $skip = intval(\cb_at($input_array, "skip", 0));
+
+        if ( ! $charset) {
+            global $G_config_common;
+            $charset = $G_config_common->get("I18N",
+                "default_external_encoding");
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance("uum");
+
+        require_once("fw/csv.csp");
+        $csvReader = new \CB_CSVReader($charset, $file_path);
+
+        // 先頭行をスキップ
+        for ($i = 0; $i < $skip; ++$i) {
+            $csvReader->readLine();
+        }
+
+        $target_type_array = [
+            self::ARG_USER,
+            self::ARG_ORGANIZATION,
+            self::ARG_STATIC_ROLE
+        ];
+        while (($line = $csvReader->readLine()) !== false) {
+            $line_length = count($line);
+            if ($line_length < self::CSV_MINIMUM_COLUMNS_LENGTH) {
+                cb_throw_error(E_GRN_SCHD_CSV_INVALID_COLUMNS);
+            }
+
+            //ユーザー取得
+            $target = cb_trim($line[0]);
+            $target_object = $uum->getUserByForeignKey($target);
+            if ( ! $target_object) {
+                /** @var string $target */
+                cb_throw_error(E_GRN_SCHD_DEFAULT_PUBLIC_CSV_INVALID_USER
+                    , null
+                    , ["name" => $target]);
+            }
+
+            /** @var \CB_User $target_object */
+            $target_id = $target_object->getOID();
+            $target_type = cb_trim($line[1]);
+            if ( ! in_array($target_type, $target_type_array)) {
+                cb_throw_error(E_GRN_SCHD_DEFAULT_PUBLIC_CSV_INVALID_USER_TYPE
+                    , null
+                    , ["type" => $target_type]);
+            }
+
+            // delete target type
+            $this->removeByUserIdAndType($target_id, $target_type);
+            // insert target value
+            for ($i = 2; $i < $line_length; $i++) {
+                $target_object = null;
+                $target_key = $line[$i];
+                switch ($target_type) {
+                    case self::ARG_USER :
+                        if ($target_object
+                            = $uum->getUserByForeignKey($target_key)
+                        ) {
+                            /** @var \CB_User $target_object */
+                            $this->setDefaultPublicWithUser($target_id,
+                                [self::ARG_USER => $target_object->getOID()]);
+                        }
+                        break;
+                    case self::ARG_ORGANIZATION :
+                        if ($target_object
+                            = $uum->getGroupByForeignKey($target_key)
+                        ) {
+                            /** @var \CB_Group $target_object */
+                            $this->setDefaultPublicWithUser($target_id,
+                                [self::ARG_ORGANIZATION => $target_object->getOID()]);
+                        }
+                        break;
+                    case self::ARG_STATIC_ROLE :
+                        if ($target_object
+                            = $uum->getStaticRoleByForeignKey($target_key)
+                        ) {
+                            /** @var \CB_Role $target_object */
+                            if (GRN_UUM_ADMINISTRATION_ROLE
+                                == $target_object->getOID()
+                            ) {
+                                cb_throw_error(E_GRN_USER_ROLE_ADMINISTRATORS_DISABLED);
+                            }
+                            $this->setDefaultPublicWithUser($target_id,
+                                [self::ARG_STATIC_ROLE => $target_object->getOID()]);
+                        }
+                        break;
+                }
+                if ( ! $target_object) {
+                    /** @var string $target_key */
+                    cb_throw_error(E_GRN_SCHD_DEFAULT_PUBLIC_CSV_INVALID_USER_TYPE_OBJECT
+                        , null
+                        , ["code" => $target_key]);
+                }
+            }
+        }
+        $csvReader->close();
+
+        // Audit Log
+        $log_params = [];
+        $this->noticeEx("import", self::AUDIT_LOG_NAME, $log_params);
+    }
+
+    /**
+     * Issue "notice" log event with action and target object information.
+     *
+     * @param string $action event action
+     * @param string $object event target object
+     * @param array  $params log params
+     */
+    public function noticeEx($action, $object, $params)
+    {
+        // Audit Log
+        $lm = \CB_LoggerManager::getInstance();
+        $l = $lm->getLogger(GRN_SCHEDULE_MODULE_ID);
+        $l->noticeEx($action, $object, $params);
+    }
+}

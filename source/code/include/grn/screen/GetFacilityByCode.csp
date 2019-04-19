@@ -1,0 +1,186 @@
+<?php
+
+namespace grn\grn\screen;
+
+use grn\grn\JSONResponse;
+use grn\schedule\ScheduleMemberLogic;
+
+require_once('schedule/facility_system_logic.csp');
+require_once('grn/uum_util.csp');
+
+class GetFacilityByCode
+{
+    public function fetch()
+    {
+        if (strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST') != 0) {
+            cb_safe_exit();
+        }
+        global $G_INPUT;
+        $response = [];
+        $facilities_code = $G_INPUT['facilities_code']
+            ? json_decode($G_INPUT['facilities_code'], true) : [];
+        $facilities_code = is_array($facilities_code) ? $facilities_code : [];
+        $event = null;
+        $event_id = $G_INPUT['event_id'] ?? null;
+        $page_name = $G_INPUT['page_name'] ?? '';
+        $is_candidate = $G_INPUT['is_candidate'] ?? null;
+        if ($event_id) {
+            /**
+             * @var \CB_User $logged_user
+             */
+            $logged_user = cb_get_login_user();
+            require_once('schedule/application.csp');
+            $app = \GRN_Schedule_Application::getInstance();
+            /** @var \GRN_Schedule_EventBase $event */
+            $event = $app->getEvent($logged_user, $event_id);
+        }
+        $facilities = $this->filterFacilities($facilities_code, $event,
+            $page_name, $is_candidate);
+        if ($facilities) {
+            $data_before_sort = [];
+            foreach ($facilities as $facility) {
+                $facility['name'] = $facility['displayName'];
+                $facility['code'] = $facility['foreignKey'];
+                unset($facility['displayName']);
+                unset($facility['foreignKey']);
+                unset($facility['type']);
+                $data_before_sort[$facility['code']] = $facility;
+            }
+            // sort with input order
+            foreach ($facilities_code as $code) {
+                if (isset($data_before_sort[$code])) {
+                    $response[] = $data_before_sort[$code];
+                }
+            }
+        }
+        $json = JSONResponse::create();
+        $json->response($response, true, JSONResponse::JSON_HEADER,
+            JSONResponse::ENCODE_OPTION & ~JSON_FORCE_OBJECT);
+
+    }
+
+    private function filterFacilities(
+        $facilities_code,
+        $event,
+        $page_name,
+        $is_candidate
+    ) {
+        $facility_logic = \GRN_Facility_SystemLogic::getInstance();
+        $facilities = $facility_logic->getFacilitiesByForeignKeys($facilities_code);
+        if ($facilities) {
+            global $G_container_base;
+            $uum = $G_container_base->getInstance('uum');
+            $dynamic_roles = $uum->listGrantedRoles();
+            $access_list = [];
+            require_once('schedule/access_logic.csp');
+            $acc = \GRN_Schedule_Access_Logic::getInstance();
+
+            /**
+             * @var \CB_User $logged_user
+             */
+            $logged_user = cb_get_login_user();
+            if ($page_name == 'schedule/repeat_add' || $page_name == 'schedule/repeat_modify') {
+                $facility_ids = array_keys($facilities);
+                require_once('schedule/facility_privilege.csp');
+                require_once('schedule/netmeeting_system_logic.csp');
+                $netmeeting_system_logic = \GRN_Netmeeting_SystemLogic::getInstance();
+                $netmeeting_system_available = $netmeeting_system_logic->getNetmeetingAvailable();
+                $repeat_and_approval_info
+                    = $facility_logic->getSettingsOfFacilities($facility_ids, ['approval', 'regulary']);
+                foreach ($facility_ids as $facility_id) {
+                    $facility = $facility_logic->toGrnFacility($facilities[$facility_id]);
+                    $is_facility_exist_in_event = false;
+                    // check on edit & not candidate list
+                    if ($event && $is_candidate == 'false') {
+                        // check facility existed in event
+                        if ($this->isExistFacilityInEvent($facility_id, $event)) {
+                            $is_facility_exist_in_event = true;
+                        }
+                    }
+
+                    if ($is_facility_exist_in_event) {
+                        if (($netmeeting_system_available == 1) && ($facility->get('netmeeting_available') == 1)) {
+                            unset($facilities[$facility_id]);
+                        }
+                    } else {
+                        if ( ! $this->canAddFacility($facility,
+                            $repeat_and_approval_info, $logged_user,
+                            $netmeeting_system_available)
+                        ) {
+                            unset($facilities[$facility_id]);
+                        }
+                    }
+                }
+            }
+
+            if (array_search($page_name, ['schedule/add', 'schedule/repeat_add']) !== false) {
+                $access_list[] = 'add';
+            } elseif (array_search($page_name, ['schedule/modify', 'schedule/repeat_modify']) !== false) {
+                $access_list[] = 'modify';
+            } else {
+                $access_list[] = 'read';
+            }
+            $evaluated
+                = $acc->evaluateAccessesById($logged_user, $facilities, $access_list, $dynamic_roles, 'facility');
+            $facility_ids = array_keys($evaluated);
+
+            $facilities = ScheduleMemberLogic::getInstance()
+                                             ->getFacilitiesRenderFromParam($facility_ids, true);
+
+            return $facilities;
+        }
+
+        return [];
+    }
+
+    /**
+     * Check is exist facility in event
+     *
+     * @param \GRN_Schedule_EventBase|NULL $event
+     * @param integer                      $facility_id facility id
+     *
+     * @return bool TRUE if exist, otherwise FALSE
+     */
+    private function isExistFacilityInEvent($facility_id, $event)
+    {
+        $facility = null;
+        if (is_array($event->facilities)
+            && isset($event->facilities[$facility_id])
+            && $event->facilities[$facility_id]
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Check can add facility
+     *
+     * @param \GRN_Facility_Facility $facility
+     * @param array                  $repeat_and_approval_info
+     * @param \CB_User               $user logged user
+     * @param int                    $netmeeting_system_available
+     *
+     * @return bool TRUE if can add, otherwise cannot add
+     */
+    private function canAddFacility(
+        $facility,
+        $repeat_and_approval_info,
+        $user,
+        $netmeeting_system_available
+    ) {
+        $priv = \GRN_Facility_Privilege_Logic::getInstance();
+        $facility_id = $facility->getOID();
+        if (( ! $repeat_and_approval_info[$facility_id]['regulary']
+              && ! $priv->hasPrivilegeOfFacility($user, $facility))
+            || (($netmeeting_system_available == 1)
+                && ($facility->get('netmeeting_available') == 1))
+            || $repeat_and_approval_info[$facility_id]['approval']
+        ) {
+            return false;
+        }
+
+        return true;
+    }
+}

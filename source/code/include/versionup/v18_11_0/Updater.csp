@@ -1,0 +1,573 @@
+<?php
+declare(strict_types=1);
+
+namespace grn\versionup\v18_11_0;
+
+use grn\versionup\AbstractUpdater;
+use grn\versionup\AlterTable;
+use grn\fts\Application as FtsApplication;
+
+class Updater extends AbstractUpdater
+{
+    protected function before()
+    {
+        // Never write code here before understanding the following comment!
+
+        // This updater is called on upgrading Gr4.10.0 and F18.11.
+        // If you need to add logic to change schema/data for future On-premise versions (which correspond with F18.11) and F18.11,
+        // please write it on v18_11_2\Updater.csp
+    }
+
+    protected function middleAlterTables()
+    {
+        // Never write code here before understanding the following comment!
+
+        // This updater is called on upgrading Gr4.10.0 and F18.11.
+        // If you need to add logic to change schema/data for future On-premise versions (which correspond with F18.11) and F18.11,
+        // please write it on v18_11_2\Updater.csp
+        $this->modifyTabGrnMessageFolder();
+    }
+
+    protected function middleUpdateData()
+    {
+        // Never write code here before understanding the following comment!
+
+        // This updater is called on upgrading Gr4.10.0 and F18.11.
+        // If you need to add logic to change schema/data for future On-premise versions (which correspond with F18.11) and F18.11,
+        // please write it on v18_11_2\Updater.csp
+        $this->removeDuplicatedBulletinReadStatusRecord();
+        $this->removeDuplicateRepeatCondition();
+        $this->removeDuplicatedWorkflowFolder();
+        $this->removeDuplicatedMessageFolder();
+        $this->modifyMessageFolderType();
+        $this->removeDuplicatedRSSFolder();
+    }
+
+    protected function after()
+    {
+        // Never write code here before understanding the following comment!
+
+        // This updater is called on upgrading Gr4.10.0 and F18.11.
+        // If you need to add logic to change schema/data for future On-premise versions (which correspond with F18.11) and F18.11,
+        // please write it on v18_11_2\Updater.csp
+    }
+
+    private function removeDuplicatedBulletinReadStatusRecord()
+    {
+        $rows = $this->checkDuplicatedBulletinReadStatusRecord();
+        if ( ! is_array($rows) || count($rows) == 0) {
+            return;
+        }
+
+        foreach ($rows as $row) {
+            $this->deleteDuplicatedBulletinReadStatusRecord($row['user_id'], $row['article_id'], $row['keep_id']);
+
+        }
+    }
+
+    /**
+     * @return array
+     */
+    private function checkDuplicatedBulletinReadStatusRecord()
+    {
+        $db = cb_get_app_db('bulletin');
+        $query
+            = <<<SQL
+SELECT
+    MAX(_id) keep_id, col_article article_id, col_user user_id
+FROM
+    tab_grn_bulletin_readstatus
+GROUP BY
+    col_article, col_user
+HAVING COUNT(*) > 1;
+SQL;
+        $result = $db->query($query);
+        $rows = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $rows[] = $row;
+        }
+        $db->free_result($result);
+
+        return $rows;
+    }
+
+    /**
+     * @param integer $user_id
+     * @param string  $article_id
+     * @param integer $keep_id
+     */
+    private function deleteDuplicatedBulletinReadStatusRecord($user_id, $article_id, $keep_id)
+    {
+        $db = cb_get_app_db('bulletin');
+        $query = "DELETE FROM tab_grn_bulletin_readstatus WHERE col_user = @X AND col_article = @X AND _id <> @X;";
+        $query = $db->format($query, [$user_id, $article_id, $keep_id]);
+        $db->query($query);
+
+        $this->log('Succeeded to delete duplicate record in tab_grn_bulletin_readstatus with user_id = ' . $user_id
+                   . ' and article_id = ' . $article_id);
+    }
+
+    private function removeDuplicateRepeatCondition()
+    {
+        $db = cb_get_app_db("schedule");
+        $event_ids = $this->checkDuplicateRepeatCondition($db);
+        if (count($event_ids) > 0) {
+            foreach ($event_ids as $event_id) {
+                $get_valid_id_query = "SELECT _id FROM tab_grn_schedule_repeatcondition WHERE col_event = @X;";
+                $get_valid_id_query = $db->format($get_valid_id_query, [$event_id]);
+                $result = $db->query($get_valid_id_query);
+                $row = $db->fetch_assoc($result);
+                $valid_id = $row['_id'];
+                $db->free_result($result);
+
+                $delete_invalid_ids_query
+                    = "DELETE FROM tab_grn_schedule_repeatcondition WHERE col_event = @X AND _id <> @X;";
+                $delete_invalid_ids_query = $db->format($delete_invalid_ids_query, [$event_id, $valid_id]);
+                $db->query($delete_invalid_ids_query);
+
+                $this->log("Succeeded to delete duplicate records in tab_grn_schedule_repeatcondition where col_event = '"
+                           . $event_id . "'.");
+            }
+        }
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     *
+     * @return array
+     */
+    private function checkDuplicateRepeatCondition($db)
+    {
+        $query
+            = "SELECT col_event event_id, COUNT(*) c FROM tab_grn_schedule_repeatcondition GROUP BY col_event HAVING c > 1;";
+        $result = $db->query($query);
+
+        $event_ids = [];
+        while ($row = $db->fetch_assoc($result)) {
+            if ( ! in_array($row['event_id'], $event_ids)) {
+                $event_ids[] = $row['event_id'];
+            }
+        }
+        $db->free_result($result);
+
+        return $event_ids;
+    }
+
+    // GTM-4659: Workflow --- start
+    private function removeDuplicatedWorkflowFolder()
+    {
+        $workflowDb = cb_get_app_db('workflow');
+
+        $rows = $this->checkInvalidWorkflowFolder($workflowDb);
+
+        if (is_array($rows) && count($rows) > 0) {
+            $users_array_max_folders = [];
+            foreach ($rows as $row) {
+                $user_id = $row['user_id'];
+                $users_array_max_folders[$user_id]['max_ids'][] = $row['max_id'];
+                $users_array_max_folders[$user_id]['duplicate_count'] = $row['duplicate_count'];
+            }
+
+            foreach ($users_array_max_folders as $user_id => $user_array_max_folders) {
+                $zero_relation_count = $this->getZeroWorkflowFolderRelationCount($workflowDb,
+                    $user_array_max_folders['max_ids']);
+
+                if ($user_array_max_folders['duplicate_count'] == 2 && $zero_relation_count) {
+                    $this->deleteInvalidFolders($workflowDb, 'tab_grn_workflow_folder',
+                        $user_array_max_folders['max_ids'], $user_id, "delete_max_ids");
+                } else {
+                    $invalid_ids = $this->getInvalidWorkflowFolderIds($workflowDb, $user_id,
+                        $user_array_max_folders['max_ids']);
+                    $this->deleteInvalidFolders($workflowDb, 'tab_grn_workflow_folder',
+                        $invalid_ids, $user_id, "keep_max_ids");
+                }
+            }
+        }
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     * @param array                  $user_array_max_folders
+     *
+     * @return bool
+     */
+    private function getZeroWorkflowFolderRelationCount($db, $user_array_max_folders)
+    {
+        $query = "SELECT COUNT(*) FROM tab_grn_workflow_folderrelation WHERE col_folder IN (@A);";
+        $query = $db->format($query, [$user_array_max_folders]);
+        $result = $db->query($query);
+        $row = $db->fetch_assoc($result);
+        $db->free_result($result);
+
+        return $row["COUNT(*)"] == 0;
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     *
+     * @return array
+     */
+    private function checkInvalidWorkflowFolder($db)
+    {
+        $query
+            = <<<SQL
+SELECT
+    COUNT(_id) duplicate_count, MAX(_id) max_id, col_foreign_key foreign_key, col_user user_id, GROUP_CONCAT(DISTINCT col_creator_name) user_name
+FROM
+    tab_grn_workflow_folder
+GROUP BY
+    col_user, col_foreign_key
+HAVING count(*) > 1;
+SQL;
+        $result = $db->query($query);
+        $rows = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $rows[] = $row;
+        }
+        $db->free_result($result);
+
+        return $rows;
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     * @param integer                $user_id
+     * @param array                  $keep_ids
+     *
+     * @return array
+     */
+    private function getInvalidWorkflowFolderIds($db, $user_id, $keep_ids)
+    {
+        $query = "SELECT _id FROM tab_grn_workflow_folder WHERE col_user = @X AND _id NOT IN (@A);";
+        $query = $db->format($query, [$user_id, $keep_ids]);
+        $result = $db->query($query);
+        $specific_type_ids = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $specific_type_ids[] = $row['_id'];
+        }
+
+        return $specific_type_ids;
+    }
+    // GTM-4659: Workflow --- end
+
+    // GTM-4659: Message --- start
+    private function removeDuplicatedMessageFolder()
+    {
+        $messageDb = cb_get_app_db('message');
+
+        $uids = $this->checkInvalidMessageFolder($messageDb);
+
+        if (is_array($uids) && count($uids) > 0) {
+
+            $move_count = 0;
+            foreach ($uids as $uid) {
+                $valid_ids = $this->getValidMessageFolderIds($messageDb, $uid);
+                $invalid_ids = $this->getInvalidMessageFolderIds($messageDb, $uid, $valid_ids);
+
+                foreach ($invalid_ids as $id => $type) {
+                    if ($type == '0') {
+                        $this->changeParentOfGeneralFolder($messageDb, $id, $valid_ids[$type]);
+                    } else {
+                        $affected_rows = $this->moveMessageToValidFolder($messageDb, $uid, $id, $valid_ids[$type]);
+                        $move_count += $affected_rows;
+                    }
+                }
+
+                $this->deleteInvalidFolders($messageDb, 'tab_grn_message_folders', array_keys($invalid_ids), $uid);
+            }
+
+            if (FtsApplication::isAvailable() && FtsApplication::getSchemaVersion() != 1 && $move_count > 0) {
+                $this->log('Message data was fixed, but it causes that some data cannot be searched by FTS. If you want to fix it, please run command/fts/full_index.csp again.');
+            }
+        }
+    }
+
+    private function modifyTabGrnMessageFolder()
+    {
+        $db = cb_get_app_db('message');
+        $alter_table = new AlterTable($db, 'tab_grn_message_folders');
+        $alter_table->modifyColumn('col_folder_type', 'char(1) DEFAULT NULL');
+        $alter_table->execute();
+        $this->log('Succeeded to modify col_folder_type column in tab_grn_message_folders.');
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     *
+     * @return array
+     */
+    private function checkInvalidMessageFolder($db)
+    {
+        $query
+            = <<<SQL
+SELECT
+    col_folder_type folder_type, col_user user_id
+FROM
+    tab_grn_message_folders
+WHERE
+    col_folder_type <> 5
+GROUP BY
+    col_user, col_folder_type
+HAVING COUNT(*) > 1;
+SQL;
+        $result = $db->query($query);
+        $rows = [];
+        while ($row = $db->fetch_assoc($result)) {
+            if ( ! in_array($row['user_id'], $rows)) {
+                $rows[] = $row['user_id'];
+            }
+        }
+        $db->free_result($result);
+
+        return $rows;
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     * @param integer                $user_id
+     *
+     * @return array $valid_ids
+     */
+    private function getValidMessageFolderIds($db, $user_id)
+    {
+        $valid_ids = [];
+
+        $folder_type_array = ['0', '1', '2', '3', '4'];
+        foreach ($folder_type_array as $folder_type) {
+            $query = "SELECT _id FROM tab_grn_message_folders WHERE col_user = @X AND col_folder_type = @X;";
+            $query = $db->format($query, [$user_id, $folder_type]);
+            $result = $db->query($query);
+
+            // Use same logic to get folder displayed on message/index
+            $row = $db->fetch_assoc($result);
+            $valid_id = $row['_id'];
+            $db->free_result($result);
+
+            $valid_ids[$folder_type] = $valid_id;
+        }
+
+        return $valid_ids;
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     * @param integer                $user_id
+     * @param array                  $valid_ids
+     *
+     * @return array $invalid_ids
+     */
+    private function getInvalidMessageFolderIds($db, $user_id, $valid_ids)
+    {
+        $invalid_ids = [];
+        $query
+            = "SELECT _id invalid_id, col_folder_type folder_type FROM tab_grn_message_folders WHERE col_user = @X AND _id NOT IN (@A) AND col_folder_type <> 5;";
+        $query = $db->format($query, [$user_id, $valid_ids]);
+        $result = $db->query($query);
+        while ($row = $db->fetch_assoc($result)) {
+            $invalid_ids[$row['invalid_id']] = $row['folder_type'];
+        }
+
+        return $invalid_ids;
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     * @param integer                $invalid_id
+     * @param integer                $keep_id
+     *
+     * @return integer $affected_rows
+     */
+    private function moveMessageToValidFolder($db, $user_id, $invalid_id, $keep_id)
+    {
+        require_once("message/table_utility.csp");
+        $table_name = grn_get_personal_tablename_message($user_id, 'tab_grn_message_foldermessagerelations');
+        $query = "UPDATE {$table_name} SET col_folder = @X WHERE col_folder = @X;";
+        $query = $db->format($query, [$keep_id, $invalid_id]);
+        $db->query($query);
+        $affected_rows = $db->affected_rows();
+
+        if ($affected_rows > 0) {
+            $this->log('Succeeded to move the Message from the invalid folder (id = ' . $invalid_id
+                       . ') to valid folder (id = ' . $keep_id . ').');
+        }
+        return $affected_rows;
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     * @param integer                $invalid_id
+     * @param integer                $keep_id
+     */
+    private function changeParentOfGeneralFolder($db, $invalid_id, $keep_id)
+    {
+        $query
+            = "UPDATE tab_grn_message_folders SET col_parent_folder = @X WHERE col_folder_type = '5' AND col_parent_folder = @X;";
+        $query = $db->format($query, [$keep_id, $invalid_id]);
+        $db->query($query);
+        $affected_rows = $db->affected_rows();
+        if ($affected_rows > 0) {
+            $this->log('Succeeded to change col_parent_folder of general folders in tab_grn_message_folders from ' . $invalid_id . ' to '
+                       . $keep_id . '.');
+        }
+    }
+
+    private function modifyMessageFolderType()
+    {
+        $db = cb_get_app_db('message');
+        $query
+            = <<<SQL
+UPDATE
+ tab_grn_message_folders
+SET
+ col_folder_type = CASE
+ WHEN col_folder_type='0' THEN '6'
+ WHEN col_folder_type='5' THEN NULL
+ ELSE col_folder_type
+ END;
+SQL;
+        $db->query($query);
+        $this->log('Succeeded to update values of col_folder_type in tab_grn_message_folders.');
+    }
+    // GTM-4659: Message --- end
+
+    // GTM-4659: RSS --- start
+    private function removeDuplicatedRSSFolder()
+    {
+        $rssDb = cb_get_app_db('rss');
+
+        $uids = $this->checkInvalidRSSFolder($rssDb);
+
+        if (is_array($uids) && count($uids) > 0) {
+            foreach ($uids as $uid) {
+                $valid_id = $this->getValidRSSFolderId($rssDb, $uid);
+                $invalid_ids = $this->getInvalidRSSFolderIds($rssDb, $uid, $valid_id);
+
+                $this->changeRSSPersonalFolderRelation($rssDb, $invalid_ids, $valid_id);
+
+                $this->deleteInvalidFolders($rssDb, 'tab_grn_rss_personalfolder', $invalid_ids, $uid);
+            }
+        }
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     *
+     * @return array
+     */
+    private function checkInvalidRSSFolder($db)
+    {
+        $query
+            = <<<SQL
+SELECT
+    col_type folder_type, col_user user_id
+FROM
+    tab_grn_rss_personalfolder
+WHERE
+    col_type = '0'
+GROUP BY
+    col_user, col_type
+HAVING COUNT(*) > 1;
+SQL;
+        $result = $db->query($query);
+        $rows = [];
+        while ($row = $db->fetch_assoc($result)) {
+            if ( ! in_array($row['user_id'], $rows)) {
+                $rows[] = $row['user_id'];
+            }
+        }
+        $db->free_result($result);
+
+        return $rows;
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     * @param integer                $user_id
+     *
+     * @return integer
+     */
+    private function getValidRSSFolderId($db, $user_id)
+    {
+        // Use same logic to get folder displayed on rss/index
+        $query = "SELECT _id FROM tab_grn_rss_personalfolder WHERE col_user = @X AND col_type = '0'";
+        $query = $db->format($query, [$user_id]);
+        $query = $db->select_format($query, 0, 1);
+
+        $result = $db->query($query);
+        $row = $db->fetch_assoc($result);
+        $valid_id = $row['_id'];
+        return $valid_id;
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     * @param integer                $user_id
+     * @param integer                $valid_id
+     *
+     * @return array $invalid_ids
+     */
+    private function getInvalidRSSFolderIds($db, $user_id, $valid_id)
+    {
+        $invalid_ids = [];
+        $query
+            = "SELECT _id FROM tab_grn_rss_personalfolder WHERE col_user = @X AND col_type = '0' AND _id <> @X;";
+        $query = $db->format($query, [$user_id, $valid_id]);
+        $result = $db->query($query);
+        while ($row = $db->fetch_assoc($result)) {
+            $invalid_ids[] = $row['_id'];
+        }
+
+        return $invalid_ids;
+    }
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     * @param array                  $invalid_ids
+     * @param integer                $keep_id
+     */
+    private function changeRSSPersonalFolderRelation($db, $invalid_ids, $keep_id)
+    {
+        foreach ($invalid_ids as $invalid_id) {
+            $query
+                = "UPDATE tab_grn_rss_personalfolderrelation SET col_parent = @X WHERE col_parent = @X;";
+            $query = $db->format($query, [$keep_id, $invalid_id]);
+            $db->query($query);
+            $affected_rows = $db->affected_rows();
+
+            if ($affected_rows > 0) {
+                $this->log('Succeeded to move the RSS data from the invalid folder (id = ' . $invalid_id
+                           . ') to valid folder (id = ' . $keep_id . ').');
+            }
+        }
+    }
+    // GTM-4659: RSS --- end
+
+    /**
+     * @param \CB_DatabaseConnection $db
+     * @param string                 $table_name
+     * @param array                  $ids
+     * @param integer                $user_id
+     * @param mixed                  $workflow_solution
+     */
+    private function deleteInvalidFolders($db, $table_name, $ids, $user_id, $workflow_solution = null)
+    {
+        $query = "DELETE FROM {$table_name} WHERE _id IN (@A);";
+        $query = $db->format($query, [$ids]);
+        $db->query($query);
+
+        switch ($workflow_solution) {
+            case "delete_max_ids":
+                $this->log('Succeeded to delete max id folders (because max id folders do not have any relation in tab_grn_workflow_folderrelation) of user (user_id = '
+                           . $user_id . ') in ' . $table_name . '. Folder ids: ' . implode(', ', $ids) . '.');
+                break;
+            case "keep_max_ids":
+                $this->log('Succeeded to delete invalid folders ' .
+                           '(keep max id folders because they do have relation in tab_grn_workflow_folderrelation or duplicate folder set count > 2) of user (user_id = '
+                           . $user_id . ') in ' . $table_name . '. Folder ids: ' . implode(', ', $ids) . '.');
+                break;
+            default:
+                $this->log('Succeeded to delete invalid folder ids of user (user_id = ' . $user_id . ') in '
+                           . $table_name . ': ' . implode(', ', $ids) . '.');
+        }
+    }
+}

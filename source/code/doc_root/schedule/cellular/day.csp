@@ -1,0 +1,323 @@
+<?php
+
+use grn\schedule\AttendanceStatusLogic;
+
+// 使用するパラメータの定義
+$day = @ $G_INPUT['day'];
+$mid = @ $G_INPUT['mid'];
+if ( ! $mid) {
+    $mid = $G_login_user->getOID();
+}
+$gid = @ $G_INPUT['gid'];
+$pg = @ $G_INPUT['pg'];
+if ( ! $pg) {
+    $pg = 0;
+}
+
+// 初期定義
+$assign_allday_map = [
+    'eid'     => 'id',            // ＩＤ
+    'title'   => 'title',         // 表題
+    'joint'   => 'share',         // 共有
+    'repeat'  => 'repeat',        // 繰り返し
+    'private' => 'private',
+];
+$assign_normal_map = [
+    'eid'     => 'id',            // ＩＤ
+    'title'   => 'title',         // 表題
+    'start'   => 'setdatetime',   // 開始時刻
+    'end'     => 'enddatetime',   // 終了時刻
+    'joint'   => 'share',         // 共有
+    'repeat'  => 'repeat',        // 繰り返し
+    'temp'    => 'temporary',     // 仮
+    'private' => 'private',
+];
+$assign_banner_map = [
+    'eid'     => 'id',            // ＩＤ
+    'title'   => 'title',         // 表題
+    'start'   => 'setdate',       // 開始日
+    'end'     => 'enddate',       // 終了日
+    'joint'   => 'share',         // 共有
+    'repeat'  => 'repeat',        // 繰り返し
+    'private' => 'private',
+];
+
+// 共通config
+require_once('schedule/system_logic.csp');
+$systemlogic = GRN_Schedule_SystemLogic::getInstance();
+$unit = $systemlogic->getScheduleUnit();
+$hiddenprivate = $systemlogic->getHiddenPrivate();
+$showholiday = $systemlogic->getShowHoliday();
+
+
+// 個人config
+require_once('schedule/personal_logic.csp');
+$personallogic = GRN_Schedule_PersonalLogic::getInstance();
+$showendtime = $personallogic->getShowEndTime($G_login_user);
+$startwday = $personallogic->getCalendarWeekStart($G_login_user);
+$set_hour = 0;
+$end_hour = 0;
+$personallogic->getViewHour($G_login_user, $set_hour, $end_hour);
+
+// ケータイconfig
+require_once('grn/application.csp');
+$locator = GRN_ApplicationLocator::instance();
+$cellular_app = $locator->getInstance('cellular');
+$user_config = $cellular_app->getUserConfig($G_login_user);
+$width = $user_config->getSubjectWidth();
+$limit = $user_config->getListMax();
+
+// アクセス権logic
+$dynamic_roles = $G_uum->listGrantedRoles();
+require_once('schedule/access_logic.csp');
+$acc_logic = GRN_Schedule_Access_logic::getInstance();
+
+//----------------------------------------------------------------------------
+// Smarty をインスタンス化
+require_once('cellular/smarty.csp');
+$smarty = new GRN_Cellular_Smarty;
+$smarty->assign('hiddenprivate', $hiddenprivate);
+// ページタイトル
+$smarty->assign('pagetitle', grn_get_current_page_display_name());
+// パス情報
+$smarty->assign('pagepath', $G_pagepath);
+
+// 施設logic
+require_once('schedule/facility_system_logic.csp');
+$facility_logic = GRN_Facility_SystemLogic::getInstance();
+
+//ターゲット
+if (mb_substr($mid, 0, 1) == 'f') {
+    $target = $facility_logic->getFacility(mb_substr($mid, 1));
+    if ($target === false) {
+        cb_throw_error(E_GRN_FCLT_NOTFOUND_FACILITY);
+    }
+
+    $affiliation_group
+        = $facility_logic->getFacilityAffiliationGroup($target->getOID());
+    if ($affiliation_group !== false) {
+        $affiliation_groups
+            = [$affiliation_group->getOID() => $affiliation_group];
+        $have_config = $acc_logic->getHaveAccessSettingList($G_login_user,
+            $affiliation_groups, 'facilitygroup', $dynamic_roles);
+        if (count($have_config) > 0) {
+            $access['read'] = $acc_logic->evaluateAccess($G_login_user,
+                $affiliation_group, ['read'], $dynamic_roles);
+            $access['add'] = $acc_logic->evaluateAccess($G_login_user,
+                $affiliation_group, ['add'], $dynamic_roles);
+        } else {
+            $access['read'] = $acc_logic->evaluateAccess($G_login_user, $target,
+                ['read'], $dynamic_roles);
+            $access['add'] = $acc_logic->evaluateAccess($G_login_user, $target,
+                ['add'], $dynamic_roles);
+        }
+    } else {
+        $access['read'] = $acc_logic->evaluateAccess($G_login_user, $target,
+            ['read'], $dynamic_roles);
+        $access['add'] = $acc_logic->evaluateAccess($G_login_user, $target,
+            ['add'], $dynamic_roles);
+    }
+
+    if ( ! $access['read']) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_VIEW);
+    }
+    $smarty->assign('member_name', $target->get('name'));
+    $smarty->assign('facility_info', true);
+
+    //--- add VCBSCH0010 ---s
+    // V-CUBEシステムが利用可能かを取得する。
+    require_once('schedule/netmeeting_system_logic.csp');
+    $netmeeting_system_logic = GRN_Netmeeting_SystemLogic::getInstance();
+    $netmeeting_system_available
+        = $netmeeting_system_logic->getNetmeetingAvailable();
+
+    // V-CUBEシステムが利用可能で、施設がV-CUBE連携対象の場合
+    if (($netmeeting_system_available == 1)
+        && ($target->get('netmeeting_available') == 1)
+    ) {
+        $access['add'] = GRN_SCHD_ACCESS_DENY;      // 登録ボタンを非表示にする。
+    }
+
+    //--- add VCBSCH0010 ---e
+
+} elseif (mb_substr($mid, 0, 1) == 'g') {
+    // 組織
+    $target = $G_uum->getGroup(mb_substr($mid, 1));
+    if ( ! $target) {
+        cb_throw_error(E_GRN_GROUP_NOT_FOUND);
+    }
+    $access['read'] = $acc_logic->evaluateAccess($G_login_user, $target,
+        ['read'], $dynamic_roles);
+    $access['add'] = $acc_logic->evaluateAccess($G_login_user, $target,
+        ['add'], $dynamic_roles);
+    if ( ! $access['read']) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_VIEW);
+    }
+    $smarty->assign('member_name', $target->get('name'));
+} else {
+    // 人物
+    $target = $G_uum->getUser($mid);
+    if ( ! $target) {
+        cb_throw_error(E_GRN_USER_NOT_FOUND);
+    }
+    $access['read'] = $acc_logic->evaluateAccess($G_login_user, $target,
+        ['read'], $dynamic_roles);
+    $access['add'] = $acc_logic->evaluateAccess($G_login_user, $target,
+        ['add'], $dynamic_roles);
+    if ( ! $access['read']) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_VIEW);
+    }
+    $smarty->assign('member_name', $target->get('display_name'));
+}
+
+$event_add = ($access['add'] == GRN_SCHD_ACCESS_DENY) ? false : true;
+
+$smarty->assign('event_add', $event_add);
+
+$smarty->assign('mid', $mid);
+
+// 日付時刻（タイムスタンプ）クラス生成
+require_once("fw/date.csp");
+$ts = new CB_TimeStamp();
+$ts->unix_ts = time();
+$tsex = new CB_TimeStampEx($ts);
+$day_today = $tsex->getDate();
+
+// 表示日の設定
+$day_disp = new CB_Date();
+
+if ( ! $day_disp->parse($day)) {
+    // 今日をdefault
+    $day_disp = $day_today;
+}
+
+//スケジュールのstart_dateとend_dateが異なる場合のために使う。
+$day_disp_ex = new CB_DateEx($day_disp);
+$smarty->assign('day_ex', $day_disp_ex);
+
+$smarty->assign('day', $day_disp->format());
+
+// 前日 before 
+$day_before = new CB_DateEx($day_disp);
+$day_before->moveDays(-1);
+$smarty->assign('before_day', $day_before->format());
+
+// 翌日 after 
+$day_after = new CB_DateEx($day_disp);
+$day_after->moveDays(1);
+$smarty->assign('after_day', $day_after->format());
+
+$setdate = $day_disp;
+$enddate = $day_disp;
+
+// 予定取得
+$attendanceStatusLogic = new AttendanceStatusLogic();
+$isEnableAttendanceStatus = $attendanceStatusLogic->isEnableAttendanceCheck();
+/** @var GRN_Schedule_Application $G_application */
+$schedata = $G_application->getEvents(
+    $target,
+    $setdate,
+    $enddate,
+    $G_login_user,
+    GRN_SCHEDULE_EVENT_TYPE_ALLDAY | GRN_SCHEDULE_EVENT_TYPE_NORMAL
+    | GRN_SCHEDULE_EVENT_TYPE_BANNER,
+    $hiddenprivate,
+    true,
+    $isEnableAttendanceStatus
+);
+
+if ($isEnableAttendanceStatus) {
+    require_once('schedule/view_util.csp');
+    $util = GRN_Schedule_View_Util::getInstance();
+    foreach (['normal', 'allday'] as $type) {
+        $schedata[$type] = $util->filterAbsentEvents($schedata[$type]);
+    }
+}
+
+$for_view = [];
+$counter = 0;
+
+// allday schedule
+if (count($schedata['allday'])) {
+    foreach ($schedata['allday'] as $event => $data) {
+        $for_view[$counter]['type'] = 'allday';
+        foreach ($assign_allday_map as $view_name => $data_name) {
+            $for_view[$counter][$view_name] = @$data[$data_name];
+        }
+        $counter++;
+    }
+}
+
+// normal schedule
+if (count($schedata['normal'])) {
+    foreach ($schedata['normal'] as $event => $data) {
+        $for_view[$counter]['type'] = 'normal';
+        foreach ($assign_normal_map as $view_name => $data_name) {
+            $for_view[$counter][$view_name] = @$data[$data_name];
+        }
+        //スケジュールのstart_dateとend_dateが異なる場合
+        if ($data['setdatetime']->getDate()
+            != $data['enddatetime']->getDate()
+        ) {
+            $for_view[$counter]['sdate'] = $data['setdatetime']->getDate();
+            $for_view[$counter]['edate'] = $data['enddatetime']->getDate();
+        }
+        $for_view[$event]['end_time_available'] = true;
+        if (isset($data['end_time_available'])) {
+            $for_view[$counter]['end_time_available']
+                = $data['end_time_available'];
+        }
+        $counter++;
+    }
+}
+
+// カスタマイズ項目処理
+foreach ($for_view as $key => $value) {
+    $item_data = &$for_view[$key];
+    if (array_key_exists('private', $item_data) && $item_data['private']) {
+        continue;
+    }
+
+    if (isset($value['eid'])) {
+        $item_data['title'] .= $facility_logic->getDataTitle($value['eid']);
+    }
+}
+
+// banner schedule
+if (count($schedata['banner'])) {
+    foreach ($schedata['banner'] as $event => $data) {
+        $for_view[$counter]['type'] = 'banner';
+        foreach ($assign_banner_map as $view_name => $data_name) {
+            $for_view[$counter][$view_name] = @$data[$data_name];
+        }
+        $counter++;
+    }
+}
+
+// 分割
+if (count($for_view) > $limit) {
+    $_chunk = array_chunk($for_view, $limit, true);
+    $_chunk_cnt = count($_chunk);
+    $for_view =& $_chunk[$pg];
+    if ($pg > 0) {
+        $smarty->assign(['prev' => true, 'prev_pg' => $pg - 1]);
+    }
+    if ($pg + 1 < $_chunk_cnt) {
+        $smarty->assign(['next' => true, 'next_pg' => $pg + 1]);
+    }
+}
+foreach ($for_view as $key => $value) {
+    $for_view[$key]['title'] = preg_replace([
+        '/&lt;/',
+        '/&gt;/',
+        '/&quot;/',
+        '/&amp;/'
+    ], ['<', '>', '"', '&'], $value['title']);
+}
+
+$smarty->assign('sche', $for_view);
+$smarty->assign('width', $width);
+
+// smartyの出力
+$smarty->display(cb_get_pagename() . '.tpl');
+

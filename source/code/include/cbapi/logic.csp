@@ -1,0 +1,246 @@
+<?php
+
+require_once('cbapi/resources.csp');
+
+/**
+ * @access   private
+ */
+function _grn_cbapi_prepare_display()
+{
+    global $G_state_set;
+    $G_state_set->set('copyright_should_be_written', false);
+    $G_state_set->set('html_should_be_closed', false);
+    header('Content-type: text/xml');
+}
+
+/**
+ * smarty display for CBAPI
+ *
+ * @param   object $smarty GRN_Smary object
+ * @param   string $page   page name
+ */
+function grn_cbapi_display(& $smarty, $page)
+{
+    // set encoding
+    $smarty->assign('encoding', cb_get_http_output_encoding());
+
+    // set API version
+    global $G_api_version;
+    $smarty->assign('api_ver', $G_api_version);
+
+    _grn_cbapi_prepare_display();
+
+    $smarty->display($page);
+}
+
+/**
+ * throw error for CBAPI
+ *
+ * @param   string $code the CBAPI error code
+ */
+function grn_cbapi_throw_error($code)
+{
+    global $G_INPUT;
+
+    // api code
+    global $G_grn_cbapi_code;
+    $api_id = array_key_exists('api_id', $G_INPUT)
+        ? strtoupper($G_INPUT['api_id']) : 'DEFAULT';
+    $api_id = defined('GRN_CBAPI_API_CODE_' . $api_id) ? $api_id
+        : 'DEFAULT';
+    $G_grn_cbapi_code = constant('GRN_CBAPI_API_CODE_' . $api_id);
+
+    // error log
+    require_once('fw/logger.csp');
+    $lm = CB_LoggerManager::getInstance();
+    $logger =& $lm->getLogger('grn.common');
+
+    if ($logger->isDebugEnabled()) {
+        $params = [];
+        foreach ($G_INPUT as $key => $value) {
+            if (strcmp($key, 'pwd') === 0) {
+                $value = '*****';
+            }
+            $params[] = $key . '=' . $value;
+        }
+        if (array_key_exists(GRN_CBAPI_AUTH_COOKIE, $_COOKIE)) {
+            $params[] = GRN_CBAPI_AUTH_COOKIE . '='
+                        . $_COOKIE[GRN_CBAPI_AUTH_COOKIE];
+        }
+        $logger->debug('[cbapi.error] ' . implode(', ', $params));
+    }
+
+    // error page
+    _grn_cbapi_prepare_display();
+    global $G_state_set;
+    $G_state_set->set('error_page_type', 'cbapi');
+    cb_throw_error('GRN_CBAPI_' . $code . '00');
+}
+
+/**
+ * encrypt specified data
+ *
+ * @param    string $data data
+ *
+ * @return   string   enctyped data
+ */
+function grn_cbapi_encrypt($data)
+{
+    $shifted_data = '';
+    $data_len = strlen($data);
+    for ($i = 0; $i < $data_len; $i++) {
+        $shifted_data = $shifted_data . chr(ord($data{$i}) << 1);
+    }
+    $encode_data = base64_encode($shifted_data);
+
+    return $encode_data;
+}
+
+/**
+ * decrypt specified data
+ *
+ * @param    string $data
+ *
+ * @return   string   decrypted data
+ */
+function grn_cbapi_decrypt($data)
+{
+    $decode_data = base64_decode($data);
+    $shifted_data = '';
+    $data_len = strlen($decode_data);
+    for ($i = 0; $i < $data_len; $i++) {
+        $shifted_data = $shifted_data . chr(ord($decode_data{$i}) >> 1);
+    }
+
+    return $shifted_data;
+}
+
+/**
+ * get cookie value for CBAPI
+ *
+ * @param    string $expire     cookie life time
+ * @param    string $product_id product ID
+ * @param    string $auth_key   CBAPI authentication key
+ *
+ * @return   string   cookie
+ */
+function grn_cbapi_get_cookie($expire, $product_id, $auth_key)
+{
+    $server_sig = md5($expire . ':' . $product_id . ':' . $auth_key);
+    $data = $expire . ':' . $server_sig;
+    $cookie = urlencode(grn_cbapi_encrypt($data));
+
+    return $cookie;
+}
+
+/**
+ * set cookie to HTTP header
+ *    domain: null
+ *    path  : server root
+ *            ex) /var/www/cgi-bin/cbgrn
+ *
+ * @param   string $cookie
+ */
+function grn_cbapi_set_cookie($cookie)
+{
+    //  Cookieの有効期限についてはRCが管理するので、製品では指定しない
+    setcookie(GRN_CBAPI_AUTH_COOKIE, $cookie, 0, cb_get_page_prefix());
+}
+
+/**
+ * authenticate the client signature list
+ *
+ * @param    string $sig      client signature
+ * @param    string $expire   client authentication expiration time
+ * @param    string $auth_key CBAPI authentication key
+ *
+ * @return   boolean   TRUE: success the client authentication
+ */
+function grn_cbapi_client_auth($sig, $expire, $auth_key)
+{
+    $result = false;
+
+    // validate the md5 value
+    $md5 = md5($expire . ':' . $auth_key);
+
+    if (strcmp($sig, $md5) === 0) {
+        $result = true;
+    }
+
+    return $result;
+}
+
+/*
+ *  指定のキーワードを使ってユーザー検索を行う。
+ *
+ *  @param  string $keyword   ユーザー検索のキーワード。
+ *  @param     int $offset    ユーザーの結果セットの開始位置。
+ *  @param     int $limit     ユーザーの結果セットの長さ。
+ *                            -1 の場合はoffset以降のすべてのユーザーを返す。
+ *
+ *  @return  array['users']   ユーザーの結果セット。
+ *                ['islast']  指定の offset, limit での結果セットが、指定のキーワードでの検索に
+ *                            該当するすべてのユーザーのリストにおいて、終端に位置する否か。
+ */
+function grn_cbapi_search($keyword, $offset = 0, $limit = -1)
+{
+    $search_result = [];
+
+    //  すべてのユーザーを取りだす
+    require_once('grn/uum_util_search.csp');
+    $uum_util_search = new GRN_UumUtil_Search();
+    $columns = [
+        'col_display_name',
+        'col_foreign_key',
+        'col_valid',
+        'col_sort_key'
+    ];
+    $all_users = $uum_util_search->searchUsersInfo($keyword, '1',
+        $columns);
+    $count_all_users = count($all_users);
+
+    //  offset 分のユーザーを先頭から削除する。
+    $keys = array_keys($all_users);
+    for ($i = 0; $i < $offset; $i++) {
+        if (count($all_users) <= 0) {
+            //  offset で指定された位置以降にユーザーがいない
+            $search_result['users'] = [];
+            $search_result['islast'] = true;
+
+            return $search_result;
+        }
+
+        unset($all_users[$keys[$i]]);
+    }
+
+    //  残ったユーザーを $user にコピーする
+    $users = [];
+    foreach ($all_users as $user_id => $user_info) {
+        //  コピーしたユーザー数がlimitに達したら、中止する
+        if (($limit != -1) && ($limit <= count($users))) {
+            break;
+        }
+
+        $users[$user_id] = $user_info;
+    }
+
+    //  結果をまとめて返す
+    $search_result['users'] = $users;
+    $search_result['islast'] = ($count_all_users <= $offset + count($users));
+
+    return $search_result;
+
+}
+
+function grn_cbapi_print_x_cybozu_user()
+{
+    global $G_container_base;
+    /** @var GRN_Uum $uum */
+    $uum = $G_container_base->getInstance('uum');
+    $user = $uum->getLoginUser();
+    if ($user !== false) {
+        header('X-Cybozu-User: ' . $user->getOID());
+    }
+}
+
+

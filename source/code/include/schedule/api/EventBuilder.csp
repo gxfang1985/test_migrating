@@ -1,0 +1,755 @@
+<?php
+
+namespace grn\schedule\api;
+
+use grn\grn\GrnException;
+use grn\grn\MemberLogic;
+use grn\schedule\api\model\Attachment;
+use grn\schedule\api\model\Company;
+use grn\schedule\api\model\DateTime;
+use grn\schedule\api\model\Event;
+use grn\schedule\api\model\Facility;
+use grn\schedule\api\model\FacilityReservationInfoItem;
+use grn\schedule\api\model\FacilityUsageRequest;
+use grn\schedule\api\model\Member;
+use grn\schedule\api\model\Person;
+use grn\schedule\api\model\RepeatInfo;
+use grn\schedule\api\model\RepeatInfoRange;
+use grn\schedule\api\model\TemporaryEventCandidate;
+use grn\schedule\collection\EventFacilityApprovals;
+use grn\schedule\collection\FacilityApprovalSettings;
+
+require_once('cbpapi/util.csp');
+
+class EventBuilder
+{
+    /**
+     * @var Event $event
+     */
+    protected $event;
+
+    /**
+     * @var RenderMemberHolder
+     */
+    private $renderMemberHolder;
+    /**
+     * @var boolean isForeignKeyPublic
+     */
+    private $isForeignKeyPublic;
+
+    public function __construct(RenderMemberProvider $render_member_provider)
+    {
+        $this->renderMemberHolder
+            = new RenderMemberHolder($render_member_provider);
+        $this->isForeignKeyPublic
+            = cb_lwc_uum()->isForeignKeyPublic();
+    }
+
+    /**
+     * Init and Build Event object from Schedule event object
+     *
+     * @param string                       $visibility_type Event visibility type (Public: 0, Private: 1, Manage: 2)
+     * @param string                       $event_type      Event type (REGULAR, ALL_DAY, REPEATING)
+     * @param \GRN_Schedule_EventBase|NULL $schedule_event
+     */
+    public function initEvent($schedule_event, $event_type, $visibility_type)
+    {
+        $this->event = new Event();
+        $this->event->setEventType($event_type);
+        // appointment type
+        $this->event->setEventMenu(! is_null($schedule_event)
+            ? $schedule_event->getMenuName() : '');
+        $this->event->setSubject($schedule_event->detail ?? '');
+        $this->event->setNotes($schedule_event->memo ?? '');
+        if ($schedule_event) {
+            $this->event->setId($schedule_event->id);
+            if ($schedule_event->creator) {
+                $creator = $this->makePerson($schedule_event->creator);
+                $this->event->setCreator($creator);
+            }
+            $timezone = $schedule_event->timezone;
+            if ($schedule_event->ctime) {
+                $this->event->setCreatedAt(grn_cbpapi_iso8601($schedule_event->ctime,
+                    true, $timezone));
+            }
+            if ($schedule_event->modifier) {
+                $modifier = $this->makePerson($schedule_event->modifier);
+                $this->event->setModifier($modifier);
+            }
+
+            if ($schedule_event->mtime) {
+                $this->event->setUpdatedAt(grn_cbpapi_iso8601($schedule_event->mtime,
+                    true, $timezone));
+            }
+
+        }
+
+        require_once('schedule/system_logic.csp');
+        $systemlogic = \GRN_Schedule_SystemLogic::getInstance();
+
+        if ($systemlogic->getUsePrivate() && $visibility_type !== null
+            && $this->event->getEventType() != Event::EVENT_TYPE_ALL_DAY
+        ) {
+            $visibility_type_data
+                = Event::getMappingVisibilityType($visibility_type);
+            $this->event->setVisibilityType($visibility_type_data);
+        }
+    }
+
+    /**
+     * @param \CB_User|null $user
+     *
+     * @return Person
+     */
+    private function makePerson($user)
+    {
+        if ($user instanceof \CB_User) {
+            $creator_display_name
+                = $this->renderMemberHolder->getUserDisplayName($user->getOID());
+
+            return new Person($user->getOID(), $user->get('foreign_key'),
+                $creator_display_name, $this->isForeignKeyPublic);
+        } else {
+            return new Person('', '', $user, $this->isForeignKeyPublic);
+        }
+    }
+
+    /**
+     * Set Company info
+     *
+     * @param array $company_arr company data
+     */
+    public function buildCompany($company_arr)
+    {
+        $company = new Company();
+        $company->setName($company_arr['company_name'] ?? '');
+        $company->setZipCode($company_arr['zip_code'] ?? '');
+        $company->setAddress($company_arr['physical_address'] ?? '');
+        $company->setRoute($company_arr['route'] ?? '');
+        $company->setRouteTime($company_arr['route_time'] ?? '');
+        $company->setRouteFare($company_arr['route_fare'] ?? '');
+        $company->setPhone($company_arr['company_telephone_number'] ?? '');
+        $this->event->setCompany($company);
+    }
+
+    /**
+     * @param string         $repeat_type  repeat type (day/WEEKDAY/WEEK/1STWEEK/2NDWEEK/3RDWEEK/4THWEEK/LASTWEEK/MONTH)
+     * @param \CB_Date       $start_date   start date
+     * @param \CB_Date       $end_date     end date
+     * @param \CB_Time       $start_time   start time
+     * @param \CB_Time       $end_time     end time
+     * @param string         $timezone     time zone
+     * @param string|integer $month_day    day of month (if End Of Month return: EOM)
+     * @param integer        $week_day     day of week
+     * @param \CB_Date       $range_date   date of range
+     * @param array          $except_dates except dates of repeat schedule
+     */
+    public function buildRepeatInfo(
+        $repeat_type,
+        $start_date,
+        $end_date,
+        $start_time,
+        $end_time,
+        $timezone,
+        $month_day,
+        $week_day,
+        $range_date = null,
+        $except_dates = []
+    ) {
+        if ($this->event->getEventType() == Event::EVENT_TYPE_REPEATING) {
+            $repeat_info = new RepeatInfo();
+            if ($range_date) {
+                $range = new RepeatInfoRange('', '');
+                $repeat_info->setRange($range);
+            }
+            $repeat_info->setType(RepeatInfo::getMappingType(strtoupper($repeat_type)));
+            $repeat_info->setStartDate($start_date ? $start_date->format()
+                : '');
+            $repeat_info->setEndDate($end_date ? $end_date->format() : '');
+            $repeat_info->setTimeZone($timezone);
+            $repeat_info->setIsStartOnly($this->isStartOnly($start_time,
+                $end_time));
+            $repeat_info->setIsAllday($this->isAllDay($start_time, $end_time));
+            if ($repeat_type === 'week' || $repeat_type === '1stweek'
+                || $repeat_type === '2ndweek'
+                || $repeat_type === '3rdweek'
+                || $repeat_type === '4thweek'
+                || $repeat_type === 'lastweek'
+            ) {
+                $repeat_info->setDayOfWeek(DateTime::getMappingDayOfWeek($week_day));
+            }
+
+            $str_start_time = $start_time ? sprintf('%02d:%02d',
+                $start_time->hour, $start_time->minute) : '00:00';
+            $str_end_time = $end_time ? sprintf('%02d:%02d', $end_time->hour,
+                $end_time->minute) : '00:00';
+            if ($repeat_info->getIsAllday()) {
+                $repeat_info->setStartTime('00:00');
+                $repeat_info->setEndTime('00:00');
+            } elseif ($repeat_info->getIsStartOnly()) {
+                $repeat_info->setStartTime($str_start_time);
+            } else {
+                $repeat_info->setStartTime($str_start_time);
+                $repeat_info->setEndTime($str_end_time);
+            }
+
+            if ($repeat_type === 'month') {
+                $month_day = $month_day === '0' ? 'EOM' : $month_day;
+                $repeat_info->setDayOfMonth($month_day);
+            }
+
+            if ($except_dates) {
+                $except = [];
+                foreach ($except_dates as $except_date) {
+                    $start_datetime = _cb_date_convert_to_datetime($except_date,
+                        $timezone);
+
+                    $next_day = new \CB_DateEx($except_date);
+                    $next_day->moveDays(1);
+                    $end_datetime = _cb_date_convert_to_datetime($next_day,
+                        $timezone);
+                    $except[] = [
+                        'start' => grn_cbpapi_iso8601($start_datetime, false,
+                            $timezone),
+                        'end'   => grn_cbpapi_iso8601($end_datetime, false,
+                            $timezone),
+                    ];
+                }
+                $repeat_info->setExclusiveDateTimes($except);
+            }
+
+            $this->event->setRepeatInfo($repeat_info);
+        }
+    }
+
+    /**
+     * @param string $original_start_timeZone
+     * @param string $original_end_timeZone
+     */
+    public function buildOriginalTimezone(
+        $original_start_timeZone,
+        $original_end_timeZone
+    ) {
+        $this->event->setOriginalStartTimeZone($original_start_timeZone);
+        if ( ! $this->event->getIsStartOnly()) {
+            $this->event->setOriginalEndTimeZone($original_end_timeZone);
+        }
+    }
+
+    /**
+     * Build start and end time
+     *
+     * @param \CB_Date      $start_date
+     * @param \CB_Time|null $start_time
+     * @param string        $start_timezone
+     * @param \CB_Date      $end_date
+     * @param \CB_Time|null $end_time
+     * @param string        $end_timezone
+     */
+    public function buildStartEnd(
+        $start_date,
+        $start_time,
+        $start_timezone,
+        $end_date,
+        $end_time,
+        $end_timezone
+    ) {
+        $start = DateTime::getIso8601DateTime($start_date, $start_time,
+            $start_timezone);
+        $this->event->setStart($start);
+
+        if ( ! $this->event->getIsStartOnly()) {
+            $end = DateTime::getIso8601DateTime($end_date, $end_time,
+                $end_timezone);
+            $this->event->setEnd($end);
+        }
+    }
+
+    /**
+     * Check start only or not
+     *
+     * @param \CB_DateTime|\CB_Date|\CB_Time|null $start
+     * @param \CB_DateTime|\CB_Date|\CB_Time|null $end
+     *
+     * @return bool
+     * @throws GrnException
+     */
+    private function isStartOnly($start, $end)
+    {
+        switch ($this->getEvent()->getEventType()) {
+            case Event::EVENT_TYPE_REGULAR:
+            case Event::EVENT_TYPE_REPEATING:
+                return ! is_null($start) && is_null($end);
+            case Event::EVENT_TYPE_ALL_DAY:
+            case Event::EVENT_TYPE_TEMPORARY:
+                return false;
+            default:
+                throw new GrnException();
+        }
+    }
+
+    /**
+     * Check is all day or not
+     *
+     * @param \CB_DateTime|\CB_Date|\CB_Time|null $start
+     * @param \CB_DateTime|\CB_Date|\CB_Time|null $end
+     *
+     * @return bool
+     * @throws GrnException
+     */
+    private function isAllDay($start, $end)
+    {
+        switch ($this->getEvent()->getEventType()) {
+            case Event::EVENT_TYPE_REGULAR:
+            case Event::EVENT_TYPE_REPEATING:
+                return is_null($start) && is_null($end);
+            case Event::EVENT_TYPE_ALL_DAY:
+                return true;
+            case Event::EVENT_TYPE_TEMPORARY:
+                return false;
+            default:
+                throw new GrnException();
+        }
+    }
+
+    /**
+     * @param \CB_DateTime|\CB_Date|\CB_Time|null $start
+     * @param \CB_DateTime|\CB_Date|\CB_Time|null $end
+     * @param bool                                $expand_repeat_temporary
+     */
+    public function buildIsStartOnlyAndIsAllDayByStartEnd(
+        $start,
+        $end,
+        $expand_repeat_temporary = false
+    ) {
+        if ($this->showIsStartOnlyAndIsAllDay($expand_repeat_temporary)) {
+            $is_start_only = $this->isStartOnly($start, $end);
+            $this->event->setIsStartOnly($is_start_only);
+
+            $is_all_day = $this->isAllDay($start, $end);
+            $this->event->setIsAllDay($is_all_day);
+        }
+    }
+
+    /**
+     * @param int  $event_type
+     * @param bool $expand_repeat_temporary
+     *
+     * @throws GrnException
+     */
+    public function buildIsStartOnlyAndIsAllDayByEventType(
+        $event_type,
+        $expand_repeat_temporary = false
+    ) {
+        if ($this->showIsStartOnlyAndIsAllDay($expand_repeat_temporary)) {
+            $is_start_only = ($event_type & GRN_SCHEDULE_EVENT_TYPE_START)
+                             === GRN_SCHEDULE_EVENT_TYPE_START;
+            $this->event->setIsStartOnly($is_start_only);
+            $is_all_day = ($event_type & GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+                          === GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+                          || ($event_type & GRN_SCHEDULE_EVENT_TYPE_BANNER)
+                             === GRN_SCHEDULE_EVENT_TYPE_BANNER;
+            $this->event->setIsAllDay($is_all_day);
+        }
+    }
+
+    /**
+     * @param int $use_attendance_check
+     */
+    public function buildUseAttendanceCheck($use_attendance_check)
+    {
+        if ($this->event->getEventType() == Event::EVENT_TYPE_REGULAR) {
+            $this->event->setUseAttendanceCheck(boolval($use_attendance_check));
+        }
+    }
+
+    /**
+     * @param bool $expand_repeat_temporary
+     *
+     * @return bool
+     * @throws GrnException
+     */
+    public function showIsStartOnlyAndIsAllDay(bool $expand_repeat_temporary)
+    {
+        $event_type = $this->event->getEventType();
+        switch ($event_type) {
+            case Event::EVENT_TYPE_REGULAR:
+            case Event::EVENT_TYPE_ALL_DAY:
+                return true;
+            case Event::EVENT_TYPE_TEMPORARY:
+            case Event::EVENT_TYPE_REPEATING:
+                return $expand_repeat_temporary;
+            default:
+                throw new GrnException();
+        }
+    }
+
+    /**
+     * @param integer $version Version of event
+     */
+    public function buildVersion($version)
+    {
+        $this->event->setVersion($version);
+    }
+
+    /**
+     * Build attendees from array
+     *
+     * @param array $users
+     * @param array $groups
+     * @param array $attendees_response
+     */
+    public function buildAttendees(
+        array $users,
+        array $groups,
+        array $attendees_response = []
+    ) {
+        $event_attendees = $this->renderMemberHolder->getRenderAttendees($users,
+            $groups);
+        $this->buildAttendeesFromRenderValues($event_attendees,
+            $attendees_response);
+    }
+
+
+    /**
+     * Build attendees from render attendees values
+     *
+     * @param array $render_attendees   Attendees that acquired from ScheduleMemberLogic
+     * @param array $attendees_response Attendees response that acquired from Member#getAttendeesResponseList
+     */
+    public function buildAttendeesFromRenderValues(
+        array $render_attendees,
+        array $attendees_response = []
+    ) {
+        $attendee_response = $attendees_response[$this->event->getId()] ?? [];
+        $attendees         = Member::getMembers($render_attendees,
+            $attendee_response, $this->isForeignKeyPublic);
+        $this->event->setAttendees($attendees);
+    }
+
+    /**
+     * Build Attendees candidate
+     *
+     * @param array $attendees_candidate
+     */
+    public function buildAttendeesCandidate(array $attendees_candidate)
+    {
+        $this->event->setAttendeesCandidate($attendees_candidate);
+    }
+
+    /**
+     * Build attachments from array
+     *
+     * @param array   $attachments      Attachment list with array keys is file ID and Item must have keys: name, mime, size
+     * @param boolean $is_original_file the list file is original or temporary
+     */
+    public function buildAttachments($attachments, $is_original_file)
+    {
+        if ($this->event->getEventType() == Event::EVENT_TYPE_REPEATING
+            || $this->event->getEventType() == Event::EVENT_TYPE_TEMPORARY
+        ) {
+            return;
+        }
+
+        $attachment_list = [];
+        if (is_array($attachments)) {
+            foreach ($attachments as $file) {
+                $file_id = $is_original_file ? $file['id'] : "";
+                $attachment_list[] = new Attachment($file_id, $file['name'],
+                    $file['mime'], $file['size']);
+            }
+        }
+        $this->event->setAttachments($attachment_list);
+    }
+
+    /**
+     * Build facilities
+     *
+     * @param \GRN_Facility_Facility[]|string[] $facilities
+     */
+    public function buildFacilities(array $facilities)
+    {
+        $render_facilities
+            = $this->renderMemberHolder->getRenderFacilities($facilities);
+        $this->buildFacilitiesFromRenderValues($render_facilities);
+    }
+
+    /**
+     * Build facilities from render facility values
+     *
+     * @param array $render_facilities Facilities that acquired from ScheduleMemberLogic
+     */
+    public function buildFacilitiesFromRenderValues(array $render_facilities)
+    {
+        if ($this->event->getEventType() == Event::EVENT_TYPE_ALL_DAY) {
+            return;
+        }
+
+        $facilities_data = [];
+        foreach ($render_facilities as $facility) {
+            $facilities_data[] = new Facility($facility[MemberLogic::MEMBER_ID],
+                $facility[MemberLogic::DISPLAY_NAME],
+                $facility[MemberLogic::FOREIGN_KEY]);
+        }
+        $this->event->setFacilities($facilities_data);
+    }
+
+    /**
+     * @param array $facilities_candidate must have keys: displayName, foreignKey
+     */
+    public function buildFacilitiesCandidate($facilities_candidate)
+    {
+        if ($this->event->getEventType() != Event::EVENT_TYPE_ALL_DAY) {
+            $facilities_candidate_data = [];
+            if (is_array($facilities_candidate)) {
+                foreach ($facilities_candidate as $facility) {
+                    $facilities_candidate_data[] = new Facility($facility['id'],
+                        $facility['displayName'], $facility['foreignKey']);
+                }
+            }
+            $this->event->setFacilitiesCandidate($facilities_candidate_data);
+        }
+    }
+
+    /**
+     * Build facility reservation info
+     *
+     * @param array $facility_reservation_info_list must have keys: id, type, value
+     */
+    public function buildFacilityReservation($facility_reservation_info_list)
+    {
+        if ($this->event->getEventType() != Event::EVENT_TYPE_ALL_DAY) {
+            if (is_array($facility_reservation_info_list)) {
+                $facility_reservation_info_list_data = [];
+                foreach ($facility_reservation_info_list as $reservation_item) {
+                    if ($reservation_item['use']) {
+                        $type
+                            = FacilityReservationInfoItem::getMappingItemType($reservation_item['type']);
+                        $item_value = $reservation_item['value'] ?? '';
+
+                        // if item value is empty and item type is "drop-down".
+                        // We need get init value if it exist in menu items
+                        if ( ! $item_value
+                             && $type
+                                == FacilityReservationInfoItem::ITEM_TYPE_DROP_DOWN
+                             && $reservation_item['item_menu_textarea']
+                             && is_array($reservation_item['item_menu_textarea'])
+                        ) {
+                            $drop_down_options
+                                = $reservation_item['item_menu_textarea'];
+                            $init_value = $reservation_item['item_menu_text'];
+                            if (in_array($init_value, $drop_down_options)) {
+                                $item_value = $init_value;
+                            }
+                        }
+                        $item = new FacilityReservationInfoItem($type,
+                            $item_value);
+                        $facility_reservation_info_list_data[$reservation_item['id']]
+                            = $item;
+                    }
+                }
+                if ($facility_reservation_info_list_data) {
+                    $this->event->setFacilityReservationInfo($facility_reservation_info_list_data);
+                }
+            }
+        }
+    }
+
+    public function buildFacilityUsageRequests(
+        array $event_facility_ids,
+        EventFacilityApprovals $facility_approvals,
+        FacilityApprovalSettings $facility_approval_settings
+    ) {
+        if ($this->event->getEventType() != Event::EVENT_TYPE_REGULAR
+            || ! $facility_approval_settings->isEnabledAnyFacilities($event_facility_ids)
+        ) {
+            return;
+        }
+
+        $all_facility_ids = array_unique(array_merge($event_facility_ids,
+            $facility_approvals->getFacilityIds()));
+
+        $list = [];
+        foreach ($all_facility_ids as $facility_id) {
+            if ( ! $facility_approval_settings->isEnabled($facility_id)) {
+                continue;
+            }
+
+            $is_in_event_facilities = in_array($facility_id,
+                $event_facility_ids);
+
+            $facility_usage_request = FacilityUsageRequest::create(
+                $facility_id, $is_in_event_facilities,
+                $facility_approvals, $this->renderMemberHolder,
+                $this->isForeignKeyPublic
+            );
+
+            $list[] = $facility_usage_request;
+        }
+
+        $this->event->setFacilityUsageRequests($list);
+    }
+
+    /**
+     * @param string                   $facility_using_purpose
+     * @param string[]                 $event_facility_ids
+     * @param FacilityApprovalSettings $facility_approval_settings
+     */
+    public function buildFacilityUsingPurpose(
+        $facility_using_purpose,
+        array $event_facility_ids,
+        FacilityApprovalSettings $facility_approval_settings
+    ) {
+        if ($this->event->getEventType() == Event::EVENT_TYPE_REGULAR
+            && $facility_approval_settings->isEnabledAnyFacilities($event_facility_ids)
+        ) {
+            $this->event->setFacilityPurpose($facility_using_purpose);
+        }
+    }
+
+    /**
+     * Build watchers
+     *
+     * @param \CB_User[]|\CB_Group[]|\CB_Role[]|array $watchers
+     */
+    public function buildWatchers(array $watchers)
+    {
+        $render_watchers
+            = $this->renderMemberHolder->getRenderNotifyAddresses($watchers);
+        $this->buildWatchersFromRenderValues($render_watchers);
+    }
+
+
+    /**
+     * Build watchers from render watchers values
+     *
+     * @param array $render_watchers Watchers that acquired from ScheduleMemberLogic
+     */
+    public function buildWatchersFromRenderValues(array $render_watchers)
+    {
+        if ($this->event->getEventType() == Event::EVENT_TYPE_ALL_DAY
+            || $this->event->getVisibilityType()
+               != Event::VISIBILITY_TYPE_SET_PRIVATE_WATCHERS
+        ) {
+            return;
+        }
+
+        $render_watchers
+            = $this->renderMemberHolder->getRenderNotifyAddresses($render_watchers);
+        $watcher_list = [];
+        foreach ($render_watchers as $watcher) {
+            $member_type
+                = Member::getMappingMemberType($watcher[MemberLogic::MEMBER_TYPE]);
+            $item = new Member($watcher[MemberLogic::MEMBER_ID],
+                $watcher[MemberLogic::FOREIGN_KEY],
+                $watcher[MemberLogic::DISPLAY_NAME], $member_type,
+                null, $this->isForeignKeyPublic);
+            $watcher_list[] = $item;
+
+        }
+        $this->event->setWatchers($watcher_list);
+    }
+
+    /**
+     * Build watchers candidate
+     *
+     * @param Member[] $watchers_candidate
+     */
+    public function buildWatchersCandidate($watchers_candidate)
+    {
+        if ($this->event->getEventType() != Event::EVENT_TYPE_ALL_DAY
+            && $this->event->getVisibilityType()
+               == Event::VISIBILITY_TYPE_SET_PRIVATE_WATCHERS
+        ) {
+            $this->event->setWatchersCandidate($watchers_candidate);
+        }
+    }
+
+    /**
+     * @param \GRN_Schedule_TemporaryEvent $event
+     */
+    public function buildTemporaryEventCandidates(
+        \GRN_Schedule_TemporaryEvent $event
+    ) {
+        $temporary_event_candidates = [];
+
+        if ($event->isORSearch()) {
+            foreach ($event->setdates as $facility_data) {
+                $facility_info = [
+                    'id'   => $facility_data['facility']->getOID(),
+                    'code' => $facility_data['facility']->get('foreign_key'),
+                    'name' => $facility_data['facility']->get('name')
+                ];
+                foreach ($facility_data['dates'] as $candidate_date) {
+                    $temporary_event_candidate
+                        = $this->makeTemporaryEventCandidate($candidate_date);
+                    $temporary_event_candidate->setFacility($facility_info);
+                    $temporary_event_candidates[] = $temporary_event_candidate;
+                }
+            }
+        } else {
+            foreach ($event->setdates as $candidate_date) {
+                $temporary_event_candidates[]
+                    = $this->makeTemporaryEventCandidate($candidate_date);
+            }
+        }
+        $this->event->setTemporaryEventCandidates($temporary_event_candidates);
+    }
+
+    /**
+     * @param array $date_array
+     *
+     * @return TemporaryEventCandidate
+     */
+    private function makeTemporaryEventCandidate(array $date_array
+    ): TemporaryEventCandidate {
+        $temporary_event_candidate = new TemporaryEventCandidate();
+
+        $current_timezone = \CB_I18N::getInstance()->getCurrentTimezone();
+
+        $end = new DateTime(grn_cbpapi_iso8601($date_array['enddatetime'],
+            false, $current_timezone),
+            $current_timezone);
+        $temporary_event_candidate->setEnd($end);
+
+        $start = new DateTime(grn_cbpapi_iso8601($date_array['setdatetime'],
+            false, $current_timezone),
+            $current_timezone);
+        $temporary_event_candidate->setStart($start);
+
+        return $temporary_event_candidate;
+    }
+
+    /**
+     * @param \GRN_Schedule_EventBase $event
+     */
+    public function buildRepeatId(\GRN_Schedule_EventBase $event)
+    {
+        $utc_start = \CB_I18N::translateDatetimeTimezone($event->getStart(),
+            $event->timezone, "UTC");
+
+        $repeat_id = sprintf('%04d%02d%02d%02d%02d', $utc_start->year,
+            $utc_start->month, $utc_start->day, $utc_start->hour,
+            $utc_start->minute);
+
+        $this->event->setRepeatId($repeat_id);
+    }
+
+    /**
+     * @param string $custom_item_info
+     */
+    public function buildCustomItem($custom_item_info)
+    {
+        $this->event->setCustomItemData($custom_item_info ?? '');
+    }
+
+    /**
+     * Get Event Object
+     *
+     * @return Event
+     */
+    public function getEvent()
+    {
+        return $this->event;
+    }
+}

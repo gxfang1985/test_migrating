@@ -1,0 +1,300 @@
+<?php
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    global $G_INPUT;
+
+    // GET/POSTされたパラメータを取得する
+    $file_id = null;
+    if (array_key_exists('file_id', $G_INPUT)) {
+        $file_id = $G_INPUT['file_id'];
+    }
+    if (0 == strlen($file_id)) {
+        cb_throw_error(E_GRN_CSV_FILE_NOT_FOUND);
+    }
+    $bid = null;
+    if (array_key_exists('bid', $G_INPUT)) {
+        $bid = $G_INPUT['bid'];
+    }
+    if (0 == strlen($bid)) {
+        cb_throw_error(E_GRN_ADDRESS_INVALID_BOOK_ID);
+    }
+    $charset = null;
+    if (array_key_exists('charset', $G_INPUT)) {
+        $charset = $G_INPUT['charset'];
+    }
+    if (0 == strlen($charset)) {
+        global $G_config_common;
+        $charset = $G_config_common->get('I18N', 'default_external_encoding');
+    }
+    $skip = true;
+    if (array_key_exists('skip', $G_INPUT)) {
+        $skip = $G_INPUT['skip'];
+    }
+
+    // セッションからファイルを取得する
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session
+        =& $session_manager->getSession('address/system/access_import1');
+    $files = $session->getFiles('import_files');
+
+    if ( ! is_array($files) || 0 == count($files)) {
+        cb_throw_error(E_GRN_CSV_FILE_NOT_FOUND);
+    }
+    if ( ! array_key_exists($file_id, $files)) {
+        cb_throw_error(E_GRN_CSV_FILE_NOT_FOUND);
+    }
+    $file =& $files[$file_id];
+
+    // アドレス帳を取得する
+    require_once('address/application.csp');
+    $app_locator = GRN_ApplicationLocator::instance();
+    /** @var GRN_Address_Application $app */
+    $app =& $app_locator->getInstance(GRN_ADDRESS_APPLICATION_ID);
+    if ( ! is_object($app) || ! is_a($app, 'GRN_Address_Application')) {
+        cb_throw_error(E_GRN_APPLICATION_NOT_AVAILABLE);
+    }
+    $book_manager =& $app->getBookManager();
+
+    if (-1 != $bid) {
+        if ( ! ($book =& $book_manager->getSharedAddressBook($bid))) {
+            cb_throw_error(E_GRN_ADDRESS_SHARED_ADDRESS_BOOK_NOT_FOUND);
+        }
+        $book_row =& $book->getRow();
+    }
+
+    require_once('address/access.csp');
+    $access_manager = GRN_Address_AccessManager::getInstance();
+
+    global $G_container_base;
+    $uum =& $G_container_base->getInstance('uum');
+    $login = &$uum->getLoginUser();
+
+    require_once('fw/csv.csp');
+    $reader = new CB_CSVReader($charset, $files[$file_id]->getPath());
+
+    for ($i = 0; $i < $skip; ++$i) {
+        $reader->readLine();
+    }
+
+    $csv_columns = [
+        'object_key',
+        'target_type',
+        'authorities',
+        'target_key'
+    ];
+    $csv_columns_num = count($csv_columns);
+
+    // 監査する
+    require_once('address/inspection.csp');
+    $inspection = GRN_Address_Inspection::getInstance();
+    if ($inspection->isEnabled()) {
+        $section = GRN_ADDRESS_INSPECTION_IMPORT;
+        $message = GRN_ADDRESS_INSPECTION_SHARED_ADDRESS_BOOK;
+        $params = ['bid' => $bid];
+
+        $inspection->record($section, $message, $params);
+    }
+
+    $foreign_key = null;
+    $read_line = 0;
+    while (false !== ($line = $reader->readLine())) {
+        if ($csv_columns_num > count($line)) {
+            cb_throw_error(E_GRN_ADDRESS_CSV_INVALID_COLUMNS);
+        }
+
+        if (0 == strlen($line[0])) {
+            cb_throw_error(E_GRN_ADDRESS_SHARED_ADDRESS_BOOK_NOT_FOUND);
+        }
+
+        if (-1 == $bid && $foreign_key != $line[0]) {
+            $foreign_key = $line[0];
+            if ( ! ($book
+                =& $book_manager->getSharedAddressBookByForeignKey($foreign_key))
+            ) {
+                cb_throw_error(E_GRN_ADDRESS_SHARED_ADDRESS_BOOK_NOT_FOUND);
+            }
+            $book_row =& $book->getRow();
+        } elseif ($book_row->get('id') != $line[0]) {
+            continue;
+        }
+        $target_type = $line[1];
+        $target_id = $line[3];
+
+        $target = null;
+        switch ($target_type) {
+            case 'security_model':
+                $target = 'security_model';
+                $security_model = $line[2];
+                break;
+            case 'user':
+                $target =& $uum->getUserByForeignKey($target_id);
+                break;
+            case 'static_role':
+                $target =& $uum->getStaticRoleByForeignKey($target_id);
+                break;
+            case 'dynamic_role':
+                $target = $target_id;
+                break;
+            case 'group':
+                $target =& $uum->getGroupByForeignKey($target_id);
+                break;
+            default:
+                cb_throw_error(E_GRN_ADDRESS_CSV_INVALID_TARGET_TYPE, null,
+                    ['target_type' => $target_type]);
+                break;
+        }
+
+        if ( ! $target) {
+            cb_throw_error(E_GRN_ADDRESS_CSV_INVALID_TARGET, null,
+                ['target_id' => $target_id]);
+        }
+
+        if ('security_model' != $target_type
+            && $csv_columns_num > count($line)
+        ) {
+            cb_throw_error(E_GRN_ADDRESS_CSV_INVALID_COLUMNS);
+        }
+
+        if (is_object($target)) {
+            $target_id = $target->getOID();
+        } else {
+            $target_id = $target;
+        }
+
+        if ('security_model' == $target_type) {
+            if ('revoke' == $security_model) {
+                $security_model = GRN_ADDRESS_SECURITYMODEL_REVOKE;
+            } elseif ('grant' == $security_model) {
+                $security_model = GRN_ADDRESS_SECURITYMODEL_GRANT;
+            } else {
+                cb_throw_error(E_GRN_ADDRESS_ACCESS_INVALID_SECURITYMODEL);
+            }
+            $access_manager->setSecurityModel($book_row, $security_model);
+            continue;
+        }
+
+        $value = $line[2];
+        if ($value !== '' && preg_match('/[^BE]/i', $value)) {
+            cb_throw_error(E_GRN_ADDRESS_CSV_INVALID_AUTHORITIES, null,
+                ['value' => $value]);
+        }
+
+        $sum = 0;
+        $authorities = ['browse' => 0, 'editing' => 0];
+        if (GRN_ADDRESS_SECURITYMODEL_REVOKE
+            == $access_manager->getSecurityModel($book_row)
+        ) {
+            if (0 === preg_match('/B/i', $value)) {
+                $authorities['browse'] = 1;
+            }
+            if (0 === preg_match('/E/i', $value)) {
+                $authorities['editing'] = 1;
+            }
+
+            if ($authorities['browse'] == 1 && $authorities['editing'] == 0) {
+                $authorities['browse'] = 0;
+            }
+
+            foreach ($authorities as $key => $value) {
+                $sum += $value;
+            }
+        } else {
+            if (0 !== preg_match('/B/i', $value)) {
+                $authorities['browse'] = 1;
+            }
+            if (0 !== preg_match('/E/i', $value)) {
+                $authorities['editing'] = 1;
+            }
+
+            if ($authorities['browse'] == 0 && $authorities['editing'] == 1) {
+                $authorities['browse'] = 1;
+            }
+
+            foreach ($authorities as $key => $value) {
+                $sum += $value;
+            }
+        }
+
+        if (0 < $sum) {
+            if ($access =& $access_manager->getAccess($book_row, $target)) {
+                foreach ($authorities as $key => $value) {
+                    $access->set('authority_' . $key, $value);
+                }
+
+                // 監査する
+                require_once('address/inspection.csp');
+                $inspection = GRN_Address_Inspection::getInstance();
+                if ($inspection->isEnabled()) {
+                    $target_name = $access_manager->getTargetName($target);
+                    $target_id = $access_manager->getTargetId($target);
+                    $keys = [];
+                    foreach ($authorities as $key => $value) {
+                        if ($value) {
+                            $keys[] = $key;
+                        }
+                    }
+                    $id_name = '';
+                    $id_value = '';
+                    switch ($target_name) {
+                        case GRN_ADDRESS_TARGET_USER:
+                            $id_name = 'uid';
+                            $id_value = $target_id;
+                            break;
+                        case GRN_ADDRESS_TARGET_GROUP:
+                            $id_name = 'gid';
+                            $id_value = $target_id;
+                            break;
+                        case GRN_ADDRESS_TARGET_STATICROLE:
+                            $id_name = 'rid';
+                            $id_value = $target_id;
+                            break;
+                        case GRN_ADDRESS_TARGET_DYNAMICROLE:
+                            $id_name = 'dynamic_role';
+                            $id_value = $target_id;
+                            break;
+                    }
+                    $section = GRN_ADDRESS_INSPECTION_MODIFY;
+                    $params = [];
+                    $informations = [];
+                    $message = GRN_ADDRESS_INSPECTION_ACCESS;
+                    if (false !== ($index = array_search('operation', $keys))) {
+                        unset($keys[$index]);
+                    }
+                    $informations['auth'] = implode('/', $keys);
+                    $params['bid'] = $book_row->getOID();
+                    $params[$id_name] = $id_value;
+
+                    $inspection->record($section, $message, $params,
+                        $informations);
+                }
+            } else {
+                $access_manager->addAccess($book_row, $target, $authorities);
+            }
+        } else {
+            require_once('grn/access_resources.csp');
+            $target_types = [
+                GRN_ACCESS_TARGET_TYPE_USER         => GRN_ADDRESS_TARGET_USER,
+                GRN_ACCESS_TARGET_TYPE_GROUP        => GRN_ADDRESS_TARGET_GROUP,
+                GRN_ACCESS_TARGET_TYPE_STATIC_ROLE  => GRN_ADDRESS_TARGET_STATICROLE,
+                GRN_ACCESS_TARGET_TYPE_DYNAMIC_ROLE => GRN_ADDRESS_TARGET_DYNAMICROLE
+            ];
+
+            require_once('grn/access_resources.csp');
+            $authorities['operation'] = 1;
+            $access_info
+                = [$target_types[$target_type] => [$target_id]];
+            $access_manager->removeAccesses($book_row, $authorities,
+                $access_info);
+        }
+    }
+    $reader->close();
+
+    foreach (array_keys($files) as $key) {
+        $session->unsetFile('import_files', $key);
+    }
+
+    cb_redirect('system/application_list', ['app_id' => 'address']);
+}
+
+

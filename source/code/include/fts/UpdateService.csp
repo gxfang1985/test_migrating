@@ -1,0 +1,146 @@
+<?php
+
+namespace grn\fts;
+
+use grn\cydec\mq\FTSIndexJobMessage;
+use grn\cydec\mq\JobNameConstants;
+use grn\cydec\mq\MessageQueue;
+use grn\cydec\mq\QueueRecord;
+use grn\cydec\mq\QueueRecordBuilder;
+use grn\fts\filter\SearchFilterInterface;
+use grn\fts\mail\cleanup\service\DeleteTempFileRegisterService;
+
+class UpdateService implements UpdateServiceInterface, \CB_Transactional
+{
+    const METHOD_ADD = 'add';
+    const METHOD_DELETE = 'delete';
+
+    /** @var QueueRecordBuilder */
+    private $bulkAddRecordBuilder;
+    /** @var QueueRecordBuilder */
+    private $addRecordBuilder;
+    /** @var QueueRecordBuilder */
+    private $deleteRecordBuilder;
+    /** @var string */
+    private $lastQueueId = "";
+
+    /** @var MessageQueue messageQueue */
+    private $messageQueue;
+
+    /** @var  \Closure */
+    private $onBuildFunction;
+
+    public function boot()
+    {
+        $transactionManager = \CB_TransactionManager::getInstance();
+        $transactionManager->register(CB_TRANSACTION_LEVEL_FILE, $this);
+        $this->messageQueue = new MessageQueue();
+        $this->initProperty();
+    }
+
+    /**
+     * Commit changes.  Implementers must be aware that this may
+     * be called many times during the process request.
+     *
+     * @return bool    TRUE if the commit succeeds; otherwise FALSE.
+     */
+    public function commit()
+    {
+        try {
+            $this->deleteRecordBuilder->build();
+            $this->addRecordBuilder->build();
+            $this->bulkAddRecordBuilder->build();
+        } catch (\Exception $e) {
+            return false;
+        }
+        $this->onCommitSuccess();
+        $this->initProperty();
+
+        return true;
+    }
+
+    /**
+     * Abort and discard changes.  Implementers must be aware that
+     * this may be called many times during the process request.
+     */
+    public function abort()
+    {
+        $this->initProperty();
+    }
+
+    private function initProperty()
+    {
+        $this->onBuildFunction = function (array $records) {
+            $this->enqueue($records);
+        };
+
+        $this->addRecordBuilder
+            = new QueueRecordBuilder(new FTSIndexJobMessage(self::METHOD_ADD,
+            JobNameConstants::FTS_INDEXER), $this->onBuildFunction);
+        $this->bulkAddRecordBuilder
+            = new QueueRecordBuilder(new FTSIndexJobMessage(self::METHOD_ADD,
+            JobNameConstants::FTS_BULK_INDEXER), $this->onBuildFunction);
+        $this->deleteRecordBuilder
+            = new QueueRecordBuilder(new FTSIndexJobMessage(self::METHOD_DELETE,
+            JobNameConstants::FTS_INDEXER), $this->onBuildFunction);
+    }
+
+    /**
+     * @param SearchEntryInterface $entry
+     */
+    public function updateIndex(SearchEntryInterface $entry)
+    {
+        $this->addRecordBuilder->addArgument($entry->getMessage(FtsProduct::solr()));
+    }
+
+    /**
+     * @param SearchEntryInterface[] $entries
+     * @param string                 $forward
+     */
+    public function bulkUpdateIndex(array $entries, $forward)
+    {
+        $this->bulkAddRecordBuilder->setForward($forward);
+        foreach ($entries as $entry) {
+            $this->bulkAddRecordBuilder->addArgument($entry->getMessage(FtsProduct::solr()));
+        }
+    }
+
+    /**
+     * Delete an index by an id.
+     *
+     * @param string $id
+     */
+    public function deleteById($id)
+    {
+        $this->deleteRecordBuilder->addArgument([SearchFields::ID_FIELD => $id]);
+    }
+
+    /**
+     * Delete indexes by a query.
+     *
+     * @param SearchFilterInterface $query
+     */
+    public function deleteByQuery(SearchFilterInterface $query)
+    {
+        $this->deleteRecordBuilder->addArgument(
+            [SearchConstants::QUERY_KEY => $query->getQuery(FtsProduct::solr())]
+        );
+    }
+
+    /**
+     * @param QueueRecord[] $queueRecords
+     */
+    private function enqueue(array $queueRecords)
+    {
+        foreach ($queueRecords as $record) {
+            $this->lastQueueId = $this->messageQueue->enqueue($record);
+        }
+    }
+
+    private function onCommitSuccess()
+    {
+        $deleteFileJobRegisterService
+            = DeleteTempFileRegisterService::getInstance();
+        $deleteFileJobRegisterService->register($this->lastQueueId);
+    }
+}

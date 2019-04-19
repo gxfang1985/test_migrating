@@ -1,0 +1,1276 @@
+<?php
+
+/**
+ * Access right for Address.
+ *
+ * @author  YOSHIDA, Hideyasu 2005/02
+ * @version 1.0
+ * @package grn.address
+ */
+
+require_once('grn/access_table.csp');
+require_once('grn/access_logic.csp');
+require_once('address/error_code.csp');
+require_once('address/resources.csp');
+require_once('address/table.csp');
+
+/**
+ * アクセス権管理クラス
+ *
+ * @package grn.address
+ */
+class GRN_Address_AccessManager extends CB_ModuleBase
+{
+    /**
+     * @var GRN_Address_AccessManager $_instance
+     *
+     */
+    private static $_instance = null;
+
+    /**
+     * シングルトンを取得する
+     *
+     * @return GRN_Address_AccessManager|null
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * @access private
+     */
+    var $_table_manager = null;
+    /**
+     * @access private
+     */
+    var $_uum = null;
+    /**
+     * @access private
+     */
+    var $_common_policy = null;
+
+    /**
+     * コンストラクタ
+     */
+    function __construct()
+    {
+        parent::__construct(GRN_ADDRESS_MODULE_ID);
+
+        global $G_container_base;
+        $app_locator = GRN_ApplicationLocator::instance();
+        $this->_table_manager = $app_locator->getTableManager('address');
+        $this->_uum = $G_container_base->getInstance('uum');
+
+        global $G_container_app;
+        $this->_common_policy = $G_container_app->getInstance('common_policy');
+    }
+
+    /**
+     * セキュリティ・モデルを取得する
+     */
+    function getSecurityModel($object)
+    {
+        $object_security_model = $object->get('security_model');
+
+        $module_id = $this->getModuleId();
+        $section = 'security_model';
+        $policy_securyti_model = $this->_common_policy->getPolicy($module_id,
+            $section);
+
+        if (is_null($object_security_model)
+            && 'revoke' == $policy_securyti_model
+        ) {
+            return GRN_ADDRESS_SECURITYMODEL_REVOKE;
+        }
+
+        return is_null($object_security_model) ? 0 : $object_security_model;
+    }
+
+    /**
+     * セキュリティ・モデルを設定する
+     */
+    function setSecurityModel($object, $security_model, $authorities = null)
+    {
+        $old_security_model = $this->getSecurityModel($object);
+        if ($security_model != $old_security_model) {
+            $object->set('security_model', intval($security_model));
+            $object->updateNow();
+
+            // 監査する
+            require_once('address/inspection.csp');
+            $inspection = GRN_Address_Inspection::getInstance();
+            if ($inspection->isEnabled()) {
+                $section = GRN_ADDRESS_INSPECTION_CONFIG;
+                $params = [];
+                switch (strtolower(get_class($object))) {
+                    case 'grn_address_sharedbook':
+                        $section = GRN_ADDRESS_INSPECTION_MODIFY;
+                        $message = GRN_ADDRESS_INSPECTION_ACCESS;
+                        $params['bid'] = $object->getOID();
+                        break;
+                    case 'grn_access_abstractdata':
+                        $message = GRN_ADDRESS_INSPECTION_AVAILABILITY;
+                        break;
+                    default:
+                        assert('FALSE');
+                }
+
+                $informations = [];
+                if (GRN_ADDRESS_SECURITYMODEL_REVOKE == $security_model) {
+                    $informations['security_model'] = 'revoke';
+                } else {
+                    $informations['security_model'] = 'grant';
+                }
+
+                $inspection->record($section, $message, $params, $informations);
+            }
+
+            $this->removeAccesses($object, $authorities);
+        }
+    }
+
+    var $_target_map
+        = [
+            GRN_ADDRESS_TARGET_DYNAMICROLE => null,
+            GRN_ADDRESS_TARGET_STATICROLE  => 'CB_Role',
+            GRN_ADDRESS_TARGET_GROUP       => 'CB_Group',
+            GRN_ADDRESS_TARGET_USER        => 'CB_User'
+        ];
+
+    /**
+     * アクセス権テーブルを生成する
+     */
+    function createAccessTable($access_info)
+    {
+        $object_name = substr($access_info['to_table'], 4);
+        if (array_key_exists('unique_key', $access_info)) {
+            $object_name .= '_' . $access_info['unique_key'];
+        }
+
+        foreach ($this->_target_map as $target_name => $target_table) {
+            $table_name = 'GRN_' . $object_name . '_' . $target_name;
+            $table_info = $this->_getTableInfo($table_name);
+
+            $column_name = 'object';
+            $column_info = [];
+            $column_info['type'] = 'relation';
+            $column_info['to'] = $access_info['to_table'];
+            $table_info->addColumn($column_name, $column_info);
+
+            $column_name = 'target';
+            $column_info = [];
+            if (is_null($target_table)) {
+                $column_info['type'] = 'char';
+                $column_info['length'] = 100;
+            } else {
+                $column_info['type'] = 'relation';
+                $column_info['to'] = $target_table;
+            }
+            $table_info->addColumn($column_name, $column_info);
+
+            $column_info = [];
+            foreach ($access_info['authorities'] as $authority) {
+                $column_name = 'authority_' . $authority;
+                $column_info['type'] = 'int';
+                $table_info->addColumn($column_name, $column_info);
+            }
+
+            $index_name = 'o_t';
+            $index_info = [];
+            $index_info['cols'] = ['object', 'target'];
+            $index_info['unique'] = true;
+            $table_info->addIndex($index_name, $index_info);
+
+            $table_info->createTable();
+        }
+    }
+
+    /**
+     * アクセス権テーブルを破棄する
+     */
+    function dropAccessTable($access_info)
+    {
+        $object_name = substr($access_info['to_table'], 4);
+        if (array_key_exists('unique_key', $access_info)) {
+            $object_name .= '_' . $access_info['unique_key'];
+        }
+
+        foreach (array_keys($this->_target_map) as $target_name) {
+            $table_name = 'GRN_' . $object_name . '_' . $target_name;
+            $table_info = $this->_getTableInfo($table_name);
+            $table_info->dropTable();
+        }
+    }
+
+    /**
+     * 抽象データを取得する
+     *
+     * @param string $unique_key
+     *
+     * @return GRN_Access_AbstractData
+     */
+    function getAbstractData($unique_key)
+    {
+        $dbconn = $this->_table_manager->getDBConnection();
+        $query = cb_queryf($dbconn, "col_unique_key = '@S'", $unique_key);
+        $logic = GRN_Access_AbstractDataLogic::getInstance();
+        $object = $logic->get(null, $query);
+
+        return $object;
+    }
+
+    /**
+     * アクセス権をかける標的の名前を取得する
+     */
+    function getTargetName($target)
+    {
+        switch (gettype($target)) {
+            case 'string':
+                return GRN_ADDRESS_TARGET_DYNAMICROLE;
+            case 'object':
+                switch (strtolower(get_class($target))) {
+                    case 'cb_group':
+                        return GRN_ADDRESS_TARGET_GROUP;
+                    case 'cb_role':
+                        return GRN_ADDRESS_TARGET_STATICROLE;
+                    case 'cb_user':
+                        return GRN_ADDRESS_TARGET_USER;
+                    default:
+                        assert('FALSE');
+                }
+            default:
+                assert('FALSE');
+        }
+    }
+
+    /**
+     * アクセス権をかける標的の識別子を取得する
+     */
+    function getTargetId($target)
+    {
+        switch (gettype($target)) {
+            case 'string':
+                return $target;
+            case 'object':
+                return $target->getOID();
+            default:
+                assert('FALSE');
+        }
+    }
+
+    /**
+     * テーブル名を取得する
+     *
+     * @access private
+     */
+    function _getTableName($object, $target_name)
+    {
+        switch (gettype($object)) {
+            case 'string':
+                $object_name = $object;
+                break;
+            case 'object':
+                $object_name = strtolower(get_class($object));
+                if (is_a($object, 'GRN_Access_AbstractData')) {
+                    $object_name = 'grn_access_abstractdata_'
+                                   . $object->get('unique_key');
+                }
+                $object_name = substr($object_name, 4);
+                break;
+            default:
+                assert('FALSE');
+        }
+
+        return 'GRN_' . $object_name . '_' . $target_name;
+    }
+
+    /**
+     * @type CB_TableInfo[] $_table_infos
+     * @access private
+     */
+    var $_table_infos = [];
+
+    /**
+     * テーブル情報を取得する
+     *
+     * @access private
+     */
+    function _getTableInfo($table_name)
+    {
+        if ( ! array_key_exists($table_name, $this->_table_infos)) {
+            $this->_table_infos[$table_name]
+                = $this->_table_manager->getTableInfo($table_name);
+        }
+
+        return $this->_table_infos[$table_name];
+    }
+
+    /**
+     * アクセス権を追加する
+     */
+    function addAccess($object, $target, $authorities)
+    {
+        $target_name = $this->getTargetName($target);
+        $table_name = $this->_getTableName($object, $target_name);
+        $table_info = $this->_getTableInfo($table_name);
+
+        $row = $table_info->newRow();
+        $row->set('object', $object);
+        $row->set('target', $target);
+        foreach ($authorities as $key => $value) {
+            $row->set('authority_' . $key, intval($value));
+        }
+        $row->registerNow();
+
+        // 監査する
+        require_once('address/inspection.csp');
+        $inspection = GRN_Address_Inspection::getInstance();
+        if ($inspection->isEnabled()) {
+            $target_id = $this->getTargetId($target);
+            $id_name = '';
+            $id_value = '';
+            switch ($target_name) {
+                case GRN_ADDRESS_TARGET_USER:
+                    $id_name = 'uid';
+                    $id_value = $target_id;
+                    break;
+                case GRN_ADDRESS_TARGET_GROUP:
+                    $id_name = 'gid';
+                    $id_value = $target_id;
+                    break;
+                case GRN_ADDRESS_TARGET_STATICROLE:
+                    $id_name = 'rid';
+                    $id_value = $target_id;
+                    break;
+                case GRN_ADDRESS_TARGET_DYNAMICROLE:
+                    $id_name = 'dynamic_role';
+                    $id_value = $target_id;
+                    break;
+            }
+            $keys = [];
+            foreach ($authorities as $key => $value) {
+                if ($value) {
+                    $keys[] = $key;
+                }
+            }
+
+            $section = GRN_ADDRESS_INSPECTION_CREATE;
+            $message = '';
+            $params = [];
+            $informations = [];
+            switch (strtolower(get_class($object))) {
+                case 'grn_address_sharedbook':
+                    if (@ $authorities['operation']) {
+                        $message .= GRN_ADDRESS_INSPECTION_PRIVILEGE;
+                    } else {
+                        $message .= GRN_ADDRESS_INSPECTION_ACCESS;
+                        if (false !== ($index = array_search('operation',
+                                $keys))
+                        ) {
+                            unset($keys[$index]);
+                        }
+                        $informations['auth'] = implode('/', $keys);
+                    }
+                    $params['bid'] = $object->getOID();
+                    break;
+                case 'grn_access_abstractdata':
+                    $message .= GRN_ADDRESS_INSPECTION_AVAILABILITY;
+                    $informations['authorities'] = implode('/', $keys);
+                    break;
+                default:
+                    assert('FALSE');
+            }
+            $params[$id_name] = $id_value;
+
+            $inspection->record($section, $message, $params, $informations);
+        }
+
+        return $row;
+    }
+
+    /**
+     * アクセス権を取得する
+     */
+    function getAccessById($object, $target_name, $access_id)
+    {
+        $table_name = $this->_getTableName($object, $target_name);
+        $table_info = $this->_getTableInfo($table_name);
+
+        if ( ! ($row = $table_info->getRow($access_id))
+             || is_null($row->get('target'))
+        ) {
+            {
+                $___ret = false;
+
+                return $___ret;
+            }
+        }
+
+        return $row;
+    }
+
+    /**
+     * アクセス権を取得する
+     */
+    function getAccess($object, $target)
+    {
+        $target_name = $this->getTargetName($target);
+        $table_name = $this->_getTableName($object, $target_name);
+        $table_info = $this->_getTableInfo($table_name);
+
+        $object_id = $object->getOID();
+        $target_id = $this->getTargetId($target);
+
+        $rowset = new CB_RowSet($table_info);
+        $condition = $rowset->queryf("col_object = '@S' AND col_target = '@S'",
+            $object_id, $target_id);
+        $rowset->addCondition($condition);
+
+        $this->_addUserJoin($rowset, $target, $table_name);
+
+        if (is_null($row = $rowset->iterate())) {
+            {
+                $___ret = false;
+
+                return $___ret;
+            }
+        }
+
+        return $row;
+    }
+
+    /**
+     * Get list of access rights of specified object.
+     *
+     * The object is a shared book or the abstract data of address application.
+     *
+     * @param GRN_Address_Book|GRN_Access_AbstractData $object
+     *
+     * @return array
+     */
+    function listAccesses($object)
+    {
+        $db = cb_get_app_db('address');
+
+        $accesses = [];
+
+        foreach ($this->_target_map as $target_type => $target_table_class_name) {
+            $access_table_name = CB_DATABASE_TABLE_PREFIX
+                                 . strtolower($this->_getTableName($object,
+                    $target_type));
+
+            $query_parts = [];
+            $query_parts[] = "SELECT a.* FROM ${access_table_name} AS a";
+
+            if ($target_type === GRN_ADDRESS_TARGET_DYNAMICROLE) {
+                $query_parts[] = $db->format("WHERE col_object = '@S'",
+                    [$object->getOID()]);
+                $query_parts[] = "ORDER BY a._id";
+            } else {
+                $target_table_name = CB_DATABASE_TABLE_PREFIX
+                                     . strtolower($target_table_class_name);
+                $query_parts[]
+                    = "INNER JOIN ${target_table_name} AS t ON a.col_target = t._id";
+                $query_parts[] = $db->format("WHERE col_object = '@S'",
+                    [$object->getOID()]);
+                if ($target_type === GRN_ADDRESS_TARGET_USER) {
+                    $query_parts[] = "AND t.col_deleted IS NULL";
+                    $query_parts[] = "ORDER BY t.col_position, t._id";
+                } else {
+                    $query_parts[] = "ORDER BY t.col_list_index, t._id";
+                }
+            }
+
+            $query = join(' ', $query_parts);
+            $result = $db->query($query);
+
+            $access_table_info
+                = $this->_getTableInfo($this->_getTableName($object,
+                $target_type));
+
+            $accesses[$target_type] = [];
+            while ($row = $db->fetch_assoc($result)) {
+                $accesses[$target_type][$row['_id']]
+                    = $access_table_info->getRow($row['_id'], $row);
+            }
+        }
+
+        return $accesses;
+    }
+
+    function listAccessCounts($objects, $authorities)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $database = $app_locator->getConnection('address');
+
+        $conditions = [];
+        $access_counts = [];
+        foreach (array_keys($objects) as $object_id) {
+            $object = $objects[$object_id];
+            $conditions[] = cb_queryf($database,
+                "a.col_object = '@S'", $object_id);
+            $access_counts[$object_id] = 0;
+        }
+
+        if (0 < count($conditions)) {
+            $additional_conditions = [];
+            $additional_conditions[] = '( ' . implode(' OR ', $conditions)
+                                       . ' )';
+
+            $conditions = [];
+            foreach ($authorities as $authority) {
+                $conditions[] = cb_queryf($database, "col_authority_@S = '1'",
+                    $authority);
+            }
+
+            if (0 < count($conditions)) {
+                $additional_conditions[] = '( ' . implode(' OR ', $conditions)
+                                           . ' )';
+                $additional_condition = implode(' AND ',
+                    $additional_conditions);
+
+                foreach ($this->_target_map as $target_name => $target_table) {
+                    $table_name = $this->_getTableName($object, $target_name);
+                    $table_info = $this->_getTableInfo($table_name);
+
+                    $rowset = new CB_RowSet($table_info, 'a');
+                    if ( ! is_null($target_table)) {
+                        $target_table_info
+                            = $this->_getTableInfo($target_table);
+                        $join_condition = 'a.col_target = t._id';
+                        if (strcasecmp($target_name, 'user') === 0) {
+                            $join_condition .= ' AND t.col_deleted IS NULL';
+                        }
+                        $join_type = CB_DATABASE_INNER_JOIN;
+                        $join_alias = 't';
+
+                        $rowset->addJoin($target_table_info, $join_condition,
+                            $join_type, $join_alias);
+                    }
+                    $group_functions = ['count' => 'COUNT(*)'];
+                    $group_by = ['_id' => 'a.col_object'];
+
+                    $rowset->addCondition($additional_condition);
+                    $rowset->applyGroupFunctions($group_functions, $group_by);
+
+                    while ( ! is_null($result = $rowset->iterate())) {
+                        $object_id = $result['_id'];
+                        $access_counts[$object_id] += $result['count'];
+                    }
+                }
+            }
+        }
+
+        return $access_counts;
+    }
+
+    /**
+     * 全てのアクセス権を削除する
+     */
+    function _removeAllAccesses($object, $authorities)
+    {
+        foreach (array_keys($this->_target_map) as $target_name) {
+            $table_name = $this->_getTableName($object, $target_name);
+            $table_info = $this->_getTableInfo($table_name);
+
+            $rowset = new CB_RowSet($table_info);
+
+            $condition = $rowset->queryf("col_object = '@S'",
+                $object->getOID());
+            $rowset->addCondition($condition);
+
+            if (is_null($authorities)) {
+                $rowset->deleteAllMatched();
+            } else {
+                while ( ! is_null($row = $rowset->iterate())) {
+                    $evaluated_value = 0;
+                    foreach ($authorities as $key => $value) {
+                        if ($value) {
+                            $value = $row->get('authority_' . $key);
+                            $evaluated_value |= intval($value);
+                        } else {
+                            $row->set('authority_' . $key, $value);
+                        }
+                    }
+                    if (0 == $evaluated_value) {
+                        $row->delete();
+                    }
+                }
+            }
+        }
+
+        // 監査する
+        require_once('address/inspection.csp');
+        $inspection = GRN_Address_Inspection::getInstance();
+        if ($inspection->isEnabled()) {
+            $section = GRN_ADDRESS_INSPECTION_DELETE_ALL;
+            $params = [];
+            switch (strtolower(get_class($object))) {
+                case 'grn_address_sharedbook':
+                    if (@ $authorities['operation']) {
+                        $message = GRN_ADDRESS_INSPECTION_ACCESS;
+                    } else {
+                        $message = GRN_ADDRESS_INSPECTION_PRIVILEGE;
+                    }
+                    $params['bid'] = $object->getOID();
+                    break;
+                case 'grn_access_abstractdata':
+                    $message = GRN_ADDRESS_INSPECTION_AVAILABILITY;
+                    break;
+                default:
+                    assert('FALSE');
+            }
+
+            $inspection->record($section, $message, $params);
+        }
+    }
+
+    /**
+     * 複数のアクセス権を削除する
+     */
+    function _removeAccesses($object, $authorities, $access_info)
+    {
+        foreach (array_keys($access_info) as $target_name) {
+            $target_ids =& $access_info[$target_name];
+
+            if (0 == count($target_ids)) {
+                continue;
+            }
+
+            $table_name = $this->_getTableName($object, $target_name);
+            $table_info = $this->_getTableInfo($table_name);
+
+            $rowset = new CB_RowSet($table_info);
+
+            $condition = $rowset->queryf("col_object='@S'", $object->getOID());
+            $rowset->addCondition($condition);
+
+            $condition = $rowset->queryf("col_target IN (@A)", $target_ids);
+            $rowset->addCondition($condition);
+
+            if (is_null($authorities)) {
+                $rowset->deleteAllMatched();
+            } else {
+                while ( ! is_null($row = $rowset->iterate())) {
+                    $evaluated_value = 0;
+                    foreach ($authorities as $key => $value) {
+                        $key = 'authority_' . $key;
+                        if ($value) {
+                            $value = $row->get($key);
+                            $evaluated_value |= intval($value);
+                        } else {
+                            $row->set($key, $value);
+                        }
+                    }
+
+                    if (0 == $evaluated_value) {
+                        $row->delete();
+                    }
+                }
+            }
+
+            // 監査する
+            require_once('address/inspection.csp');
+            $inspection = GRN_Address_Inspection::getInstance();
+            if ($inspection->isEnabled()) {
+                $section = GRN_ADDRESS_INSPECTION_DELETE;
+                $params = [];
+                switch (strtolower(get_class($object))) {
+                    case 'grn_address_sharedbook':
+                        if (@ $authorities['operation']) {
+                            $message = GRN_ADDRESS_INSPECTION_ACCESS;
+                        } else {
+                            $message = GRN_ADDRESS_INSPECTION_PRIVILEGE;
+                        }
+                        $params['bid'] = $object->getOID();
+                        break;
+                    case 'grn_access_abstractdata':
+                        $message = GRN_ADDRESS_INSPECTION_AVAILABILITY;
+                        break;
+                    default:
+                        assert('FALSE');
+                }
+                $id_name = '';
+                switch ($target_name) {
+                    case GRN_ADDRESS_TARGET_USER:
+                        $id_name = 'uid';
+                        break;
+                    case GRN_ADDRESS_TARGET_GROUP:
+                        $id_name = 'gid';
+                        break;
+                    case GRN_ADDRESS_TARGET_STATICROLE:
+                        $id_name = 'rid';
+                        break;
+                    case GRN_ADDRESS_TARGET_DYNAMICROLE:
+                        $id_name = 'dynamic_role';
+                        break;
+                }
+                foreach ($target_ids as $target_id) {
+                    $params[$id_name] = $target_id;
+                    $inspection->record($section, $message, $params);
+                }
+            }
+        }
+    }
+
+    /**
+     * アクセス権一覧を削除する
+     */
+    function removeAccesses($object, $authorities = null, $access_info = null)
+    {
+        if (is_null($access_info)) {
+            $this->_removeAllAccesses($object, $authorities);
+        } else {
+            $this->_removeAccesses($object, $authorities, $access_info);
+        }
+    }
+
+    /**
+     * @access private
+     */
+    var $_evaluation_info
+        = [
+            [
+                'retval_true'    => true,
+                'retval_false'   => false,
+                'initial_access' => 1,
+                'operations'     => [
+                    0 => [
+                        0 => 0,
+                        1 => 0
+                    ],
+                    1 => [
+                        0 => 0,
+                        1 => 1
+                    ]
+                ]
+            ],
+            [
+                'retval_true'    => false,
+                'retval_false'   => true,
+                'initial_access' => 0,
+                'operations'     => [
+                    0 => [
+                        0 => 0,
+                        1 => 1
+                    ],
+                    1 => [
+                        0 => 1,
+                        1 => 1
+                    ]
+                ]
+            ]
+        ];
+
+    /**
+     * オブジェクトのアクセス権を評価する
+     */
+    function evaluateAccess(
+        $object,
+        $user,
+        $dynamic_roles,
+        $authorities,
+        $force_security_model = false
+    ) {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $database = $app_locator->getConnection('address');
+
+        $object_name = strtolower(get_class($object));
+        $object_id = $object->getOID();
+        if (array_key_exists($object_id, $this->_cached_access)) {
+            return $this->_cached_access[$object_name][$object_id];
+        }
+
+        $targets = [];
+        $targets[GRN_ADDRESS_TARGET_DYNAMICROLE] = $dynamic_roles;
+
+        $user_id = $user->getOID();
+        $targets[GRN_ADDRESS_TARGET_USER] = [$user_id => $user];
+
+        if (false === ($static_roles = $this->_uum->getUserRoles($user_id))) {
+            assert('FALSE');
+        }
+        $targets[GRN_ADDRESS_TARGET_STATICROLE] = $static_roles;
+
+        if (false === ($groups = $this->_uum->getUserGroups($user_id))) {
+            assert('FALSE');
+        }
+        $targets[GRN_ADDRESS_TARGET_GROUP] = $groups;
+
+        if ($force_security_model) {
+            $security_model = $force_security_model;
+        } else {
+            $security_model = $this->getSecurityModel($object);
+        }
+
+        $conditions = [];
+        foreach ($authorities as $authority) {
+            $conditions[] = cb_queryf($database, "col_authority_@S = '1'",
+                $authority);
+        }
+        $base_condition = cb_queryf($database, "col_object = '@S'", $object_id);
+        $base_condition = $base_condition . " AND (" . implode(' OR ',
+                $conditions) . ") AND ";
+
+        $cached_access = [];
+        foreach (array_keys($this->_target_map) as $target_name) {
+            if (0 == count($targets[$target_name])) {
+                continue;
+            }
+
+            $table_name = $this->_getTableName($object, $target_name);
+            $table_info = $this->_getTableInfo($table_name);
+            $rowset = new CB_RowSet($table_info);
+
+            $conditions = [];
+            foreach (array_keys($targets[$target_name]) as $target_id) {
+                $conditions[] = $rowset->queryf("col_target = '@S'",
+                    $target_id);
+            }
+            $condition = $base_condition . '( ' . implode(' OR ', $conditions)
+                         . ' )';
+            $rowset->addCondition($condition);
+
+            $this->_addUserJoin($rowset, $target_name, $table_name);
+
+            while ( ! is_null($row = $rowset->iterate())) {
+                foreach ($authorities as $authority) {
+                    $access = $row->get('authority_' . $authority);
+                    if ($access > @ $cached_access[$authority]) {
+                        $cached_access[$authority] = $access;
+                    }
+                }
+            }
+        }
+        if ( ! array_key_exists($object_name, $this->_cached_access)) {
+            $this->_cached_access[$object_name] = [];
+        }
+        $this->_cached_access[$object_name][$object_id] = $cached_access;
+
+        return $cached_access;
+    }
+
+    var $_cached_access = [];
+
+    /**
+     * 複数のオブジェクトのアクセス権を評価する
+     */
+    function evaluateAccesses(
+        $objects,
+        $user,
+        $dynamic_roles,
+        $authorities,
+        $force_security_model = false
+    ) {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $database = $app_locator->getConnection('address');
+
+        $targets = [];
+        $targets[GRN_ADDRESS_TARGET_DYNAMICROLE] = $dynamic_roles;
+
+        $user_id = $user->getOID();
+        $targets[GRN_ADDRESS_TARGET_USER] = [$user_id => $user];
+
+        if (false === ($static_roles = $this->_uum->getUserRoles($user_id))) {
+            assert('FALSE');
+        }
+        $targets[GRN_ADDRESS_TARGET_STATICROLE] = $static_roles;
+
+        if (false === ($groups = $this->_uum->getUserGroups($user_id))) {
+            assert('FALSE');
+        }
+        $targets[GRN_ADDRESS_TARGET_GROUP] = $groups;
+
+        $cached_access = [];
+        $conditions = [];
+        foreach (array_keys($objects) as $object_id) {
+            $object = $objects[$object_id];
+            if ($force_security_model) {
+                $security_model = $force_security_model;
+            } else {
+                $security_model = $this->getSecurityModel($object);
+            }
+
+            $cached_access[$object_id] = [];
+            $conditions[] = cb_queryf($database,
+                "col_object = '@S'", $object_id);
+        }
+        $base_condition = '( ' . implode(' OR ', $conditions) . ' ) AND ';
+
+        $conditions = [];
+        foreach ($authorities as $authority) {
+            $conditions[] = cb_queryf($database, "col_authority_@S = '1'",
+                $authority);
+        }
+        $base_condition .= '( ' . implode(' OR ', $conditions) . ' ) AND ';
+
+        foreach (array_keys($this->_target_map) as $target_name) {
+            if (0 == count($targets[$target_name])) {
+                continue;
+            }
+
+            $table_name = $this->_getTableName($object, $target_name);
+            $table_info = $this->_getTableInfo($table_name);
+            $rowset = new CB_RowSet($table_info);
+            $conditions = [];
+            foreach (array_keys($targets[$target_name]) as $target_id) {
+                $conditions[] = $rowset->queryf("col_target = '@S'",
+                    $target_id);
+            }
+            $condition = $base_condition . '( ' . implode(' OR ', $conditions)
+                         . ' )';
+            $rowset->addCondition($condition);
+
+            $this->_addUserJoin($rowset, $target_name, $table_name);
+
+            while ( ! is_null($row = $rowset->iterate())) {
+                $object = $row->get('object');
+                $object_id = $object->getOID();
+                if ($force_security_model) {
+                    $security_model = $force_security_model;
+                } else {
+                    $security_model = $this->getSecurityModel($object);
+                }
+
+                foreach ($authorities as $authority) {
+                    $access = $row->get('authority_' . $authority);
+                    if ($access > @ $cached_access[$object_id][$authority]) {
+                        $cached_access[$object_id][$authority] = $access;
+                    }
+                }
+            }
+        }
+        $object_name = strtolower(get_class($object));
+        if ( ! array_key_exists($object_name, $this->_cached_access)) {
+            $this->_cached_access[$object_name] = [];
+        }
+        $this->_cached_access[$object_name] = $cached_access;
+
+        return $cached_access;
+    }
+
+    /**
+     * 許可されたオブジェクトを取得する
+     */
+    function pickAllowedObjects(
+        $objects,
+        $user,
+        $dynamic_roles,
+        $authorities,
+        $force_security_model = false
+    ) {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $database = $app_locator->getConnection('address');
+
+        $targets = [];
+        $targets[GRN_ADDRESS_TARGET_DYNAMICROLE] = $dynamic_roles;
+
+        $user_id = $user->getOID();
+        $targets[GRN_ADDRESS_TARGET_USER] = [$user_id => $user];
+
+        if (false === ($static_roles = $this->_uum->getUserRoles($user_id))) {
+            assert('FALSE');
+        }
+        $targets[GRN_ADDRESS_TARGET_STATICROLE] = $static_roles;
+
+        if (false === ($groups = $this->_uum->getUserGroups($user_id))) {
+            assert('FALSE');
+        }
+        $targets[GRN_ADDRESS_TARGET_GROUP] = $groups;
+
+        $cached_access = [];
+        $picked_objects = [];
+        $conditions = [];
+        foreach (array_keys($objects) as $object_id) {
+            $object = $objects[$object_id];
+            if ($force_security_model) {
+                $security_model = $force_security_model;
+            } else {
+                $security_model = $this->getSecurityModel($object);
+            }
+
+            $cached_access[$object_id] = [];
+            if ($this->_evaluation_info[$security_model]['retval_false']) {
+                $picked_objects[$object_id] = $object;
+            }
+            $conditions[] = cb_queryf($database, "col_object = '@S'",
+                $object_id);
+        }
+        $base_condition = '( ' . implode(' OR ', $conditions) . ' ) AND ';
+
+        $conditions = [];
+        foreach ($authorities as $authority) {
+            $conditions[] = cb_queryf($database, "col_authority_@S = '1'",
+                $authority);
+        }
+        $base_condition .= '( ' . implode(' OR ', $conditions) . ' ) AND ';
+
+        foreach (array_keys($this->_target_map) as $target_name) {
+            if (0 == count($targets[$target_name])) {
+                continue;
+            }
+
+            $table_name = $this->_getTableName($object, $target_name);
+            $table_info = $this->_getTableInfo($table_name);
+            $rowset = new CB_RowSet($table_info);
+            $conditions = [];
+            foreach (array_keys($targets[$target_name]) as $target_id) {
+                $conditions[] = $rowset->queryf("col_target = '@S'",
+                    $target_id);
+            }
+            $condition = $base_condition . '( ' . implode(' OR ', $conditions)
+                         . ' )';
+            $rowset->addCondition($condition);
+
+            $this->_addUserJoin($rowset, $target_name, $table_name);
+
+            while ( ! is_null($row = $rowset->iterate())) {
+                $object = $row->get('object');
+                $object_id = $object->getOID();
+                if ($force_security_model) {
+                    $security_model = $force_security_model;
+                } else {
+                    $security_model = $this->getSecurityModel($object);
+                }
+
+                $evaluated_value
+                    = $this->_evaluation_info[$security_model]['initial_access'];
+                foreach ($authorities as $authority) {
+                    $cached_access[$object_id][$authority]
+                        = intval(max(@ $cached_access[$object_id][$authority],
+                        $row->get('authority_' . $authority)));
+                    $evaluated_value
+                        = $this->_evaluation_info[$security_model]['operations'][$evaluated_value][$cached_access[$object_id][$authority]];
+                }
+
+                if (1 == $evaluated_value) {
+                    if ($this->_evaluation_info[$security_model]['retval_true']) {
+                        $picked_objects[$object_id] = $object;
+                    } elseif (array_key_exists($object_id, $picked_objects)) {
+                        unset($picked_objects[$object_id]);
+                    }
+                }
+            }
+        }
+        $object_name = strtolower(get_class($object));
+        if ( ! array_key_exists($object_name, $this->_cached_access)) {
+            $this->_cached_access[$object_name] = [];
+        }
+        $this->_cached_access[$object_name] = $cached_access;
+
+        return $picked_objects;
+    }
+
+    /**
+     * 許可されたアクセス権か判定する
+     */
+    function isAllowedAccess($access, $authorities, $security_model)
+    {
+        if (GRN_ADDRESS_SECURITYMODEL_REVOKE == $security_model) {
+            $allowed_access = 0;
+        } else {
+            $allowed_access = 1;
+        }
+
+        $evaluated_access = true;
+        foreach ($authorities as $authority) {
+            $evaluated_access &= $allowed_access
+                                 == intval(@ $access[$authority]);
+        }
+
+        return $evaluated_access;
+    }
+
+    function exportAccessToCSV($writer, $object)
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $database = $app_locator->getConnection('address');
+
+        $object_name = 'Address_Sharedbook';
+        $foreign_key = $object->get('id');
+        $security_model = $this->getSecurityModel($object);
+        $add_condition = cb_queryf($database, "col_object = '@S'",
+            $object->getOID());
+        $access_count = 0;
+        foreach (array_keys($this->_target_map) as $target_name) {
+            $table_name = $this->_getTableName($object_name, $target_name);
+            $table_info = $this->_getTableInfo($table_name);
+
+            $rowset = new CB_RowSet($table_info);
+            $rowset->addCondition($add_condition);
+            $rowset->addOrderColumn('col_target');
+
+            $this->_addUserJoin($rowset, $target_name, $table_name);
+
+            if (0 < $rowset->count()) {
+                if (0 == $access_count) {
+                    $line = [];
+                    $line[] = $foreign_key;
+                    $line[] = 'security_model';
+                    $line[] = GRN_ADDRESS_SECURITYMODEL_GRANT == $security_model
+                        ? 'grant' : 'revoke';
+                    $line[] = '';
+
+                    $writer->writeLine($line);
+                }
+
+                while ( ! is_null($row = $rowset->iterate())) {
+                    $target = $row->get('target');
+                    $target_type = '';
+                    if (is_a($target, 'CB_User')) {
+                        $target_type = 'user';
+                        $target_name = $target->get('foreign_key');
+                    } elseif (is_a($target, 'CB_Role')) {
+                        $target_type = 'static_role';
+                        $target_name = $target->get('foreign_key');
+                    } elseif (is_a($target, 'CB_Group')) {
+                        $target_type = 'group';
+                        $target_name = $target->get('foreign_key');
+                    } else {
+                        $target_type = 'dynamic_role';
+                        $target_name = $target;
+                    }
+                    $access = '';
+                    $autority = $row->get('authority_editing');
+                    if (($security_model == GRN_ADDRESS_SECURITYMODEL_GRANT
+                         && $autority)
+                        || ($security_model == GRN_ADDRESS_SECURITYMODEL_REVOKE
+                            && ! $autority)
+                    ) {
+                        $access .= 'E';
+                    }
+                    $autority = $row->get('authority_browse');
+                    if (($security_model == GRN_ADDRESS_SECURITYMODEL_GRANT
+                         && $autority)
+                        || ($security_model == GRN_ADDRESS_SECURITYMODEL_REVOKE
+                            && ! $autority)
+                    ) {
+                        $access .= 'B';
+                    }
+                    if ((GRN_ADDRESS_SECURITYMODEL_GRANT == $security_model
+                         && 0 == strlen($access))
+                        || (GRN_ADDRESS_SECURITYMODEL_REVOKE == $security_model
+                            && 2 == strlen($access))
+                    ) {
+                        continue;
+                    }
+
+                    $line = [];
+                    $line[] = $foreign_key;
+                    $line[] = $target_type;
+                    $line[] = $access;
+                    $line[] = $target_name;
+
+                    $writer->writeLine($line);
+                }
+
+                $access_count += $rowset->count();
+            }
+        }
+
+        if (0 == $access_count) {
+            $table_info = $this->_getTableInfo('grn_address_sharedbook');
+            $rowset = new CB_RowSet($table_info);
+            $rowset->addCondition($rowset->queryf("_id = '@S'",
+                $object->getOID()));
+
+            while ( ! is_null($row = $rowset->iterate())) {
+                $foreign_key = $row->get('id');
+                $security_model = $this->getSecurityModel($row);
+
+                $line = [];
+                $line[] = $foreign_key;
+                $line[] = 'security_model';
+                $line[] = GRN_ADDRESS_SECURITYMODEL_GRANT == $security_model
+                    ? 'grant' : 'revoke';
+                $line[] = '';
+
+                $writer->writeLine($line);
+            }
+            $rowset->destroy();
+        }
+    }
+
+    /**
+     * access private
+     */
+    function _addUserJoin($rowset, $target, $table_name)
+    {
+        if ((is_object($target) && is_a($target, 'cb_user'))
+            || (is_string($target) && strcasecmp($target, 'user') === 0)
+        ) {
+            $user_table_info = $this->_table_manager->getTableInfo('cb_user');
+            $on = CB_DATABASE_TABLE_PREFIX
+                  . strtolower($table_name)
+                  . '.col_target = u._id '
+                  . 'AND u.col_deleted IS NULL';
+            $rowset->addJoin($user_table_info, $on, CB_DATABASE_INNER_JOIN,
+                'u');
+        }
+    }
+}
+
+class GRN_Access_AbstractData_Addr_Available_Base extends CB_PersistentBase
+{
+    var $col_authority_private_address = ['type' => 'int'];
+    var $col_authority_shared_address = ['type' => 'int'];
+    var $col_object = ['type' => 'relation', 'to' => 'grn_access_abstractdata'];
+}
+
+class GRN_Access_AbstractData_Addr_Available_User
+    extends GRN_Access_AbstractData_Addr_Available_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_user'];
+}
+
+class GRN_Access_AbstractData_Addr_Available_Group
+    extends GRN_Access_AbstractData_Addr_Available_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_group'];
+}
+
+class GRN_Access_AbstractData_Addr_Available_DynamicRole
+    extends GRN_Access_AbstractData_Addr_Available_Base
+{
+    var $col_target = ['type' => 'char', 'length' => 100];
+}
+
+class GRN_Access_AbstractData_Addr_Available_StaticRole
+    extends GRN_Access_AbstractData_Addr_Available_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_role'];
+}
+
+class GRN_Address_SharedBook_Base extends CB_PersistentBase
+{
+    var $col_authority_browse = ['type' => 'int'];
+    var $col_authority_editing = ['type' => 'int'];
+    var $col_authority_operation = ['type' => 'int'];
+    var $col_object = ['type' => 'relation', 'to' => 'grn_address_sharedbook'];
+}
+
+class GRN_Address_SharedBook_User extends GRN_Address_SharedBook_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_user'];
+}
+
+class GRN_Address_SharedBook_Group extends GRN_Address_SharedBook_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_group'];
+}
+
+class GRN_Address_SharedBook_DynamicRole extends GRN_Address_SharedBook_Base
+{
+    var $col_target = ['type' => 'char', 'length' => 100];
+}
+
+class GRN_Address_SharedBook_StaticRole extends GRN_Address_SharedBook_Base
+{
+    var $col_target = ['type' => 'relation', 'to' => 'cb_role'];
+}

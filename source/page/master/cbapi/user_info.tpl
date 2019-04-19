@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="{$encoding}"?>
+<methodResponse>
+  <params>
+    <param>
+      <value>
+        <struct>
+          <member>
+            <name>apiver</name>
+            <value><double>{$api_ver}</double></value>
+          </member>
+          <member>
+            <name>userid</name>
+            <value><string>{$user.id}</string></value>
+          </member>
+          <member>
+            <name>username</name>
+            <value><string>{$user.name|escape}</string></value>
+          </member>
+          <member>
+            <name>loginid</name>
+            <value><string>{$user.login|escape}</string></value>
+          </member>
+        </struct>
+      </value>
+    </param>
+  </params>
+</methodResponse>

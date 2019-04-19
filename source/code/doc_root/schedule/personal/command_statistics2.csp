@@ -1,0 +1,219 @@
+<?php
+
+function _grn_schedule_time_format($seconds)
+{
+    $hour = (int)floor($seconds / 3600);
+    $minute = (int)floor(($seconds % 3600) / 60);
+
+    return sprintf('%d:%02d', $hour, $minute);
+}
+
+function _grn_schedule_writeLine(& $writer, $line, $results)
+{
+    foreach ($results as $result) {
+        $line[] = _grn_schedule_time_format($result);
+    }
+    $writer->writeLine($line);
+}
+
+function _grn_schedule_writeNullLine(& $writer, $line, $menus)
+{
+    foreach ($menus as $menu) {
+        $line[] = '0:00';
+    }
+    // その他
+    $line[] = '0:00';
+
+    $writer->writeLine($line);
+}
+
+if (strcasecmp(cb_at($_SERVER, 'REQUEST_METHOD', ''), 'POST') == 0) {
+    // --------
+    // brabrabra after success
+    // --------
+    $session_manager = CB_SessionManager::getInstance();
+    $session =& $session_manager->getSession('grn.schedule.statistics');
+
+    $charset = cb_at($G_INPUT, 'charset', false);
+    if ( ! $charset) {
+        global $G_config_common;
+        $charset = $G_config_common->get('I18N', 'default_external_encoding');
+    }
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+
+    // 必要なファイルの読み込み
+    require_once('schedule/application.csp');
+    $app = GRN_Schedule_Application::getInstance();
+    require_once('schedule/system_logic.csp');
+    $system_logic = GRN_Schedule_SystemLogic::getInstance();
+    require_once('schedule/personal_logic.csp');
+    $personal_logic = GRN_Schedule_PersonalLogic::getInstance();
+    $login = $uum->getLoginUser();
+    $dynamic_roles = $uum->listGrantedRoles();
+    require_once('schedule/access_logic.csp');
+    $acc_logic = GRN_Schedule_Access_logic::getInstance();
+    require_once('schedule/view_util.csp');
+    $util = GRN_Schedule_View_Util::getInstance();
+
+    // 準備
+    $showholiday = $system_logic->getShowHoliday();
+    $menus = $system_logic->getMenus();
+
+    // 出力に必要なデータ
+    $b_sunday = cb_at($G_INPUT, 'sunday', false);
+    $b_saturday = cb_at($G_INPUT, 'saturday', false);
+    $setdate = $util->createDateTimeFromParameters(
+        cb_at($G_INPUT, 'start_year', false),
+        cb_at($G_INPUT, 'start_month', false),
+        cb_at($G_INPUT, 'start_day', false)
+    );
+    $enddate = $util->createDateTimeFromParameters(
+        cb_at($G_INPUT, 'end_year', false),
+        cb_at($G_INPUT, 'end_month', false),
+        cb_at($G_INPUT, 'end_day', false)
+    );
+
+    // データのチェック
+    if ( ! is_a($setdate, 'CB_Date')) {
+        cb_throw_error(E_GRN_SCHD_INVALID_SETDATE);
+    }
+    if ( ! is_a($enddate, 'CB_Date')) {
+        cb_throw_error(E_GRN_SCHD_INVALID_ENDDATE);
+    }
+    // 日付のチェック
+    $app->checkDateTime($setdate, $enddate);
+
+    $settime = $util->createDateTimeFromParameters(null, null, null,
+        cb_at($G_INPUT, 'shour_hour', false),
+        cb_at($G_INPUT, 'shour_minute', false)
+    );
+    $endtime = $util->createDateTimeFromParameters(null, null, null,
+        cb_at($G_INPUT, 'ehour_hour', false),
+        cb_at($G_INPUT, 'ehour_minute', false)
+    );
+    // 時間のチェック
+    if ( ! is_a($settime, 'CB_Time')) {
+        cb_throw_error(E_GRN_SCHD_INVALID_SETTIME);
+    }
+    if ( ! is_a($endtime, 'CB_Time')) {
+        cb_throw_error(E_GRN_SCHD_INVALID_ENDTIME);
+    }
+    // 時間のチェック
+    $app->checkDateTime($settime, $endtime);
+
+    // 祝日
+    $b_holiday = cb_at($G_INPUT, 'holiday', false);
+    $calednars = null;
+    if ( ! $b_holiday) {
+        require_once('grn/calendar.csp');
+        $calendar_service = GRN_CalendarService::getInstance();
+        $calednars = $calendar_service->getDaysInfo($setdate, $enddate,
+            $login);
+    }
+
+    // テンポラリのファイルを作成
+    $tempdir = cb_tmpdir();
+    $temp_filename = tempnam($tempdir, 'sc_');
+
+    require_once('fw/csv.csp');
+    $writer = new CB_CSVWriter($charset, $temp_filename);
+
+    // ヘッダーの出力
+    $csv_header = [];
+    $csv_header[] = cb_msg('grn.schedule', 'user_types');
+    foreach ($menus as $menu) {
+        $csv_header[] = $menu[0];
+    }
+    $csv_header[] = cb_msg('grn.schedule', 'others');
+    $writer->writeLine($csv_header);
+
+    // 監査ログ
+    require_once('grn/logger.csp');
+    $lm = CB_LoggerManager::getInstance();
+    $l = $lm->getLogger(GRN_SCHEDULE_MODULE_ID);
+
+    // 組織
+    if ( ! is_null($target_ids = $session->get('target_ids'))) {
+        foreach (array_keys($target_ids) as $id_label) {
+            $ids = explode(':', $id_label);
+            if (count($ids) < 2) {
+                continue;
+            }
+            $type = $ids[0];
+            $id = $ids[1];
+            if (is_null($id) || 0 == strlen($id)) {
+                continue;
+            }
+
+            if ($type == 'user') {
+                $user = $uum->getUser($id);
+                if ($user) {
+                    $user_display_name
+                        = GRN_ControllerUtil::getUserNameText($login->getOID(),
+                        $id);
+                    $line = [$user_display_name];
+                    // アクセス権のチェック
+                    if ($acc_logic->evaluateAccess($login, $user, ['read'],
+                        $dynamic_roles)
+                    ) {
+                        $results = $app->statisticsEvents($login, $user,
+                            $setdate, $settime,
+                            $enddate, $endtime,
+                            $menus,
+                            $b_sunday, $b_saturday, $calednars);
+                        _grn_schedule_writeLine($writer, $line, $results);
+                    } else {
+                        _grn_schedule_writeNullLine($writer, $line, $menus);
+                    }
+                    $log_params = [
+                        'uid'          => $id,
+                        'display_name' => $user->get('display_name')
+                    ];
+                    $l->noticeEx('export', 'statistics', $log_params);
+                }
+            } elseif ($type == 'group') {
+                $group = $uum->getGroup($id);
+                if ($group) {
+                    $line = [$group->get('name')];
+                    // アクセス権のチェック
+                    if ($acc_logic->evaluateAccess($login, $group, ['read'],
+                        $dynamic_roles)
+                    ) {
+                        $results = $app->statisticsEvents($login, $group,
+                            $setdate, $settime,
+                            $enddate, $endtime,
+                            $menus,
+                            $b_sunday, $b_saturday, $calednars);
+
+                        _grn_schedule_writeLine($writer, $line, $results);
+                    } else {
+                        _grn_schedule_writeNullLine($writer, $line, $menus);
+                    }
+
+                    $log_params = [
+                        'oid'          => $id,
+                        'display_name' => $group->get('name')
+                    ];
+                    $l->noticeEx('export', 'statistics', $log_params);
+                }
+            }
+        }
+    }
+
+    // 閉じる
+    $writer->close();
+
+    // 一時ファイルに書き出した内容をファイルとして出力
+    // 'text/comma-separated-values' <= CSV でこういったMIMETYPEがあるらしい
+    cb_prepare_download('schedules.csv', 'application/csv', false);
+    $fp = fopen($temp_filename, 'rb');
+    if (($size = filesize($temp_filename)) > 0) {
+        echo fread($fp, $size);
+    }
+    fclose($fp);
+    // 一時ファイルの削除
+    unlink($temp_filename);
+
+}

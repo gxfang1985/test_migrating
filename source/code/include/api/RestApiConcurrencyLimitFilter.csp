@@ -1,0 +1,259 @@
+<?php
+declare(strict_types=1);
+
+namespace grn\api;
+
+use grn\api\exception\request\TooManyRequestsException;
+use grn\api\http\HttpHeaders;
+
+class RestApiConcurrencyLimitFilter implements \CB_Transactional
+{
+    const PREFIX = "thread_";
+    const DEFAULT_THREAD_CONTROL_DIR = "rest_api";
+
+    private $threadControlPath;
+    private $threadProcessTimeLimit = 300;
+    private $concurrencyLimit = 100;
+    private $threadFilePath;
+
+    public function __construct()
+    {
+        $this->initialize();
+    }
+
+    private function initialize()
+    {
+        $this->initializeThreadProcessTimeLimit();
+        $this->initializeConcurrencyLimit();
+
+        $thread_control_path = cb_tmpdir() . DIRECTORY_SEPARATOR
+                               . $this->getThreadControlDir()
+                               . DIRECTORY_SEPARATOR;
+        $this->setThreadControlPath($thread_control_path);
+        $this->makeThreadControlDirectory();
+
+        $transactionManager = \CB_TransactionManager::getInstance();
+        $transactionManager->register(CB_TRANSACTION_LEVEL_REST_API, $this);
+    }
+
+    private function initializeThreadProcessTimeLimit()
+    {
+        global $G_config_common;
+
+        $thread_process_time_limit = (int)$G_config_common->get('RestApi',
+            'thread_process_time_limit');
+        if ($thread_process_time_limit >= 1) {
+            $this->setThreadProcessTimeLimit($thread_process_time_limit);
+        }
+    }
+
+    private function initializeConcurrencyLimit()
+    {
+        global $G_config_common;
+
+        $concurrency_limit = (int)$G_config_common->get('RestApi',
+            'concurrency_limit');
+        if ($concurrency_limit >= 1) {
+            $this->setConcurrencyLimit($concurrency_limit);
+        }
+    }
+
+    public function makeThreadControlDirectory()
+    {
+        cb_mkdir($this->threadControlPath, 0700, false, true);
+    }
+
+    /**
+     * @return string
+     */
+    public function getThreadControlDir(): string
+    {
+        global $G_config_common;
+        $thread_control_dir = $G_config_common->get('RestApi',
+            'thread_control_dir');
+        if (is_string($thread_control_dir)) {
+            return $thread_control_dir;
+        }
+
+        return self::DEFAULT_THREAD_CONTROL_DIR;
+    }
+
+    /**
+     * @param string $path
+     */
+    public function setThreadControlPath(string $path)
+    {
+        $this->threadControlPath = $path;
+    }
+
+    /**
+     * @param int $thread_process_time_limit
+     */
+    public function setThreadProcessTimeLimit(int $thread_process_time_limit)
+    {
+        $this->threadProcessTimeLimit = $thread_process_time_limit;
+    }
+
+    /**
+     * @return string
+     */
+    public function getThreadControlPath(): string
+    {
+        return $this->threadControlPath;
+    }
+
+    /**
+     * @param int $concurrencyLimit
+     */
+    public function setConcurrencyLimit(int $concurrencyLimit)
+    {
+        $this->concurrencyLimit = $concurrencyLimit;
+    }
+
+    /**
+     * @throws TooManyRequestsException
+     */
+    public function register()
+    {
+        $current_thread_count = $this->getThreadCount() + 1;
+        HttpHeaders::setConcurrencyLimit($this->concurrencyLimit,
+            $current_thread_count);
+
+        if ($current_thread_count > $this->concurrencyLimit) {
+            throw new TooManyRequestsException();
+        }
+
+        $this->threadFilePath = $this->threadControlPath . self::PREFIX
+                                . session_id() . "-" . uniqid('', true);
+        touch($this->threadFilePath);
+    }
+
+    /**
+     * @return bool
+     */
+    public function commit()
+    {
+        $this->gc();
+
+        return true;
+    }
+
+    public function abort()
+    {
+        $this->gc();
+    }
+
+    /**
+     * @param int $process_started_time
+     *
+     * @return bool
+     */
+    public function isInThreadProcessTimeLimit(int $process_started_time): bool
+    {
+        $now_time = $this->getTime();
+        $elapsed_time = $now_time - $process_started_time;
+
+        return ($elapsed_time <= $this->threadProcessTimeLimit);
+    }
+
+    /**
+     * @param string $thread_file
+     *
+     * @return bool
+     */
+    private function isAliveThreadFile(string $thread_file): bool
+    {
+        $file_created_time = $this->getFileCreatedTime($thread_file);
+        if ( ! $file_created_time) {
+            return false;
+        }
+
+        return $this->isInThreadProcessTimeLimit($file_created_time);
+    }
+
+    /**
+     * @param string|null $file_path
+     */
+    private function deleteFile(string $file_path = null)
+    {
+        if ($file_path && file_exists($file_path)) {
+            @unlink($file_path);
+        }
+    }
+
+    /**
+     * @return int
+     */
+    public function getThreadCount(): int
+    {
+        $max_count = 0;
+        $thread_files = $this->streamSafeGlob($this->threadControlPath,
+            self::PREFIX . "*");
+        foreach ($thread_files as $thread_file) {
+            if ($this->isAliveThreadFile($thread_file)) {
+                $max_count++;
+            }
+        }
+
+        return $max_count;
+    }
+
+    /**
+     * This function deletes
+     * - the file made by the instance which calls the gc function.
+     * - files whose thread process time exceeds the limit
+     */
+    public function gc()
+    {
+        $this->deleteFile($this->threadFilePath);
+        $thread_files = $this->streamSafeGlob($this->threadControlPath,
+            self::PREFIX . "*");
+        foreach ($thread_files as $thread_file) {
+            if ( ! $this->isAliveThreadFile($thread_file)) {
+                $this->deleteFile($thread_file);
+            }
+        }
+    }
+
+    /**
+     * @param string $directory
+     * @param string $pattern
+     *
+     * @return array
+     */
+    public function streamSafeGlob(string $directory, string $pattern): array
+    {
+        if ( ! is_dir($directory)) {
+            return [];
+        }
+
+        $files = scandir($directory);
+        $found = [];
+
+        foreach ($files as $filename) {
+            if (fnmatch($pattern, $filename)) {
+                $found[] = $directory . DIRECTORY_SEPARATOR . $filename;
+            }
+        }
+
+        return $found;
+    }
+
+    /**
+     * @return int
+     */
+    protected function getTime(): int
+    {
+        return time();
+    }
+
+    /**
+     * @param $file_path
+     *
+     * @return bool|int
+     */
+    protected function getFileCreatedTime(string $file_path)
+    {
+        return @filectime($file_path);
+    }
+}

@@ -1,0 +1,803 @@
+<?php
+declare(strict_types=1);
+
+namespace grn\notification\screen;
+
+require_once('portal/error_code.csp');
+require_once("grn/smarty.csp");
+require_once('SmartyValidate.class.php');
+require_once 'fw/i18n.csp';
+require_once('notification/application.csp');
+
+use grn\grn\access\utility\AppAvailabilityUtil;
+use grn\grn\access\service\AppAccess;
+use GRN_Smarty;
+use GRN_Portal_Portal_Controller_Utility;
+use SmartyValidate;
+use GRN_ApplicationLocator;
+use GRN_ControllerUtil;
+
+class NotificationPortlet
+{
+    CONST SESSION_ID = "notification_portlet_view";
+    CONST TRANSLATION_MAP_PORTLET
+        = [
+            'pid'               => 'portal_id',
+            //Portal ID
+            'ppid'              => 'portlet_id',
+            //Portlet  ID
+            'plid'              => 'layout_id',
+            //Portlet Layout ID
+            'title'             => 'layout_title_name',
+            //Portlet Layout Display Name
+            'type'              => 'portlet_type',
+            //Portlet Type
+            'version'           => 'portlet_version',
+            //Portlet Version
+            'set_template'      => 'portlet_set_template',
+            //Portlet Setting Template
+            'view_template'     => 'portlet_view_template',
+            //Portlet View Template
+            'settings'          => 'layout_settings',
+            //Portlet Settings
+            'source'            => 'portlet_source',
+            //Portlet Source (Only HTML/PHP Portlet)
+            'open'              => 'layout_is_open',
+            //Portlet Open Flag
+            'display_name_mode' => 'layout_display_name_mode',
+            //Portlet Display Name Mode
+        ];
+    private $portlet = [];
+    private $isRead = false;
+    private $isToMe = false;
+
+    public function __construct(array $input = [])
+    {
+        $portal_id = isset($input['portal_id'])
+            ? intval($input['portal_id']) : 0;
+        $portlet_layout_id = isset($input['portlet_layout_id'])
+            ? intval($input['portlet_layout_id']) : 0;
+        if ($portal_id && $portlet_layout_id) {
+            $this->portlet = $this->getPortlet($portal_id, $portlet_layout_id);
+        }
+
+        require_once('fw/session_manager.csp');
+        $sm = \CB_SessionManager::getInstance();
+        $session = $sm->getSession(self::SESSION_ID);
+        $is_read = $session->get('isRead');
+        $is_to_me = $session->get('isToMe');
+
+        if (isset($input['read'])) {
+            $this->isRead = intval($input['read']) == 1 ? true : false;
+        } elseif ($is_read !== null) {
+            $this->isRead = $is_read;
+        }
+
+        if (isset($input['is_to_me'])) {
+            $this->isToMe = intval($input['is_to_me']) == 1 ? true : false;
+        } elseif ($is_to_me !== null) {
+            $this->isToMe = $is_to_me;
+        }
+
+        $session->set('isRead', $this->isRead);
+        $session->set('isToMe', $this->isToMe);
+    }
+
+    public function isRead()
+    {
+        return $this->isRead;
+    }
+
+    public function isToMe()
+    {
+        return $this->isToMe;
+    }
+
+    /**
+     * Is unread in category "All"
+     *
+     * @return bool
+     */
+    private function isUnreadAll()
+    {
+        return ! $this->isToMe && ! $this->isRead;
+    }
+
+    /**
+     * Get portlet from portal ID & Portlet layout ID
+     *
+     * @param int $portal_id         Portal ID
+     * @param int $portlet_layout_id Portlet layout ID
+     *
+     * @return array Portlet data
+     */
+    private function getPortlet(int $portal_id, int $portlet_layout_id): array
+    {
+        require_once('portal/controller_util.csp');
+        $portal_util = GRN_Portal_Portal_Controller_Utility::getInstance();
+        $column_list_for_view = $portal_util->getColumnListView($portal_id,
+            self::TRANSLATION_MAP_PORTLET, true, true, true, false,
+            CB_DATABASE_NO_LOCK);
+        $portlet = [];
+        foreach ($column_list_for_view as $columns) {
+            foreach ($columns as $layout_id => $column) {
+                if ($portlet_layout_id == $layout_id) {
+                    $portlet = $column;
+                    break;
+                }
+            }
+        }
+
+        return $portlet;
+    }
+
+    /**
+     * Get portlet Data Screen for Unread notification
+     *
+     * @param array  $portlet       Portlet data
+     * @param string $template_name template name in folder notification/portlet
+     *
+     * @return array
+     */
+    public function getNotificationForPortlet(
+        array $portlet,
+        string $template_name
+    ): array {
+        if ( ! $portlet) {
+            cb_throw_error(E_GRN_PRTL_PORTLET_INVALID_ACCESS);
+        }
+        $login = cb_lwc_uum()->getLoginUser();
+        if ( ! is_object($login)) {
+            cb_throw_error(E_COMMON_ACCOUNT_INVALIDATED);
+        }
+
+        $total_unread_to_me = 0;
+        $total_unread_all = 0;
+        $is_to_me = $this->isToMe();
+        $is_read = $this->isRead();
+
+        //Get Smarty Instance
+        $t = new GRN_Smarty;
+
+        //Initialize SmartyValidate and Register Form
+        SmartyValidate::connect($t);
+        SmartyValidate::register_form('view_whatsnew', true);
+
+        // 通知アプリ取得
+        $app_locator = GRN_ApplicationLocator::instance();
+        /** @var \GRN_Notification_App $notification_app */
+        $notification_app = $app_locator->getInstance(GRN_NOTIFICATION_APP_ID);
+        if ( ! is_null($notification_app)) {
+            // 外部アプリケーション管理ロジックを取得する
+            $app_manager = $notification_app->getOutsideApplicationManager();
+
+            $notification_app->updateApplications($login, true);
+
+            $personal_config = $notification_app->getPersonalConfig($login);
+            $portlet_logic = $notification_app->getPortletLogic();
+
+            // 表示する文字列長取得
+            $personal_config->getMaxLength($subject_cols, $abstract_cols,
+                $name_cols, $space_cols);
+            $t->assign('subject_cols', $subject_cols);
+            $t->assign('abstract_cols', $abstract_cols);
+            $t->assign('name_cols', $name_cols);
+
+            // 設定がされていない場合はデフォルトの設定
+            $b_common_setting = false;
+            $module_data_list = null;
+            $users_id = [];
+
+            if (isset($portlet['settings']) && $portlet['settings']) {
+                // 共通設定
+                if (array_key_exists('common', $portlet['settings'])) {
+                    if (array_key_exists('display_item',
+                        $portlet['settings']['common'])
+                    ) {
+                        $b_common_setting = true;
+                        $abstract
+                            = @ $portlet['settings']['common']['display_item']['abstract'];
+                        $sender_name
+                            = @ $portlet['settings']['common']['display_item']['sender_name'];
+                        $timestamp
+                            = @ $portlet['settings']['common']['display_item']['timestamp'];
+
+                        $t->assign('no_abstract',
+                            (is_null($abstract) || ! $abstract));
+                        $t->assign('no_sender_name',
+                            (is_null($sender_name) || ! $sender_name));
+                        $t->assign('no_timestamp',
+                            (is_null($timestamp) || ! $timestamp));
+                    }
+                }
+
+                // 通知対応アプリ列挙
+                $apps_list = [];
+                $apps_list[] = $notification_app->getApplicationList(true);
+                $apps_list[] = $app_manager->getAllList();
+
+                //ここで通知アプリの入れ替え GRN2-2158
+                $apps_list_for_view
+                    = $notification_app->orderApplicationList($apps_list,
+                    $portlet);
+
+                // アプリごとのデータ
+                if (array_key_exists('application', $portlet['settings'])
+                    && is_array($portlet['settings']['application'])
+                ) {
+                    $module_data_list = [];
+                    $module_data_list['indexes'] = [];
+                    $module_data_list['numbers'] = [];
+                    foreach ($apps_list_for_view as $module_id => $app) {
+                        if ( ! array_key_exists($module_id,
+                            $portlet['settings']['application'])
+                        ) {
+                            $setting = ['module_id' => $module_id];
+                            $portlet['setting']['application'][$module_id]
+                                = $setting;
+                        } else {
+                            $setting
+                                = $portlet['settings']['application'][$module_id];
+                        }
+
+                        $portlet_settings
+                            = $this->getPortletSettings($module_id,
+                            $setting);
+                        $display_type = $portlet_settings['display_type'];
+                        $system_set = $portlet_settings['is_system_set'];
+                        $rows = $portlet_settings['rows'];
+
+                        // 通知対応で利用可能かどうかチェック
+                        if ($display_type === 'number') {
+                            // 最新情報データ数取得
+                            $data_count = $this->getDataCount($module_id);
+
+                            $module_data_list['numbers'][$module_id] = [
+                                'id'           => $module_id,
+                                'display_type' => $display_type,
+                                'system_set'   => $system_set,
+                                'count'        => $data_count
+                            ];
+
+                            if ($module_id === GRN_SCHEDULE_MODULE_ID) {
+                                $module_data_list['numbers'][$module_id]['AttendanceCheckEventCount']
+                                    = $this->isUnreadAll()
+                                    ? $app->getAttendanceCheckEventCount($login,
+                                        false) : 0;
+                                $module_data_list['numbers'][$module_id]['FacilityApprovalRequestNum']
+                                    = $this->isUnreadAll()
+                                    ? $app->getFacilityApprovalRequestNum($login,
+                                        false) : 0;
+                            }
+                        } else {
+                            // 最新情報データリスト取得
+                            $data_list = $this->getDataList($module_id, $rows);
+
+                            $data_count = is_array($data_list)
+                                ? count($data_list) : 0;
+                            $module_data_list['indexes'][$module_id] = [
+                                'id'           => $module_id,
+                                'name'         => $app->getName(),
+                                'rows'         => $rows,
+                                'display_type' => $display_type,
+                                'system_set'   => $system_set,
+                                'data_list'    => $data_list,
+                                'count'        => $data_count
+                            ];
+                            foreach ($data_list as $data) {
+                                if (array_key_exists('sender_id', $data)) {
+                                    $users_id[] = $data['sender_id'];
+                                }
+                            }
+
+                            // スペースアプリの時は、$data_listの下にスペースID毎の配列となっているため、別でおこなう。
+                            if ($module_id === 'grn.space') {
+                                foreach ($data_list as $space_data_list) {
+                                    foreach ($space_data_list as $data) {
+                                        if (is_array($data)
+                                            && isset($data['sender_id'])
+                                        ) {
+                                            $users_id[] = $data['sender_id'];
+                                        }
+                                    }
+                                }
+                            }
+                            if ($module_id === GRN_SCHEDULE_MODULE_ID) {
+                                $module_data_list['indexes'][$module_id]['AttendanceCheckEventCount']
+                                    = $this->isUnreadAll()
+                                    ? $app->getAttendanceCheckEventCount($login,
+                                        false) : 0;
+                                $module_data_list['indexes'][$module_id]['FacilityApprovalRequestNum']
+                                    = $this->isUnreadAll()
+                                    ? $app->getFacilityApprovalRequestNum($login,
+                                        false) : 0;
+                            }
+                        }
+                    }
+                }
+
+                $t->assign('module_data_list', $module_data_list);
+            }
+
+            // 設定がされていない場合はデフォルトの設定
+            if ( ! $b_common_setting) {
+                // 共通設定デフォルト
+                $portlet_logic->getWhatsNewDefaultDisplayItem($default_abstract,
+                    $default_sender_name,
+                    $default_timestamp);
+                $t->assign('no_abstract',
+                    (is_null($default_abstract) || ! $default_abstract));
+                $t->assign('no_sender_name',
+                    (is_null($default_sender_name) || ! $default_sender_name));
+                $t->assign('no_timestamp',
+                    (is_null($default_timestamp) || ! $default_timestamp));
+            }
+
+            // アプリのデフォルト設定
+            if (is_null($module_data_list)) {
+                // 通知対応アプリ列挙
+                $apps_list = [];
+                $apps_list[] = $notification_app->getApplicationList(true);
+                $apps_list[] = $app_manager->getAllList();
+
+                // アプリごとのデータ
+                $module_data_list = [];
+                $module_data_list['indexes'] = [];
+                $module_data_list['numbers'] = [];
+
+                foreach (array_keys($apps_list) as $apps_id) {
+                    $apps =& $apps_list[$apps_id];
+                    foreach (array_keys($apps) as $app_id) {
+                        $app =& $apps[$app_id];
+                        // 通知対応で利用可能かどうかチェック
+                        if (is_object($app)
+                            && is_a($app, 'GRN_ApplicationBase')
+                        ) {
+                            // 最新情報取得
+                            $module_id = $app->getModuleId();
+
+                            $portlet_settings
+                                = $this->getPortletSettings($module_id);
+                            $display_type = $portlet_settings['display_type'];
+                            $system_set = $portlet_settings['is_system_set'];
+                            $default_rows = $portlet_settings['rows'];
+
+                            if ($display_type === 'number') {
+                                // 最新情報データ数取得
+                                $data_count = $this->getDataCount($module_id);
+
+                                $module_data_list['numbers'][$module_id] = [
+                                    'id'           => $module_id,
+                                    'display_type' => $display_type,
+                                    'system_set'   => $system_set,
+                                    'count'        => $data_count
+                                ];
+                                if ($module_id === GRN_SCHEDULE_MODULE_ID) {
+                                    $module_data_list['numbers'][$module_id]['AttendanceCheckEventCount']
+                                        = $this->isUnreadAll()
+                                        ? $app->getAttendanceCheckEventCount($login,
+                                            false) : 0;
+                                    $module_data_list['numbers'][$module_id]['FacilityApprovalRequestNum']
+                                        = $this->isUnreadAll()
+                                        ? $app->getFacilityApprovalRequestNum($login,
+                                            false) : 0;
+                                }
+                            } else {
+                                // 最新情報データリスト取得
+                                $data_list = $this->getDataList($module_id,
+                                    $default_rows);
+
+                                $data_count = is_array($data_list)
+                                    ? count($data_list) : 0;
+                                $module_data_list['indexes'][$module_id] = [
+                                    'id'           => $module_id,
+                                    'name'         => $app->getName(),
+                                    'rows'         => $default_rows,
+                                    'data_list'    => $data_list,
+                                    'display_type' => $display_type,
+                                    'system_set'   => $system_set,
+                                    'count'        => $data_count
+                                ];
+
+                                foreach ($data_list as $data) {
+                                    if (array_key_exists('sender_id', $data)) {
+                                        $users_id[] = $data['sender_id'];
+                                    }
+                                }
+                                // スペースアプリの時は、$data_listの下にスペースID毎の配列となっているため、別でおこなう。
+                                if ($module_id === 'grn.space') {
+                                    foreach ($data_list as $space_data_list) {
+                                        foreach ($space_data_list as $data) {
+                                            if (isset($data['sender_id'])) {
+                                                $users_id[]
+                                                    = $data['sender_id'];
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if ($module_id === GRN_SCHEDULE_MODULE_ID) {
+                                    $module_data_list['indexes'][$module_id]['AttendanceCheckEventCount']
+                                        = $this->isUnreadAll()
+                                        ? $app->getAttendanceCheckEventCount($login,
+                                            false) : 0;
+                                    $module_data_list['indexes'][$module_id]['FacilityApprovalRequestNum']
+                                        = $this->isUnreadAll()
+                                        ? $app->getFacilityApprovalRequestNum($login,
+                                            false) : 0;
+                                }
+                            }
+                        }
+                    }
+                }
+                $t->assign('module_data_list', $module_data_list);
+            }
+            // GMT-529
+            require_once('grn/application.csp');
+            $apps_id_support_privilege
+                = AppAvailabilityUtil::getAppIdsSupportPrivilege();
+            $applications_id = [];
+            foreach ($module_data_list as $datas) {
+                foreach ($datas as $data) {
+                    preg_match("/^grn.(.*)/i", $data['id'],
+                        $matches);//GRB-15046
+                    if (count($matches) > 0) {
+                        $applications_id[] = $matches[1];
+                    }
+                }
+            }
+            $applications_id = array_intersect($apps_id_support_privilege,
+                array_unique($applications_id));
+            $users_id = array_diff($users_id,
+                [0]);//Remove element value 0
+            $users_id = array_values(array_unique($users_id));
+            $users_id_allow
+                = AppAccess::getAvailabilityAppIdsInternalByUserIds($users_id,
+                $applications_id);
+
+            // end GMT-529
+            require_once("grn/controller.csp");
+            $users_info
+                = GRN_ControllerUtil::getUserInfoToShowUserName($users_id,
+                $login);
+            foreach ($users_info as $user_info) {
+                $users_info[$user_info['_id']]['col_using_apps']
+                    = $users_id_allow[$user_info['_id']];
+            }
+            $t->assign('users_info', $users_info);
+
+            unset($module_data_list);
+
+            $total_unread_to_me = $portlet_logic->getWhatsNewDataCount(null,
+                true);
+            $total_unread_all = $portlet_logic->getWhatsNewDataCount(null,
+                false);
+        }
+
+        $t->assign('page_title', $portlet['title']);
+
+        //Assign include_php Parameter
+        $t->assign('portlet', $portlet);
+
+        $data_portlet = [
+            'portalId'        => $portlet['pid'],
+            'portletLayoutId' => $portlet['plid'],
+            'isToMe'          => $is_to_me,
+            'isRead'          => $is_read,
+            'totalUnreadToMe' => $total_unread_to_me,
+            'totalUnreadAll'  => $total_unread_all,
+        ];
+
+        $t->assign('data_portlet', $data_portlet);
+        $t->assign('total_unread_to_me', $total_unread_to_me);
+        $t->assign('total_unread_all', $total_unread_all);
+        $t->assign('is_to_me', $is_to_me);
+        $t->assign('is_read', $is_read);
+        $t->assign('notification_app_name', $notification_app->getName());
+
+        // Ignore Licence Warnning
+        $t->skipWarning();
+
+        //Display Smarty Template
+        $doc_name = 'notification/portlet/' . $template_name . '.tpl';
+
+        return [
+            'content'         => $t->fetch($doc_name),
+            'totalUnreadToMe' => $total_unread_to_me,
+            'totalUnreadAll'  => $total_unread_all
+        ];
+    }
+
+    /**
+     * Get portlet Data Screen for read notification
+     *
+     * @param array  $portlet       Portlet data
+     * @param string $template_name template name in folder notification/portlet
+     *
+     * @return array
+     */
+    public function getAllReadNotification(
+        array $portlet,
+        string $template_name
+    ): array {
+        if ( ! isset($portlet)) {
+            cb_throw_error(E_GRN_PRTL_PORTLET_INVALID_ACCESS);
+        }
+
+        //Get Smarty Instance
+        $t = new GRN_Smarty;
+
+        //Initialize SmartyValidate and Register Form
+        SmartyValidate::connect($t);
+        SmartyValidate::register_form('view_history', true);
+
+        // 通知アプリ取得
+        $app_locator = GRN_ApplicationLocator::instance();
+        /** @var \GRN_Notification_App $notification_app */
+        $notification_app =& $app_locator->getInstance(GRN_NOTIFICATION_APP_ID);
+        if ( ! is_null($notification_app)) {
+            $login = cb_lwc_uum()->getLoginUser();
+            if ( ! is_object($login) || ! is_a($login, 'CB_User')) {
+                cb_throw_error(E_COMMON_ACCOUNT_INVALIDATED);
+            }
+
+            $portlet_logic = $notification_app->getPortletLogic();
+            $personal_config = $notification_app->getPersonalConfig($login);
+
+            // 表示する文字列長取得
+            $personal_config->getMaxLength($subject_cols, $abstract_cols,
+                $name_cols, $space_cols);
+            $t->assign('space_cols', $space_cols);
+            $t->assign('subject_cols', $subject_cols);
+            $t->assign('abstract_cols', $abstract_cols);
+            $t->assign('name_cols', $name_cols);
+
+            // ポートレットの設定
+            $portlet_setting = null;
+            if (isset($portlet['settings']) && $portlet['settings']) {
+                // 表示設定
+                $portlet_setting =& $portlet['settings'];
+            }
+
+            // 表示する項目
+            if ( ! is_null($portlet_setting)
+                 && array_key_exists('display_item', $portlet_setting)
+            ) {
+                // 以前設定されていたら反映
+                $space_name = @ $portlet_setting['display_item']['space_name'];
+                $abstract = @ $portlet_setting['display_item']['abstract'];
+                $sender_name
+                    = @ $portlet_setting['display_item']['sender_name'];
+                $timestamp = @ $portlet_setting['display_item']['timestamp'];
+            } else {
+                // デフォルト
+                $portlet_logic->getHistoryDefaultDisplayItem($space_name,
+                    $abstract, $sender_name, $timestamp);
+            }
+
+            // GRN2-3902 スペースアプリが使用不可の場合は、スペース名を表示しない。
+            require_once('space/GrnSpaceApplication.csp');
+            $t->assign('no_space_name', (is_null($space_name) || ! $space_name
+                                         || ! AppAccess::isAppAvailableInternalAccess(\GrnSpaceApplication::GRN_SPACE_APPLICATION_ID)));
+            $t->assign('no_abstract', (is_null($abstract) || ! $abstract));
+            $t->assign('no_sender_name',
+                (is_null($sender_name) || ! $sender_name));
+            $t->assign('no_timestamp', (is_null($timestamp) || ! $timestamp));
+
+            // 表示する件数
+            $rows = 0;
+            if ( ! is_null($portlet_setting)
+                 && array_key_exists('rows', $portlet_setting)
+            ) {
+                $rows = intval($portlet_setting['rows']);
+            }
+
+            if ( ! $rows) {
+                $rows = $portlet_logic->getHistoryDefaultRows();
+            }
+
+            $t->assign('rows', $rows);
+
+            // 表示するアプリ
+            $module_id = @ $portlet_setting['module_id'];
+            $t->assign('module_id', $module_id);
+            // 通知履歴データリスト取得
+            $history_list =& $portlet_logic->getHistoryDataList($module_id,
+                $rows);
+            // スペース情報追加
+            if (AppAccess::isAppAvailableInternalAccess(\GrnSpaceApplication::GRN_SPACE_APPLICATION_ID)) {
+                $notification_app->addSpaceInfoForDataList($history_list,
+                    $login->getOID());
+            }
+
+            $t->assign('history_list', $history_list);
+
+            $users_id = [];
+            foreach ($history_list as $data) {
+                if (array_key_exists('sender_id', $data)) {
+                    $users_id[] = $data['sender_id'];
+                }
+            }
+            require_once("grn/controller.csp");
+            $users_info
+                = GRN_ControllerUtil::getUserInfoToShowUserName($users_id,
+                $login);
+            $t->assign('users_info', $users_info);
+        }
+        //Assign include_php Parameter
+        $t->assign('portlet', $portlet);
+
+        //Set Page Title
+        if ($portlet['title'] === '') {
+            $page_title = cb_plain_msg(GRN_NOTIFICATION_MODULE_ID,
+                'portlet_history');
+        } else {
+            $page_title = $portlet['title'];
+        }
+
+        $t->assign('page_title', $page_title);
+
+        // Ignore Licence Warnning
+        $t->skipWarning();
+        $doc_name = 'notification/portlet/' . $template_name . '.tpl';
+
+        return ['content' => $t->fetch($doc_name)];
+    }
+
+
+    /**
+     * Get Data of notification
+     *
+     * @return array
+     */
+    public function getHTML()
+    {
+        if ( ! $this->portlet) {
+            return ['content' => '', 'total_unread_to_me' => 0];
+        }
+
+        return $this->getNotificationForPortlet($this->portlet,
+            '_view_whatsnew_content');
+    }
+
+    /**
+     * Get Total notification
+     *
+     * @param string $module_id Module Id
+     *
+     * @return int
+     */
+    private function getDataCount(string $module_id)
+    {
+        $portlet_logic = $this->getNotificationApp()->getPortletLogic();
+        if ($this->isRead()) {
+            return $portlet_logic->getHistoryDataCount($module_id,
+                $this->isToMe());
+        }
+
+        return $portlet_logic->getWhatsNewDataCount($module_id,
+            $this->isToMe());
+    }
+
+    /**
+     * Get Notification by module ID with limit item
+     *
+     * @param string $module_id
+     * @param int    $limit
+     *
+     * @return mixed
+     */
+    private function getDataList(string $module_id, int $limit)
+    {
+        $notification_app = $this->getNotificationApp();
+        $portlet_logic = $notification_app->getPortletLogic();
+        if ($this->isRead()) {
+            $read_list = $portlet_logic->getHistoryDataList($module_id, $limit,
+                $this->isToMe());
+
+            // reformat data for space & group data
+            if ($module_id == \GrnSpaceApplication::GRN_SPACE_MODULE_ID) {
+                return $this->createSpaceListForDataList($read_list);
+            }
+
+            return $read_list;
+        }
+
+        return $portlet_logic->getWhatsNewDataList($module_id, $limit,
+            $this->isToMe());
+    }
+
+    /**
+     * Create Space data list
+     *
+     * @param array $space_list
+     *
+     * @return array
+     */
+    private function createSpaceListForDataList(array $space_list)
+    {
+        $result = [];
+        if (AppAccess::isAppAvailableInternalAccess(\GrnSpaceApplication::GRN_SPACE_APPLICATION_ID)) {
+            $this->getNotificationApp()->addSpaceInfoForDataList($space_list,
+                cb_lwc_uum()->getLoginUser()->getOID());
+        }
+
+        foreach ($space_list as $key => $data) {
+            $space_info = [];
+            $space_info['name'] = $data['space_name'];
+            $space_info['icon'] = $data['space_icon_url'] ?? '';
+            $space_info['data'][$data['id']] = $data;
+
+            if (isset($result[$data['space_id']])) {
+                $result[$data['space_id']]['data'][$data['id']] = $data;
+            } else {
+                $result[$data['space_id']] = $space_info;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Get notification app instance
+     *
+     * @return \GRN_Notification_App
+     */
+    private function getNotificationApp()
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $notification_app = $app_locator->getInstance(GRN_NOTIFICATION_APP_ID);
+
+        return $notification_app;
+    }
+
+    /**
+     * Get portlet settings by module ID
+     *
+     * @param  string $module_id        Module ID
+     * @param array   $portlet_settings Portlet settings
+     *
+     * @return array Result data with following structure [display_type, is_system_set, rows]
+     */
+    private function getPortletSettings(
+        string $module_id,
+        array $portlet_settings = []
+    ) {
+        $notification_app = $this->getNotificationApp();
+        /**
+         * @var \GRN_Notification_PortletLogic $portlet_logic
+         */
+        $portlet_logic = $notification_app->getPortletLogic();
+
+        /**
+         * @var \GRN_Notification_SystemConfig $system_config
+         */
+        $system_config = $notification_app->getSystemConfig();
+
+        $system_config->getWhatsNewPortletForceSetting($module_id,
+            $system_setting);
+
+        $data = [];
+        $data['is_system_set'] = false;
+        if (isset($system_setting['set'])
+            && isset($system_setting['display_type'])
+            && $system_setting['set']
+        ) {
+            $display_type = $system_setting['display_type'];
+            $data['is_system_set'] = true;
+        } else {
+            $display_type = $portlet_settings['display_type'] ??
+                            $portlet_logic->getDefaultDisplayType();
+        }
+
+        $data['display_type'] = $display_type;
+
+        $rows = $portlet_settings['rows'] ??
+                $portlet_logic->getWhatsNewDefaultRows($module_id);
+        $data['rows'] = intval($rows);
+
+        return $data;
+
+    }
+
+}

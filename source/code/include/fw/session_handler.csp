@@ -1,0 +1,627 @@
+<?php
+
+use grn\cydec\yrmcds\exception\SessionKeyNotFoundException;
+use grn\cydec\yrmcds\GaroonSessionClient;
+use grn\cydec\yrmcds\SessionClient;
+
+/**
+ * Defines CB_SessionHandler interface and implements some handlers.
+ * This is imported from clover.
+ *
+ * These handlers are used to prevents session fixation attacks.
+ *
+ * @package fw.core
+ * @filesource
+ */
+
+/**
+ * Session handler interface.
+ *
+ * This interface defines the interface that the session handler must
+ * implement.  Most interfaces are the same as described in {@link
+ * session_set_save_handler()} except "exist()" which is used to test the
+ * existence of previously written session data for a given session id.
+ *
+ * @see session_set_save_handler()
+ */
+interface CB_SessionHandler extends \SessionHandlerInterface
+{
+    /**
+     * Disable exclusive locking for lengthy read-only operations.
+     * Without calling this method, the session will be mutually excluded.
+     */
+    public function setReadOnly();
+
+    /**
+     * Calling this method prohibits session data to be written.
+     */
+    public function setError();
+
+    /**
+     * Return TRUE if $id already exists in the session storage; otherwise
+     * return FALSE.  This method is used to prevent session fixation attacks.
+     *
+     * @param string $id
+     *
+     * @return bool
+     */
+    public function exist($id);
+}
+
+abstract class CB_AbstractSessionHandler implements CB_SessionHandler
+{
+    private $_orig_data = null;
+    private $_aborted = false;
+    private $_force_write = false;
+    /**
+     * When TRUE, do not acquire the exclusive lock for this session.
+     */
+    protected $_read_only = false;
+
+    public function setReadOnly()
+    {
+        $this->_read_only = true;
+    }
+
+    public function setError()
+    {
+        $this->_aborted = true;
+    }
+
+    protected function forceWrite()
+    {
+        $this->_force_write = true;
+    }
+
+
+    /**
+     * Implement session handler's read() function.
+     *
+     * @param string $id
+     *
+     * @return mixed
+     */
+    abstract protected function _do_read($id);
+
+    /**
+     * Read session data
+     *
+     * @param string $id The session id to read data for.
+     *
+     * @return string
+     */
+    public function read($id)
+    {
+        $this->_orig_data = $this->_do_read($id);
+
+        return $this->_orig_data;
+    }
+
+    /**
+     * Implement session handler's write() function.
+     *
+     * @param string $id
+     * @param string $data
+     *
+     * @return mixed
+     */
+    abstract protected function _do_write($id, $data);
+
+    /**
+     * Write session data
+     *
+     * @param string $id   The session id
+     * @param string $data The session data
+     *
+     * @return bool
+     */
+    public function write($id, $data)
+    {
+        if ($this->_aborted) {
+            return true;
+        }
+        if ($this->_read_only) {
+            return true;
+        }
+        if ($this->_force_write || $this->_orig_data !== $data) {
+            $this->_do_write($id, $data);
+        }
+
+        return true;
+    }
+
+    /**
+     * Implement session handler's destroy() function.
+     *
+     * @param string $id
+     *
+     * @return mixed
+     */
+    abstract protected function _do_destroy($id);
+
+    /**
+     * Destroy a session
+     *
+     * @param string $id
+     *
+     * @return bool
+     */
+    public function destroy($id)
+    {
+        $this->_do_destroy($id);
+
+        return true;
+    }
+}
+
+/**
+ * Session handler using local files.
+ */
+class CB_FileSessionHandler extends CB_AbstractSessionHandler
+{
+    private $_fd = null;
+
+    /**
+     * @param string $id
+     *
+     * @return string
+     */
+    private function getPath($id)
+    {
+        return session_save_path() . DIRECTORY_SEPARATOR . 'sess_' . $id;
+    }
+
+    /**
+     * Constructor.
+     */
+    public function __construct()
+    {
+    }
+
+    /**
+     * @param string $id
+     *
+     * @return bool
+     */
+    public function exist($id)
+    {
+        return is_file($this->getPath($id));
+    }
+
+    /**
+     * @param $session_id
+     *
+     * @return bool
+     */
+    private function validateId($session_id)
+    {
+        return (bool)preg_match('/^[0-9a-zA-Z,-]+\z/', $session_id);
+    }
+
+    /**
+     * Initialize session
+     *
+     * @param string $save_path    The path where to store/retrieve the session.
+     * @param string $session_name The session name
+     *
+     * @return bool TRUE on success, FALSE on failure
+     * @throws CBException
+     */
+    public function open($save_path, $session_name)
+    {
+        if (( ! is_dir($save_path)) || ! is_writable($save_path)) {
+            cb_throw_error(E_COMMON_FILES_DIR_NO_WRITE_PRIV, null,
+                ['dir' => $save_path]);
+        }
+
+        return true;
+    }
+
+    public function close()
+    {
+        return true;
+    }
+
+    /**
+     * @param string $id
+     *
+     * @return string
+     */
+    protected function _do_read($id)
+    {
+        if ( ! $this->validateId($id)) {
+            return '';
+        }
+
+        $path = $this->getPath($id);
+        $fd = @fopen($path, "r+b");
+        if ($fd === false) {
+            return '';
+        }
+        $this->_fd = $fd;
+        flock($fd, LOCK_EX);
+        if (time() > filemtime($path) + 300) {
+            $this->forceWrite();
+        }
+        $contents = fread($fd, filesize($path));
+        if ($this->_read_only) {
+            flock($this->_fd, LOCK_UN);
+            fclose($this->_fd);
+        }
+
+        return (string)$contents;
+    }
+
+    /**
+     * @param string $id
+     * @param string $data
+     *
+     * @return bool|int
+     */
+    protected function _do_write($id, $data)
+    {
+        if ( ! $this->validateId($id)) {
+            return false;
+        }
+
+        if (is_null($this->_fd)) {
+            return file_put_contents($this->getPath($id), $data, LOCK_EX);
+        }
+        if (fseek($this->_fd, 0) < 0) {
+            return false;
+        }
+        if (fwrite($this->_fd, $data) === false) {
+            return false;
+        }
+        if (fflush($this->_fd) === false) {
+            return false;
+        }
+        if (ftruncate($this->_fd, ftell($this->_fd)) === false) {
+            return false;
+        }
+        if (flock($this->_fd, LOCK_UN) === false) {
+            return false;
+        }
+        fclose($this->_fd);
+        $this->_fd = null;
+
+        return true;
+    }
+
+    /**
+     * Destroy a session
+     *
+     * @param string $id The session id
+     *
+     * @return bool      TRUE on success, FALSE on failure
+     */
+    public function _do_destroy($id)
+    {
+        if ( ! $this->validateId($id)) {
+            return false;
+        }
+
+        if (is_file($this->getPath($id))) {
+            if ( ! is_null($this->_fd)) {
+                // Unlock session file
+                flock($this->_fd, LOCK_UN); // no read-only case here.
+                fclose($this->_fd);
+            }
+
+            return @unlink($this->getPath($id));
+        }
+
+        return true;
+    }
+
+    /**
+     * Cleanup old sessions
+     *
+     * @param string $maxlifetime
+     *
+     * @return bool
+     */
+    public function gc($maxlifetime)
+    {
+        $t = time();
+        $files = glob(session_save_path() . DIRECTORY_SEPARATOR . "sess_*");
+        foreach ($files as $f) {
+            if (is_file($f) && (filemtime($f) + (int)$maxlifetime < $t)) {
+                @unlink($f);
+            }
+        }
+
+        return true;
+    }
+}
+
+define('CB_SESSION_TABLE', 'garoon_sessions');
+
+/**
+ * Session handler using MySQL table.
+ */
+class CB_MySQLSessionHandler extends CB_AbstractSessionHandler
+{
+    private $_conn;
+    private $_locked = false;
+
+    /**
+     * Constructor.
+     */
+    public function __construct()
+    {
+        global $G_container_base;
+        $this->_conn = $G_container_base->getInstance('dbconn');
+    }
+
+    /**
+     * Return TRUE if $id already exists in the session storage; otherwise
+     * return FALSE.  This method is used to prevent session fixation attacks.
+     *
+     * @param string $id
+     *
+     * @return bool
+     */
+    public function exist($id)
+    {
+        $q = sprintf("SELECT id FROM %s WHERE id = '%s';",
+            CB_SESSION_TABLE, $this->getDomainSessionId($id));
+        $result = $this->_conn->query($q);
+        $num = $this->_conn->num_rows($result);
+        $this->_conn->free_result($result);
+
+        return $num !== 0;
+    }
+
+    /**
+     * @param string $save_path
+     * @param string $session_name
+     *
+     * @return bool
+     */
+    public function open($save_path, $session_name)
+    {
+        return true;
+    }
+
+    public function close()
+    {
+        return true;
+    }
+
+    /**
+     * @param string $id
+     *
+     * @return string
+     */
+    protected function _do_read($id)
+    {
+        $lock = $this->_read_only ? '' : 'FOR UPDATE';
+        $q
+            = sprintf("SELECT UNIX_TIMESTAMP(ts), data FROM %s WHERE id = '%s' %s;",
+            CB_SESSION_TABLE, $this->getDomainSessionId($id), $lock);
+        $result = $this->_conn->query($q);
+        $row = $this->_conn->fetch_row($result);
+        $this->_conn->free_result($result);
+        if ($row === false) {
+            return '';
+        }
+        $this->_locked = true;
+        $ts = (int)$row[0];
+        if (time() > $ts + 300) {
+            $this->forceWrite();
+        }
+
+        return $row[1];
+    }
+
+    /**
+     * @param string $id
+     * @param string $data
+     *
+     * @return bool
+     */
+    protected function _do_write($id, $data)
+    {
+        $escaped = $this->_conn->escape($data);
+        $q
+            = sprintf("INSERT INTO %s (id, data) VALUES ('%s', '%s') ON DUPLICATE KEY UPDATE data='%s', ts=CURRENT_TIMESTAMP;",
+            CB_SESSION_TABLE, $this->getDomainSessionId($id),
+            $escaped, $escaped);
+        $this->_conn->query($q);
+        $num = $this->_conn->affected_rows();
+
+        return $num > 0;
+    }
+
+    /**
+     * Destroy a session
+     *
+     * @param string $id The session id
+     *
+     * @return bool
+     */
+    public function _do_destroy($id)
+    {
+        $q = sprintf("DELETE FROM %s WHERE id = '%s';",
+            CB_SESSION_TABLE, $this->getDomainSessionId($id));
+        $this->_conn->query($q);
+
+        return true;
+    }
+
+    /**
+     * Cleanup old sessions
+     *
+     * @param string $maxlifetime
+     *
+     * @return bool
+     */
+    public function gc($maxlifetime)
+    {
+        $q = sprintf("DELETE FROM %s WHERE ts + INTERVAL %d SECOND < NOW();",
+            CB_SESSION_TABLE, (int)$maxlifetime);
+        $this->_conn->query($q);
+
+        return true;
+    }
+
+    /**
+     * @param string $id
+     *
+     * @return bool|string
+     */
+    private function getDomainSessionId($id)
+    {
+        return $this->_conn->escape($id);
+    }
+}
+
+
+/**
+ * Session handler using yrmcds.
+ */
+class CB_yrmcdsSessionHandler extends CB_AbstractSessionHandler
+{
+    const TIMEOUT = 6;
+    private $_client;
+    private $_locked;
+
+    /**
+     * Constructor.
+     */
+    public function __construct()
+    {
+        try {
+            $this->_client = GaroonSessionClient::getInstance();
+            $this->_locked = false;
+        } catch (\Exception $e) {
+            cb_throw_error(E_COMMON_SESSION_CREATE_ERROR, null, null, null,
+                ['msg' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * @param string $id
+     *
+     * @return bool
+     */
+    public function exist($id)
+    {
+        try {
+            return $this->_client->exist($id);
+        } catch (\Exception $e) {
+            cb_throw_error(E_COMMON_SESSION_CONNECTION_LOST_ERROR, null, null,
+                null, ['msg' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * @param string $save_path
+     * @param string $session_name
+     *
+     * @return bool
+     */
+    public function open($save_path, $session_name)
+    {
+        return true;
+    }
+
+    public function close()
+    {
+        // \yrmcds\Client will automatically unlock session objects.
+        return true;
+    }
+
+    /**
+     * @param $id
+     *
+     * @return yrmcds\Response
+     */
+    private function wait_lock($id)
+    {
+        $start = time();
+        while (true) {
+            $response = $this->_client->lockGet($id);
+            if ($this->_client->isStatusLocked($response)) {
+                if ((time() - $start) > self::TIMEOUT) {
+                    cb_throw_error(E_COMMON_SESSION_LOCK_TIMEOUT);
+                }
+                time_nanosleep(0, 50000000); // 50 msec
+                continue;
+            }
+
+            return $response;
+        }
+    }
+
+    /**
+     * @param string $id
+     *
+     * @return string
+     */
+    protected function _do_read($id)
+    {
+        try {
+            if ($this->_read_only) {
+                return $this->_client->read($id);
+            }
+            $r = $this->wait_lock($id);
+            if ($this->_client->isStatusOK($r)) {
+                $this->_locked = true;
+
+                return $r->data;
+            }
+
+            return '';
+        } catch (SessionKeyNotFoundException $e) {
+            return "";
+        } catch (\Exception $e) {
+            cb_throw_error(E_COMMON_SESSION_CONNECTION_LOST_ERROR, null, null,
+                null, ['msg' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * @param string $id
+     * @param string $data
+     *
+     * @return bool
+     */
+    protected function _do_write($id, $data)
+    {
+        try {
+            return $this->_client->write($id, $data, $this->_locked);
+        } catch (\Exception $e) {
+            cb_throw_error(E_COMMON_SESSION_CONNECTION_LOST_ERROR, null, null,
+                null, ['msg' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * @param string $id
+     *
+     * @return bool
+     */
+    public function _do_destroy($id)
+    {
+        try {
+            return $this->_client->destroy($id);
+        } catch (\Exception $e) {
+            cb_throw_error(E_COMMON_SESSION_CONNECTION_LOST_ERROR, null, null,
+                null, ['msg' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Cleanup on sessions
+     *
+     * @param string $maxlifetime
+     *
+     * @return bool
+     */
+    public function gc($maxlifetime)
+    {
+        return true;
+    }
+}

@@ -1,0 +1,2 @@
+<input class="margin" type="button" value="{cb_msg module='grn.schedule.system' key='GRN_SCH_SY-649' replace='true'}" onclick="grn.component.member_modify_order.get_instance('member_modify_order').prepareSubmit();submit(this.form);">
+<input type="button" value="{cb_msg module='grn.schedule.system' key='GRN_SCH_SY-650' replace='true'}" onclick="location.href='{grn_pageurl page='schedule/system/default_public_list' params=$ous_params}'">

@@ -1,0 +1,186 @@
+<?php
+
+use grn\schedule\AttendanceStatusLogic;
+use grn\schedule\bean\AttendanceStatus;
+
+if (strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST') == 0) {
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    $charset = @ $G_INPUT['charset'];
+    if ( ! $charset) {
+        global $G_config_common;
+        $charset = $G_config_common->get('I18N', 'default_external_encoding');
+    }
+
+    require_once('schedule/view_util.csp');
+    $util = GRN_Schedule_View_Util::getInstance();
+    // 日付のチェック
+    $setdate = &$util->createDateTimeFromParameters(@ $G_INPUT['start_year'],
+        @ $G_INPUT['start_month'], @ $G_INPUT['start_day']);
+    $enddate = &$util->createDateTimeFromParameters(@ $G_INPUT['end_year'],
+        @ $G_INPUT['end_month'], @ $G_INPUT['end_day']);
+
+    if ( ! is_a($setdate, 'CB_Date')) {
+        cb_throw_error(E_GRN_SCHD_INVALID_SETDATE);
+    }
+    if ( ! is_a($enddate, 'CB_Date')) {
+        cb_throw_error(E_GRN_SCHD_INVALID_ENDDATE);
+    }
+    require_once('schedule/application.csp');
+    $app = GRN_Schedule_Application::getInstance();
+    $sc_type = GRN_SCHEDULE_EVENT_TYPE_NORMAL + GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+               + GRN_SCHEDULE_EVENT_TYPE_BANNER
+               + GRN_SCHEDULE_EVENT_TYPE_DAILYEVENT;
+
+    // 期間のチェック
+    $app->checkDateTime($setdate, $enddate);
+    require_once('schedule/system_logic.csp');
+    $systemlogic = GRN_Schedule_SystemLogic::getInstance();
+    $hiddenprivate = $systemlogic->getHiddenPrivate();
+
+    //GTM-1632
+    $attendanceStatusLogic = new AttendanceStatusLogic();
+    $isEnableAttendanceCheck
+        = $attendanceStatusLogic->isEnableAttendanceCheck();
+
+    $events = $app->getEventsForExportIcs(
+        $login, $setdate, $enddate, $login, $sc_type, $hiddenprivate, false,
+        $isEnableAttendanceCheck
+    );
+
+    if (count($events) > 0) {
+        $repeat_ids = [];
+        foreach (array_keys($events) as $event_id) {
+            $event = [];
+            $event = $events[$event_id];
+
+            //GTM-1632
+            if ($event[AttendanceStatus::ATTENDANCE_CHECK_USING]
+                && $event[AttendanceStatus::ATTENDANCE_CHECK_STATUS]
+                   == AttendanceStatus::STATUS_ABSENT
+            ) {
+                unset($events[$event_id]);
+                continue;
+            }
+
+            $str_event_detail = $event['event_detail'];
+            $str_event_detail = str_replace('\\', '\\\\',
+                $str_event_detail);
+            $event['event_detail'] = $str_event_detail;
+
+            $str_event_menu = $event['event_menu'];
+            $str_event_menu = str_replace('\\', '\\\\', $str_event_menu);
+            $event['event_menu'] = $str_event_menu;
+
+            $str_memo = $event['memo'];
+            $str_memo = str_replace('\\', '\\\\', $str_memo);
+            $str_memo = preg_replace("/(\r\n|\n|\r)/i", "\\n", $str_memo);
+            $event['memo'] = $str_memo;
+            if (array_key_exists('banner', $event)
+                && $event['banner'] == true
+            ) {
+                //with ical we need move 1 day for correct format
+                cb_date_move_days($event['enddate'], 1);
+            }
+            if (array_key_exists('repeat', $event)
+                && $event['repeat'] == true
+            ) {
+                $allday = array_key_exists('allday', $event) ? $event['allday']
+                    : null;
+                require_once('schedule/repeat_event_logic.csp');
+                $repeat_logic = GRN_Schedule_RepeatEventLogic::getInstance();
+                $until = $repeat_logic->getRepeatEndDate($event_id,
+                    $allday);
+                if (count($until) > 0) {
+                    if ($allday) {
+                        $event['until'] = array_key_exists('end_date', $until)
+                            ? $until['end_date'] : null;
+                    } else {
+                        $event['until'] = array_key_exists('end_datetime',
+                            $until) ? $until['end_datetime'] : null;
+                    }
+                }
+                $repeat_ids[$event_id] = $event_id;
+            }
+            $events[$event_id] = $event;
+        }
+
+        $repeat_condition = [];
+        if (count($repeat_ids) > 0) {
+            require_once('schedule/repeat_event_logic.csp');
+            $repeat_logic = GRN_Schedule_RepeatEventLogic::getInstance();
+            $repeat_condition = $repeat_logic->getRepeatCondition($repeat_ids);
+            if (count($repeat_condition) > 0) {
+                foreach (array_keys($repeat_condition) as $key) {
+                    if (array_key_exists($key, $events)) {
+                        $day_in_week = [
+                            '0' => 'SU',
+                            '1' => 'MO',
+                            '2' => 'TU',
+                            '3' => 'WE',
+                            '4' => 'TH',
+                            '5' => 'FR',
+                            '6' => 'SA'
+                        ];
+                        $repeat_type = $repeat_condition[$key]['repeat_type'];
+                        if ($repeat_type == GRN_REPEAT_TYPE_DAY) {
+                            $events[$key]['GRN_REPEAT_TYPE_DAY'] = true;
+                        } elseif ($repeat_type == GRN_REPEAT_TYPE_WEEKDAY) {
+                            $events[$key]['GRN_REPEAT_TYPE_WEEKDAY'] = true;
+                        } elseif ($repeat_type == GRN_REPEAT_TYPE_WEEK) {
+                            $events[$key]['GRN_REPEAT_TYPE_WEEK'] = true;
+                            $events[$key]['repeat_wday']
+                                = $day_in_week[$repeat_condition[$key]['repeat_wday']];
+                        } elseif ($repeat_type == GRN_REPEAT_TYPE_MONTH) {
+                            $events[$key]['GRN_REPEAT_TYPE_MONTH'] = true;
+                            $events[$key]['repeat_day']
+                                = $repeat_condition[$key]['repeat_day'];
+                        }
+                    }
+                }
+            }
+            $exceptdates = $repeat_logic->getExceptDatesByIds($repeat_ids);
+            if (is_array($exceptdates)) {
+                foreach ($exceptdates as $event_id => $exdates) {
+                    $event = $events[$event_id];
+                    $suffix = '';
+                    if ( ! isset($event['allday'])
+                         || false === $event['allday']
+                    ) {
+                        $suffix = sprintf('T%02d%02d%02d',
+                            $event['setdatetime']->hour,
+                            $event['setdatetime']->minute,
+                            $event['setdatetime']->second);
+                    }
+                    foreach ($exdates as $key => $exdate) {
+                        $exdates[$key] = str_replace('-', '', $exdate)
+                                         . $suffix;
+                    }
+                    $events[$event_id]['EXDATE'] = implode(',', $exdates);
+                }
+            }
+        }
+    }
+    $Filename = "schedule.ics";
+    header("Content-Type: text/Calendar");
+    header("Content-Disposition: inline; filename=$Filename");
+    // 項目名の書き出し
+    require_once("grn/smarty.csp");
+    $t = new GRN_Smarty;
+    $t->assign('events', $events);
+    require_once('grn/system_logic.csp');
+    $syslogic = GRN_System::getInstance();
+    $t->assign('uuid', $syslogic->getSystemUUID());
+    global $G_state_set;
+    $G_state_set->set('copyright_should_be_written', false);
+    $G_state_set->set('html_should_be_closed', false);
+    $t->skipWarning();
+    $t->display("schedule/personal/_event_ical_format.tpl");
+    // 監査ログ
+    require_once('grn/logger.csp');
+    $lm = CB_LoggerManager::getInstance();
+    $l = $lm->getLogger(GRN_SCHEDULE_MODULE_ID);
+    $log_params = [];
+    $l->noticeEx('export_ical', 'personal_event', $log_params);
+}

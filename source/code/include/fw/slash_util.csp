@@ -1,0 +1,627 @@
+<?php
+
+require_once('fw/cydec.csp');
+require_once('fw/i18n.csp');
+
+class CB_SlashUtil
+{
+    public static function redirectToLogin()
+    {
+        require_once('fw/login.csp');
+        $params = cb_get_page_params();
+        $redirect
+            = rawurlencode(cb_fully_qualify_url(cb_format_url(cb_get_server_pagename(),
+            $params)));
+
+        // redirect to http://<domain>.cybozu.com/login?redirect=<URL>
+        cb_redirect_to_url(self::getSlashURL('login?redirect=' . $redirect),
+            false);
+    }
+
+    /**
+     * @param  string $foreignKey Login Name
+     *
+     * @return string
+     */
+    public static function getSlashProfileURL($foreignKey)
+    {
+        // http://<domain>.cybozu.com/users/<user_code>
+        return self::getSlashURL('users/' . rawurlencode($foreignKey));
+    }
+
+    /**
+     * @param  string $url
+     *
+     * @return string
+     */
+    private static function getSlashURL($url)
+    {
+        // http://<domain>.cybozu.com/$url
+        return cb_fully_qualify_url('/' . $url);
+    }
+
+    /**
+     * @param CB_User $user
+     *
+     * @return bool
+     */
+    public static function isPasswordExpired(CB_User $user)
+    {
+        $slash = CB_SlashDB::getInstance();
+        $expirationTime = $slash->getPasswordExpirationTime($user);
+        if (is_null($expirationTime) || $expirationTime > time()) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @static
+     *
+     * @param CB_User $user
+     *
+     * @return bool
+     */
+    public static function isIgnorePasswordExpire(CB_User $user)
+    {
+        return self::isIgnorePasswordExpireWithSlashDBInjection($user,
+            CB_SlashDB::getInstance());
+    }
+
+    /**
+     * @static
+     *
+     * @param CB_User    $user
+     * @param CB_SlashDB $slashDb
+     *
+     * @return bool
+     */
+    public static function isIgnorePasswordExpireWithSlashDBInjection(
+        CB_User $user,
+        $slashDb
+    ) {
+        return ($slashDb->getIgnorePasswordExpire($user) == '1');
+    }
+
+    /**
+     * @static
+     * @return bool
+     */
+    public static function isSameOrigin()
+    {
+        $slashDb = CB_SlashDB::getInstance();
+
+        return $sameOrigin = $slashDb->getSameOrigin();
+    }
+
+    /**
+     * @static
+     * @return bool
+     */
+    public static function isGaiaLicenseapiRequest()
+    {
+        $slashDb = CB_SlashDB::getInstance();
+
+        return $result = $slashDb->getGaiaLicenseapiRequest();
+    }
+
+    /**
+     * @static
+     * @return string (JP / CN / US)
+     */
+    public static function getRegion()
+    {
+        require_once('fw/forest_util.csp');
+        $forest_config = CB_ForestUtil::getConfig();
+        $region = $forest_config->get('Common', 'base_region');
+        if ( ! $region
+             || ($region != 'JP' && $region != 'CN'
+                 && $region != 'US')
+        ) {
+            $region = 'US';
+        }
+
+        return $region;
+    }
+}
+
+class CB_SlashDB
+{
+    const CONVERTER_SLASH_SIZE
+        = [
+            'SMALL'  => 'SMALL',
+            'NORMAL' => 'NORMAL',
+            'MEDIUM' => 'SIZE_48_R',
+            'LARGE'  => 'SIZE_96_R'
+        ];
+
+    private function __construct()
+    {
+        $this->conn = CB_CyDECUtil::getInstance()->getDatabase('slash');
+    }
+
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return CB_SlashDB
+     */
+    public static function getInstance()
+    {
+        if (is_null(self::$_instance)) {
+            self::$_instance = new static();
+        }
+
+        return self::$_instance;
+    }
+
+    private function query($sql)
+    {
+        $result = $this->conn->query($sql);
+        if ($result === false) {
+            CB_CyDECUtil::throwDbError($this->conn, $sql, false, false);
+        }
+
+        return $result;
+    }
+
+    private function escape($str)
+    {
+        return $this->conn->real_escape_string($str);
+    }
+
+    public function commit()
+    {
+        $this->conn->commit();
+        $this->conn = null;
+    }
+
+    private $_slash_ids = [];
+
+    public function getSlashID($uid = null)
+    {
+        if ( ! array_key_exists($uid, $this->_slash_ids)) {
+            global $G_container_base;
+            /** @var $uum GRN_Uum */
+            $uum = $G_container_base->getInstance('uum');
+            if (is_null($uid)) {
+                $user = $uum->getLoginUser();
+            } else {
+                $user = $uum->getUser($uid);
+            }
+            if ($user === false) {
+                die("Could not identify slash user.");
+            }
+            $this->_slash_ids[$uid] = $user->get('slash');
+        }
+
+        return $this->_slash_ids[$uid];
+    }
+
+    private $_user_infos = [];
+
+    private function getUserInfo($uid = null)
+    {
+        if ( ! array_key_exists($uid, $this->_user_infos)) {
+            $slash_id = $this->escape($this->getSlashID($uid));
+            $i18n = CB_I18N::getInstance();
+            $locale = $this->escape($i18n->getCurrentLanguage());
+            $sql
+                = "SELECT CASE WHEN localName IS NOT NULL AND LENGTH(localName) > 0 AND (localNameLocale = '${locale}') THEN localName ELSE name END as displayName, photo FROM _dir_user WHERE id = '${slash_id}'";
+            $result = $this->query($sql);
+            $row = $result->fetch_assoc();
+            $result->close();
+            if (is_null($row)) {
+                die("Failed to locate user's information.");
+            }
+            $this->_user_infos[$uid] = $row;
+        }
+
+        return $this->_user_infos[$uid];
+    }
+
+    private function getUsersInfo($uids = [])
+    {
+        $ret = [];
+        if (count($uids) > 0) {
+            $i18n = CB_I18N::getInstance();
+            $locale = $this->escape($i18n->getCurrentLanguage());
+
+            $escaped_ids = [];
+            foreach ($uids as $id) {
+                $escaped_ids[] = "'" . $this->escape($id) . "'";
+            }
+            $condition = " WHERE id IN (" . implode(",", $escaped_ids) . ") ";
+
+            $sql
+                = "SELECT CASE WHEN localName IS NOT NULL AND LENGTH(localName) > 0 AND (localNameLocale = '${locale}') THEN localName ELSE name END as displayName, photo, id FROM _dir_user ";
+            $sql .= $condition;
+            $result = $this->query($sql);
+            while ($row = $result->fetch_assoc()) {
+                $ret[$row['id']] = $row;
+            }
+            $result->close();
+        }
+
+        return $ret;
+    }
+
+    public function getLoginUserName()
+    {
+        $a = $this->getUserInfo();
+
+        return $a['displayName'];
+    }
+
+    /**
+     * @param string      $size
+     * @param null|string $userId
+     *
+     * @return string
+     */
+    public function getUserImageLink($size, $userId = null)
+    {
+        $slashId = $this->getSlashID($userId);
+        $userInfo = $this->getUserInfo($userId);
+        if (strlen($userInfo['photo']) === 0) {
+            return '';
+        }
+        $pi = explode("\n", $userInfo['photo']);
+
+        return "/api/user/photo.do/-/user.png?id={$slashId}&size={$size}&hash={$pi[2]}&.png";
+    }
+
+    public function addPhotoUrlForMultiUserByUsersInfoFromSlash(
+        $size,
+        $users_info = []
+    ) {
+        if (is_array($users_info) && count($users_info) > 0) {
+            $slashIds = [];
+            $slashInfos = [];
+            $arr_mapping_id = [];
+            foreach ($users_info as $uid => $user_info) {
+                $slashIds[] = $user_info['col_slash'];
+                $arr_mapping_id[$user_info['col_slash']] = $uid;
+            }
+            if (count($slashIds) > 0) {
+                $slashInfos = $this->getUsersInfo($slashIds);
+
+                foreach ($slashInfos as $slashId => $slashInfo) {
+                    $link = "";
+                    if (strlen($slashInfo['photo']) === 0) {
+                        continue;
+                    }
+                    $pi = explode("\n",
+                        $slashInfo['photo']);
+                    $link
+                        = "/api/user/photo.do/-/user.png?id={$slashId}&size={$size}&hash={$pi[2]}&.png";
+                    $users_info[$arr_mapping_id[$slashId]]['photoUrl'] = $link;
+                }
+            }
+        }
+
+        return $users_info;
+    }
+
+    /**
+     * @param string $size_type
+     * Accept values: SMALL | NORMAL | MEDIUM | LARGE
+     *
+     * @return string
+     */
+    public function getUserImage(string $size_type = 'NORMAL')
+    {
+        $slash_size = self::CONVERTER_SLASH_SIZE[$size_type] ?? 'NORMAL';
+        $link = $this->getUserImageLink($slash_size);
+        if (strlen($link) === 0) {
+            global $G_config_common;
+
+            return $G_config_common->get('Global', 'app_path')
+                   . "/grn/image/cybozu/image-common/user_hd.svg";
+        }
+
+        return $link;
+    }
+
+    private static $extensions
+        = [
+            'image/png'      => '.png',
+            'image/jpeg'     => '.jpg',
+            'image/pjpeg'    => '.jpg',
+            'image/gif'      => '.gif',
+            'image-x-ms-bmp' => '.bmp',
+            'image-bmp'      => '.bmp'
+        ];
+
+    public function getLogo()
+    {
+        $sql
+            = "SELECT name, value FROM system_settings WHERE name LIKE 'com.cybozu.slash.company%'";
+        $result = $this->query($sql);
+        $info = [];
+        $info['isDefaultLogo'] = false;
+        while ($row = $result->fetch_assoc()) {
+            if (strstr($row['name'], 'companyName') !== false
+                && strlen($row['value']) > 0
+            ) {
+                $info['name'] = $row['value'];
+            }
+            if (strstr($row['name'], 'companyUrl') !== false
+                && strlen($row['value']) > 0
+            ) {
+                $info['url'] = $row['value'];
+            }
+            if (strstr($row['name'], 'companyLogo') !== false
+                && strlen($row['value']) > 0
+            ) {
+                $t = json_decode($row['value'], true);
+                $mime = strtolower($t['contentType']);
+                $ext = array_key_exists($mime, self::$extensions)
+                    ? self::$extensions[$mime] : '.png';
+                $hash = $t['hash'];
+                $info['image']
+                    = "/api/company/logo.do/-/logo{$ext}?hash=${hash}&${ext}";
+            }
+        }
+        $result->close();
+        if ( ! array_key_exists('name', $info)) {
+            $info['name'] = 'Top';
+        }
+        if ( ! array_key_exists('url', $info)) {
+            $info['url'] = '/';
+        }
+        if ( ! array_key_exists('image', $info)) {
+            global $G_config_common;
+            $reg = CB_SlashUtil::getRegion();
+            if ($reg == "CN") {
+                $img_name = "cloudLogo_cn.png";
+            } else {
+                $img_name = "cloudLogo.png";
+            }
+
+            $info['image'] = $G_config_common->get('Global', 'app_path')
+                             . '/grn/image/cybozu/image-common/'
+                             . $img_name;
+            $info['isDefaultLogo'] = true;
+        }
+
+        return $info;
+    }
+
+    private $_services = null;
+
+    public function getServices()
+    {
+        if (is_null($this->_services)) {
+            $sql
+                = "SELECT service FROM available_services WHERE max_user != 0;";
+            $result = $this->query($sql);
+            $ret = [];
+            while ($row = $result->fetch_row()) {
+                $ret[$row[0]] = true;
+            }
+            $result->close();
+            $this->_services = $ret;
+        }
+
+        return $this->_services;
+    }
+
+    private $_available = null;
+
+    public function getAvailableServices()
+    {
+        if (is_null($this->_available)) {
+            $services = $this->getServices();
+
+            global $G_container_base;
+            /** @var GRN_Uum $uum */
+            $uum = $G_container_base->getInstance('uum');
+            $login_user = $uum->getLoginUser();
+            if ($login_user->getOID() === '1') {
+                return $services;
+            }
+
+            $slash_id = $this->escape($this->getSlashID());
+            $sql
+                = "SELECT service FROM _dir_available_user WHERE userId = '${slash_id}'";
+            $result = $this->query($sql);
+            $this->_available = [];
+            while ($row = $result->fetch_row()) {
+                if (array_key_exists($row[0], $services)) {
+                    $this->_available[$row[0]] = true;
+                }
+            }
+            $result->close();
+        }
+
+        return $this->_available;
+    }
+
+    /**
+     *  指定したサービスのライセンスが有効or試用中かどうか
+     *
+     * @param string $service_name サービス名
+     *
+     * @return bool 指定されたサービスのライセンスが有効な場合にTRUE、無効な場合にFALSE
+     */
+    public function getAvailableServiceLicense($service_name)
+    {
+        $service_name = $this->escape($service_name);
+        $sql = "SELECT * FROM available_services WHERE service = '"
+               . $service_name . "' AND max_user != 0";
+        $result = $this->query($sql);
+        $ret = ! is_null($result->fetch_row());
+        $result->close();
+
+        return $ret;
+    }
+
+    /**
+     *  ログインユーザーにセキュアアクセスの証明書が発行されているか
+     *
+     * @return bool 証明書が発行されている場合にTRUE、発行されていない場合にFALSE
+     */
+    public function hasSkylabCert()
+    {
+        $slash_id = $this->escape($this->getSlashID());
+        $sql
+            = "SELECT password FROM view_dir_cert WHERE userId = '${slash_id}' ORDER BY expireTime DESC limit 1";
+        $result = $this->query($sql);
+        $ret = ! is_null($result->fetch_row());
+        $result->close();
+
+        return $ret;
+    }
+
+    /**
+     *  証明書がダウンロード可能かどうか
+     *
+     * @return bool ダウンロードできない場合にFALSE、それ以外はTRUE
+     */
+    public function isCertDownload()
+    {
+        $sql
+            = "SELECT * FROM system_settings WHERE name = 'com.cybozu.slash.certificate.download.setting' AND value ='false'";
+        $result = $this->query($sql);
+        $ret = is_null($result->fetch_row());
+        $result->close();
+
+        return $ret;
+    }
+
+    /**
+     * @param CB_User $user
+     *
+     * @return DateTime
+     */
+    private function getPasswordMtime(CB_User $user)
+    {
+        $slashId = $this->escape($user->get('slash'));
+        $query
+            = "SELECT passwordMtime FROM _dir_user WHERE id = '{$slashId}';";
+        $result = $this->query($query);
+        $row = $result->fetch_assoc();
+        $result->close();
+
+        return new DateTime($row['passwordMtime'], new DateTimeZone('UTC'));
+    }
+
+    /**
+     * @param CB_User $user
+     *
+     * @return int or null  return null if password expiration is unlimited
+     */
+    public function getPasswordExpirationTime(CB_User $user)
+    {
+        $passwordMtime = $this->getPasswordMtime($user);
+
+        $query
+            = "SELECT value FROM system_settings WHERE name = 'com.cybozu.common.directory.passwordpolicy.ExpireTime';";
+        $result = $this->query($query);
+        $row = $result->fetch_assoc();
+        $result->close();
+
+        $time = null;
+        switch ($row['value']) {
+            case 'DAY_30':
+                $time = $passwordMtime->add(new DateInterval("P30D"))
+                                      ->getTimestamp();
+                break;
+            case 'DAY_60':
+                $time = $passwordMtime->add(new DateInterval("P60D"))
+                                      ->getTimestamp();
+                break;
+            case 'DAY_90':
+                $time = $passwordMtime->add(new DateInterval("P90D"))
+                                      ->getTimestamp();
+                break;
+            case 'DAY_180':
+                $time = $passwordMtime->add(new DateInterval("P180D"))
+                                      ->getTimestamp();
+                break;
+            case 'ONE_YEAR':
+                $time = $passwordMtime->add(new DateInterval("P1Y"))
+                                      ->getTimestamp();
+                break;
+            case 'FOREVER':
+            default:
+                break;
+        }
+
+        return $time;
+    }
+
+    /**
+     * @param CB_User $user
+     *
+     * @return mixed (0 or 1)
+     */
+    public function getIgnorePasswordExpire(CB_User $user)
+    {
+        $slashId = $this->escape($this->getSlashID($user->getOID()));
+        $sql
+            = "SELECT ignorePasswordExpire FROM _dir_user WHERE id='{$slashId}'";
+        $result = $this->query($sql);
+        $row = $result->fetch_assoc();
+        $result->close();
+        assert('isset($row["ignorePasswordExpire"])');
+
+        return $row['ignorePasswordExpire'];
+    }
+
+    /**
+     * @return bool
+     */
+    public function getSameOrigin()
+    {
+        $sql
+            = "SELECT value FROM system_settings WHERE name = 'com.cybozu.slash.sameOrigin'";
+        $result = $this->query($sql);
+        $row = $result->fetch_assoc();
+        $result->close();
+        // default TRUE
+        if (is_null($row) || is_null($row['value'])
+            || $row['value'] == 'true'
+        ) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    public function getGaiaLicenseapiRequest()
+    {
+        $sql
+            = "SELECT value FROM system_settings WHERE name = 'com.cybozu.gaia.license.apiRequest'";
+        $result = $this->query($sql);
+        $row = $result->fetch_assoc();
+        $result->close();
+
+        if ( ! is_null($row) && $row['value'] === '0') {
+            return false;
+        } else {
+            return true;
+        }
+    }
+
+    /**
+     * @return int|string
+     */
+    public function getSessionTimeoutSeconds()
+    {
+        $query
+            = "SELECT value FROM system_settings WHERE name = 'com.cybozu.slash.session.timeoutSeconds'";
+        $result = $this->query($query);
+        $row = $result->fetch_assoc();
+        $result->close();
+
+        if (is_null($row)) {
+            return DEFAULT_SESSION_EXPIRE_TIME;
+        } else {
+            return $row['value'];
+        }
+    }
+
+}

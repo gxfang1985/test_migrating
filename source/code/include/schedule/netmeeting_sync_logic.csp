@@ -1,0 +1,1320 @@
+<?php
+
+/**
+ * Netmeeting API Logic
+ *
+ * @updated:
+ *    2011/06/08 VCBSCH0010 Sync for V-CUBE
+ */
+
+require_once('schedule/netmeeting_inspection.csp');
+
+/**
+ * @package     grn.netmeeting
+ */
+class GRN_Netmeeting_SyncLogic
+{
+    /**
+     * @access private
+     */
+    private $_n2url;
+    private $_n2my_session;
+    private $_logger;
+    //--- Add VCBSCH0040 ---s
+    private $_login_langage;
+    private $_login_timezone;
+    //--- Add VCBSCH0040 ---e
+    private $_netmeeting_vcube_version;
+
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        $this->_n2url = null;
+        $this->_n2my_session = null;
+        //--- Add VCBSCH0040 ---s
+        $this->_login_langage = null;
+        $this->_login_timezone = null;
+        $this->_netmeeting_vcube_version = null;
+
+        // セッションからV-CUBEログインセッションを取得する
+        require_once('fw/session_manager.csp');
+        $session_manager = CB_SessionManager::getInstance();
+        $session
+            = $session_manager->getSession('netmeeting');
+        $this->_n2url = $session->get('n2url');
+        $this->_n2my_session = $session->get('n2my_session');
+        $this->_login_langage = $session->get('login_langage');
+        $this->_login_timezone = $session->get('login_timezone');
+        $this->_netmeeting_vcube_version
+            = $session->get('netmeeting_vcube_version');
+        //--- Add VCBSCH0040 ---e
+
+        $this->_logger = GRN_Netmeeting_Inspection::getInstance();
+    }
+
+    private static $_instance = null;
+
+    /**
+     * @return GRN_Netmeeting_SyncLogic
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * V-CUBEシステムURL取得
+     * @access private
+     * @return  boolean
+     */
+    function _getNetmeetingURL()
+    {
+        if (isset($this->_n2url) && strlen($this->_n2url) > 0) {
+            return true;
+        }
+
+        require_once('schedule/netmeeting_system_logic.csp');
+        $system_logic = GRN_Netmeeting_SystemLogic::getInstance();
+
+        $url = null;
+        if (($url = $system_logic->getNetmeetingURL()) === false) {
+            return false;
+        }
+
+        $this->_n2url = $url;
+
+        return true;
+    }
+
+    /**
+     * @param string $data
+     *
+     * @access private
+     * @return  mixed   False or レスポンスデータ
+     */
+    function _parsePHP($data)
+    {
+        $result = null;
+        if ( ! isset($data) || strlen($data) == 0) {
+            return false;
+        } else {
+            if (($result = cb_unserialize($data, ["allowed_classes" => false]))
+                === false
+            ) {
+                return false;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * APIエラーチェック
+     *
+     * @param array      $result
+     * @param array|null $data
+     * @param string     $action
+     *
+     * @access private
+     * @return array|null null or エラーメッセージ
+     */
+    function _checkAPIError($result, & $data, $action = '')
+    {
+        $cause = null;
+        $data = null;
+        if (is_array($result) !== false) {
+            $status = array_key_exists('status', $result) ? $result['status']
+                : 0;
+            // APIエラーの場合
+            if ($status == GRN_NETMEETING_API_RESPONSE_ERR) {
+                // エラーメッセージ取得
+                $error_msg = array_key_exists('error_msg', $result)
+                    ? $result['error_msg'] : null;
+                $error_cd = null;
+                if (array_key_exists('error_info', $result)) {
+                    $error_info = $result['error_info'];
+                    if (array_key_exists('error_cd', $error_info)) {
+                        // エラーコード取得
+                        $error_cd = $error_info['error_cd'];
+                        $errors = $error_info['data']['errors'] ?? [];
+
+                        foreach ($errors as $info) {
+                            // 該当データなしの場合はエラーコードを置き換える
+                            if ((strcmp($info['field'], 'reservation_id') == 0)
+                                && (strcmp($info['err_cd'],
+                                        GRN_NETMEETING_API_ERR_RESERVATION_SESSION_INVALID)
+                                    == 0)
+                            )   //-- Upd VCBSCH0040
+                            {
+                                $error_cd
+                                    = GRN_NETMEETING_API_ERR_RESERVATION_SESSION_INVALID;                          //-- Upd VCBSCH0040
+                            }
+                        }
+                    }
+                }
+                // write log
+                $log_params = [
+                    'error_cd'  => $error_cd,
+                    'error_msg' => $error_msg
+                ];
+                $this->_logger->writeInspectionLog(CB_LOGGER_ERROR, $action,
+                    'netmeeting_api_error', $log_params);
+
+                $cause = [
+                    'error_cd'  => $error_cd,
+                    'error_msg' => $error_msg . ' (code=' . $error_cd . ')',
+                ];
+            } else {
+                // APIレスポンスデータを返す
+                $data = $result['data'] ?? null;
+            }
+        }
+
+        return $cause;
+    }
+
+    /**
+     * リクエスト送信
+     *
+     * @param string $url
+     * @param null   $post_params
+     * @param string $action
+     *
+     * @access private
+     * @return  mixed   False or レスポンスデータ
+     */
+    function _sendRequest($url, $post_params = null, $action = '')
+    {
+        global $G_container_base;
+        $http_client = $G_container_base->getInstance('http_client');
+
+        //--------------------------------------------------------------------------
+        // Webプロキシ対応 start
+        //--------------------------------------------------------------------------
+        require_once('grn/http_proxy.csp');
+        $prox_config = GRN_HttpProxyConfigManager::getInstance();
+
+        // HTTPプロキシ利用可能
+        if ($prox_config->isAvaliable()) {
+            $uri = new CB_URI($url);
+
+            $exception_address = '';
+            $prox_config->getProperty('exception_address', $exception_address);
+            $addresses = explode(';', $exception_address);
+            if ( ! is_array($addresses)) {
+                $addresses = [];
+            }
+
+            $use_proxy = true;
+            $search = $uri->toString(false);
+
+            // 例外アドレスのチェック
+            foreach ($addresses as $address) {
+                if (strlen($address) == 0) {
+                    continue;
+                }
+
+                if (stristr($search, $address) !== false) {
+                    $use_proxy = false;
+                    break;
+                }
+            }
+
+            // プロキシを利用する場合
+            if ($use_proxy) {
+                $prox_config->getProperty('server', $server);
+                $prox_config->getProperty('port', $port);
+                $proxy = "$server:$port";
+                $http_client->setCurlOption(CURLOPT_PROXY, $proxy);
+            }
+        }
+        //--------------------------------------------------------------------------
+        // Webプロキシ対応 end
+        //--------------------------------------------------------------------------
+
+        // set request method : POST
+        $http_client->setCurlOption(CURLOPT_POST, 1);
+
+        // set post data
+        if ( ! is_null($post_params)) {
+            $http_client->setCurlOption(CURLOPT_POSTFIELDS, $post_params);
+        }
+
+        // send request
+        if ($http_client->execute($url)) {
+            // get http result code
+            $status_line = $http_client->getStatusLine();
+            if ($status_line['status-code'] != 200) {
+                // write log
+                $log_params = [
+                    'status_code' => $status_line['status-code'],
+                    'url'         => $url
+                ];
+                $this->_logger->writeInspectionLog(CB_LOGGER_ERROR, $action,
+                    'netmeeting_http_error', $log_params);
+
+                return false;
+            }
+
+            // read response data
+            $body = $http_client->getBody();
+
+            // parse reponse data to obtain error code
+            $result = $this->_parsePHP($body);
+            if ($result === false) {
+                // write log
+                $this->_logger->writeInspectionLog(CB_LOGGER_ERROR, $action,
+                    'netmeeting_auth_error', $body);
+
+                return false;
+            }
+        } else {
+            $error = $http_client->getError();
+
+            // write log
+            $log_params = [
+                'error_code'    => @$error['errno'],
+                'error_message' => @$error['message']
+            ];
+            $this->_logger->writeInspectionLog(CB_LOGGER_ERROR, $action,
+                'netmeeting_connection_error', $log_params);
+
+            return false;
+        }
+
+        return $result;
+    }
+
+    //--- Add VCBSCH0040 ---s
+
+    /**
+     * ログインリトライ
+     *
+     * @param string     $api_name
+     * @param array      $post_data
+     * @param array|null $data
+     * @param string     $action
+     *
+     * @return array|bool|null
+     */
+    public function login_retry($api_name, $post_data, & $data, $action)
+    {
+        if ($this->netmeeting_login(true) === false) {
+            return false;
+        }
+        $url = $this->_n2url . $api_name;
+
+        $post_data['n2my_session'] = $this->_n2my_session;
+
+        $result = $this->_sendRequest($url, $post_data, $action);
+        if (is_array($result) === false) {
+            return false;
+        }
+        $err_msg = $this->_checkAPIError($result, $data, $action);
+
+        return $err_msg;
+    }
+    //--- Add VCBSCH0040 ---e
+
+    /**
+     * ログインAPI実行
+     *
+     * @param bool $new_flg
+     *
+     * @return  boolean
+     */
+    public function netmeeting_login($new_flg = false
+    )        //-- Upd VCBSCH0040
+    {
+        //--- Upd VCBSCH0040 ---s
+        require_once('schedule/netmeeting_system_logic.csp');
+        $system_logic = GRN_Netmeeting_SystemLogic::getInstance();
+
+        if (($post_data = $system_logic->getLoginItem()) === false) {
+            return false;
+        }
+
+        if ($new_flg) {
+            $this->_n2url = null;
+            $this->_n2my_session = null;
+        } else {
+            if ((isset($this->_n2url) && strlen($this->_n2url) > 0)
+                && (isset($this->_n2my_session)
+                    && strlen($this->_n2my_session) > 0)
+                && ($post_data['lang'] == $this->_login_langage)
+                && ($post_data['timezone'] == $this->_login_timezone)
+                && ($post_data['netmeeting_vcube_version']
+                    == $this->_netmeeting_vcube_version)
+            ) {
+                return true;
+            }
+        }
+
+        // セッションからV-CUBEログインセッションをクリアする
+        require_once('fw/session_manager.csp');
+        $session_manager = CB_SessionManager::getInstance();
+        $session = $session_manager->getSession('netmeeting');
+        $session->set('n2url', null);
+        $session->set('n2my_session', null);
+        $session->set('login_langage', null);
+        $session->set('login_timezone', null);
+        $session->set('netmeeting_vcube_version', null);
+        //--- Upd VCBSCH0040 ---e
+
+        if ($this->_getNetmeetingURL() === false) {
+            return false;
+        }
+        $this->_netmeeting_vcube_version
+            = $post_data['netmeeting_vcube_version'];
+        $url = $this->_netmeeting_vcube_version
+               == GRN_NETMEETING_VCUBE_VERSION_5
+            ? $this->_n2url . GRN_NETMEETING_API_ACTION_LOGIN_V5
+            : $this->_n2url . GRN_NETMEETING_API_ACTION_LOGIN;
+
+        $action = 'netmeeting_login';
+        $result = $this->_sendRequest($url, $post_data, $action);
+        if (is_array($result) === false) {
+            return false;
+        }
+        $err_msg = $this->_checkAPIError($result, $data, $action);
+        if (isset($err_msg)) {
+            return false;
+        }
+        if (is_array($data) !== false) {
+            if (array_key_exists('session', $data)) {
+                if (isset($data['session']) && strlen($data['session']) > 0) {
+                    $this->_n2my_session = $data['session'];
+                }
+            }
+        }
+        if ( ! isset($this->_n2my_session)
+             || strlen($this->_n2my_session) == 0
+        ) {
+            return false;
+        }
+
+        //--- Add VCBSCH0040 ---s
+        // セッションにV-CUBEログインセッションをセットする
+        $session->set('n2url', $this->_n2url);
+        $session->set('n2my_session', $this->_n2my_session);
+        $session->set('login_langage', $post_data['lang']);
+        $session->set('login_timezone', $post_data['timezone']);
+        $session->set('netmeeting_vcube_version',
+            $post_data['netmeeting_vcube_version']);
+
+        //--- Add VCBSCH0040 ---e
+
+        return true;
+    }
+
+    /**
+     * 予約登録API実行
+     *
+     * @param array      $param
+     * @param array|null $data
+     *
+     * @return string 連携結果ステータス
+     */
+    public function netmeeting_reservation_add($param, & $data)
+    {
+        $status = GRN_NETMEETING_COOPERATION_STATUS_INCOMPLETE;
+
+        if ($this->netmeeting_login() === false) {
+            return $status;
+        }
+        $url_action = $this->_netmeeting_vcube_version
+                      == GRN_NETMEETING_VCUBE_VERSION_5
+            ? GRN_NETMEETING_API_RSV_ACTION_ADD_V5
+            : GRN_NETMEETING_API_RSV_ACTION_ADD;
+        $url = $this->_n2url . $url_action;
+
+        $post_data = $param;
+        $post_data['n2my_session'] = $this->_n2my_session;
+        $post_data['output_type'] = 'php';
+
+        $action = 'netmeeting_rsv_add';
+        $result = $this->_sendRequest($url, $post_data, $action);
+        if (is_array($result) === false) {
+            return $status;
+        }
+        $err_msg = $this->_checkAPIError($result, $data, $action);
+        //--- Add VCBSCH0040 ---s
+        // ログインエラーの場合はリトライ
+        if (isset($err_msg)
+            && $err_msg['error_cd'] == GRN_NETMEETING_API_ERRCD_LOGIN_FAILED
+        ) {
+            if (($err_msg = $this->login_retry($url_action, $post_data, $data,
+                    $action)) === false
+            ) {
+                return $status;
+            }
+        }
+        //--- Add VCBSCH0040 ---e
+        if (isset($err_msg)) {
+            return $status;
+        }
+        if (is_array($data) !== false) {
+            $status = GRN_NETMEETING_COOPERATION_STATUS_COMPLETE;
+        }
+
+        return $status;
+    }
+
+    /**
+     * 予約変更API実行
+     *
+     * @param array      $param
+     * @param array|null $data
+     *
+     * @return string 連携結果ステータス
+     */
+    public function netmeeting_reservation_update($param, & $data)
+    {
+        $status = GRN_NETMEETING_COOPERATION_STATUS_INCOMPLETE;
+
+        if ($this->netmeeting_login() === false) {
+            return $status;
+        }
+        $url_action = $this->_netmeeting_vcube_version
+                      == GRN_NETMEETING_VCUBE_VERSION_5
+            ? GRN_NETMEETING_API_RSV_ACTION_UPDATE_V5
+            : GRN_NETMEETING_API_RSV_ACTION_UPDATE;
+        $url = $this->_n2url . $url_action;
+
+        $post_data = $param;
+        $post_data['n2my_session'] = $this->_n2my_session;
+        $post_data['output_type'] = 'php';
+
+        $action = 'netmeeting_rsv_update';
+        $result = $this->_sendRequest($url, $post_data, $action);
+        if (is_array($result) === false) {
+            return $status;
+        }
+        $err_msg = $this->_checkAPIError($result, $data, $action);
+        //--- Add VCBSCH0040 ---s
+        // ログインエラーの場合はリトライ
+        if (isset($err_msg)
+            && $err_msg['error_cd'] == GRN_NETMEETING_API_ERRCD_LOGIN_FAILED
+        ) {
+            if (($err_msg = $this->login_retry($url_action, $post_data, $data,
+                    $action)) === false
+            ) {
+                return $status;
+            }
+        }
+        //--- Add VCBSCH0040 ---e
+        if (isset($err_msg)) {
+            return $status;
+        }
+        if (is_array($data) !== false) {
+            $status = GRN_NETMEETING_COOPERATION_STATUS_COMPLETE;
+        }
+        // http://issues.dev.cybozu.co.jp/browse/GRN2-7945
+        // remove pin_cd elment value for cellular phone
+        if (isset($data["pin_cd"])) {
+            unset($data["pin_cd"]);
+        }
+        if (isset($data["onetime_did"])) {
+            unset($data["onetime_did"]);
+        }
+
+        return $status;
+    }
+
+    /**
+     * 予約削除API実行
+     *
+     * @param string $reservation_id
+     *
+     * @return  boolean
+     */
+    public function netmeeting_reservation_delete($reservation_id)
+    {
+        if ($this->netmeeting_login() === false) {
+            return false;
+        }
+        $url_action = $this->_netmeeting_vcube_version
+                      == GRN_NETMEETING_VCUBE_VERSION_5
+            ? GRN_NETMEETING_API_RSV_ACTION_DELETE_V5
+            : GRN_NETMEETING_API_RSV_ACTION_DELETE;
+        $url = $this->_n2url . $url_action;
+
+        $post_data = [
+            'n2my_session'   => $this->_n2my_session,
+            'reservation_id' => $reservation_id,
+            'output_type'    => 'php'
+        ];
+
+        $action = 'netmeeting_rsv_delete';
+        $result = $this->_sendRequest($url, $post_data, $action);
+        if (is_array($result) === false) {
+            return false;
+        }
+        $err_msg = $this->_checkAPIError($result, $data, $action);
+        //--- Add VCBSCH0040 ---s
+        // ログインエラーの場合はリトライ
+        if (isset($err_msg)
+            && $err_msg['error_cd'] == GRN_NETMEETING_API_ERRCD_LOGIN_FAILED
+        ) {
+            if (($err_msg = $this->login_retry($url_action, $post_data, $data,
+                    $action)) === false
+            ) {
+                return false;
+            }
+        }
+        //--- Add VCBSCH0040 ---e
+        if (isset($err_msg)) {
+            // 該当データなしはエラーにしない
+            if (($err_msg['error_cd'] == GRN_NETMEETING_API_ERRCD_PARAM_ERR)
+                ||                     //-- Upd VCBSCH0040
+                ($err_msg['error_cd']
+                 == GRN_NETMEETING_API_ERR_RESERVATION_SESSION_INVALID)
+            )       //-- Upd VCBSCH0040
+            {
+                return true;
+            } else {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 招待者追加API実行
+     *
+     * @param array      $param
+     * @param array|null $data
+     *
+     * @return  boolean
+     */
+    public function netmeeting_invite_add($param, & $data)
+    {
+        if ($this->netmeeting_login() === false) {
+            return false;
+        }
+        $url_action = $this->_netmeeting_vcube_version
+                      == GRN_NETMEETING_VCUBE_VERSION_5
+            ? GRN_NETMEETING_API_RSV_ACTION_ADD_INVITE_V5
+            : GRN_NETMEETING_API_RSV_ACTION_ADD_INVITE;
+        $url = $this->_n2url . $url_action;
+
+        $post_data = $param;
+        $post_data['n2my_session'] = $this->_n2my_session;
+        $post_data['output_type'] = 'php';
+
+        $action = 'netmeeting_inv_add';
+        $result = $this->_sendRequest($url, $post_data, $action);
+        if (is_array($result) === false) {
+            return false;
+        }
+        $err_msg = $this->_checkAPIError($result, $data, $action);
+        //--- Add VCBSCH0040 ---s
+        // ログインエラーの場合はリトライ
+        if (isset($err_msg)
+            && $err_msg['error_cd'] == GRN_NETMEETING_API_ERRCD_LOGIN_FAILED
+        ) {
+            if (($err_msg = $this->login_retry($url_action, $post_data, $data,
+                    $action)) === false
+            ) {
+                return false;
+            }
+        }
+        //--- Add VCBSCH0040 ---e
+        if (isset($err_msg)) {
+            return false;
+        }
+        if (is_array($data) === false) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * 招待者削除API実行
+     *
+     * @param string $reservation_id
+     * @param string $guest_id
+     *
+     * @return  boolean
+     */
+    public function netmeeting_invite_delete($reservation_id, $guest_id)
+    {
+        if ($this->netmeeting_login() === false) {
+            return false;
+        }
+        $url_action = $this->_netmeeting_vcube_version
+                      == GRN_NETMEETING_VCUBE_VERSION_5
+            ? GRN_NETMEETING_API_RSV_ACTION_DELETE_INVITE_V5
+            : GRN_NETMEETING_API_RSV_ACTION_DELETE_INVITE;
+        $url = $this->_n2url . $url_action;
+
+        $post_data = [
+            'n2my_session'   => $this->_n2my_session,
+            'reservation_id' => $reservation_id,
+            'guest_id'       => $guest_id,
+            'output_type'    => 'php'
+        ];
+
+        $action = 'netmeeting_inv_delete';
+        $result = $this->_sendRequest($url, $post_data, $action);
+        if (is_array($result) === false) {
+            return false;
+        }
+        $err_msg = $this->_checkAPIError($result, $data, $action);
+        //--- Add VCBSCH0040 ---s
+        // ログインエラーの場合はリトライ
+        if (isset($err_msg)
+            && $err_msg['error_cd'] == GRN_NETMEETING_API_ERRCD_LOGIN_FAILED
+        ) {
+            if (($err_msg = $this->login_retry($url_action, $post_data, $data,
+                    $action)) === false
+            ) {
+                return false;
+            }
+        }
+        //--- Add VCBSCH0040 ---e
+        if (isset($err_msg)) {
+            // 該当データなしはエラーにしない
+            if (($err_msg['error_cd'] == GRN_NETMEETING_API_ERRCD_PARAM_ERR)
+                ||                     //-- Upd VCBSCH0040
+                ($err_msg['error_cd']
+                 == GRN_NETMEETING_API_ERR_RESERVATION_SESSION_INVALID)
+            )       //-- Upd VCBSCH0040
+            {
+                return true;
+            } else {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 予約情報詳細取得API実行
+     *
+     * @param string $reservation_id
+     * @param        $password string
+     *
+     * @return  mixed   False or レスポンスデータ
+     */
+    public function netmeeting_reservation_get_detail(
+        $reservation_id,
+        $password = null
+    ) {
+        if ($this->netmeeting_login() === false) {
+            return false;
+        }
+        $url_action = $this->_netmeeting_vcube_version
+                      == GRN_NETMEETING_VCUBE_VERSION_5
+            ? GRN_NETMEETING_API_RSV_ACTION_GET_DETAIL_V5
+            : GRN_NETMEETING_API_RSV_ACTION_GET_DETAIL;
+        $url = $this->_n2url . $url_action;
+
+        $post_data = [
+            'n2my_session'   => $this->_n2my_session,
+            'reservation_id' => $reservation_id,
+            'password'       => $password,
+            'output_type'    => 'php'
+        ];
+
+        $action = 'netmeeting_rsv_get';
+        $result = $this->_sendRequest($url, $post_data, $action);
+        if (is_array($result) === false) {
+            return false;
+        }
+        $err_msg = $this->_checkAPIError($result, $data, $action);
+        //--- Add VCBSCH0040 ---s
+        // ログインエラーの場合はリトライ
+        if (isset($err_msg)
+            && $err_msg['error_cd'] == GRN_NETMEETING_API_ERRCD_LOGIN_FAILED
+        ) {
+            if (($err_msg = $this->login_retry($url_action, $post_data, $data,
+                    $action)) === false
+            ) {
+                return false;
+            }
+        }
+        //--- Add VCBSCH0040 ---e
+        if (isset($err_msg)) {
+            // 該当データなしはエラーにしない
+            if (($err_msg['error_cd'] == GRN_NETMEETING_API_ERRCD_PARAM_ERR)
+                ||                     //-- Upd VCBSCH0040
+                ($err_msg['error_cd']
+                 == GRN_NETMEETING_API_ERR_RESERVATION_SESSION_INVALID)
+            )       //-- Upd VCBSCH0040
+            {
+                return true;
+            } else {
+                return false;
+            }
+        } else {
+            $reserve_detail = null;
+            if (array_key_exists('reservation_info', $data)) {
+                // 入れ物準備
+                $reserve_detail
+                    = new GRN_Schedule_Netmeeting_ReservationDetail();
+
+                $reservation_info = $data['reservation_info'];
+
+                if (array_key_exists('info', $reservation_info)) {
+                    $info = $reservation_info['info'];
+                    if (is_array($info)) {
+                        $reserve_detail->reservation_name
+                            = array_key_exists('reservation_name', $info)
+                            ? $info['reservation_name'] : null;
+                        $reserve_detail->reservation_pw
+                            = array_key_exists('reservation_pw', $info)
+                            ? $info['reservation_pw'] : null;
+                        $reserve_detail->status
+                            = array_key_exists('status', $info)
+                            ? $info['status'] : null;
+                        $reserve_detail->sender
+                            = array_key_exists('sender', $info)
+                            ? $info['sender'] : null;
+                        $reserve_detail->sender_mail
+                            = array_key_exists('sender_mail', $info)
+                            ? $info['sender_mail'] : null;
+                        $reserve_detail->mail_body
+                            = array_key_exists('mail_body', $info)
+                            ? $info['mail_body'] : null;
+                        $reserve_detail->room_id
+                            = array_key_exists('room_id', $info)
+                            ? $info['room_id'] : null;
+                        $reserve_detail->meeting_id
+                            = array_key_exists('meeting_id', $info)
+                            ? $info['meeting_id'] : null;
+                        $reserve_detail->reservation_id
+                            = array_key_exists('reservation_id', $info)
+                            ? $info['reservation_id'] : null;
+                        $reserve_detail->reservation_start_date
+                            = array_key_exists('reservation_start_date', $info)
+                            ? $info['reservation_start_date'] : null;
+                        $reserve_detail->reservation_end_date
+                            = array_key_exists('reservation_end_date', $info)
+                            ? $info['reservation_end_date'] : null;
+                        $reserve_detail->url
+                            = array_key_exists('url', $info) ? $info['url']
+                            : null;
+                    }
+                }
+
+                if (array_key_exists('guests', $reservation_info)) {
+                    $guests = $reservation_info['guests'];
+                    $invite_guests = [];
+
+                    foreach ($guests as $guest) {
+                        if (is_array($guest)) {
+                            // 入れ物準備
+                            $reserve_guests
+                                = new GRN_Schedule_Netmeeting_ReservationGuests();
+
+                            $reserve_guests->user_name
+                                = array_key_exists('name', $guest)
+                                ? $guest['name'] : null;
+                            $reserve_guests->user_email
+                                = array_key_exists('email', $guest)
+                                ? $guest['email'] : null;
+                            $reserve_guests->user_type
+                                = array_key_exists('type', $guest)
+                                ? $guest['type'] : null;
+                            $reserve_guests->user_timezone
+                                = array_key_exists('timezone', $guest)
+                                ? $guest['timezone'] : null;
+                            $reserve_guests->user_lang
+                                = array_key_exists('lang', $guest)
+                                ? $guest['lang'] : null;
+                            $reserve_guests->guest_id
+                                = array_key_exists('guest_id', $guest)
+                                ? $guest['guest_id'] : null;
+                            $reserve_guests->invite_url
+                                = array_key_exists('invite_url', $guest)
+                                ? $guest['invite_url'] : null;
+
+                            $invite_guests[] = $reserve_guests;
+                        }
+                    }
+                    if (count($invite_guests) > 0) {
+                        $reserve_detail->guests = $invite_guests;
+                    }
+                }
+            }
+        }
+
+        return $reserve_detail;
+    }
+
+    /**
+     * 招待者一覧取得API実行
+     *
+     * @param string $reservation_id
+     *
+     * @return  mixed   False or レスポンスデータ
+     */
+    public function netmeeting_get_invite($reservation_id)
+    {
+        if ($this->netmeeting_login() === false) {
+            return false;
+        }
+        $url_action = $this->_netmeeting_vcube_version
+                      == GRN_NETMEETING_VCUBE_VERSION_5
+            ? GRN_NETMEETING_API_RSV_ACTION_GET_INVITE_V5
+            : GRN_NETMEETING_API_RSV_ACTION_GET_INVITE;
+        $url = $this->_n2url . $url_action;
+
+        $post_data = [
+            'n2my_session'   => $this->_n2my_session,
+            'reservation_id' => $reservation_id,
+            'output_type'    => 'php'
+        ];
+
+        $action = 'netmeeting_invite_get';
+        $result = $this->_sendRequest($url, $post_data, $action);
+        if (is_array($result) === false) {
+            return false;
+        }
+        $err_msg = $this->_checkAPIError($result, $data, $action);
+        //--- Add VCBSCH0040 ---s
+        // ログインエラーの場合はリトライ
+        if (isset($err_msg)
+            && $err_msg['error_cd'] == GRN_NETMEETING_API_ERRCD_LOGIN_FAILED
+        ) {
+            if (($err_msg = $this->login_retry($url_action, $post_data, $data,
+                    $action)) === false
+            ) {
+                return false;
+            }
+        }
+        //--- Add VCBSCH0040 ---e
+        if (isset($err_msg)) {
+            // 該当データなしはエラーにしない
+            if (($err_msg['error_cd'] == GRN_NETMEETING_API_ERRCD_PARAM_ERR)
+                ||                     //-- Upd VCBSCH0040
+                ($err_msg['error_cd']
+                 == GRN_NETMEETING_API_ERR_RESERVATION_SESSION_INVALID)
+            )       //-- Upd VCBSCH0040
+            {
+                return true;
+            } else {
+                return false;
+            }
+        } else {
+            $invite_data = null;
+            if (array_key_exists('guests', $data)) {
+                if (array_key_exists('guest', $data['guests'])) {
+                    $guests = $data['guests']['guest'];
+                    $invite_guests = [];
+
+                    if (is_array($guests)) {
+                        foreach ($guests as $guest) {
+                            if (is_array($guest)) {
+                                // 入れ物準備
+                                $reserve_guests
+                                    = new GRN_Schedule_Netmeeting_ReservationGuests();
+
+                                $reserve_guests->user_name
+                                    = array_key_exists('name', $guest)
+                                    ? $guest['name'] : null;
+                                $reserve_guests->user_email
+                                    = array_key_exists('email', $guest)
+                                    ? $guest['email'] : null;
+                                $reserve_guests->user_type
+                                    = array_key_exists('type', $guest)
+                                    ? $guest['type'] : null;
+                                $reserve_guests->user_timezone
+                                    = array_key_exists('timezone', $guest)
+                                    ? $guest['timezone'] : null;
+                                $reserve_guests->user_lang
+                                    = array_key_exists('lang', $guest)
+                                    ? $guest['lang'] : null;
+                                $reserve_guests->guest_id
+                                    = array_key_exists('guest_id', $guest)
+                                    ? $guest['guest_id'] : null;
+                                $reserve_guests->invite_url
+                                    = array_key_exists('invite_url', $guest)
+                                    ? $guest['invite_url'] : null;
+
+                                $invite_guests[] = $reserve_guests;
+                            }
+                        }
+                    }
+                    if (count($invite_guests) > 0) {
+                        $invite_data = $invite_guests;
+                    }
+                }
+            }
+        }
+
+        return $invite_data;
+    }
+
+    public function netmeeting_start_url($reservation_id, $password)
+    {
+        $reserve_detail
+            = $this->netmeeting_reservation_get_detail($reservation_id,
+            $password);
+        if ($reserve_detail) {
+            if ($reserve_detail->status
+                != GRN_NETMEETING_API_MEETING_STATUS_NOW
+            ) {
+                return false;
+            }
+            $room_id = $reserve_detail->room_id;
+            $meeting_id = $reserve_detail->meeting_id;
+
+            $url_action = $this->_netmeeting_vcube_version
+                          == GRN_NETMEETING_VCUBE_VERSION_5
+                ? GRN_NETMEETING_API_MTG_ACTION_START_V5
+                : GRN_NETMEETING_API_MTG_ACTION_START;
+            $url = $this->_n2url . $url_action;
+            $post_data = [
+                'n2my_session'  => $this->_n2my_session,
+                'room_id'       => $room_id,
+                'meeting_id'    => $meeting_id,
+                'flash_version' => 'as3',
+                'output_type'   => 'php',
+            ];
+
+            $action = 'action_start';
+            $result = $this->_sendRequest($url, $post_data, $action);
+            if (is_array($result) === false) {
+                return false;
+            }
+            $err_msg = $this->_checkAPIError($result, $data, $action);
+            //--- Add VCBSCH0040 ---s
+            // ログインエラーの場合はリトライ
+            if (isset($err_msg)
+                && $err_msg['error_cd'] == GRN_NETMEETING_API_ERRCD_LOGIN_FAILED
+            ) {
+                if (($err_msg = $this->login_retry($url_action, $post_data,
+                        $data, $action)) === false
+                ) {
+                    return false;
+                }
+            }
+            if (is_array($data) && array_key_exists('url', $data)) {
+                $url = $data['url'];
+
+                return $url;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * POSTデータセット
+     *
+     * @param GRN_Schedule_Netmeeting_CoopTable $coop_data
+     *
+     * @return  array
+     */
+    public function setPostData($coop_data)
+    {
+        $post = [];
+        if ( ! is_null($coop_data->reservation_id)) {
+            $post['reservation_id'] = $coop_data->reservation_id;
+        }
+        $post['room_id'] = $coop_data->facility_code;
+        $post['name'] = mb_substr($coop_data->title, 0,
+            GRN_NETMEETING_API_TITLE_LIMIT);
+        $post['start'] = $coop_data->start_datetime->unix_ts;
+        $post['end'] = $coop_data->end_datetime->unix_ts;
+        if ( ! is_null($coop_data->password)) {
+            $post['password'] = $coop_data->password;
+        }
+
+        require_once('schedule/netmeeting_system_logic.csp');
+        $vcb_system_logic = GRN_Netmeeting_SystemLogic::getInstance();
+
+        // 招待メール送信する
+        if ($vcb_system_logic->isNetmeetingUrlMailSend()) {
+            $post['send_mail'] = '1';
+        } else {
+            $post['send_mail'] = '0';
+        }
+
+        $post['sender_name'] = mb_substr($coop_data->operator['user_name'], 0,
+            GRN_NETMEETING_API_USER_NAME_LIMIT);
+        $post['sender_email'] = $coop_data->operator['user_email'];
+        $post['info'] = mb_substr($coop_data->memo, 0,
+            GRN_NETMEETING_API_INFO_LIMIT);
+
+        $idx = 0;
+        if (is_array($coop_data->invite_data)
+            && count($coop_data->invite_data) > 0
+        ) {
+            foreach (array_keys($coop_data->invite_data) as $key) {
+                $member = $coop_data->invite_data[$key];
+                if (isset($member->guest_id) && strlen($member->guest_id) > 0) {
+                    $post['guests[' . $idx . '][guest_id]'] = $member->guest_id;
+                }
+                $post['guests[' . $idx . '][name]']
+                    = mb_substr($member->user_name,
+                    0, GRN_NETMEETING_API_USER_NAME_LIMIT);
+                $post['guests[' . $idx . '][email]'] = $member->user_email;
+                $post['guests[' . $idx . '][timezone]']
+                    = $member->user_timezone;
+                $post['guests[' . $idx . '][lang]'] = $member->user_lang;
+
+                $idx++;
+            }
+        }
+
+        return $post;
+    }
+
+    /**
+     * POSTデータセット(招待者以外)
+     *
+     * @param GRN_Schedule_Netmeeting_CoopTable $coop_data
+     *
+     * @return  array
+     */
+    public function setPostDataMain($coop_data)
+    {
+        $post = [];
+        if ( ! is_null($coop_data->reservation_id)) {
+            $post['reservation_id'] = $coop_data->reservation_id;
+        }
+        $post['room_id'] = $coop_data->facility_code;
+        $post['name'] = mb_substr($coop_data->title, 0,
+            GRN_NETMEETING_API_TITLE_LIMIT);
+        $post['start'] = $coop_data->start_datetime->unix_ts;
+        $post['end'] = $coop_data->end_datetime->unix_ts;
+        if ( ! is_null($coop_data->password)) {
+            $post['password'] = $coop_data->password;
+        }
+
+        $post['send_mail'] = '0';
+        $post['sender_name'] = mb_substr($coop_data->operator['user_name'], 0,
+            GRN_NETMEETING_API_USER_NAME_LIMIT);
+        $post['sender_email'] = $coop_data->operator['user_email'];
+        $post['info'] = mb_substr($coop_data->memo, 0,
+            GRN_NETMEETING_API_INFO_LIMIT);
+
+        return $post;
+    }
+
+    /**
+     * POSTデータセット(招待者のみ)
+     *
+     * @param array $members
+     *
+     * @return  array or null
+     */
+    public function setPostDataMembers($members)
+    {
+        $idx = 0;
+        $post = [];
+        if (is_array($members) && count($members) > 0) {
+            foreach (array_keys($members) as $key) {
+                $member = $members[$key];
+                $post['guests[' . $idx . '][name]']
+                    = mb_substr($member->user_name,
+                    0, GRN_NETMEETING_API_USER_NAME_LIMIT);
+                $post['guests[' . $idx . '][email]'] = $member->user_email;
+                $post['guests[' . $idx . '][timezone]']
+                    = $member->user_timezone;
+                $post['guests[' . $idx . '][lang]'] = $member->user_lang;
+
+                $idx++;
+            }
+        }
+        if ($idx == 0) {
+            $post = null;
+        }
+
+        return $post;
+    }
+
+    /**
+     * POSTデータをセット(招待者追加API用)
+     *
+     * @param string                              $reservation_id
+     * @param GRN_Schedule_Netmeeting_InviteTable $member
+     *
+     * @return  array
+     */
+    public function setPostDataInviteAdd($reservation_id, $member)
+    {
+        $post = [];
+        if ( ! is_null($reservation_id)) {
+            $post['reservation_id'] = $reservation_id;
+        }
+
+        require_once('schedule/netmeeting_system_logic.csp');
+        $vcb_system_logic = GRN_Netmeeting_SystemLogic::getInstance();
+
+        // 招待メール送信する
+        if ($vcb_system_logic->isNetmeetingUrlMailSend()) {
+            $post['send_mail'] = '1';
+        } else {
+            $post['send_mail'] = '0';
+        }
+
+        $post['name'] = mb_substr($member->user_name, 0,
+            GRN_NETMEETING_API_USER_NAME_LIMIT);
+        $post['email'] = $member->user_email;
+        $post['timezone'] = $member->user_timezone;
+        $post['lang'] = $member->user_lang;
+
+        return $post;
+    }
+
+    /**
+     * レスポンスデータをセット
+     *
+     * @param GRN_Schedule_Netmeeting_CoopTable $coop_data
+     * @param array                             $rsv_guests
+     *
+     * @return  boolean
+     */
+    public function setResponseGuestData($coop_data, $rsv_guests)
+    {
+        if ( ! is_array($coop_data->invite_data)
+             || count($coop_data->invite_data) == 0
+        ) {
+            return false;
+        }
+
+        if ( ! is_array($rsv_guests) || count($rsv_guests) == 0) {
+            return false;
+        }
+
+        if (count($coop_data->invite_data) != count($rsv_guests)) {
+            return false;
+        }
+
+        $idx = 0;
+        if (is_array($coop_data->invite_data)
+            && count($coop_data->invite_data) > 0
+        ) {
+            foreach (array_keys($coop_data->invite_data) as $key) {
+                if (array_key_exists('guest_id', $rsv_guests[$idx])) {
+                    $coop_data->invite_data[$key]->guest_id
+                        = $rsv_guests[$idx]['guest_id'];
+                }
+                if (array_key_exists('invite_url', $rsv_guests[$idx])) {
+                    $coop_data->invite_data[$key]->invite_url
+                        = $rsv_guests[$idx]['invite_url'];
+                }
+                $idx++;
+            }
+        }
+
+        return true;
+    }
+}
+
+/**
+ * @package     grn.netmeeting
+ */
+class GRN_Schedule_Netmeeting_ReservationDetail
+{
+    /**
+     * 予約名
+     */
+    var $reservation_name = null;
+    /**
+     * パスワード有無
+     */
+    var $reservation_pw = null;
+    /**
+     * 状態
+     */
+    var $status = null;
+    /**
+     * 差出人
+     */
+    var $sender = null;
+    /**
+     * 差出人メールアドレス
+     */
+    var $sender_mail = null;
+    /**
+     * 本文
+     */
+    var $mail_body = null;
+    /**
+     * 部屋ID
+     */
+    var $room_id = null;
+    /**
+     * 会議ID
+     */
+    var $meeting_id = null;
+    /**
+     * 予約ID
+     */
+    var $reservation_id = null;
+    /**
+     * 開始時間
+     */
+    var $reservation_start_date = null;
+    /**
+     * 終了時間
+     */
+    var $reservation_end_date = null;
+    /**
+     * 招待URL
+     */
+    var $url = null;
+    /**
+     * 招待者一覧
+     */
+    var $guests = null;
+
+    function __construct()
+    {
+    }
+}
+
+/**
+ * @package     grn.netmeeting
+ */
+class GRN_Schedule_Netmeeting_ReservationGuests
+{
+    /**
+     * 名前
+     */
+    var $user_name = null;
+    /**
+     * E-Mail
+     */
+    var $user_email = null;
+    /**
+     * 言語
+     */
+    var $user_lang = null;
+    /**
+     * タイムゾーン
+     */
+    var $user_timezone = null;
+    /**
+     * 招待者タイプ
+     */
+    var $user_type = null;
+    /**
+     * ゲストID
+     */
+    var $guest_id = null;
+    /**
+     * 招待URL
+     */
+    var $invite_url = null;
+
+    function __construct()
+    {
+    }
+}
+

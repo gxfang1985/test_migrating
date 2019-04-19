@@ -1,0 +1,1 @@
+<div style="font-size=140%;color: red; font-weight: bold;">{cb_msg module='grn.grn' key='GRN_GRN-881' replace='true'}</div>

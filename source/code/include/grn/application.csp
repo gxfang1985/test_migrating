@@ -1,0 +1,1167 @@
+<?php
+
+/**
+ * Provide fundamentals of Ogre applications.
+ *
+ * The key feature of Ogre applications is dynamicity & pluggability.
+ * This file provides two classes to realize it; one is the application
+ * base class, and another is the locator class for dynamic applications.
+ *
+ * @author  Yamamoto, Hirotaka      2004/10
+ * @author  Tanaka, Yoshiaki        2004/10
+ * @version 1.0
+ * @package grn.common
+ */
+
+use grn\favour\data\bean\FavourNotify;
+use grn\fts\Application as FtsApplication;
+use grn\fts\Fields;
+use grn\fts\filter\TermFilter;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\exception\GrnInvalidPermissionException;
+
+
+require_once('fw/lwc.csp');
+require_once('fw/module.csp');
+require_once('fw/persistent.csp');
+require_once('favour/FavourApplicationBaseInterface.csp');
+
+define('GRN_APPLICATION_PREFIX', 'grn.');
+
+/**
+ * Application name database.
+ *
+ * @package grn.common
+ */
+class GRN_ApplicationName extends CB_PersistentBase
+{
+    var $col_application
+        = [
+            'type'    => 'char',
+            'length'  => 60,
+            'notnull' => true
+        ];
+    var $col_locale = ['type' => 'char', 'length' => 8, 'notnull' => true];
+    var $col_name = ['type' => 'char', 'length' => 100];
+
+    var $idx_app_loc
+        = [
+            'cols'   => ['application', 'locale'],
+            'unique' => true
+        ];
+
+    function __construct($row)
+    {
+        parent::__construct($row);
+    }
+}
+
+/**
+ * The base class of all Ogre applications (application logics).
+ *
+ * @package grn.common
+ */
+class GRN_ApplicationBase extends CB_ModuleBase
+    implements \grn\favour\FavourApplicationBaseInterface
+{
+    /**
+     * @access private
+     */
+    var $__app_id;
+
+    /**
+     * @access private
+     * @var CB_LWContainerDirectoryConfig[]
+     */
+    var $__config = [];
+
+
+    function __construct($app_id)
+    {
+        $this->__app_id = $app_id;
+        parent::__construct(GRN_APPLICATION_PREFIX . $app_id);
+
+    }
+
+    function getApplicationId()
+    {
+        return $this->__app_id;
+    }
+
+    /**
+     * Return TRUE if $user can use this application; otherwise return FALSE.
+     *
+     * @param  object CB_User $user
+     *
+     * @return bool
+     */
+    function isAvailableFor($user)
+    {
+        if ( ! $user) {
+            return ! $this->getConfig('login');
+        }
+
+        return true;
+    }
+
+    /**
+     * @param CB_User $user
+     *
+     * @return bool
+     */
+    function isLicensedUser($user)
+    {
+        return true;
+    }
+
+    /**
+     * Return TRUE if license registerd; overwise return FALSE.
+     *
+     * @return bool
+     */
+    function isLicensed()
+    {
+        return true;
+    }
+
+    /**
+     * @access private
+     */
+    var $__names = [];
+
+    /**
+     * Return the application name for the specified locale.
+     * If $locale is NULL, return the name for the current locale.
+     *
+     * @param string|null $locale
+     *
+     * @return string
+     */
+    function getName($locale = null)
+    {
+        $locator = GRN_ApplicationLocator::instance();
+
+        return $locator->getName($this->__app_id, $locale);
+    }
+
+    function getDefaultName($locale = null)
+    {
+        $locator = GRN_ApplicationLocator::instance();
+
+        return $locator->getDefaultName($this->__app_id, $locale);
+    }
+
+    function setName($locale, $name)
+    {
+        assert('$locale');
+
+        $table = cb_class2table('GRN_ApplicationName');
+        $db = $table->getDBConnection();
+        $loc = $db->escape($locale);
+        $app = $db->escape($this->__app_id);
+
+        $rowset = new CB_RowSet($table);
+        $rowset->addCondition("col_application='${app}' AND col_locale='${loc}'");
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        if (is_null($row)) {
+            $row = $table->newRow();
+            $row->set('application', $this->__app_id);
+            $row->set('locale', $locale);
+        }
+        $row->set('name', $name);
+        $row->updateNow();
+    }
+
+    /**
+     * @param string $name optional configuration name.
+     *
+     * @return mixed         array of configurations if $name is NULL;
+     *                       or any value if $name is not null.
+     *                       FALSE if no configuration is available.
+     */
+    function getConfig($name = null)
+    {
+        if (is_null($name)) {
+            return $this->__config;
+        }
+        if (array_key_exists($name, $this->__config)) {
+            return $this->__config[$name];
+        }
+
+        if ($name === 'login') {
+            return true;
+        }
+        if ($name === 'icon20') {
+            return 'application20';
+        }
+        if ($name === 'icon32') {
+            return 'application32';
+        }
+
+        return false;
+    }
+
+    /**
+     * Return the amount of disk usage for the named user.
+     * Applications should override this to reflect their specific
+     * knowledge about the disk usage.
+     *
+     * @param CB_User $user
+     *
+     * @return int    Disk usage in kilo bytes.
+     */
+    function getDiskUsage($user)
+    {
+        return 0;
+    }
+
+    /**
+     * Return array of system configuration categories, and
+     * contents of each category.  If the application does not provide
+     * any system configuration, this will return FALSE.
+     *
+     * Note that ogre system will control access privileges based on
+     * the "categories" in the returning array. (i.e., the array keys).
+     *
+     * "icon" may be omitted; in such case the system will use
+     * "general32" icon.
+     *
+     * For each category, you need to provide an I18N message resource
+     * (for "grn.${app_id}.system" module).
+     *
+     * The return value will look like:
+     *   array( 'general' => array(  // array of pages
+     *                               array('page'=>'todo/system/general1',
+     *                                     'icon'=>'general32'),
+     *                               array('page'=>'todo/system/general2',
+     *                                     'icon'=>'general32'),
+     *                                 ... ),
+     *          'foobar'  => array(  array('page'=>'todo/system/foobar1',
+     *                                     'icon'=>'general32'),
+     *                               array('page'=>'todo/system/foobar2',
+     *                                     'icon'=>'general32'),
+     *                               ... ),
+     *          ...);
+     *
+     * @return mixed   array, or FALSE if no system configuration.
+     */
+    function getSystemConfigArray()
+    {
+        return false;
+    }
+
+    /**
+     * Return array of personal configuration categories, and
+     * contents of each category.  If the application does not provide
+     * any personal configuration, this will return FALSE.
+     *
+     * Note that ogre system will control access privileges based on
+     * the "categories" in the returning array. (i.e., the array keys).
+     *
+     * "icon" may be omitted; in such case the system will use
+     * "general32" icon.
+     *
+     * For each category, you need to provide an I18N message resource
+     * (for "grn.${app_id}.system" module).
+     *
+     * The return value will look like:
+     *   array( 'general' => array(  // array of pages
+     *                               array('page'=>'todo/personal/general1',
+     *                                     'icon'=>'general32'),
+     *                               array('page'=>'todo/personal/general2',
+     *                                     'icon'=>'general32'),
+     *                                 ... ),
+     *          'foobar'  => array(  array('page'=>'todo/personal/foobar1',
+     *                                     'icon'=>'general32'),
+     *                               array('page'=>'todo/personal/foobar2',
+     *                                     'icon'=>'general32'),
+     *                               ... ),
+     *          ...);
+     *
+     * @return mixed   array, or FALSE if no system configuration.
+     */
+    function getPersonalConfigArray()
+    {
+        return false;
+    }
+
+    function forceRedirect($page_parts)
+    {
+        return false;
+    }
+
+    /**
+     * @return CB_DatabaseConnection
+     */
+    function getConnection()
+    {
+        $conn = $this->getConfig('connection');
+        if ($conn === false) {
+            $conn = 'dbconn';
+        }
+        global $G_container_base;
+        $ret = $G_container_base->getInstance($conn);
+
+        return $ret;
+    }
+
+    /**
+     * @return GRN_TableManager
+     */
+    function getTableManager()
+    {
+        $tm = $this->getConfig('table_manager');
+        if ($tm === false) {
+            $tm = 'table_manager';
+        }
+        global $G_container_base;
+        $ret = $G_container_base->getInstance($tm);
+
+        return $ret;
+    }
+
+    public function initialize()
+    {
+        require_once("fw/i18n/locale.csp");
+        require_once("fw/i18n.csp");
+        $i18n = CB_I18N::getInstance();
+        $resource_id = ($this->getModuleId() === 'grn.favour')
+            ? 'default_application_name' : 'application_name';
+
+        foreach (
+            CB_LanguageManager::getAllowedLanguagesByConfigurationFile() as
+            $l_code
+        ) {
+            $this->setName("$l_code",
+                $i18n->getResource('message', $this->getModuleId(),
+                    $resource_id, false, $l_code));
+        }
+
+        // initialize this application in the core
+        require_once('grn/application.csp');
+        $locator = GRN_ApplicationLocator::instance();
+        $locator->initialize($this->getApplicationId());
+
+        // DB の初期化
+        $this->initializeDatabase();
+
+        // プロファイルの初期化
+        $this->initializeProfile();
+
+        // アプリケーションのfilesディレクトリの初期化
+        require_once('grn/file.csp');
+        $app_id = $this->getApplicationId();
+        grn_initialize_files($app_id);
+
+        // Solrのインデックスの初期化
+        if (FtsApplication::isAvailable()
+            && FtsApplication::isSearchableApplication($this->getApplicationId())
+        ) {
+            $updateService = cb_lwc_fts_update_service();
+            $query = new TermFilter(Fields::appName(),
+                $this->getApplicationId());
+            $updateService->deleteByQuery($query);
+        }
+    }
+
+    protected function initializeProfile()
+    {
+        // システムプロファイルを初期化する
+        $this->initializeSystemProfile();
+
+        // ユーザープロファイルの初期化
+        $this->initializeUserProfile();
+    }
+
+    protected function initializeSystemProfile()
+    {
+        require_once("fw/profile.csp");
+        cb_get_system_profile($this->getModuleId())->removeAttributes();
+        cb_get_system_profile($this->getModuleId()
+                              . ".system")->removeAttributes();
+    }
+
+    protected function initializeUserProfile()
+    {
+        global $G_container_base;
+        /** @var GRN_Uum $uum */
+        $uum = $G_container_base->getInstance('uum');
+        $table_info = $uum->getUserTable();
+        $rowset = new CB_RowSet($table_info);
+        while ( ! is_null($row = $rowset->iterate())) {
+            cb_get_user_profile($row, $this->getModuleId())->removeAttributes();
+            cb_get_user_profile($row,
+                $this->getModuleId() . ".personal")->removeAttributes();
+        }
+    }
+
+    public function initializeDatabase()
+    {
+        require_once("grn/sql_loader.csp");
+        $sql_loader = new GRN_SQLLoader();
+
+        foreach (['schema', 'init'] as $sql_type) {
+            $sql_dir = implode(DIRECTORY_SEPARATOR,
+                [
+                    cb_basedir(),
+                    'db',
+                    $sql_type,
+                    $this->getApplicationId(),
+                    '*.sql'
+                ]);
+
+            foreach (glob($sql_dir) as $sql_file) {
+                $db_name = basename($sql_file, '.sql');
+                foreach (db_get_app_dbs($db_name) as $db) {
+                    foreach ($sql_loader->loadSQL($sql_file) as $sql) {
+                        $db->query($sql);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * @param string $loginId
+     * @param string $type
+     * @param string $value
+     * @param array  $params
+     * @param string $sub_module
+     *
+     * @throws grn\space\common\exception\GrnInvalidPermissionException
+     * @return mixed
+     */
+    public function checkLoginUserAuthorityForFavour(
+        $loginId,
+        $type,
+        $value,
+        array $params = [],
+        $sub_module = ''
+    ) {
+        require_once("space/common/exception/GrnInvalidPermissionException.csp");
+        require_once("space/common/exception/ErrorCode.csp");
+        throw new GrnInvalidPermissionException(ErrorCode::GRN_UNEXPECTED_ERROR);
+    }
+
+    /**
+     * @param string $loginId
+     * @param string $type
+     * @param string $value
+     * @param array  $params
+     * @param string $sub_module
+     *
+     * @return \grn\favour\data\bean\FavourNotify
+     */
+    public function getNotifyDataForFavour(
+        $loginId,
+        $type,
+        $value,
+        array $params = [],
+        $sub_module = ''
+    ) {
+        return new FavourNotify();
+    }
+
+    /**
+     * @param string $loginId
+     * @param string $type
+     * @param string $value
+     * @param array  $params
+     * @param string $sub_module
+     *
+     * @return bool
+     */
+    public function checkNotifyUserAuthorityForFavour(
+        $loginId,
+        $type,
+        $value,
+        array $params = [],
+        $sub_module = ''
+    ) {
+        return false;
+    }
+}
+
+
+/**
+ * The Ogre application locator.
+ *
+ * This is to realize the dynamic nature of Ogre applications, that is,
+ * applications can be dynamically installed/uninstalled, or dynamically
+ * activated/deactivated.
+ *
+ * The application locator will help to locate ogre applications,
+ * to list applications, and to set/reset activity of applications.
+ *
+ * @package grn.common
+ */
+class GRN_ApplicationLocator extends CB_ModuleBase
+{
+    /**
+     *
+     * @return GRN_ApplicationLocator
+     */
+    public static function instance()
+    {
+        static $_instance = null;
+
+        if (is_null($_instance)) {
+            $_instance = new GRN_ApplicationLocator();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * @access private
+     * @var CB_LWContainerDirectoryConfig
+     */
+    var $_config = null;
+
+    /**
+     * @access private
+     * @var CB_LWContainer
+     */
+    var $_lwc = null;
+
+    /**
+     * @access private
+     */
+    private $tableAppName = null;
+
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        parent::__construct('grn.common.application');
+        $this->tableAppName = 'tab_grn_applicationname';
+        $this->reload();
+    }
+
+    /**
+     * @access private
+     */
+    var $_apps = [];
+
+    /**
+     * @access private
+     *
+     * @param string $app_id
+     *
+     * @return GRN_ApplicationBase|null
+     */
+    function _getInstance($app_id)
+    {
+        if ( ! array_key_exists($app_id, $this->_apps)) {
+            $config = $this->_config->getConfig($app_id);
+            if ($config === false) {
+                $___ret = null;
+
+                return $___ret;
+            }
+
+            $app = $this->_lwc->getInstance($app_id);
+            assert('is_a( $app, "GRN_ApplicationBase")');
+            $app->__config = $config;
+            $this->_apps[$app_id] = $app;
+        }
+
+        return $this->_apps[$app_id];
+    }
+
+    /**
+     * reload application config.
+     */
+    function reload()
+    {
+        require_once('fw/config.csp');
+        global $G_config_grn;
+        $this->_config
+            = new CB_LWContainerDirectoryConfig($G_config_grn->get('Application',
+            'ini_dir'));
+        $dummy = null;
+        $this->_lwc = new CB_LWContainer($dummy, $this->_config);
+        $this->clearApplicationNameCache();
+    }
+
+    /**
+     * Initialize profile entries for an application.
+     * This should be called during the initialization process of
+     * that application.
+     *
+     * @param string $appid
+     * @param bool   $active
+     */
+    function initialize($appid, $active = true)
+    {
+        $profile = $this->getSystemProfile();
+        $this->getConfig($appid);
+
+        $status = ['active' => $active];
+
+        $profile->removeAttribute($appid);
+        $profile->createAttribute($appid, $status);
+    }
+
+    /**
+     * Get application status.
+     *
+     * @param string $appid application id
+     *
+     * @return mixed
+     */
+    function getStatus($appid)
+    {
+        if ($this->getConfig($appid) === false) {
+            return false;
+        }
+
+        $profile = $this->getSystemProfile();
+
+        $status = false;
+        if ($profile->getAttribute($appid, $status)) {
+            return $status;
+        }
+
+        // default
+        return ['active' => true];
+    }
+
+    /**
+     * @param string $app_id
+     *
+     * @return mixed   FALSE if no such application; otherwise string
+     */
+    function getErrorPrefix($app_id)
+    {
+        $config = $this->_config->getConfig($app_id);
+        if ($config === false) {
+            return false;
+        }
+
+        if ( ! array_key_exists('error_prefix', $config)) {
+            return false;
+        }
+
+        return $config['error_prefix'];
+    }
+
+    /**
+     * @access private
+     */
+    var $_active_apps = [];
+
+    /**
+     *
+     * @param $app_id string  アプリケーションID (e.g., bulletin)
+     *
+     * @return bool           アクティブな場合にTRUE、それ以外でFALSEを返す
+     */
+    function isActive($app_id)
+    {
+        if (strlen($app_id) === 0) {
+            return false;
+        }
+
+        if (array_key_exists($app_id, $this->_active_apps)) {
+            return $this->_active_apps[$app_id];
+        }
+
+        $status = $this->getStatus($app_id);
+        if ($status === false) {
+            return false;
+        }
+
+        $active = false;
+        if (array_key_exists('active', $status)) {
+            $active = (bool)$status['active'];
+        }
+
+        $this->_active_apps[$app_id] = $active;
+
+        return $active;
+    }
+
+    function activate($app_id)
+    {
+        $this->_setActive($app_id, true);
+    }
+
+    function deactivate($app_id)
+    {
+        $this->_setActive($app_id, false);
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $app_id
+     * @param bool   $active
+     *
+     * @return bool
+     */
+    function _setActive($app_id, $active)
+    {
+        if ($this->getConfig($app_id) === false) {
+            return false;
+        }
+
+        $profile = $this->getSystemProfile();
+        if ($profile->getAttribute($app_id, $status) === false) {
+            $status = [];
+            $status['active'] = $active;
+            $profile->createAttribute($app_id, $status);
+        } else {
+            $status['active'] = $active;
+            $profile->updateAttribute($app_id, $status);
+        }
+        $this->_active_apps[$app_id] = $active;
+
+        return true;
+    }
+
+    /**
+     * @param string $app_id
+     *
+     * @return bool
+     */
+    function isLicensed($app_id)
+    {
+        $ret = true;
+        $app = $this->_getInstance($app_id);
+        if ($app) {
+            $ret = $app->isLicensed();
+        }
+
+        return $ret;
+    }
+
+    /**
+     * アプリケーションの実体を取得する.
+     * アクティブでない/存在しないアプリケーションは取得できない.
+     *
+     * @param  string $app_id アプリケーションID
+     * @param  bool   $force  アクティブでない場合でも取得可能な場合、強制的に取得する。
+     *
+     * @return GRN_ApplicationBase|mixed Object, or NULL if not available.
+     */
+    function getInstance($app_id, $force = false)
+    {
+        if ( ! $force && ! $this->isActive($app_id)) {
+            return null;
+        }
+
+        $app = $this->_getInstance($app_id);
+        if (is_null($app)) {
+            return null;
+        }
+
+        return $app;
+    }
+
+    /**
+     * 呼び出し可能なメソッドを持つアプリケーションの実体を取得.
+     *
+     * @param  string $method           メソッド名
+     * @param  bool   $available_only   TRUEの場合、ログインユーザーが
+     *                                  利用可能かどうかもチェックする
+     *
+     * @return array  アプリケーションIDをキー, インスタンスを値とする配列
+     */
+    function &getInstancesWithMethod($method, $available_only = true)
+    {
+        $result = [];
+
+        $ids = $this->getActiveApplicationIds();
+        foreach ($ids as $id) {
+            $instance = $this->getInstance($id);
+
+            if (is_null($instance)) {
+                continue;
+            }
+            if ( ! method_exists($instance, $method)) {
+                continue;
+            }
+
+            $result[$id] = $instance;
+        }
+
+        return $result;
+    }
+
+    /**
+     * インストールされているアプリケーションIDの一覧を取得する.
+     *
+     * @return array アプリケーションIDを格納した配列.
+     */
+    function getApplicationIds()
+    {
+        $apps = $this->_config->listConfigs();
+        foreach ($apps as $key => $app_id) {
+            // full-text-search application must not be displayed.
+            if ($app_id === 'fts') {
+                unset($apps[$key]);
+            }
+
+            // When app_id is KUNAI, check whether kunai controlled Apps are active.
+            if ($app_id === 'kunai') {
+                /** @var \grn\kunai\Application $kunai_app */
+                $kunai_app = $this->_getInstance('kunai');
+                if (count($kunai_app->getActiveControlledApps()) == 0) {
+                    unset($apps[$key]);
+                }
+            }
+        }
+
+        $disable_apps = [];
+        if (defined('ON_FOREST')) {
+            $disable_apps = ['dezielink', 'job'];
+        }
+
+        foreach ($disable_apps as $app) {
+            $key = array_search($app, $apps);
+            if ($key !== false) {
+                unset($apps[$key]);
+            }
+        }
+
+        return $apps;
+    }
+
+    /**
+     * アクティブなアプリケーションIDの一覧を取得する.
+     *
+     * @return array アプリケーションIDを格納した配列.
+     */
+    function getActiveApplicationIds()
+    {
+        $apps = $this->getApplicationIds();
+
+        $ids = [];
+        foreach ($apps as $app_id) {
+            if ($this->isActive($app_id)) {
+                $ids[] = $app_id;
+            }
+        }
+
+        return $ids;
+    }
+
+
+    /**
+     * アプリケーションの設定を取得する
+     *
+     * @param string $app_id アプリケーションID
+     *
+     * @return mixed
+     */
+    function getConfig($app_id)
+    {
+        return $this->_config->getConfig($app_id);
+    }
+
+    /**
+     * @var string[][]
+     */
+    var $_app_names = [];
+    /**
+     * @var string[][]
+     */
+    var $_default_app_names = [];
+
+    /**
+     * アプリケーションのデフォルト名(機能)を取得する
+     *
+     * @param $app_id   アプリケーションID
+     * @param $locale   ロケール
+     *
+     * @return string デフォルト名(機能)
+     */
+    function getDefaultName($app_id, $locale = null)
+    {
+        if (is_null($locale)) {
+            require_once('fw/i18n.csp');
+            $i18n = CB_I18N::getInstance();
+            $locale = $i18n->getCurrentLanguage();
+        }
+
+        $module = 'grn.' . $app_id;
+
+        require_once('fw/i18n.csp');
+        $this->_default_app_names[$locale][$app_id] = cb_msg($module,
+            'application_name', null, $locale);
+
+        return $this->_default_app_names[$locale][$app_id];
+    }
+
+    /**
+     * アプリケーションデフォルト名(機能)の一覧を取得する
+     *
+     * @param string|null $locale
+     *
+     * @return string
+     */
+    function getDefaultNames($locale = null)
+    {
+        if (is_null($locale)) {
+            require_once('fw/i18n.csp');
+            $i18n = CB_I18N::getInstance();
+            $locale = $i18n->getCurrentLanguage();
+        }
+
+        if (isset($this->_default_app_names[$locale])) {
+            return $this->_default_app_names[$locale];
+        }
+
+        $ids = $this->getApplicationIds();
+        foreach ($ids as $id) {
+            $this->getDefaultName($id, $locale);
+        }
+
+        return $this->_default_app_names[$locale];
+    }
+
+    /**
+     * アプリケーション名を取得する
+     *
+     * @param string $app_id アプリケーションID
+     * @param string $locale ロケール
+     *
+     * @return string
+     */
+    function getName($app_id, $locale = null)
+    {
+        if (is_null($locale)) {
+            require_once('fw/i18n.csp');
+            $i18n = CB_I18N::getInstance();
+            $locale = $i18n->getCurrentLanguage();
+        }
+        if (isset($this->_app_names[$locale][$app_id])) {
+            return $this->_app_names[$locale][$app_id];
+        }
+
+        $name = $this->_getName($app_id, $locale);
+        if ($name !== false) {
+            return $name;
+        } else {
+            // 親の言語を調べる
+            $pos = strpos($locale, '_');
+            if ($pos === false) {
+                return false;
+            }
+            $locale = substr($locale, 0, $pos);
+
+            $name = $this->_getName($app_id, $locale);
+
+            return $name;
+        }
+    }
+
+    private function clearApplicationNameCache()
+    {
+        $this->_app_names = [];
+    }
+
+    /**
+     * すべてのアプリケーション名の一覧を取得する。
+     * ( Active等の判定は行わないので切り出して使用する )
+     *
+     * @param string $locale ロケール
+     *
+     * @return array            アプリケーション名
+     */
+    function getNames($locale = null)
+    {
+        if (is_null($locale)) {
+            require_once('fw/i18n.csp');
+            $i18n = CB_I18N::getInstance();
+            $locale = $i18n->getCurrentLanguage();
+        }
+
+        if (isset($this->_app_names[$locale])) {
+            return $this->_app_names[$locale];
+        }
+
+        $this->_app_names[$locale] = $this->_getNames($locale);
+//        if( $this->_app_names[ $locale ] === FALSE ) return FALSE;
+
+        if (count($this->_app_names) <= 0) {
+            $pos = strpos($locale, '_');
+            if ($pos === false) {
+                return $this->_app_names[$locale];
+            }
+
+            global $G_container_base;
+            /** @var CB_DatabaseConnection $db */
+            $db = $G_container_base->getInstance('dbconn');
+
+            $locale = $db->escape(substr($locale, 0, $pos));
+            $this->_app_names[$locale] = $this->_getNames($locale);
+        }
+
+        return $this->_app_names[$locale];
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $app_id
+     * @param string $locale
+     *
+     * @return string|bool
+     */
+    function _getName($app_id, $locale)
+    {
+        $ret = $this->_getNames($locale);
+        if (is_array($ret) && array_key_exists($app_id, $ret)) {
+            return $ret[$app_id];
+        }
+
+        $i18n = CB_I18N::getInstance();
+        $name = $i18n->getResource('message', 'grn.' . $app_id,
+            'application_name', false, $locale);
+        if ($name !== false) {
+            return $name;
+        }
+
+        return false;
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $locale
+     *
+     * @return string[]|bool
+     */
+    function _getNames($locale)
+    {
+        $columns = ['col_application', 'col_name'];
+
+        global $G_container_base;
+        /** @var CB_DatabaseConnection $db */
+        $db = $G_container_base->getInstance('dbconn');
+        $condition = sprintf("col_locale='%s'", $locale);
+        $query = sprintf('SELECT %s FROM %s WHERE %s',
+            implode(',', $columns), $this->tableAppName, $condition);
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+        $result = $db->query($query);
+
+        $names = [];
+        if (cb_is_db_result($result)) {
+            $n = $db->num_rows($result);
+            for ($i = 0; $i < $n; $i++) {
+                $row = $db->fetch_assoc($result);
+                $names[$row['col_application']] = $row['col_name'];
+            }
+            $this->_app_names[$locale] = $names;
+
+            return $names;
+        }
+
+        return false;
+    }
+
+    /**
+     * ログインなしで使用可能なアプリケーションの情報を取得する
+     *
+     * @return array array( 'id' => アプリケーションID, 'index' => トップページ );
+     */
+    function getNoLoginApplicationInfo()
+    {
+        $ret = [];
+
+        $ids = $this->_config->listConfigs();
+
+        foreach ($ids as $id) {
+            $config = $this->_config->getConfig($id);
+            if ($config !== false) {
+                if ( ! isset($config['login']) && isset($config['index'])) {
+                    $ret[] = [
+                        'id'    => $id,
+                        'index' => $config['index']
+                    ];
+                }
+            }
+        }
+
+        return $ret;
+    }
+
+    /**
+     * @param string $app_id
+     *
+     * @return CB_DatabaseConnection
+     */
+    function getConnection($app_id)
+    {
+        $config = $this->getConfig($app_id);
+        $conn = false;
+        if (is_array($config) && array_key_exists('connection', $config)) {
+            $conn = $config['connection'];
+        }
+        if ($conn === false) {
+            $conn = 'dbconn';
+        }
+        global $G_container_base;
+        $ret = $G_container_base->getInstance($conn);
+
+        return $ret;
+    }
+
+    /**
+     * @param string $app_id
+     *
+     * @return GRN_TableManager
+     */
+    function getTableManager($app_id)
+    {
+        $config = $this->getConfig($app_id);
+        $tm = false;
+        if (array_key_exists('table_manager', $config ? $config : [])) {
+            $tm = $config['table_manager'];
+        }
+        if ($tm === false) {
+            $tm = 'table_manager';
+        }
+        global $G_container_base;
+        $ret = $G_container_base->getInstance($tm);
+
+        return $ret;
+    }
+
+    /**
+     * load and cache multi user setting
+     *
+     * @param           $users
+     * @param           $params         array of setting
+     *                                  user            cache user
+     *                                  base            cache user base setting
+     *                                  locale          cache locale setting
+     */
+    function loadAndCacheUsersSetting($users, $params)
+    {
+        $users_id = array_keys($users);
+        if (in_array('user', $params)) {
+            //uum
+            global $G_container_base;
+            /** @var GRN_Uum $uum */
+            $uum = $G_container_base->getInstance('uum');
+            $uum->loadAndCache($users_id);
+        }
+
+        if (in_array('base', $params)) {
+            require_once('fw/i18n/base.csp');
+            CB_UserBaseSetting::loadAndCache($users_id);
+        }
+
+        if (in_array('locale', $params)) {
+            require_once('fw/i18n/locale.csp');
+            CB_UserLocaleSetting::loadAndCache($users_id);
+        }
+    }
+
+}

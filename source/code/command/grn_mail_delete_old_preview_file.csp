@@ -1,0 +1,211 @@
+<?php
+cb_require_role('CommandLine');
+
+require_once('grn/cli.csp');
+
+$opts = cb_cli_start(
+// Mandatory command-line options
+    [
+    ],
+
+    // Optional command-line options
+    [
+        new CB_CLI_BEFORE_OPTION(),
+        new CB_CLI_EXEC_OPTION(),
+        new CB_CLI_MAX_COUNT_OPTION(),
+        new CB_CLI_MAX_DURATION_OPTION()
+    ]
+);
+
+if (array_key_exists(CB_CLI_BEFORE_OPTION, $opts)) {
+    $before = cb_date_convert2timestamp($opts[CB_CLI_BEFORE_OPTION]);
+} else {
+    $before = time(); // All the records should be deleted.
+}
+
+global $_cb_cli_starting_timestamp;
+$start_ts = cb_date_convert2timestamp($_cb_cli_starting_timestamp);
+
+define(
+    "SELECT_FILEBODY_TEMPLATE",
+    '(SELECT _id FROM tab_grn_mail_filebody___p%1$s WHERE col_mail IS NULL AND col_temporary_mail IS NULL AND col_timestamp < %2$s ORDER BY _id)
+	UNION DISTINCT
+	(SELECT f._id AS _id FROM tab_grn_mail_filebody___p%1$s AS f LEFT JOIN tab_grn_mail_temporarymessage AS t ON f.col_temporary_mail = t._id WHERE t.col_user IS NULL AND f.col_mail IS NULL AND f.col_temporary_mail IS NOT NULL AND f.col_timestamp < %2$s ORDER BY f._id);');
+define("DELETE_FILEBODY_TEMPLATE",
+    "DELETE FROM tab_grn_mail_filebody___p%s WHERE _id = %s;");
+define("DELETE_TEMPORARYMESSAGE",
+    "DELETE FROM tab_grn_mail_temporarymessage WHERE col_user IS NULL;");
+
+class CMD_GRN_MailFilebody
+{
+    var $table_id;
+    var $record_id;
+
+    function __construct($table_id, $record_id)
+    {
+        $this->table_id = $table_id;
+        $this->record_id = $record_id;
+    }
+
+    function log($message)
+    {
+        cb_cli_log($message);
+    }
+
+    function deleteNow(&$db_conn)
+    {
+        $this->_execDeleteQuery($db_conn);
+        if ($this->_removeFile()) {
+            $db_conn->commit();
+
+            return true;
+        } else {
+            $db_conn->abort();
+
+            return false;
+        }
+    }
+
+    function _execDeleteQuery(&$dbconn)
+    {
+        $query = sprintf(DELETE_FILEBODY_TEMPLATE, $this->table_id,
+            $this->record_id);
+        $this->log("deleting record: table_id:{$this->table_id}, record_id:{$this->record_id}");
+        $dbconn->query($query);
+    }
+
+    function _removeFile()
+    {
+        $path = $this->_getFilePath();
+        $this->log("deleting file: {$path}");
+        if ( ! file_exists($path)) {
+            $this->log("file did not found : {$path}");
+
+            return true;
+        }
+        if ( ! @unlink($path)) {
+            $this->log("failed to delete {$path}");
+
+            return false;
+        }
+
+        return true;
+    }
+
+    function _getFilePath()
+    {
+        global $G_config_common;
+        $files_root = $G_config_common->get('Files', 'dir');
+
+        $table_root = "mail/grn_mail_filebody___p" . $this->table_id;
+        $dir1 = '0';
+        $dir2 = '0';
+        $file = '';
+
+        $len = strlen($this->record_id);
+        if ($len > 6) {
+            $limit = $len - 6;
+            $dir1 = substr($this->record_id, 0, $limit);
+            $dir2 = substr($this->record_id, $limit, 3);
+            $file = substr($this->record_id, $limit + 3, 3);
+        } elseif ($len > 3) {
+            $limit = $len - 3;
+            $dir2 = substr($this->record_id, 0, $limit);
+            $file = substr($this->record_id, $limit, 3);
+        } else {
+            $file = $this->record_id;
+        }
+
+        return "{$files_root}/{$table_root}/{$dir1}/{$dir2}/$file";
+    }
+}
+
+
+/**
+ *
+ * return the following array
+ * array(
+ *     table_id0 => array( $record_id1, $record_id2 ... ),
+ *     table_id1 => array( $record_id1, $record_id2 ... ),
+ *     ...
+ *     table_id49 => array( $record_id1, $record_id2 ... ),
+ *     )
+ *
+ * @param $db
+ *
+ * @return array
+ */
+function __getTargetRecords(&$db, $before)
+{
+    $records = [];
+
+    for (
+        $table_id = 0; $table_id < CB_DATABASE_DEFAULT_USER_TABLES; $table_id++
+    ) {
+        if ( ! array_key_exists($table_id, $records)) {
+            $records[$table_id] = [];
+        }
+
+        $query = sprintf(SELECT_FILEBODY_TEMPLATE, $table_id, $before);
+        $result = $db->query($query);
+
+        while ($row = $db->fetch_assoc($result)) {
+            $records[$table_id][] = $row['_id'];
+        }
+        $db->free_result($result);
+    }
+
+    return $records;
+}
+
+$error_code = 0;
+
+$app_locator = GRN_ApplicationLocator::instance();
+$db =& $app_locator->getConnection("mail");
+$target_records = __getTargetRecords($db, $before);
+
+$count = 0;
+foreach ($target_records as $per_table) {
+    $count += count($per_table);
+}
+cb_cli_log("{$count} files are going to be deleted.");
+
+if (array_key_exists(CB_CLI_EXEC_OPTION, $opts)) {
+    $db->query(DELETE_TEMPORARYMESSAGE);
+    $max_duration = array_key_exists(CB_CLI_MAX_DURATION_OPTION, $opts)
+        ? intval($opts[CB_CLI_MAX_DURATION_OPTION]) * 60 : null;
+    $num_deleted_file = 0;
+
+    foreach ($target_records as $table_id => $record_ids) {
+        foreach ($record_ids as $record_id) {
+            $data = new CMD_GRN_MailFilebody($table_id, $record_id);
+            if ( ! $data->deleteNow($db)) {
+                $error_code = 1;
+                break 2;  // Exit the outer foreach.
+            }
+
+            $num_deleted_file++;
+
+            if (is_null($max_duration) !== true
+                && (time() - $start_ts) > $max_duration
+            ) {
+                cb_cli_log("Stopped processing by passing the max_duration.");
+                break 2; // Exit the outer foreach.
+            }
+
+            if (array_key_exists(CB_CLI_MAX_COUNT_OPTION, $opts)
+                && $num_deleted_file >= $opts[CB_CLI_MAX_COUNT_OPTION]
+            ) {
+                cb_cli_log("Stopped processing by reaching the max_count.");
+                break 2; // Exit the outer foreach.
+            }
+        }
+    }
+    cb_cli_log("{$num_deleted_file} files were deleted.");
+}
+
+cb_cli_end("");
+
+if ($error_code != 0) {
+    exit($error_code);
+}

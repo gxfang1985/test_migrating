@@ -1,0 +1,988 @@
+<?php
+require_once('grn/uum_util.csp');
+
+use grn\grn\access\service\AppAccess;
+use grn\grn\MemberLogic;
+use grn\grn\uum\AccessPlugin;
+
+class GRN_UumUtil_Search extends GRN_UumUtil
+{
+    var $_uum;
+
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_UumUtil_Search
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    function __construct()
+    {
+        parent::__construct();
+        require_once('grn/uum_search.csp');
+        $this->_uum = new GRN_Uum_Search();
+    }
+
+    function searchUsersInfo(
+        $keyword,
+        $system_flg = false,
+        $columns = null,
+        $sensitive = false
+    ) {
+        require_once("grn/org_util_search.csp");
+        $condition = grn_get_user_info_search_condition(0, $keyword,
+            $system_flg, $sensitive);
+
+        $users = $this->_uum->getUsersInfo(null, $columns, 0, -1, null,
+            $condition);
+
+        return $users;
+    }
+
+    function searchUsersId($keyword, $system_flg = false, $sensitive = false)
+    {
+        require_once("grn/org_util_search.csp");
+        $condition = grn_get_user_info_search_condition(0, $keyword,
+            $system_flg, $sensitive);
+
+        $users_id = $this->_uum->getUsersId(null, 0, -1, null, $condition);
+
+        return $users_id;
+    }
+
+    function scheduleSearchUsersInfo($keyword, $system_flg = false)
+    {
+        require_once('fw/string_util.csp');
+        if (strlen(cb_trim($keyword)) <= 0) {
+            return [];
+        }
+
+        // LIKE節用エスケープ
+        global $G_container_base;
+        $dbconn = $G_container_base->getInstance('dbconn');
+        $query = 'LIKE ';
+
+        $uum = $G_container_base->getInstance('uum');
+        $item_values = &$uum->getDefaultItemProperties();
+
+        $texts = cb_parse_search_text($keyword);
+        $conditions = [];
+        foreach ($texts as $text) {
+            if (0 < strlen($text)) {
+                $format = cb_queryf($dbconn,
+                    " (tab_cb_user.col_display_name @S '%@L%') ", $query,
+                    $text);
+                $format .= cb_queryf($dbconn,
+                    " OR (tab_cb_user.col_nickname @S '%@L%') ", $query, $text);
+            }
+
+            if ($item_values['foreign_key']['show']) {
+                $format .= cb_queryf($dbconn,
+                    "OR (tab_cb_user.col_foreign_key @S '%@L%') ", $query,
+                    $text);
+            }
+            if ($item_values['sort_key']['use']
+                && $item_values['sort_key']['show']
+            ) {
+                $format .= cb_queryf($dbconn,
+                    "OR (tab_cb_user.col_normalized_sort_key @S '%@L%') ",
+                    $query, cb_normalize_sort_key($text));
+            }
+            if ($item_values['email_address']['use']
+                && $item_values['email_address']['show']
+            ) {
+                $format .= cb_queryf($dbconn,
+                    "OR (tab_cb_user.col_email_address @S '%@L%') ", $query,
+                    $text);
+            }
+            if ($item_values['post']['use'] && $item_values['post']['show']) {
+                $format .= cb_queryf($dbconn,
+                    "OR (tab_grn_userinfo.col_post @S '%@L%') ", $query, $text);
+            }
+
+
+            $extend_condition = 'r.col_user=tab_cb_user._id'
+                                . ' AND i.col_use=1 '
+                                . ' AND i.col_type<>"password"'
+                                . ' AND i.col_show=1'
+                                . ' AND i.col_search=1';
+
+            $extend_format
+                = "OR ((SELECT GROUP_CONCAT(r.col_string SEPARATOR ' ')"
+                  . " FROM tab_grn_itemuserrelation r INNER JOIN tab_grn_useritem i ON r.col_item=i._id"
+                  . " WHERE " . $extend_condition . ") @S '%@L%')";
+
+            $format .= cb_queryf($dbconn, $extend_format, $query, $text);
+
+            $format = "( " . $format . " )";
+            $conditions[] = $format;
+
+        }
+
+        $condition = implode(' OR ', $conditions);
+        $users_id = $this->_uum->getUsersId(null, 0, -1, null, $condition);
+        $users_id = AppAccess::filterUserIdsInternalAccessByAppId($users_id,
+            GRN_SCHEDULE_APPLICATION_ID);
+        $users = $this->_uum->getUsersInfo($users_id);
+
+        return $users;
+    }
+
+    /***
+     *
+     * @param $uids
+     *
+     * @return array
+     */
+    function SelectedUsersInfo($uids)
+    {
+        cb_require_role("LoginUser");
+        $login_user = cb_get_login_user();
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $users_id = AppAccess::filterUserIdsInternalAccessByAppId($uids,
+            GRN_SCHEDULE_APPLICATION_ID);
+        //checking user access right
+        // Access right
+        $users_id_access = array_combine($users_id, $users_id);//(uid=>uid)
+        $dynamic_roles = $uum->listGrantedRoles();
+        require_once('schedule/access_logic.csp');
+        $acc_logic = \GRN_Schedule_Access_logic::getInstance();
+        $acc_lists = $acc_logic->getEvaluateAccessesListById(
+            $login_user, $users_id_access, 'user', ['read'], $dynamic_roles
+        );
+        foreach ($acc_lists as $key => $value) {
+            if ($acc_lists[$key]['read'] === 0) {
+                $index = array_search($key, $users_id);
+                unset($users_id[$index]);
+            }
+        }
+        $users_id = array_values($users_id); //re index
+        $columns = [
+            "tab_cb_user._id",
+            "tab_cb_user.col_display_name",
+            "tab_cb_user.col_nickname",
+            "tab_cb_user.col_normalized_sort_key",
+            "tab_cb_user.col_display_name_language"
+        ];
+        $users_result = $this->_uum->getUsersInfo($users_id, $columns);
+        $users_keep_order = [];
+        $tmp_ids = [];
+        require_once("grn/controller.csp");
+        foreach ($users_id as $uid) {
+            if (array_key_exists($uid, $users_result)) {
+                $users_result[$uid]['col_display_name']
+                    = GRN_ControllerUtil::getUserNameText($login_user->getOID(),
+                    $uid, $users_result, true);
+                $users_keep_order[] = $users_result[$uid];
+                $tmp_ids[] = $uid;
+            }
+        }
+        //re assign
+        $users_result = $users_keep_order;
+        $ui_config_manager = \GRN_UIConfigManager::getInstance();
+        $ui_config = $ui_config_manager->getUserConfig($login_user);
+        $users = [];
+        //show group setting
+        $show_priority_group
+            = $ui_config->getShowPriorityGroup();//$ui_config['_settings']['show_priority_group'];
+        if ($show_priority_group) {
+            $priority_group = $uum->getManyUserPrimaryGroupInfoList($users_id);
+            foreach ($users_id as $index => $uid) {
+                $key = array_search($uid, $tmp_ids);
+                if ($key !== false && array_key_exists($key, $users_result)) {
+                    $users[$index] = $users_result[$key];
+                }
+                if (array_key_exists($uid, $priority_group)) {
+                    $users[$index]['primary_group']
+                        = $priority_group[$uid]['col_name'];
+                }
+            }
+        } else {
+            $users = $users_result;
+        }
+
+        return $users;
+    }
+
+    /**
+     * The function search organization by keyword
+     *
+     * @param $keyword
+     * @param $limit
+     *
+     * @return array
+     */
+    public function scheduleIncrementalSearchOrganizationsInfo($keyword, $limit)
+    {
+        $login = cb_get_login_user();
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $dynamic_roles = $uum->listGrantedRoles();
+
+        require_once('schedule/access_logic.csp');
+        $acc_logic = \GRN_Schedule_Access_logic::getInstance();
+        require_once('fw/string_util.csp');
+        if (strlen(cb_trim($keyword)) < 1) {
+            return [];
+        }
+
+        $org_list = self::_incrementalSearchOrganizationByNames($keyword,
+            $limit);
+        //Organization access right
+        $org_list_length = count($org_list);
+        $org_id_list = [];
+        $org_id_access_list = [];
+
+        for ($j = 0; $j < $org_list_length; $j++) {
+            $org_id = $org_list[$j]['_id'];
+            $org_id_list[$org_id] = $org_id;
+        }
+        $org_id_access_list = $acc_logic->getEvaluateAccessesListById(
+            $login, $org_id_list, 'group', ['read'], $dynamic_roles
+        );
+        //format (uid=>(read=>1, add=>0)
+
+        foreach ($org_id_access_list as $org_id => $org_access_list) {
+            if ($org_access_list['read'] !== 0) {
+                continue;
+            }
+            for ($i = 0; $i < $org_list_length; $i++) {
+                if (array_key_exists($i, $org_list)
+                    && $org_id == $org_list[$i]["_id"]
+                ) {
+                    unset($org_list[$i]);
+                }
+            }
+        }
+        //re-index of array
+        $org_list = array_values($org_list);
+
+        return $org_list;
+    }
+
+    private function _incrementalSearchOrganizationByNames(
+        $keyword,
+        $limit,
+        AccessPlugin $access_plugin = null
+    ) {
+        global $G_container_base;
+        $db = $G_container_base->getInstance('dbconn');
+        $i18n = CB_I18N::getInstance();
+        $inLock = CB_DATABASE_NO_LOCK;
+        $inOffset = 0;
+        $inLimit = $limit;
+        $inLanguage = $i18n->getCurrentLanguage();
+
+        $inWordArray = cb_parse_search_text($keyword);
+        foreach ($inWordArray as $word) {
+            $inEscapeWordArray[] = cb_queryf($db,
+                " main.col_display_name LIKE '%@L%'", $word);
+        }
+
+        $inWords = implode(" OR ", $inEscapeWordArray);
+
+        $query = "SELECT *";
+        $query .= " FROM (";
+        $query .= "SELECT g._id, IFNULL(gl.col_name, g.col_name) AS col_display_name, g.col_description, g.col_list_index, g.col_mtime, g.col_foreign_key ";
+
+        $query .= " FROM (tab_cb_group g LEFT JOIN (tab_cb_group_local gl INNER JOIN tab_cb_language_status l";
+        $query .= cb_queryf($db,
+            " ON gl.language_id = l._id AND l.col_language = '@L') ON g._id = gl.parent_id)",
+            $inLanguage);
+
+        $query .= ") main";
+        $query .= " WHERE ${inWords}";
+        $query .= " ORDER BY CASE ";
+
+        $orderCaseClause = "";
+        $order_auto_grow = 0;
+        $col_name_order = cb_queryf($db,
+            " WHEN main.col_display_name LIKE '@L' THEN @S ", $keyword,
+            $order_auto_grow++);
+        $col_name_order .= cb_queryf($db,
+            " WHEN main.col_display_name LIKE '@L%' THEN @S ", $keyword,
+            $order_auto_grow++);
+        $col_name_order .= cb_queryf($db,
+            " WHEN main.col_display_name LIKE '%@L' THEN @S ", $keyword,
+            $order_auto_grow++);
+        $col_name_order .= cb_queryf($db,
+            " WHEN main.col_display_name LIKE '%@L%' THEN @S ", $keyword,
+            $order_auto_grow++);
+        if (count($inWordArray) > 1) {
+            foreach ($inWordArray as $text) {
+                $col_name_order .= cb_queryf($db,
+                    " WHEN main.col_display_name LIKE '@L%' THEN @S ", $text,
+                    $order_auto_grow++);
+            }
+        }
+
+        $orderCaseClause .= $col_name_order;
+        $orderCaseClause .= " ELSE " . $order_auto_grow++ . " END";
+
+        $query .= $orderCaseClause;
+
+        $inLimit = AccessPlugin::isAvailableTarget($access_plugin,
+            MemberLogic::TYPE_ORGANIZATION) ? -1 : $inLimit;
+
+        if ( ! is_null($inOffset)) {
+            $query = $db->select_format($query, $inOffset, $inLimit, $inLock);
+        }
+
+        return $this->getMembersByQuery($query, MemberLogic::TYPE_ORGANIZATION,
+            $limit, $access_plugin);
+    }
+
+    /**
+     * @param string $keyword
+     * @param int    $limit
+     * @param bool   $is_display_icon
+     * @param int    $login_user_id
+     *
+     * @return array
+     */
+    function scheduleIncrementalSearchUsersInfo(
+        $keyword,
+        $limit = 20,
+        $is_display_icon = false,
+        $login_user_id = -1
+    ) {
+        require_once('fw/string_util.csp');
+        if (strlen(cb_trim($keyword)) < 1) {
+            return [];
+        }
+        global $G_container_base;
+        $db_conn = $G_container_base->getInstance('dbconn');
+
+        $uum = $G_container_base->getInstance('uum');
+
+        $query = $this->getSearchUserCondition($keyword);
+        $result = $db_conn->query($query);
+
+        $num_rows = $db_conn->num_rows($result);
+        cb_require_role("LoginUser");
+        $login_user = cb_get_login_user();
+        $login_id = cb_get_login_user()->getOID();
+
+        $usersIdTopN = [];
+        $usersInfoTopN = [];
+        // Access right
+        $dynamic_roles = $uum->listGrantedRoles();
+        require_once('schedule/access_logic.csp');
+        $acc_logic = \GRN_Schedule_Access_logic::getInstance();
+        require_once("grn/controller.csp");
+
+        for ($i = 0; $i < $num_rows; $i++) {
+            $r = $db_conn->fetch_assoc($result);
+            $users_id[] = $r['_id'];
+            $user_id = $r['_id'];
+            $users_id_access[$user_id]
+                = $user_id;//Standardize input parameter for access right
+            $users[$user_id] = $r;
+            $users[$user_id]['col_display_name']
+                = GRN_ControllerUtil::getUserNameText(
+                $login_id, $user_id, $users, true
+            );
+            $users[$user_id]['col_nickname'] = '';
+
+            if ($is_display_icon == true) {
+                $users[$user_id]['icon_path']
+                    = GRN_ControllerUtil::getUserIconPath(GRN_ControllerUtil::getUserProfilePhotoSmallSize(), $user_id);
+            }
+
+            //The logic for logged-in user
+            if ($user_id == $login_user_id) {
+                $users[$user_id]['logged_in'] = true;
+            } else {
+                $users[$user_id]['logged_in'] = false;
+            }
+
+            if ($i > 0 && $i % ($limit - 1) === 0 || $i === $num_rows - 1) {
+                $users_id_tmp
+                    = AppAccess::filterUserIdsInternalAccessByAppId($users_id,
+                    GRN_SCHEDULE_APPLICATION_ID);
+                $users_id_diff = array_diff($users_id,
+                    $users_id_tmp); //revert application privilege user
+                foreach ($users_id_diff as $uid) {
+                    unset($users[$uid]);
+                }
+                $acc_lists = $acc_logic->getEvaluateAccessesListById(
+                    $login_user, $users_id_access, 'user', ['read'],
+                    $dynamic_roles
+                );
+                foreach ($acc_lists as $key => $value) {
+                    if ($acc_lists[$key]['read'] === 0) {
+                        unset($users[$key]);
+                        $index = array_search($key, $users_id_tmp);
+                        unset($users_id_tmp[$index]);
+                    }
+                }
+                //end
+                $usersIdTopN = array_merge($usersIdTopN, $users_id_tmp);
+                $usersInfoTopN = array_merge($usersInfoTopN, $users);
+                //Cleaning the arrays
+                $users_id = [];
+                $users = [];
+                $users_id_access = [];
+
+                if (count($usersIdTopN) >= $limit || $i === $num_rows) {
+                    break;
+                }
+            }
+        }
+
+        $db_conn->free_result($result);
+        $ui_config_manager = \GRN_UIConfigManager::getInstance();
+        $ui_config = $ui_config_manager->getUserConfig($login_user);
+
+        //show group setting
+        $show_priority_group = $ui_config->getShowPriorityGroup();
+        if ($show_priority_group) {
+            $count_loop = count($usersInfoTopN);
+            $priority_group
+                = $uum->getManyUserPrimaryGroupInfoList($usersIdTopN);
+            for ($i = 0; $i < $count_loop; $i++) {
+                if (array_key_exists($usersInfoTopN[$i]['_id'],
+                    $priority_group)
+                ) {
+                    $usersInfoTopN[$i]['primary_group']
+                        = $priority_group[$usersInfoTopN[$i]['_id']]['col_name'];
+                }
+            }
+        }
+
+        return array_values($usersInfoTopN);
+    }
+
+    /**
+     * Search Organization by name
+     *
+     * @param  string      $keyword       keyword to search
+     * @param int          $limit         total Org
+     * @param AccessPlugin $access_plugin Access plugin
+     *
+     * @return array
+     */
+    public function searchOrganization(
+        $keyword,
+        $limit = -1,
+        AccessPlugin $access_plugin = null
+    ) {
+        $org_list = self::_incrementalSearchOrganizationByNames($keyword,
+            $limit, $access_plugin);
+
+        return $org_list;
+    }
+
+    /**
+     * Search static role
+     *
+     * @param string       $role_search_text text to search
+     * @param int          $offset           Offset
+     * @param int          $limit            The maximum number of items will be returned
+     * @param string       $condition_type   Condition type (AND, OR). Default is "AND"
+     * @param AccessPlugin $access_plugin    Access plugin Object
+     *
+     * @return array list of role
+     */
+    public function searchStaticRole(
+        $role_search_text,
+        $offset = 0,
+        $limit = -1,
+        $condition_type = 'AND',
+        AccessPlugin $access_plugin = null
+    ) {
+        $texts = cb_parse_search_text($role_search_text);
+        //StaticRolesList
+        global $G_container_base;
+        $dbconn = cb_get_master_db();
+
+        /**
+         * @var GRN_Uum $uum
+         */
+        $uum = $G_container_base->getInstance('uum');
+        $conditions = [];
+        foreach ($texts as $text) {
+            if (0 < strlen($text)) {
+                $conditions[] = cb_queryf($dbconn,
+                    " (CONVERT(tab_cb_role.col_foreign_key USING utf8mb4) LIKE '%@L%') ",
+                    $text);
+            }
+        }
+        $condition = implode(' ' . $condition_type . ' ', $conditions);
+        /**
+         * @var CB_Role[] $static_roles
+         */
+        $static_roles = $uum->searchStaticRolesList($condition, $offset,
+            $limit);
+        $data = [];
+        foreach ($static_roles as $role_id => $role) {
+            $data[$role_id] = [
+                'rid'         => $role_id,
+                'foreign_key' => $role->get('foreign_key')
+            ];
+        }
+
+        if (AccessPlugin::isAvailableTarget($access_plugin,
+            MemberLogic::TYPE_STATIC_ROLE)
+        ) {
+            $filtered_ids = $access_plugin->getPlugin()
+                                          ->evalRoles(array_keys($data),
+                                              $access_plugin->getParams());
+            $data = $this->filterArrayByKeys($data, $filtered_ids);
+            if ($limit != -1) {
+                $data = array_slice($data, 0, $limit);
+            }
+        }
+
+        return $data;
+    }
+
+    /**
+     * Search user info by keyword
+     *
+     * @param  string $keyword
+     * @param int     $limit Total item
+     * @param mixed   AccessPlugin $access_plugin        Access plugin
+     *
+     * @return array User list
+     */
+    public function searchUsersInfoExtend(
+        string $keyword,
+        int $limit = 0,
+        AccessPlugin $access_plugin = null
+    ) {
+        if (strlen(cb_trim($keyword)) < 1) {
+            return [];
+        }
+
+        $is_need_evaluation = AccessPlugin::isAvailableTarget($access_plugin,
+            MemberLogic::TYPE_USER);
+
+        $limit_in_query = $is_need_evaluation ? -1 : $limit;
+        $query = $this->getSearchUserCondition($keyword, 0,
+            $limit_in_query);
+        $users = $this->getMembersByQuery($query,
+            MemberLogic::TYPE_USER, $limit, $access_plugin);
+
+        return $this->formatMemberList($users);
+    }
+
+    /**
+     * Get Member result with SQL query
+     *
+     * @param  string $query SQL query
+     * @param string  $type  Member type
+     * @param int     $limit Total item. Default is -1 (no limit)
+     * @param mixed   AccessPlugin $access_plugin        Access plugin Object
+     *
+     * @return array Member list
+     */
+    private function getMembersByQuery(
+        string $query,
+        string $type,
+        int $limit = -1,
+        AccessPlugin $access_plugin = null
+    ) {
+        global $G_container_base;
+        /**
+         * @var \CB_DatabaseConnection $db_conn
+         */
+        $db_conn = $G_container_base->getInstance('dbconn');
+
+        $plugin = $access_plugin ? $access_plugin->getPlugin() : null;
+        $plugin_params = $access_plugin ? $access_plugin->getParams() : [];
+        $eval_function = '';
+        switch ($type) {
+            case MemberLogic::TYPE_USER:
+                $eval_function = 'evalUsers';
+                break;
+            case MemberLogic::TYPE_ORGANIZATION:
+                $eval_function = 'evalGroups';
+                break;
+        }
+
+        $is_need_evaluation = $eval_function
+                              && AccessPlugin::isAvailableTarget($access_plugin,
+                $type);
+        $result = $db_conn->query($query);
+        $num_rows = $db_conn->num_rows($result);
+
+        $members = [];
+        $member_ids = [];
+        $filtered_ids = [];
+
+        for ($i = 0; $i < $num_rows; $i++) {
+            $member = $db_conn->fetch_assoc($result);
+            $member_id = $member['_id'];
+            $member_ids[$member_id] = $member_id;
+            $member[MemberLogic::MEMBER_ID] = $member_id;
+            $member[MemberLogic::MEMBER_TYPE] = $type;
+            $members[$member_id] = $member;
+
+            if ($limit != -1 && $is_need_evaluation) {
+                // check permission by block of members
+                if ($i > 0 && $i % $limit === 0 || $i === $num_rows - 1) {
+                    $eval_ids = $plugin->{$eval_function}($member_ids,
+                        $plugin_params);
+                    $filtered_ids = array_merge($filtered_ids, $eval_ids);
+                    $member_ids = [];
+                }
+
+                if (count($filtered_ids) >= $limit) {
+                    break;
+                }
+            }
+        }
+
+        if ($limit == -1 && $is_need_evaluation) {
+            $filtered_ids = $plugin->{$eval_function}($member_ids,
+                $plugin_params);
+        }
+
+        if ($is_need_evaluation) {
+            $members = $this->filterArrayByKeys($members, $filtered_ids);
+        }
+
+        $db_conn->free_result($result);
+
+        return array_values($members);
+    }
+
+
+    /**
+     * Format member list
+     *
+     * @param array $members Input member array
+     *
+     * @return array member data with formatted
+     */
+    private function formatMemberList(array $members)
+    {
+        $members = MemberLogic::getInstance()
+                              ->getDisplayMemberList($members, null, true);
+        // get addition data
+        foreach ($members as $member_id => &$member) {
+            $member_info = [
+                '_id'             => $member_id,
+                'col_foreign_key' => $member[MemberLogic::FOREIGN_KEY]
+            ];
+            $member[MemberLogic::MEMBER_URL]
+                = GRN_ControllerUtil::getUserProfileURL($member_info['_id']);
+            $small_image = GRN_ControllerUtil::getUserIconPath(GRN_ControllerUtil::getUserProfilePhotoSmallSize(),
+                $member_id);
+            $large_image = GRN_ControllerUtil::getUserIconPath(GRN_ControllerUtil::getUserProfilePhotoLargeSize(),
+                $member_id);
+            $member[MemberLogic::IMAGE] = [];
+            $member[MemberLogic::IMAGE][MemberLogic::ICON_SIZE_NAME_SMALL]
+                = $small_image;
+            $member[MemberLogic::IMAGE][MemberLogic::ICON_SIZE_NAME_LARGE]
+                = $large_image;
+        }
+
+        return $members;
+    }
+
+    /**
+     * Filter array with key
+     *
+     * @param array $members Input member array
+     * @param array $keys    Input key
+     *
+     * @return array member data with key in $keys
+     */
+    private function filterArrayByKeys(array $members, array $keys)
+    {
+        $data = [];
+        foreach ($keys as $key) {
+            if (isset($members[$key])) {
+                $data[$key] = $members[$key];
+            }
+        }
+
+        return $data;
+    }
+
+    /**
+     * Get search user condition by keyword
+     *
+     * @param string $keyword keyword to search
+     * @param int    $offset  Offset in database
+     * @param int    $limit   Total item
+     *
+     * @return string Query string
+     */
+    private function getSearchUserCondition($keyword, $offset = 0, $limit = -1)
+    {
+        global $G_container_base;
+        /**
+         * @var \CB_DatabaseConnection $db_conn
+         */
+        $db_conn = $G_container_base->getInstance('dbconn');
+        $uum = $G_container_base->getInstance('uum');
+        $item_values = $uum->getDefaultItemProperties();
+        $search_key_list = cb_parse_search_text($keyword);
+
+        $conditions = [];
+        $query
+            = "SELECT u._id, u.col_display_name, u.col_nickname, u.col_normalized_sort_key, 
+        u.col_display_name_language, u.col_valid, u.col_foreign_key ";
+        $query .= "FROM tab_cb_user as u LEFT JOIN tab_grn_userinfo as ui ON u._id = ui.col_user ";
+        $query .= "WHERE u.col_deleted IS NULL AND ( ";
+        foreach ($search_key_list as $search_key) {
+            $condition = cb_queryf($db_conn, " u.col_display_name like '%@L%'",
+                $search_key);
+            $condition .= cb_queryf($db_conn, " OR u.col_nickname like '%@L%'",
+                $search_key);
+            if ($item_values['foreign_key']['show']) {
+                $condition .= cb_queryf($db_conn,
+                    " OR u.col_foreign_key like '%@L%'", $search_key);
+            }
+
+            if ($item_values['sort_key']['use']
+                && $item_values['sort_key']['show']
+            ) {
+                $condition .= cb_queryf($db_conn,
+                    " OR u.col_normalized_sort_key like '%@L%'",
+                    cb_normalize_sort_key($search_key));
+            }
+
+            if ($item_values['email_address']['use']
+                && $item_values['email_address']['show']
+            ) {
+                $condition .= cb_queryf($db_conn,
+                    " OR u.col_email_address like '%@L%'", $search_key);
+            }
+
+            if ( ! defined('ON_FOREST')) {
+
+                if ($item_values['post']['use']
+                    && $item_values['post']['show']
+                ) {
+                    $condition .= cb_queryf($db_conn,
+                        " OR ui.col_post like '%@L%'", $search_key);
+                }
+            }
+
+            $extend_condition = "r.col_user=u._id"
+                                . " AND i.col_use=1"
+                                . " AND i.col_type<>'password'"
+                                . " AND i.col_show=1"
+                                . " AND i.col_search=1";
+
+            $extend_format
+                = " OR ((SELECT GROUP_CONCAT(r.col_string SEPARATOR ' ')"
+                  . " FROM tab_grn_itemuserrelation r INNER JOIN tab_grn_useritem i ON r.col_item=i._id"
+                  . " WHERE " . $extend_condition . ") LIKE '%@L%')";
+
+            $condition .= cb_queryf($db_conn, $extend_format, $search_key);
+
+            $condition = "(" . $condition . ")";
+            $conditions[] = $condition;
+        }
+        $query .= implode(' OR ', $conditions);
+        $query .= ' ) ';
+        $query .= "ORDER BY CASE ";
+        $col_foreign_key_order = "";
+        $col_email_address_order = "";
+        $col_normalized_sort_key_order = "";
+        $col_post_order = "";
+
+        $order_auto_grow = 0;
+        $col_display_order = cb_queryf(
+            $db_conn, " WHEN u.col_display_name LIKE '@L' THEN @S ", $keyword,
+            $order_auto_grow++
+        );
+        $col_display_order .= cb_queryf(
+            $db_conn, " WHEN u.col_display_name LIKE '@L%' THEN @S ", $keyword,
+            $order_auto_grow++
+        );
+        $col_display_order .= cb_queryf(
+            $db_conn, " WHEN u.col_display_name LIKE '%@L' THEN @S ", $keyword,
+            $order_auto_grow++
+        );
+        $col_display_order .= cb_queryf(
+            $db_conn, " WHEN u.col_display_name LIKE '%@L%' THEN @S ", $keyword,
+            $order_auto_grow++
+        );
+        if (count($search_key_list) > 1) {
+            foreach ($search_key_list as $search_key) {
+                $col_display_order .= cb_queryf(
+                    $db_conn, " WHEN u.col_display_name LIKE '@L%' THEN @S ",
+                    $search_key, $order_auto_grow++
+                );
+            }
+        }
+
+        $col_nickname_order = cb_queryf(
+            $db_conn, " WHEN u.col_nickname LIKE '@L' THEN @S ", $keyword,
+            $order_auto_grow++
+        );
+        $col_nickname_order .= cb_queryf(
+            $db_conn, " WHEN u.col_nickname LIKE '@L%' THEN @S ", $keyword,
+            $order_auto_grow++
+        );
+        $col_nickname_order .= cb_queryf(
+            $db_conn, " WHEN u.col_nickname LIKE '%@L' THEN @S ", $keyword,
+            $order_auto_grow++
+        );
+        $col_nickname_order .= cb_queryf(
+            $db_conn, " WHEN u.col_nickname LIKE '%@L%' THEN @S ", $keyword,
+            $order_auto_grow++
+        );
+        if (count($search_key_list) > 1) {
+            foreach ($search_key_list as $search_key) {
+                $col_nickname_order .= cb_queryf(
+                    $db_conn, " WHEN u.col_nickname LIKE '@L%' THEN @S ",
+                    $search_key, $order_auto_grow++
+                );
+            }
+        }
+
+        if ($item_values['foreign_key']['show']) {
+            $col_foreign_key_order = cb_queryf(
+                $db_conn, " WHEN u.col_foreign_key LIKE '@L' THEN @S ",
+                $keyword, $order_auto_grow++
+            );
+            $col_foreign_key_order .= cb_queryf(
+                $db_conn, " WHEN u.col_foreign_key LIKE '@L%' THEN @S ",
+                $keyword, $order_auto_grow++
+            );
+            $col_foreign_key_order .= cb_queryf(
+                $db_conn, " WHEN u.col_foreign_key LIKE '%@L' THEN @S ",
+                $keyword, $order_auto_grow++
+            );
+            $col_foreign_key_order .= cb_queryf(
+                $db_conn, " WHEN u.col_foreign_key LIKE '%@L%' THEN @S ",
+                $keyword, $order_auto_grow++
+            );
+            if (count($search_key_list) > 1) {
+                foreach ($search_key_list as $search_key) {
+                    $col_foreign_key_order .= cb_queryf(
+                        $db_conn, " WHEN u.col_foreign_key LIKE '@L%' THEN @S ",
+                        $search_key, $order_auto_grow++
+                    );
+                }
+            }
+        }
+
+        if ($item_values['sort_key']['use']
+            && $item_values['sort_key']['show']
+        ) {
+            $keyword_converted = cb_normalize_sort_key($keyword);
+            $col_normalized_sort_key_order = cb_queryf(
+                $db_conn, " WHEN u.col_normalized_sort_key LIKE '@L' THEN @S ",
+                $keyword_converted, $order_auto_grow++
+            );
+            $col_normalized_sort_key_order .= cb_queryf(
+                $db_conn, " WHEN u.col_normalized_sort_key LIKE '@L%' THEN @S ",
+                $keyword_converted, $order_auto_grow++
+            );
+            $col_normalized_sort_key_order .= cb_queryf(
+                $db_conn, " WHEN u.col_normalized_sort_key LIKE '%@L' THEN @S ",
+                $keyword_converted, $order_auto_grow++
+            );
+            $col_normalized_sort_key_order .= cb_queryf(
+                $db_conn,
+                " WHEN u.col_normalized_sort_key LIKE '%@L%' THEN @S ",
+                $keyword_converted, $order_auto_grow++
+            );
+            if (count($search_key_list) > 1) {
+                foreach ($search_key_list as $search_key) {
+                    $search_key_converted = cb_normalize_sort_key($search_key);
+                    $col_normalized_sort_key_order .= cb_queryf(
+                        $db_conn,
+                        " WHEN u.col_normalized_sort_key LIKE '@L%' THEN @S ",
+                        $search_key_converted,
+                        $order_auto_grow++
+                    );
+                }
+            }
+        }
+
+        if ($item_values['email_address']['use']
+            && $item_values['email_address']['show']
+        ) {
+            $col_email_address_order = cb_queryf(
+                $db_conn, " WHEN u.col_email_address LIKE '@L' THEN @S ",
+                $keyword, $order_auto_grow++
+            );
+            $col_email_address_order .= cb_queryf(
+                $db_conn, " WHEN u.col_email_address LIKE '@L%' THEN @S ",
+                $keyword, $order_auto_grow++
+            );
+            $col_email_address_order .= cb_queryf(
+                $db_conn, " WHEN u.col_email_address LIKE '%@L' THEN @S ",
+                $keyword, $order_auto_grow++
+            );
+            $col_email_address_order .= cb_queryf(
+                $db_conn, " WHEN u.col_email_address LIKE '%@L%' THEN @S ",
+                $keyword, $order_auto_grow++
+            );
+            if (count($search_key_list) > 1) {
+                foreach ($search_key_list as $search_key) {
+                    $col_email_address_order .= cb_queryf(
+                        $db_conn,
+                        " WHEN u.col_email_address LIKE '@L%' THEN @S ",
+                        $search_key, $order_auto_grow++
+                    );
+                }
+            }
+        }
+
+        if ( ! defined('ON_FOREST')) {
+            if ($item_values['post']['use'] && $item_values['post']['show']) {
+                $col_post_order = cb_queryf(
+                    $db_conn, " WHEN ui.col_post LIKE '@L' THEN @S ", $keyword,
+                    $order_auto_grow++
+                );
+                $col_post_order .= cb_queryf(
+                    $db_conn, " WHEN ui.col_post LIKE '@L%' THEN @S ", $keyword,
+                    $order_auto_grow++
+                );
+                $col_post_order .= cb_queryf(
+                    $db_conn, " WHEN ui.col_post LIKE '%@L' THEN @S ", $keyword,
+                    $order_auto_grow++
+                );
+                $col_post_order .= cb_queryf(
+                    $db_conn, " WHEN ui.col_post LIKE '%@L%' THEN @S ",
+                    $keyword, $order_auto_grow++
+                );
+                if (count($search_key_list) > 1) {
+                    foreach ($search_key_list as $search_key) {
+                        $col_post_order .= cb_queryf(
+                            $db_conn, " WHEN ui.col_post LIKE '@L%' THEN @S ",
+                            $search_key, $order_auto_grow++
+                        );
+                    }
+                }
+            }
+        }
+        $query .= $col_display_order;
+        $query .= $col_nickname_order;
+        $query .= $col_foreign_key_order;
+        $query .= $col_normalized_sort_key_order;
+        $query .= $col_email_address_order;
+
+        if ( ! defined('ON_FOREST')) {
+            $query .= $col_post_order;
+        }
+        $query .= cb_queryf($db_conn, " ELSE @S END, u.col_position, u._id",
+            $order_auto_grow);
+        $query = $db_conn->select_format($query, $offset, $limit,
+            CB_DATABASE_NO_LOCK);
+
+        return $query;
+    }
+
+}
+

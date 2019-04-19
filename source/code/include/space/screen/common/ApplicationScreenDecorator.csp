@@ -1,0 +1,950 @@
+<?php
+
+namespace grn\space\screen\common;
+
+use grn\favour\service\FavourService;
+use grn\grn\access\service\AppAccess;
+use grn\space\common\logic\SpaceMemberLogic;
+use grn\space\common\utility\SpaceMemberUtility;
+use grn\space\data\bean\MemberOpenStatus;
+use grn\space\data\collection\SpaceCollection;
+use grn\space\screen\GenericScreenBase;
+use grn\space\common\data\condition\CategorySearchCondition;
+use grn\space\common\utility\ValidateUtility;
+use grn\space\service\KintoneService;
+use grn\space\utility\SpaceMemoUtility;
+use grn\space\common\utility\IconUtility;
+use grn\space\common\data\collection\SpaceMemberCollection;
+use grn\space\common\data\bean\DatetimeFormat;
+use grn\space\data\collection\SpaceUserCollection;
+use grn\space\common\data\bean\Authority;
+use grn\space\common\data\bean\Application;
+use grn\space\common\data\condition\ApplicationSearchCondition;
+use grn\space\common\exception\GrnDatabaseException;
+use grn\space\common\exception\GrnDataNotFoundException;
+use grn\space\common\exception\GrnException;
+use grn\space\common\exception\GrnInvalidArgumentException;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\utility\SpaceDatetimeUtility;
+use grn\space\data\bean\Space;
+use grn\space\data\bean\SpaceApplication;
+use grn\space\data\bean\SpaceMemo;
+use grn\space\data\ApplicationTab;
+use grn\space\data\collection\SpaceApplicationCollection;
+use grn\space\data\condition\SpaceApplicationSearchCondition;
+use grn\space\service\SpaceService;
+use grn\space\service\DiscussionService;
+use grn\space\service\TodoService;
+use grn\space\screen\mobile\MobileGenericScreenBase;
+use grn\space\logic\SpaceLogic;
+use grn\space\common\data\bean;
+use grn\space\common\data\bean\LanguageStatus;
+
+/**
+ * Class ApplicationScreenDecorator
+ *
+ */
+class ApplicationScreenDecorator extends GenericScreenBase
+{
+    const ARG_SPACE_ID = "spid";
+    const ARG_APPLICATION_ID = "appid";
+
+    private $input;
+    private $component;
+
+    private $spaceId;
+    private $applicationId;
+    private $space;
+    private $spaceMemo;
+    private $tabList;
+    private $spaceCollection;
+    private $isScheduleAvailable;
+    private $memberFieldStatus;
+    private $spaceUserCollection;
+    private $spaceOperatorCollection;
+
+    //for performance
+    private $_loginUserId = null;
+
+    const URL_DISCUSSION_INDEX = "space/application/discussion/index";
+    const URL_TODO_INDEX = "space/application/todo/index";
+    const URL_EXTERNAL_INDEX = "space/application/external/index";
+    const URL_SPACE_LIST = "space/list";
+    const URL_TOP = "space/top";
+
+    const URL_PARTIAL_DISCUSSION = "space/application/discussion";
+    const URL_PARTIAL_TODO = "space/application/todo";
+    const URL_PARTIAL_EXTERNAL = "space/application/external";
+
+    /**
+     * @param object $discussionScreen
+     */
+    public function __construct($discussionScreen)
+    {
+        $this->component = $discussionScreen;
+
+        $this->setInput($this->component->getInput());
+        $this->setSpaceId(null);
+        $this->setApplicationId(null);
+        $this->setSpace(null);
+        $this->setSpaceMemo(null);
+        $this->setTabList(null);
+
+        require_once('schedule/resources.csp');
+        $this->setScheduleAvailable(AppAccess::isAppAvailableInternalAccess(GRN_SCHEDULE_APPLICATION_ID,
+            $this->getLoginUserId()));
+    }
+
+    /**
+     * Make HTML
+     *
+     * @return string
+     * @throws GrnException
+     */
+    public function fetch()
+    {
+        global $G_state_set;
+        if ($G_state_set->get('is_cybozu_browser')) {
+            MobileGenericScreenBase::redirectMobilePage($this->getInput());
+        }
+
+        $input = $this->getInput();
+        $this->setInput($input);
+
+        if ( ! is_array($input)) {
+            throw new GrnDataNotFoundException(ErrorCode::GRN_INVALID_SPACE_ID);
+        }
+
+        $space = null;
+        if (cb_at($input, self::ARG_THREAD_ID)) {
+            $spaceLogic = SpaceLogic::getInstance();
+            $space
+                = $spaceLogic->getSpaceByThreadId($input[self::ARG_THREAD_ID],
+                LanguageStatus::STANDARD_LANGUAGE_CODE, true);
+            if ($space) {
+                $this->setSpaceId($space->getId());
+            }
+        } elseif (cb_at($input, self::ARG_TODO_ID)) {
+            $spaceLogic = SpaceLogic::getInstance();
+            $space
+                = $spaceLogic->getSpaceByTodoId($input[self::ARG_TODO_ID],
+                LanguageStatus::STANDARD_LANGUAGE_CODE, true);
+            if ($space) {
+                $this->setSpaceId($space->getId());
+            }
+        }
+        if (is_null($space)) {
+            if ( ! array_key_exists(self::ARG_SPACE_ID, $input)) {
+                throw new GrnDataNotFoundException(ErrorCode::GRN_INVALID_SPACE_ID);
+            }
+            $this->setSpaceId($input[self::ARG_SPACE_ID]);
+        }
+
+        if (array_key_exists(self::ARG_APPLICATION_ID, $input)) {
+            $this->setApplicationId($input[self::ARG_APPLICATION_ID]);
+        }
+
+        $spaceService = SpaceService::getInstance();
+
+        $operationUserId = $this->getLoginUserId();
+
+        // GRN35-643: Do not display an error screen when the notification is clicked
+        if (array_key_exists('nid', $input) || array_key_exists('nhid', $input)
+            || array_key_exists('fnid', $input)
+        ) {
+            $no_header = cb_at($input, 'no_header', true);
+            $deletedScreenPosition = [
+                [
+                    "page" => self::URL_SPACE_LIST,
+                    "name" => grn_get_page_display_name("space/index"),
+                    "cid"  => $spaceService->getSpaceRootCategory($operationUserId,
+                        $this->getLanguageCode())->getId()
+                ],
+                [
+                    "name" => grn_get_page_display_name("space/config_view"),
+                    "spid" => null
+                ]
+            ];
+            try {
+                $spaceService->getSpace($this->getSpaceId(), $operationUserId);
+            } catch (GrnDataNotFoundException $e) {
+                $subModuleId = \GrnSpaceApplication::GRN_SPACE_SUB_MODULE_ID;
+                $this->checkData($input, $operationUserId, $this->getSpaceId(),
+                    $subModuleId, $e, false);
+                if (array_key_exists('tid', $input)) {
+                    $this->checkData($input, $operationUserId, $input['tid'],
+                        \GrnSpaceApplication::GRN_DISCUSSION_SUB_MODULE_ID, $e,
+                        false);
+                }
+                if (array_key_exists('tdid', $input)) {
+                    $this->checkData($input, $operationUserId, $input['tdid'],
+                        \GrnSpaceApplication::GRN_TODO_SUB_MODULE_ID, $e,
+                        false);
+                }
+                require_once("grn/smarty.csp");
+                $smarty = new \GRN_Smarty();
+                $smarty->assign('site_position', $deletedScreenPosition);
+                $smarty->assign('appli', $subModuleId);
+                $smarty->assign("no_header", $no_header);
+                $smarty->assign("no_footer", $no_header);
+
+                return $smarty->fetch("space/deleted_screen.tpl");
+            }
+            if (array_key_exists('tid', $input)) {
+                try {
+                    $discussionService = DiscussionService::getInstance();
+                    $discussionService->getThread($input['tid'],
+                        $operationUserId);
+                } catch (GrnDataNotFoundException $e) {
+                    $subModuleId
+                        = \GrnSpaceApplication::GRN_DISCUSSION_SUB_MODULE_ID;
+                    $this->checkData($input, $operationUserId, $input['tid'],
+                        $subModuleId, $e);
+                    require_once("grn/smarty.csp");
+                    $smarty = new \GRN_Smarty();
+                    $smarty->assign('site_position', $deletedScreenPosition);
+                    $smarty->assign('appli', $subModuleId);
+                    $smarty->assign("no_header", $no_header);
+                    $smarty->assign("no_footer", $no_header);
+
+                    return $smarty->fetch("space/deleted_screen.tpl");
+                }
+            }
+            if (array_key_exists('tdid', $input)) {
+                try {
+                    $todoService = TodoService::getInstance();
+                    $todoService->getTodo($input['tdid'], $operationUserId);
+                } catch (GrnDataNotFoundException $e) {
+                    $subModuleId = \GrnSpaceApplication::GRN_TODO_SUB_MODULE_ID;
+                    $this->checkData($input, $operationUserId, $input['tdid'],
+                        $subModuleId, $e);
+                    require_once('grn/smarty.csp');
+                    $smarty = new \GRN_Smarty();
+                    $smarty->assign('site_position', $deletedScreenPosition);
+                    $smarty->assign('appli', $subModuleId);
+                    $smarty->assign("no_header", $no_header);
+                    $smarty->assign("no_footer", $no_header);
+
+                    return $smarty->fetch('space/deleted_screen.tpl');
+                }
+            }
+        }
+
+        if ( ! $spaceService->hasSpaceAccessControl(
+            Authority::AUTHORITY_CODE_READ_DETAIL, $this->getSpaceId(),
+            $this->getLoginUserId())
+        ) {
+            throw new GrnDataNotFoundException(ErrorCode::GRN_INVALID_SPACE_ID);
+        }
+
+        try {
+            // Set Space
+            $space = $spaceService->getSpace($this->getSpaceId(),
+                $operationUserId, $this->getLanguageCode());
+            IconUtility::constructionSpaceIconPath($space);
+            $this->setSpace($space);
+        } catch (GrnDataNotFoundException $e) {
+            $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+            throw $e;
+        }
+
+        if ( ! $spaceService->hasSpaceAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $this->getSpaceId(), $this->getLoginUserId())
+        ) {
+            require_once('grn/notification.csp');
+            $dbconn = grn_notification_get_connection($operationUserId);
+
+            $mapping_name = grn_get_personal_tablename($operationUserId,
+                'tab_grn_notification_notify');
+            $format
+                = "delete from ${mapping_name} where ((col_user='@S') and (col_module_id='@S') and (col_space_id='@S'))";
+            $query = cb_queryf($dbconn, $format, $operationUserId,
+                'grn.space', $this->getSpaceId());
+            $dbconn->query($query);
+            $dbconn->commit();
+
+            throw new GrnDataNotFoundException(ErrorCode::GRN_NO_READ_PERMISSION);
+        }
+
+        try {
+            // Set Space Memo
+            $spaceMemo = $spaceService->getSpaceMemo($this->getSpaceId(),
+                $this->getLoginUserId());
+            $spaceService->addInspectionUserInfo($spaceMemo,
+                $this->getLoginUserId(), $this->isSystemUseEnglish(),
+                $this->isEnglishDisplayAfterName(),
+                $this->isOrganizationDisplayAfterName(),
+                $this->getLanguageCode());
+            SpaceMemoUtility::constructDisplayMemo($spaceMemo);
+            SpaceDatetimeUtility::constructDisplayDatetimeOfInspection($spaceMemo,
+                $this->getDatetimeFormat(),
+                SpaceDatetimeUtility::DISPLAY_TYPE_LONGDATE_AND_TIME,
+                $this->getLanguageCode(), $this->getTimezoneName());
+
+            // Get Space memo Modifier and check if modifier is Deleted or not //
+            $spaceMemoModifier = $spaceMemo->getModifier();
+            $isModifierDeleted = $spaceMemo->getModifierId() != null
+                ? $spaceMemoModifier->isDeleted() : true;
+
+            $this->setSpaceMemo($spaceMemo);
+
+            // Set Space Members
+            $spaceMembersCollection
+                = $spaceService->getSpaceUserCollection($this->getSpaceId(),
+                $this->getLoginUserId(), 0, self::MAX_NUM_DISPLAY_MEMBER);
+            $spaceService->addSimpleUserInfo($spaceMembersCollection);
+            $spaceUserCollection
+                = $spaceService->getSpaceUserCollection($this->getSpaceId(),
+                $this->getLoginUserId());
+            $this->setSpaceUserCollection($spaceUserCollection);
+
+            // Set ApplicationTabList
+            $applicationSearchCondition = new SpaceApplicationSearchCondition();
+            $applicationSearchCondition->setSearchSpaceId($this->getSpaceId());
+            if ($this->isKintoneAvailable()) {
+                $applicationSearchCondition->setSearchApplicationType(Application::APPLICATION_TYPE_ANY);
+            } else {
+                $applicationSearchCondition->setSearchApplicationType(Application::APPLICATION_TYPE_INTERNAL);
+            }
+            $applicationSearchCondition->setLanguageCode($this->getLanguageCode());
+
+            $applicationList
+                = $spaceService->searchSpaceApplicationBySearchCondition($applicationSearchCondition,
+                $operationUserId);
+            $this->setTabList($this->makeTabList($applicationList));
+
+            // Set MemberField open/closed
+            $memberOpenStatus = new MemberOpenStatus();
+            $memberOpenStatus->setId($this->getSpaceId());
+            $memberOpenStatus->setUserId($this->getLoginUserId());
+            $this->setMemberFieldStatus($spaceService->isMemberFieldOpen($memberOpenStatus));
+
+            if ($spaceService->isNotConfirmedSpaceNotification($operationUserId,
+                $this->getSpaceId())
+            ) {
+                $spaceService->confirmSpaceNotification($operationUserId,
+                    $space);
+            }
+
+            $operator_collection
+                = $spaceService->getSpaceUserCollectionAccordingToAuthorityCode($spaceUserCollection,
+                Authority::AUTHORITY_CODE_OPERATION_PRIVILEGE,
+                $this->getSpace()->getId());
+            $this->setSpaceOperatorCollection($operator_collection);
+        } catch (GrnDataNotFoundException $e) {
+            $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+            throw $e;
+        } catch (GrnInvalidArgumentException $e) {
+            $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+            throw $e;
+        }
+
+        require_once("grn/smarty.csp");
+        $smarty = new \GRN_Smarty();
+
+        $smarty->assign("component", $this->component);
+        $smarty->assign("this", $this);
+        $smarty->assign("this_getSpace", $this->getSpace());
+        $smarty->assign("this_getSpaceMemo", $this->getSpaceMemo());
+        $smarty->assign("this_getModifier", $spaceMemoModifier);
+        $smarty->assign("this_isModifierDeleted", $isModifierDeleted);
+        $smarty->assign("this_getTabList", $this->getTabList());
+        $smarty->assign("site_position", $this->getSitePosition());
+        $smarty->assign("page_title", $this->getTitle());
+        $smarty->assign("schedule_active", $this->isScheduleAvailable());
+        $smarty->assign("schedule_available_for_external",
+            AppAccess::isAppAvailableExternalAccess('schedule'));
+        $smarty->assign("this_getSpaceUserCollection", $spaceMembersCollection);
+        $smarty->assign("count_space_members", $this->countSpaceMembers());
+        $smarty->assign("all_spaceUserCollection",
+            $this->getSpaceUserCollection());
+        $smarty->assign("maxNumMember", self::MAX_NUM_DISPLAY_MEMBER);
+        $smarty->assign("has_privilege",
+            $this->isSpaceAdminOrOperator($spaceService, $this->getSpaceId(),
+                $this->getLoginUserId()));
+
+        $smarty->assign("no_header", cb_at($input, 'no_header', false));
+        $smarty->assign("no_footer", cb_at($input, 'no_footer', false));
+        $smarty->assign("ajax_load", cb_at($input, 'use_ajax', false));
+
+        return $smarty->fetch("space/application/common.tpl");
+    }
+
+    /**
+     * Make site position
+     *
+     * @return array
+     * @todo
+     */
+    public function getSitePosition()
+    {
+        $sitePosition = $this->createCategorySitePosition(
+            $this->getSpace()->getCategoryId()
+        );
+
+        $input = $this->getInput();
+        if ( ! cb_at($input, 'top')) {
+            $sitePosition[] = [
+                "page"     => self::URL_TOP,
+                "name"     => $this->getSpace()->getSpaceName(),
+                "spid"     => $this->getSpaceId(),
+                "icon"     => [
+                    "image"  => $this->getSpace()->getDisplayIconPath(),
+                    "direct" => true,
+                    "class"  => "breadcrumb-icon",
+                ],
+                "isHidden" => ! $this->getSpace()->isPublic(),
+            ];
+
+            foreach ($this->component->getSitePosition() as $each) {
+                if (cb_at($each, 'spid')) {
+                    $each['spid'] = $this->getSpaceId();
+                }
+                $sitePosition[] = $each;
+            }
+        } else {
+            $sitePosition[] = [
+                "name"     => $this->getSpace()->getSpaceName(),
+                "spid"     => $this->getSpaceId(),
+                "icon"     => [
+                    "image"  => $this->getSpace()->getDisplayIconPath(),
+                    "direct" => true,
+                    "class"  => "breadcrumb-icon",
+                ],
+                "isHidden" => ! $this->getSpace()->isPublic(),
+            ];
+        }
+
+        return $sitePosition;
+    }
+
+    /**
+     * Get Title from the component
+     *
+     * @return string
+     */
+    public function getTitle()
+    {
+        return $this->component->getTitle();
+    }
+
+    /**
+     * Get array of ApplicationTab
+     * return array<ApplicationTab>
+     */
+    public function getTabList()
+    {
+        return $this->tabList;
+    }
+
+    /**
+     *
+     * Set array of Application Tab
+     *
+     * @param array<ApplicationTab> $tabList
+     */
+    private function setTabList($tabList)
+    {
+        $this->tabList = $tabList;
+    }
+
+    /**
+     *
+     * Make Tab list
+     *
+     * @param SpaceApplicationCollection $spaceApplicationCollection
+     *
+     * @return SpaceApplicationTab[]
+     */
+    private function makeTabList(
+        SpaceApplicationCollection $spaceApplicationCollection
+    ) {
+        $pathInfo = $this->getPathInfo();
+        $selectedTab = Application::APPLICATION_CODE_DISCUSSION;
+        if (preg_match('@' . ApplicationScreenDecorator::URL_PARTIAL_EXTERNAL
+                       . '@', $pathInfo)
+        ) {
+            $selectedTab = $this->getApplicationId();
+        } elseif (preg_match('@' . ApplicationScreenDecorator::URL_PARTIAL_TODO
+                             . '@', $pathInfo)
+        ) {
+            $selectedTab = Application::APPLICATION_CODE_TODO;
+        }
+
+        $result = [];
+        foreach ($spaceApplicationCollection as $applicationBean) {
+            /** @var \grn\space\data\bean\SpaceApplication $applicationBean */
+            $applicationTab = new ApplicationTab();
+            $applicationTab->setName($applicationBean->getApplicationName());
+            $applicationTab->setLink($this->makeTabLink($applicationBean));
+            $applicationTab->setSelected($this->makeTabSelected($applicationBean,
+                $selectedTab));
+
+            $result[] = $applicationTab;
+        }
+
+        return $result;
+    }
+
+    /**
+     *
+     * Decide whether the tab is selected or not
+     *
+     * @param SpaceApplication $spaceApplication
+     * @param string           $selectedTab
+     *
+     * @return boolean
+     * @todo replace string literals with consts.
+     */
+    private function makeTabSelected(
+        SpaceApplication $spaceApplication,
+        $selectedTab
+    ) {
+        if ($spaceApplication->getApplicationCode()
+            == Application::APPLICATION_CODE_DISCUSSION
+            && $selectedTab == Application::APPLICATION_CODE_DISCUSSION
+        ) {
+            return true;
+        } elseif ($spaceApplication->getApplicationCode()
+                  == Application::APPLICATION_CODE_TODO
+                  && $selectedTab == Application::APPLICATION_CODE_TODO
+        ) {
+            return true;
+        } elseif ($selectedTab == $spaceApplication->getId()) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     *
+     * Make link when the tab is clicked.
+     *
+     * @param SpaceApplication $spaceApplication
+     *
+     * @return string
+     * @todo replace string literals with consts.
+     */
+    private function makeTabLink(SpaceApplication $spaceApplication)
+    {
+        if ($spaceApplication->getApplicationCode()
+            == Application::APPLICATION_CODE_DISCUSSION
+        ) {
+            return cb_pageurl(
+                self::URL_DISCUSSION_INDEX,
+                [self::ARG_SPACE_ID => $this->getSpaceId()]);
+        } elseif ($spaceApplication->getApplicationCode()
+                  == Application::APPLICATION_CODE_TODO
+        ) {
+            return cb_pageurl(
+                self::URL_TODO_INDEX,
+                [self::ARG_SPACE_ID => $this->getSpaceId()]);
+        } else {
+            return cb_pageurl(
+                self::URL_EXTERNAL_INDEX,
+                [
+                    self::ARG_SPACE_ID       => $this->getSpaceId(),
+                    self::ARG_APPLICATION_ID => $spaceApplication->getId()
+                ]);
+        }
+    }
+
+    /**
+     * Get space ID
+     *
+     * @return string
+     */
+    public function getSpaceId()
+    {
+        return $this->spaceId;
+    }
+
+    /**
+     * Set space ID
+     *
+     * @param string $spaceId
+     */
+    protected function setSpaceId($spaceId)
+    {
+        $this->spaceId = $spaceId;
+    }
+
+    public function getApplicationId()
+    {
+        return $this->applicationId;
+    }
+
+    /**
+     * Set (Kintone) application Id
+     *
+     * @param string $applicationId
+     */
+    private function setApplicationId($applicationId)
+    {
+        $this->applicationId = $applicationId;
+    }
+
+    /**
+     * Get Space
+     *
+     * @return Space
+     */
+    public function getSpace()
+    {
+        return $this->space;
+    }
+
+    /**
+     * Set Space
+     *
+     * @param Space $space
+     */
+    private function setSpace($space)
+    {
+        $this->space = $space;
+    }
+
+    /**
+     * Get Memo of the Space
+     *
+     * @return SpaceMemo
+     */
+    public function getSpaceMemo()
+    {
+        return $this->spaceMemo;
+    }
+
+    /**
+     * Set Memo of the Space
+     *
+     * @param SpaceMemo $spaceMemo
+     */
+    private function setSpaceMemo($spaceMemo)
+    {
+        $this->spaceMemo = $spaceMemo;
+    }
+
+    /**
+     * Get $G_INPUT
+     * return array
+     */
+    public function getInput()
+    {
+        return $this->input;
+    }
+
+    /**
+     * Set $G_INPUT
+     *
+     * @param array $input
+     */
+    protected function setInput($input)
+    {
+        $this->input = $input;
+    }
+
+
+    /**
+     * @param bool $is_range_only_assigned_user
+     *
+     * @return bool
+     */
+    public function isMember($is_range_only_assigned_user = false)
+    {
+        if ($is_range_only_assigned_user) {
+            // Is user only
+            $space_user_ids = $this->getSpaceUserCollection()
+                                   ->getSpaceUsersArray();
+        } else {
+            $space_user_ids = $this->getSpaceUserIdArray();
+        }
+
+        return SpaceMemberUtility::isMember($this->_loginUserId,
+            $space_user_ids);
+    }
+
+    /**
+     * Set space users
+     *
+     * @param SpaceUserCollection $userCollection
+     */
+    public function setSpaceUserCollection(SpaceUserCollection $userCollection)
+    {
+        $this->spaceUserCollection = $userCollection;
+    }
+
+    /**
+     * Get space members
+     *
+     * @return SpaceUserCollection
+     */
+    public function getSpaceUserCollection()
+    {
+        return $this->spaceUserCollection;
+    }
+
+    /**
+     * @return array
+     */
+    public function getSpaceUserIdArray()
+    {
+        static $space_user_ids = null;
+        if ( ! is_array($space_user_ids)) {
+            $spaceLogic = new SpaceLogic();
+            $space_user_ids
+                = $spaceLogic->getSpaceUserMemberIds($this->getSpaceUserCollection(),
+                $this->getSpaceId());
+        }
+
+        return $space_user_ids;
+    }
+
+    /**
+     * @return string UserId
+     */
+    public function getLoginUserId()
+    {
+        if (is_null($this->_loginUserId)) {
+            global $G_container_base;
+            $uum = $G_container_base->getInstance('uum');
+            $login = $uum->getLoginUser();
+            $this->_loginUserId = $login->getOID();
+        }
+
+        return $this->_loginUserId;
+    }
+
+    /**
+     * True when Schedule application is available.
+     *
+     * @return boolean
+     */
+    public function isScheduleAvailable()
+    {
+        return $this->isScheduleAvailable;
+    }
+
+    /**
+     * Set true when Schedule application is available
+     *
+     * @param boolean $isScheduleAvailable
+     */
+    private function setScheduleAvailable($isScheduleAvailable)
+    {
+        $this->isScheduleAvailable = $isScheduleAvailable;
+    }
+
+    /**
+     * @return bool
+     */
+    protected function isSystemUseEnglish()
+    {
+        require_once("fw/i18n/system_config.csp");
+
+        return \CB_I18N_SystemConfig::isNickname() == true;
+    }
+
+    /**
+     * @return bool
+     */
+    protected function isEnglishDisplayAfterName()
+    {
+        return $this->getUserConfig()->getUserNameFormat() == true;
+    }
+
+    /**
+     * @return bool
+     */
+    protected function isOrganizationDisplayAfterName()
+    {
+        return $this->getUserConfig()->getShowPriorityGroup() == true;
+    }
+
+    /**
+     * @return string
+     */
+    private function getPathInfo()
+    {
+        return cb_get_pagename();
+    }
+
+    /**
+     * @return bool
+     */
+    public function isKintoneAvailable()
+    {
+        require_once('kintone/Logic.csp');
+        $kintoneService = KintoneService::getInstance();
+
+        return $kintoneService->isAvailable()
+               && \GRN_Kintone_Logic::isAvailable();
+    }
+
+    /**
+     * @param                          $input
+     * @param                          $userId
+     * @param                          $uniqueId
+     * @param                          $subModuleId
+     * @param bool                     $throw_exception
+     * @param GrnDataNotFoundException $e
+     *
+     * @throws GrnDataNotFoundException
+     */
+    private function checkData(
+        $input,
+        $userId,
+        $uniqueId,
+        $subModuleId,
+        GrnDataNotFoundException $e,
+        $throw_exception = true
+    ) {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $user = $uum->getUser($userId);
+        require_once('grn/notification.csp');
+        $notificationService = \GRN_Notification_Service::getInstance();
+        if (array_key_exists('nid', $input)) {
+            $notifyData = $notificationService->getNotifyDataProperties($user,
+                \GrnSpaceApplication::GRN_SPACE_MODULE_ID, $uniqueId,
+                $subModuleId);
+            if (is_null($notifyData) && $throw_exception) {
+                $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+                throw $e;
+            }
+
+            if ( ! is_null($notifyData)
+                 && ($notifyData->isStatusUnread()
+                     || $notifyData->isStatusUpdated())
+            ) {
+                $timestamp = new \CB_Timestamp();
+                $timestamp->unix_ts = time();
+                $b_no_add_history = false;
+                $notificationService->confirmNotifyData($user,
+                    \GrnSpaceApplication::GRN_SPACE_MODULE_ID, $uniqueId,
+                    $timestamp, $b_no_add_history, $subModuleId);
+            }
+        } elseif (array_key_exists('nhid', $input)) {
+            $historyData = $notificationService->gethistoryDataProperties($user,
+                \GrnSpaceApplication::GRN_SPACE_MODULE_ID, $uniqueId,
+                $subModuleId);
+            if (is_null($historyData) && $throw_exception) {
+                $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+                throw $e;
+            }
+        }
+    }
+
+    /**
+     * Balloon を表示するかどうか
+     *
+     * @return boolean
+     */
+    public function isBalloonShow()
+    {
+        return $this->getSpaceMemo()->isMemoOpen()
+               || $this->isMemberFieldOpen();
+    }
+
+    /**
+     * Balloon の間の border を表示するかどうか
+     *
+     * @return boolean
+     */
+    public function isBalloonBorderShow()
+    {
+        return $this->getSpaceMemo()->isMemoOpen()
+               && $this->isMemberFieldOpen();
+    }
+
+    /**
+     * Member fieldの開閉状態
+     *
+     * @param boolean $memberFieldStatus
+     */
+    private function setMemberFieldStatus($memberFieldStatus)
+    {
+        $this->memberFieldStatus = $memberFieldStatus;
+    }
+
+    /**
+     * Member fieldの開閉状態
+     *
+     * @return boolean
+     */
+    public function isMemberFieldOpen()
+    {
+        return $this->memberFieldStatus;
+    }
+
+    /**
+     * @return bool
+     */
+    public function isSpaceAllowJoinLeave()
+    {
+        return $this->getSpace()->isAllowJoinLeave();
+    }
+
+    /**
+     * @param SpaceUserCollection $operatorCollection
+     */
+    public function setSpaceOperatorCollection(
+        SpaceUserCollection $operatorCollection
+    ) {
+        $this->spaceOperatorCollection = $operatorCollection;
+    }
+
+    /**
+     * @return array
+     */
+    public function getSpaceOperatorCollection()
+    {
+        return $this->spaceOperatorCollection;
+    }
+
+    /**
+     * To determine whether login user is unique member of the space
+     *
+     * @return boolean
+     */
+    public function isUniqueSpaceMember()
+    {
+        return (count($this->getSpaceUserCollection()) < 2);
+    }
+
+    /**
+     * To determine whether login user is unique operator of the space
+     * administrator of the space not include the administrator of the space application and super administrator.
+     *
+     * @return bool
+     */
+    public function isUniqueSpaceOperatorWithCurrentUser()
+    {
+        $space_service = SpaceService::getInstance();
+        $operators = $this->getSpaceOperatorCollection();
+
+        if ($operators->count() == 1
+            && $this->isSpaceOperator($space_service, $this->getSpaceId(),
+                $this->getLoginUserId())
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @return int
+     */
+    public function countSpaceMembers()
+    {
+        $space_collection = new SpaceCollection();
+        $space_collection->appendBean($this->getSpace());
+
+        $space_logic = SpaceLogic::getInstance();
+        $space_logic->appendSpaceUserCount($space_collection);
+
+        return $space_collection->getBean(0)->countMembers();
+    }
+
+}

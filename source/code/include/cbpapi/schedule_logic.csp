@@ -1,0 +1,2494 @@
+<?php
+
+require_once('schedule/resources.csp');
+require_once('fw/date.csp');
+require_once('schedule/error_code.csp');
+require_once('grn/application.csp');
+require_once('cbpapi/util.csp');
+require_once('schedule/api_eventfactory.csp');
+
+/**
+ *
+ */
+class GRN_CBPApi_Schedule_Logic
+{
+    /**
+     * @return GRN_CBPApi_Schedule_Logic
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_CBPApi_Schedule_Logic();
+        }
+
+        return $_instance;
+    }
+
+    private $_dbconn = null;
+
+    protected function _getDBConnection()
+    {
+        if (is_null($this->_dbconn)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->_dbconn = $app_locator->getConnection('schedule');
+        }
+
+        return $this->_dbconn;
+    }
+
+    public function getEventsForViewByIds(
+        $login,
+        $event_id_list,
+        $check_private = true,
+        &$deny = false,
+        $get_by_target = false
+    ) {
+        if ( ! is_array($event_id_list) || count($event_id_list) <= 0) {
+            return [];
+        }
+
+        $logic = GRN_Schedule_API_EventFactory::getInstance();
+        $events_for_view = $logic->getEventsByIDs($event_id_list, false);
+        if ($check_private) {
+            $events_for_view = $logic->checkPrivateEvent($events_for_view);
+        }
+
+        // 取得したデータの数が合わない場合はエラー
+        if (count($event_id_list) !== count($events_for_view)) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        //GTM-1136
+        require_once('schedule/system_logic.csp');
+        $systemlogic = GRN_Schedule_SystemLogic::getInstance();
+        $allow_file = $systemlogic->getAllowFileAttachment();
+        //End GTM-1136
+
+        require_once('schedule/access_logic.csp');
+        $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $dynamic_roles = $uum->listGrantedRoles();
+        foreach ($events_for_view as $key => $event) {
+            // アクセス権のチェック
+            $access = $acc_logic->getEventAccessByID($login, $event,
+                ['read', 'add', 'modify', 'delete'], $dynamic_roles);
+
+            if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+                if ($get_by_target) {
+                    $deny = true;
+                } else {
+                    cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+                }
+            }
+            $temp = [
+                'uid'          => $login->getOID(),
+                'id'           => $event->id,
+                'event_type'   => $this->_getEventType($event),
+                'timezone'     => $event->timezone,
+                'end_timezone' => $event->end_timezone,
+                'version'      => $event->mtime,
+                'follows'      => [],
+                'observers'    => [],
+            ];
+
+            if ( ! is_null($event->private)) {
+                $temp['public_type'] = $this->getPublicTypeName($event);
+            }
+            if (strlen($event->menu) > 0) {
+                $temp['plan'] = $event->menu;
+            }
+            if (strlen($event->menucolor) > 0) {
+                $temp['plan_color'] = $event->menucolor;
+            }
+            if (strlen($event->detail) > 0) {
+                $temp['detail'] = $event->detail;
+            }
+            if (strlen($event->memo) > 0) {
+                $temp['memo'] = $event->memo;
+            }
+
+            if ($event->notify_address) {
+                $temp['observers'] = $event->notify_address;
+            }
+
+            if ($event->event_type & GRN_SCHEDULE_EVENT_TYPE_ALLDAY) {
+                $temp['allday'] = 'true';
+            } else {
+                $temp['allday'] = 'false';
+            }
+            if ($event->event_type & GRN_SCHEDULE_EVENT_TYPE_START) {
+                $temp['start_only'] = 'true';
+            } else {
+                $temp['start_only'] = 'false';
+            }
+            if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+                if ($event->event_type & GRN_SCHEDULE_EVENT_TYPE_START) {
+                    $temp['start_date'] = $event->setdatetime;
+                } else {
+                    $temp['start_date'] = $event->setdatetime;
+                    $temp['end_date'] = $event->enddatetime;
+                }
+            } elseif (is_a($event, 'GRN_Schedule_BannerEvent')) {
+                $temp['start_date'] = $event->setdate;
+                $temp['end_date'] = $event->enddate;
+            } elseif (is_a($event, 'GRN_Schedule_RepeatEvent')) {
+                $temp['repeat_type'] = $event->repeat_type;
+                $temp['day'] = $event->day;
+                $temp['week'] = $event->wday;
+                if ( ! ($event->event_type & GRN_SCHEDULE_EVENT_TYPE_ALLDAY)) {
+                    $temp['start_date'] = $event->setdate;
+                    if ($event->settime) {
+                        $temp['start_time'] = $event->settime;
+                    }
+                    if ($event->enddate) {
+                        $temp['end_date'] = $event->enddate;
+                        if ($event->endtime) {
+                            $temp['end_time'] = $event->endtime;
+                        }
+                    }
+                } else {
+                    // All day event
+                    $temp['start_date'] = $event->setdate;
+                    $temp['end_date'] = $event->enddate;
+                }
+
+                $temp['exclusive_datetimes'] = $event->except;
+            } elseif (is_a($event, 'GRN_Schedule_TemporaryEvent')) {
+                $temporary = [];
+                if ($event->isORSearch()) {
+                    $temp['facilities'] = [];
+                    $i = 0;
+                    foreach ($event->setdates as $facility_data) {
+                        $facility_dates = [];
+                        foreach (
+                            $facility_data['dates'] as $tp_id => $temp_date
+                        ) {
+                            $facility_dates[] = [
+                                'temporary_id' => $tp_id,
+                                'setdatetime'  => grn_cbpapi_iso8601($temp_date['setdatetime']),
+                                'enddatetime'  => grn_cbpapi_iso8601($temp_date['enddatetime'])
+                            ];
+                        }
+
+                        $temporary[] = [
+                            'facility_id' => $facility_data['facility']->getOID(),
+                            'dates'       => $facility_dates
+                        ];
+                        $temp['facilities'][] = [
+                            'id'    => $facility_data['facility']->getOID(),
+                            'name'  => $facility_data['facility']->get('name'),
+                            'order' => ++$i,
+                        ];
+                    }
+
+                    $temp['temporary_type'] = 'or';
+                } else {
+                    foreach ($event->setdates as $tp_id => $temp_date) {
+                        $temporary[] = [
+                            'temporary_id' => $tp_id,
+                            'setdatetime'  => grn_cbpapi_iso8601($temp_date['setdatetime']),
+                            'enddatetime'  => grn_cbpapi_iso8601($temp_date['enddatetime'])
+                        ];
+                    }
+                    $temp['temporary_type'] = 'normal';
+                }
+
+                $temp['temporary'] = $temporary;
+                $temp['version'] = $event->mtime->unix_ts;
+            }
+            if ( ! is_null($event->company_name)
+                 ||
+                 ! is_null($event->zip_code)
+                 ||
+                 ! is_null($event->physical_address)
+                 ||
+                 ! is_null($event->map)
+                 ||
+                 ! is_null($event->route)
+                 ||
+                 ! is_null($event->route_time)
+                 ||
+                 ! is_null($event->route_fare)
+                 ||
+                 ! is_null($event->company_telephone_number)
+                 ||
+                 ! is_null($event->facsimile_number)
+                 ||
+                 ! is_null($event->company_url)
+            ) {
+                $address = [
+                    'name'       => $event->company_name,
+                    'zipcode'    => $event->zip_code,
+                    'address'    => $event->physical_address,
+                    'map'        => $event->map,
+                    'route'      => $event->route,
+                    'route_time' => $event->route_time,
+                    'route_fare' => $event->route_fare,
+                    'phone'      => $event->company_telephone_number,
+                    'fax'        => $event->facsimile_number,
+                    'url'        => $event->company_url,
+                ];
+
+                $temp['customer'] = $address;
+            }
+
+            if ($event->users) {
+                $temp['users'] = $event->members_data['users'];
+            }
+            if ($event->members_data['groups']) {
+                $temp['groups'] = $event->members_data['groups'];
+            }
+            if ($event->members_data['facilities']) {
+                $temp['facilities'] = $event->members_data['facilities'];
+            }
+
+            $root_element = 'schedule_event';
+            $find_tag_original = strpos($key, 'original');
+            if ($find_tag_original !== false) {
+                $root_element = 'original';
+            }
+            $find_tag_modified = strpos($key, 'modified');
+            if ($find_tag_modified !== false) {
+                $root_element = 'modified';
+            }
+            $temp['root'] = $root_element;
+
+            //GTM-1136
+            if ($allow_file) {
+                $files = $this->getFiles($key, false);
+                $temp_files = [];
+                foreach ($files as $file_id => $file_obj) {
+                    if ($file_body = $file_obj->getCurrentBody()) {
+                        $temp_files[$file_id] = [
+                            'id'   => $file_id,
+                            'name' => $file_body->get('name'),
+                            'size' => $file_body->get('size'),
+                            'mime' => $file_body->get('mime')
+                        ];
+                    }
+                }
+
+                $temp['files'] = $temp_files;
+            }
+            //End GTM-1136
+
+            $temp['required_facility_using_purpose']
+                = $this->_isRequiredFacilityUsingPurpose($event);
+            $temp['facility_using_purpose'] = $event->usingPurpose;
+
+            $events_for_view[$key] = $temp;
+        }
+
+        $events_for_view = $this->_getEventsFollows($events_for_view);
+
+        return $events_for_view;
+    }
+
+
+    /**
+     * @param GRN_Schedule_EventBase $event
+     *
+     * @return bool
+     */
+    private function _isRequiredFacilityUsingPurpose($event)
+    {
+        if ( ! ($event instanceof GRN_Schedule_NormalEvent)) {
+            return false;
+        }
+
+        if ( ! isset($event->members_data['facilities'])
+             || ! is_array($event->members_data['facilities'])
+        ) {
+            // the event doesn't have any facilities
+            return false;
+        }
+
+        foreach ($event->members_data['facilities'] as $facility) {
+            if ($facility['approval'] == '1') {
+                return true;
+            }
+        }
+
+        // the event doesn't have any approval required facility
+        return false;
+    }
+
+    /**
+     * Get normal schedule
+     *
+     * @param                  $member_id
+     * @param                  $member_type
+     * @param CB_DateTime      $setdate start time to get schedule
+     * @param CB_DateTime|null $enddate end time to get schedule
+     * @param bool|null        $isEnableAttendanceCheck
+     *
+     * @return array
+     */
+    public function getNormalEvents(
+        $member_id,
+        $member_type,
+        $setdate,
+        $enddate = null,
+        $isEnableAttendanceCheck = false
+    ) {
+        $str_member = '';
+        $_attendanceCheckForUser = false;
+        switch ($member_type) {
+            case 'user':
+                $str_member = 'col_user = \'' . $member_id . '\'';
+                $_attendanceCheckForUser = true;
+                break;
+            case 'group':
+                $str_member = 'col_group = \'' . $member_id . '\'';
+                break;
+            case 'facility':
+                $str_member = 'col_facility = \'' . $member_id . '\'';
+                break;
+            default:
+                return false;
+        }
+        $ts1 = null;
+        $ts2 = null;
+        // 取得する日付の計算
+        if (is_a($setdate, 'CB_Date')) {
+            $datetime = new CB_DateTime();
+            $datetime->year = intval($setdate->year);
+            $datetime->month = intval($setdate->month);
+            $datetime->day = intval($setdate->day);
+            $datetime->hour = 0;
+            $datetime->minute = 0;
+            $datetime->second = 0;
+            $ts1 = new CB_TimeStampEx();
+            $ts1->setDateTime($datetime);
+            if ($enddate) {
+                $datetime->year = intval($enddate->year);
+                $datetime->month = intval($enddate->month);
+                $datetime->day = intval($enddate->day);
+                $ts2 = new CB_TimeStampEx();
+                $ts2->setDateTime($datetime);
+                $ts2->unix_ts += 86400;
+            }
+        } elseif (is_a($setdate, 'CB_DateTime')) {
+            $ts1 = new CB_TimeStampEx();
+            $ts1->setDateTime($setdate);
+            if ($enddate) {
+                $ts2 = new CB_TimeStampEx();
+                $ts2->setDateTime($enddate);
+            }
+
+        } elseif (is_a($setdate, 'CB_TimeStamp')) {
+            $ts1 = &$setdate;
+            if ($enddate) {
+                $ts2 = &$enddate;
+            }
+        }
+
+        $db = $this->_getDBConnection();
+
+        $query = "SELECT" .
+                 "   e._id," .
+                 "   e.col_ctime," .
+                 "   e.col_mtime," .
+                 "   e.col_event_type," .
+                 "   MIN(d.col_enddatetime) as col_enddatetime," .
+                 "   MIN(d.col_setdatetime) as col_setdatetime," .
+                 "   MAX(f.col_mtime) AS follow_mtime" .
+                 " FROM " .
+                 "       (tab_grn_schedule_eventmember AS m" .
+                 "       LEFT JOIN tab_grn_schedule_eventdatetime AS d ON m.col_event_type_simple = '1'"
+                 .
+                 "                AND m." . $str_member .
+                 "                AND d.col_event = m.col_event) " .
+                 "       LEFT JOIN tab_grn_schedule_event AS e ON m.col_event = e._id "
+                 .
+                 "       LEFT JOIN tab_grn_schedule_eventfollow AS f ON e._id = f.col_event";
+
+        if ($enddate) {
+            $query .= "       WHERE ((d.col_setdatetime < '@S'" .
+                      "           AND d.col_enddatetime > '@S')" .
+                      "           OR (d.col_setdatetime = '@S'" .
+                      "           AND d.col_enddatetime = '@S'))";
+            $query = cb_queryf($db, $query, $ts2->unix_ts, $ts1->unix_ts,
+                $ts1->unix_ts, $ts1->unix_ts);
+        } else {
+            $query .= "       WHERE ( (d.col_enddatetime > '@S')" .
+                      "           OR (d.col_setdatetime = '@S'" .
+                      "           AND d.col_enddatetime = '@S'))";
+            $query = cb_queryf($db, $query, $ts1->unix_ts, $ts1->unix_ts,
+                $ts1->unix_ts);
+        }
+
+        $query .= "       GROUP BY e._id " .
+                  "       ORDER BY col_setdatetime, col_enddatetime, e._id";
+
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $events = [];
+        $timestamp = new CB_TimeStampEx();
+        while ($row = $db->fetch_assoc($result)) {
+            $event = [];
+            $event['id'] = $row['_id'];
+            $event['ctime'] = $row['col_ctime'];
+            $event_modified_time = $row['col_mtime'];
+            if ( ! is_null($row['follow_mtime'])
+                 && $event_modified_time < $row['follow_mtime']
+            ) {
+                $event_modified_time = $row['follow_mtime'];
+            }
+            $event['mtime'] = $event_modified_time;
+            $timestamp->unix_ts = intval($row['col_setdatetime']);
+            $event['setdatetime'] = $timestamp->getDateTime();
+            $timestamp->unix_ts = intval($row['col_enddatetime']);
+            $event['enddatetime'] = $timestamp->getDateTime();
+            $event['event_type'] = $row['col_event_type'];
+
+            $events[$row['_id']] = $event;
+        }
+
+        // 結果の開放
+        $db->free_result($result);
+
+        $temp_list = [];
+        foreach (array_keys($events) as $key) {
+            $event_id = $events[$key]['id'];
+            $event_type = $events[$key]['event_type'];
+            if ($event_type != GRN_SCHEDULE_EVENT_TYPE_TEMPORARY) {
+                continue;
+            }
+
+            if (array_key_exists($event_id, $temp_list)) {
+                $event = $events[$key];
+                foreach (array_keys($temp_list[$event_id]) as $temp_key) {
+                    $temp = $temp_list[$event_id][$temp_key];
+                    // 開始日時と終了日時がまったく一緒だったら削除
+                    if ($event['setdatetime']->compare($temp['setdatetime'])
+                        === 0
+                        && $event['enddatetime']->compare($temp['enddatetime'])
+                           === 0
+                    ) {
+                        unset($events[$key]);
+                    }
+                }
+                // 重複でなかったら次の重複チェック候補に入れる
+                if (array_key_exists($key, $events)) {
+                    $temp_list[$event_id][] = $event;
+                }
+            } else {
+                $temp_list[$event_id] = [];
+                $temp_list[$event_id][] = $events[$key];
+            }
+        }
+        unset($temp_list);
+
+        if ($_attendanceCheckForUser && $isEnableAttendanceCheck) {
+            require_once('schedule/eventfactory.csp');
+            $factory = GRN_Schedule_EventFactory::getInstance();
+            $factory->setAttendanceInfo($events, $member_id);
+        }
+
+        return $events;
+    }
+
+    /**
+     * @param                  $member_id
+     * @param                  $member_type
+     * @param CB_DateTime      $setdate
+     * @param CB_DateTime|null $enddate
+     * @param bool|null        $isEnableAttendanceCheck
+     *
+     * @return array
+     */
+    public function getDailyEvents(
+        $member_id,
+        $member_type,
+        $setdate,
+        $enddate = null,
+        $isEnableAttendanceCheck = false
+    ) {
+        $str_member = '';
+        $_attendanceCheckForUser = false;
+        switch ($member_type) {
+            case 'user':
+                $str_member = 'col_user = \'' . $member_id . '\'';
+                $_attendanceCheckForUser = true;
+                break;
+            case 'group':
+                $str_member = 'col_group = \'' . $member_id . '\'';
+                break;
+            case 'facility':
+                return [];
+            default:
+                return false;
+        }
+        if (is_a($setdate, 'CB_DateTime')) {
+            $ex = new CB_DateTimeEx($setdate);
+            $setdate = $ex->getDate();
+            if ($enddate) {
+                $ex = new CB_DateTimeEx($enddate);
+                $enddate = $ex->getDate();
+                $time = $ex->getTime();
+                // 0時は1日前にする
+                if ($time->hour == 0 && $time->minute == 0
+                    && $time->second == 0
+                ) {
+                    $enddate->moveDays(-1);
+                }
+            }
+        }
+
+        $db = $this->_getDBConnection();
+
+        $query = "SELECT " .
+                 "   e._id," .
+                 "   e.col_ctime," .
+                 "   e.col_mtime," .
+                 "   MIN(d.col_enddate) as col_enddate," .
+                 "   MIN(d.col_setdate) as col_setdate," .
+                 "   MAX(f.col_mtime) AS follow_mtime" .
+                 " FROM " .
+                 "       (tab_grn_schedule_eventmember AS m" .
+                 "       LEFT JOIN tab_grn_schedule_eventdate AS d ON m.col_event_type BETWEEN '32' AND '64'"
+                 .
+                 "               AND m." . $str_member .
+                 "               AND d.col_event = m.col_event)" .
+                 "           LEFT JOIN tab_grn_schedule_event AS e ON m.col_event = e._id"
+                 .
+                 "           LEFT JOIN tab_grn_schedule_eventfollow AS f ON e._id = f.col_event";
+
+        if ($enddate) {
+            $query .= " WHERE ( d.col_setdate <= '@S' AND d.col_enddate >= '@S' )";
+            $query = cb_queryf($db, $query, $enddate->format(),
+                $setdate->format());
+        } else {
+            $query .= " WHERE d.col_enddate >= '@S'";
+            $query = cb_queryf($db, $query, $setdate->format());
+        }
+
+        $query .= "       GROUP BY e._id" .
+                  " ORDER BY col_setdate, col_enddate, e._id";
+
+        $query = $db->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        $events = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $event = [];
+
+            $eid = $row['_id'];
+            $event['id'] = $eid;
+            $event['ctime'] = $row['col_ctime'];
+            $event_modified_time = $row['col_mtime'];
+            if ( ! is_null($row['follow_mtime'])
+                 && $event_modified_time < $row['follow_mtime']
+            ) {
+                $event_modified_time = $row['follow_mtime'];
+            }
+            $event['mtime'] = $event_modified_time;
+            $events[$row['_id']] = $event;
+        }
+
+        // 結果の開放
+        $db->free_result($result);
+
+        if ($_attendanceCheckForUser && $isEnableAttendanceCheck) {
+            require_once('schedule/eventfactory.csp');
+            $factory = GRN_Schedule_EventFactory::getInstance();
+            $factory->setAttendanceInfo($events, $member_id);
+        }
+
+        return $events;
+    }
+
+    private function _getEventsFollows(& $events)
+    {
+        $db = $this->_getDBConnection();
+        $query = cb_queryf($db,
+            'SELECT f.col_event,f._id,f.col_creator,f.col_creator_name,f.col_ctime,f.col_follow,u.col_deleted FROM tab_grn_schedule_eventfollow AS f LEFT JOIN tab_cb_user AS u ON f.col_creator = u._id WHERE f.col_event IN (@A) ORDER BY col_event,_id DESC',
+            array_keys($events));
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        while ($row = $db->fetch_assoc($result)) {
+            if ( ! isset($events[$row['col_event']]['follows'])) {
+                $events[$row['col_event']]['follows'] = [];
+            }
+
+            $timestamp = new CB_TimeStamp();
+            $timestamp->unix_ts
+                = (int)$row['col_ctime'];
+            $events[$row['col_event']]['follows'][$row['_id']] = [
+                'id'      => $row['_id'],
+                'content' => $row['col_follow'],
+                'ctime'   => $timestamp,
+                'date'    => grn_cbpapi_iso8601(cb_timestamp_to_datetime($timestamp->unix_ts)),
+            ];
+
+            if ( ! is_null($row['col_ctime'])
+                 && $events[$row['col_event']]['version'] < $row['col_ctime']
+            ) {
+                $events[$row['col_event']]['version'] = $row['col_ctime'];
+            }
+            if ($row['col_creator'] && is_null($row['col_deleted'])) {
+                $events[$row['col_event']]['follows'][$row['_id']]['creator_id']
+                    = $row['col_creator'];
+                $events[$row['col_event']]['follows'][$row['_id']]['creator_name']
+                    = $row['col_creator_name'];;
+            } elseif ($row['col_creator_name']) {
+                $events[$row['col_event']]['follows'][$row['_id']]['creator_id']
+                    = '';
+                $events[$row['col_event']]['follows'][$row['_id']]['creator_name']
+                    = $row['col_creator_name'];
+            } else {
+                $events[$row['col_event']]['follows'][$row['_id']]['creator_id']
+                    = '';
+                $events[$row['col_event']]['follows'][$row['_id']]['creator_name']
+                    = '';
+            }
+        }
+
+        $db->free_result($result);
+
+        return $events;
+    }
+
+    private function _getEventType($event)
+    {
+        if ($event instanceof GRN_Schedule_NormalEvent) {
+            return 'normal';
+        } elseif ($event instanceof GRN_Schedule_RepeatEvent) {
+            return 'repeat';
+        } elseif ($event instanceof GRN_Schedule_BannerEvent) {
+            return 'banner';
+        } elseif ($event instanceof GRN_Schedule_TemporaryEvent) {
+            return 'temporary';
+        } else {
+            cb_throw_error();
+        }
+    }
+
+    /**
+     * Get name by private type id
+     *
+     * @param $type_id    int   private type
+     */
+
+    public function getPublicTypeName($event)
+    {
+        // 非公開の場合のみ
+        if ($event->private && is_array($event->notify_address)
+            && count($event->notify_address) > 0
+        ) {
+            $public_name = 'qualified';
+        } elseif ($event->private == GRN_EVENT_PRIVATE_PRIVATE) {
+            $public_name = 'private';
+        } else {
+            $public_name = 'public';
+        }
+
+        return $public_name;
+    }
+
+
+    /**
+     *
+     * Create Notification Title
+     *
+     * @param $event
+     * @param $bdate
+     */
+    public function createNotificationTitle($event, $bdate)
+    {
+        require_once('schedule/view_util.csp');
+        $util = GRN_Schedule_View_Util::getInstance();
+
+        return $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+    }
+
+    /**
+     * 通知の設定
+     *
+     * @param   CB_User $login 通知者
+     * @param   object  $event イベント
+     * @param   object  $old_event
+     * @param   CB_Date $bdate 日付
+     */
+    public function createNotification(
+        & $login,
+        $event,
+        $old_event = null,
+        $bdate = null,
+        $notify_mode = GRN_SCHEDULE_NOTIFY_ENTRY,
+        $mod_members = null,
+        $del_members = null
+    ) {
+        require_once('schedule/application.csp');
+        $app = GRN_Schedule_Application::getInstance();
+        $tsex = new CB_TimeStampEx();
+
+        if (is_null($bdate)) {
+            $bdate = $tsex->getDate();
+        }
+
+        $remote_notification_list = [];
+        // 登録の通知
+        if ($event->users && count($event->users) > 0) {
+            $add_members = $event->users;
+            if (is_array($mod_members) && count($mod_members)) {
+                foreach (array_keys($mod_members) as $key) {
+                    $mod_member =& $mod_members[$key];
+                    if ( ! $mod_member) {
+                        continue;
+                    }
+                    foreach (array_keys($add_members) as $key1) {
+                        $add_member =& $add_members[$key1];
+                        if ($add_member
+                            && $add_member->getOID() == $mod_member->getOID()
+                        ) {
+                            unset($add_members[$key1]);
+                        }
+                    }
+                }
+            }
+            $title = $this->createNotificationTitle($event, $bdate);
+            $app->setNotify($add_members, $login, $event, $bdate, $title, '',
+                $notify_mode, $tsex);
+            $remote_notification_list[$notify_mode] = $add_members;
+        }
+
+        // 変更の通知
+        if (count($mod_members) > 0) {
+            $title = $this->createNotificationTitle($event, $bdate);
+            $app->setNotify($mod_members, $login, $event, $bdate, $title, '',
+                GRN_SCHEDULE_NOTIFY_MODIFY, $tsex);
+            $remote_notification_list[GRN_SCHEDULE_NOTIFY_MODIFY]
+                = $mod_members;
+        }
+
+        // 削除の通知
+        if (count($del_members) > 0) {
+            $title = $this->createNotificationTitle($event, $bdate);
+            $app->setNotify($del_members, $login, $event, $bdate, $title, '',
+                GRN_SCHEDULE_NOTIFY_DELETE, $tsex);
+            $remote_notification_list[GRN_SCHEDULE_NOTIFY_DELETE]
+                = $del_members;
+        }
+
+        if (count($remote_notification_list) > 0) {
+            /** @var GRN_Schedule_EventBase $event */
+            $app->forwardMail($event, $remote_notification_list, $login);
+            $app->sendPushNotification(
+                $event, $remote_notification_list, $login, true, $bdate, null);
+        }
+
+        // 通知先の指定がある場合
+        if ($event->private && is_array($event->notify_address)
+            && count($event->notify_address) > 0
+        ) {
+            $title = $this->createNotificationTitle($event, $bdate);
+            $app->sendNotificationsToPublic($login, $event, $bdate, '', $tsex,
+                $title, false, true, $notify_mode);
+        }
+
+        if (is_array($event->facilities) && ! empty($event->facilities)
+            && is_a($event, 'GRN_Schedule_NormalEvent')
+            && $notify_mode === GRN_SCHEDULE_NOTIFY_ENTRY
+        ) {
+            if (is_null($old_event)) {
+                $app->sendFacilityApprovalRequestNotify($event->facilities,
+                    $event, $login, $tsex);
+                $app->forwardFacilityRelyMail($event, $login);
+                $app->sendPushNotificationOfFacilityRequest($event, [], $login);
+            } else {
+                $app->sendFacilityApprovalRequestNotifyForUpdate($old_event,
+                    $event, $login, $tsex);
+                $app->forwardFacilityRelyMailForUpdate($old_event, $event);
+                $app->sendPushNotificationOfUpdatedFacilityRequest($old_event,
+                    $event);
+            }
+        }
+    }
+
+    public function getInputParamerters(&$login, &$parameters)
+    {
+        $params = [];
+        $event = array_key_exists('children', $parameters)
+            ? $parameters['children'] : null;
+        if (0 >= count($event)) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => 'schedule_event']);
+        }
+
+        foreach (array_keys($event) as $event_key) {
+            if (array_key_exists('node_name', $event[$event_key])
+                && $event[$event_key]['node_name'] == 'request_token'
+            ) {
+                continue;
+            }
+            $param = [];
+            $required_fields = ['id', 'event_type', 'version'];
+            $event_type = '';
+            if (array_key_exists('attributes', $event[$event_key])) {
+                $param['uid'] = $login->getOID();
+                $attributes = $event[$event_key]['attributes'];
+                foreach ($required_fields as $field) {
+                    if ( ! array_key_exists($field, $attributes)) {
+                        require_once('cbpapi/error_code.csp');
+                        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                            ['param' => $field]);
+                    }
+                }
+                $param['event'] = $attributes['id'];
+                $event_type = $attributes['event_type'];
+                $param['event_type'] = $event_type;
+                $param['version'] = $attributes['version'];
+                if (isset($attributes['facility_using_purpose'])) {
+                    $param['facility_using_purpose']
+                        = $attributes['facility_using_purpose'];
+                }
+                $public_type = '';
+                if (isset($attributes['public_type'])) {
+                    if ($attributes['public_type'] == 'private') {
+                        $public_type = 1;
+                    } elseif ($attributes['public_type'] == 'qualified') {
+                        $public_type = 2;
+                    } else {
+                        $public_type = 0;
+                    }
+                }
+                $param['private'] = $public_type;
+                $plan = '';
+                if (isset($attributes['plan'])) {
+                    $plan = $attributes['plan'];
+                }
+                $param['menu'] = $plan;
+                $detail = '';
+                if (isset($attributes['detail'])) {
+                    $detail = $attributes['detail'];
+                }
+                $param['title'] = $detail;
+                $memo = '';
+                if (isset($attributes['description'])) {
+                    $memo = $attributes['description'];
+                }
+                $param['memo'] = $memo;
+                $timezone_list = CB_I18N::getAvailableTimezones();
+                $timezone = isset($attributes['timezone'])
+                    ? $attributes['timezone']
+                    : CB_I18N::getInstance()->getCurrentTimezone();
+                // validate timezone support
+                if ( ! in_array($timezone, $timezone_list)) {
+                    cb_throw_error(E_COMMON_MISSING_TIMEZONE, null, null,
+                        ['timezone' => $timezone]);
+                }
+                $param['timezone'] = $timezone;
+
+                $end_timezone = isset($attributes['end_timezone'])
+                    ? $attributes['end_timezone'] : $param['timezone'];
+                // validate timezone support
+                if ( ! in_array($end_timezone, $timezone_list)) {
+                    cb_throw_error(E_COMMON_MISSING_TIMEZONE, null, null,
+                        ['timezone' => $end_timezone]);
+                }
+                $param['end_timezone'] = $end_timezone;
+            }
+
+            $elements_children = [];
+            if (array_key_exists('children', $event[$event_key])) {
+                $elements_children = $event[$event_key]['children'];
+            }
+
+            $datetimes = []; // use for temporary event
+            foreach (array_keys($elements_children) as $children_key) {
+                $element = $elements_children[$children_key];
+
+                foreach (array_keys($element) as $element_key) {
+                    if ($element['node_name'] == 'members') {
+                        $members = [];
+                        if (isset($element['children'])) {
+                            $members = $element['children'];
+                        }
+                        $users_ids = [];
+                        $organization = [];
+                        $facilities = [];
+                        foreach (array_keys($members) as $key) {
+                            $member = $members[$key]['children'];
+
+                            foreach ($member as $user_key) {
+                                if ($user_key['node_name'] == 'user') {
+                                    if (array_key_exists('attributes',
+                                        $user_key)
+                                    ) {
+                                        $attributes = $user_key['attributes'];
+                                        if (isset($attributes['id'])) {
+                                            $user_id = $attributes['id'];
+                                        } else {
+                                            require_once('cbpapi/error_code.csp');
+                                            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                                null, ['param' => 'user_id']);
+                                        }
+                                        $users_ids[] = $user_id;
+                                    }
+                                } elseif ($user_key['node_name']
+                                          == 'organization'
+                                ) {
+                                    if (array_key_exists('attributes',
+                                        $user_key)
+                                    ) {
+                                        $attributes = $user_key['attributes'];
+                                        if (isset($attributes['id'])) {
+                                            $group_id = $attributes['id'];
+                                        } else {
+                                            require_once('cbpapi/error_code.csp');
+                                            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                                null, ['param' => 'group_id']);
+                                        }
+                                        $users_ids[] = 'g' . $group_id;
+                                        $organization[] = $group_id;
+                                    }
+                                } elseif ($user_key['node_name']
+                                          == 'facility'
+                                ) {
+                                    if (array_key_exists('attributes',
+                                        $user_key)
+                                    ) {
+                                        $attributes = $user_key['attributes'];
+                                        if (isset($attributes['id'])) {
+                                            $facility_id = $attributes['id'];
+                                        } else {
+                                            require_once('cbpapi/error_code.csp');
+                                            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                                null,
+                                                ['param' => 'facility_id']);
+                                        }
+                                        $facilities[] = $facility_id;
+                                    }
+                                }
+
+                            }
+
+                        }
+                        $param['sUID'] = $users_ids;
+                        $param['selected_users_sUID'] = $users_ids;
+                        $param['selected_groups_sUID'] = $organization;
+                        $param['sITEM'] = $facilities;
+                    }
+
+                    if ($element['node_name'] == 'customer') {
+                        $customer = array_key_exists('attributes', $element)
+                            ? $element['attributes'] : [];
+                        if (array_key_exists('name', $customer)) {
+                            $param['company_name'] = $customer['name'];
+                        }
+                        if (array_key_exists('zipcode', $customer)) {
+                            $param['zip_code'] = $customer['zipcode'];
+                        }
+                        if (array_key_exists('address', $customer)) {
+                            $param['physical_address'] = $customer['address'];
+                        }
+                        if (array_key_exists('route', $customer)) {
+                            $param['route'] = $customer['route'];
+                        }
+                        if (array_key_exists('route_time', $customer)) {
+                            $param['route_time'] = $customer['route_time'];
+                        }
+                        if (array_key_exists('route_fare', $customer)) {
+                            $param['route_fare'] = $customer['route_fare'];
+                        }
+                        if (array_key_exists('phone', $customer)) {
+                            $param['company_telephone_number']
+                                = $customer['phone'];
+                        }
+                        if (array_key_exists('url', $customer)) {
+                            $param['url'] = $customer['url'];
+                        }
+                    }
+
+                    if ($element['node_name'] == 'when') {
+                        $when = array_key_exists('children', $element)
+                            ? $element['children'] : [];
+                        $setdate = null;
+                        $enddate = null;
+                        $facilities = [];
+                        foreach (array_keys($when) as $key) {
+                            $attributes = array_key_exists('attributes',
+                                $when[$key]) ? $when[$key]['attributes'] : [];
+                            if (isset($attributes['facility_id'])) {
+                                $facilities[] = $attributes['facility_id'];
+                            }
+                        }
+                        $facility_date = [];
+                        foreach (array_keys($when) as $key) {
+                            $attributes = array_key_exists('attributes',
+                                $when[$key]) ? $when[$key]['attributes'] : [];
+                            $node = $when[$key]['node_name'];
+                            if ($node == 'datetime') {
+                                if (isset($attributes['start'])) {
+                                    $set_date
+                                        = grn_cbpapi_parse_ISO8601($attributes['start']);
+                                    if ($set_date) {
+                                        $setdate
+                                            = schedule_parse_datetime($set_date,
+                                            null, $timezone);
+                                        if ($setdate->year) {
+                                            $param['start_year']
+                                                = $setdate->year;
+                                        }
+                                        if ($setdate->month) {
+                                            $param['start_month']
+                                                = $setdate->month;
+                                        }
+                                        if ($setdate->day) {
+                                            $param['start_day'] = $setdate->day;
+                                        }
+                                        if ( ! is_null($setdate->hour)) {
+                                            $param['start_hour']
+                                                = $setdate->hour;
+                                        }
+                                        if ( ! is_null($setdate->minute)) {
+                                            $param['start_minute']
+                                                = $setdate->minute;
+                                        }
+                                    }
+                                } else {
+                                    require_once('cbpapi/error_code.csp');
+                                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                        null, ['param' => 'start']);
+                                }
+                                if (isset($attributes['end'])) {
+                                    $end_date
+                                        = grn_cbpapi_parse_ISO8601($attributes['end']);
+                                    if ($end_date) {
+                                        $enddate
+                                            = schedule_parse_datetime($end_date,
+                                            null, $end_timezone);
+                                        if ($enddate->year) {
+                                            $param['end_year'] = $enddate->year;
+                                        }
+                                        if ($enddate->month) {
+                                            $param['end_month']
+                                                = $enddate->month;
+                                        }
+                                        if ($enddate->day) {
+                                            $param['end_day'] = $enddate->day;
+                                        }
+                                        if ( ! is_null($enddate->hour)) {
+                                            $param['end_hour'] = $enddate->hour;
+                                        }
+                                        if ( ! is_null($enddate->minute)) {
+                                            $param['end_minute']
+                                                = $enddate->minute;
+                                        }
+                                    }
+                                }
+                                if ($event_type == 'temporary') {
+                                    $facility_id = null;
+                                    if (isset($attributes['facility_id'])) {
+                                        $facility_id
+                                            = $attributes['facility_id'];
+                                    }
+                                    if ($setdate && $enddate) {
+                                        if (strlen($facility_id) > 0) {
+                                            if ( ! array_key_exists($facility_id,
+                                                $datetimes)
+                                            ) {
+                                                $datetimes[$facility_id] = [];
+                                            }
+                                            $facility_date = $setdate->format()
+                                                             . '='
+                                                             . $enddate->format();
+
+                                            if ($facility_date
+                                                && ! in_array($facility_date,
+                                                    $datetimes[$facility_id])
+                                            ) {
+                                                $datetimes[$facility_id][]
+                                                    = $facility_date;
+                                            }
+                                        } else {
+                                            $facility_date[]
+                                                = $setdate->format()
+                                                  . '='
+                                                  . $enddate->format();
+                                            $datetimes[] = $facility_date;
+                                        }
+                                    }
+                                }
+                            } else {
+                                if (isset($attributes['start'])) {
+                                    $setdate = $attributes['start'];
+                                } else {
+                                    require_once('cbpapi/error_code.csp');
+                                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                        null, ['param' => 'start']);
+                                }
+                                $start_date = new CB_Date();
+                                if ($start_date->parse($setdate)) {
+                                    if ($start_date->year) {
+                                        $param['start_year']
+                                            = $start_date->year;
+                                    }
+                                    if ($start_date->month) {
+                                        $param['start_month']
+                                            = $start_date->month;
+                                    }
+                                    if ($start_date->day) {
+                                        $param['start_day'] = $start_date->day;
+                                    }
+                                }
+                                if (isset($attributes['end'])) {
+                                    $enddate = $attributes['end'];
+                                } else {
+                                    require_once('cbpapi/error_code.csp');
+                                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                        null, ['param' => 'end']);
+                                }
+                                $end_date = new CB_Date();
+                                if ($end_date->parse($enddate)) {
+                                    if ($end_date->year) {
+                                        $param['end_year'] = $end_date->year;
+                                    }
+                                    if ($end_date->month) {
+                                        $param['end_month'] = $end_date->month;
+                                    }
+                                    if ($end_date->day) {
+                                        $param['end_day'] = $end_date->day;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if ($element['node_name'] == 'observers') {
+                        $observers = [];
+                        if (isset($element['children'])) {
+                            $observers = $element['children'];
+                        }
+                        $observer_ids = [];
+                        $organization = [];
+                        $observer_default_order_ids = [];
+                        foreach (array_keys($observers) as $key) {
+                            $observer = $observers[$key]['children'];
+                            foreach ($observer as $observer_key) {
+                                if ($observer_key['node_name'] == 'user') {
+                                    if (array_key_exists('attributes',
+                                        $observer_key)
+                                    ) {
+                                        $attributes
+                                            = $observer_key['attributes'];
+                                        if (isset($attributes['id'])) {
+                                            $user_id = $attributes['id'];
+                                        } else {
+                                            require_once('cbpapi/error_code.csp');
+                                            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                                null, ['param' => 'user_id']);
+                                        }
+                                        if (isset($attributes['order'])) {
+                                            $observer_ids[$user_id]
+                                                = $attributes['order'];
+                                        } else {
+                                            $observer_default_order_ids[]
+                                                = $user_id;
+                                        }
+                                    }
+                                } elseif ($observer_key['node_name']
+                                          == 'organization'
+                                ) {
+                                    if (array_key_exists('attributes',
+                                        $observer_key)
+                                    ) {
+                                        $attributes
+                                            = $observer_key['attributes'];
+                                        if (isset($attributes['id'])) {
+                                            $group_id = $attributes['id'];
+                                        } else {
+                                            require_once('cbpapi/error_code.csp');
+                                            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                                null, ['param' => 'group_id']);
+                                        }
+                                        if (isset($attributes['order'])) {
+                                            $observer_ids['g' . $group_id]
+                                                = $attributes['order'];
+                                        } else {
+                                            $observer_default_order_ids[] = 'g'
+                                                                            . $group_id;
+                                        }
+                                        $organization[] = $group_id;
+                                    }
+                                } elseif ($observer_key['node_name']
+                                          == 'role'
+                                ) {
+                                    if (array_key_exists('attributes',
+                                        $observer_key)
+                                    ) {
+                                        $attributes
+                                            = $observer_key['attributes'];
+                                        if (isset($attributes['id'])) {
+                                            $role_id = $attributes['id'];
+                                        } else {
+                                            require_once('cbpapi/error_code.csp');
+                                            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                                null, ['param' => 'role_id']);
+                                        }
+                                        if (isset($attributes['order'])) {
+                                            $observer_ids['r' . $role_id]
+                                                = $attributes['order'];
+                                        } else {
+                                            $observer_default_order_ids[] = 'r'
+                                                                            . $role_id;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        asort($observer_ids, SORT_NUMERIC);
+                        $observer_ids = array_keys($observer_ids);
+                        $observer_ids = $observer_ids
+                                        + $observer_default_order_ids;
+                        $param['p_sUID'] = $observer_ids;
+                        $param['selected_users_p_sUID'] = $observer_ids;
+                        $param['selected_groups_p_sUID'] = $organization;
+                    }
+
+                    if ($element['node_name'] == 'repeat_info') {
+                        $repeat_info = array_key_exists('children', $element)
+                            ? $element['children'] : [];
+                        foreach ($repeat_info as $info_key) {
+                            if ($info_key['node_name'] == 'condition') {
+                                $attributes = array_key_exists('attributes',
+                                    $info_key) ? $info_key['attributes'] : [];
+                                if (isset($attributes['type'])) {
+                                    $type = $attributes['type'];
+                                } else {
+                                    require_once('cbpapi/error_code.csp');
+                                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                        null, ['param' => 'type']);
+                                }
+                                $day = array_key_exists('day', $attributes)
+                                    ? $attributes['day'] : null;
+                                $wday = array_key_exists('week', $attributes)
+                                    ? $attributes['week'] : null;
+                                if (isset($attributes['start_date'])) {
+                                    $setdate = new CB_Date();
+                                    if ($setdate->parse($attributes['start_date'])) {
+                                        if ($setdate->year) {
+                                            $param['start_year']
+                                                = $setdate->year;
+                                        }
+                                        if ($setdate->month) {
+                                            $param['start_month']
+                                                = $setdate->month;
+                                        }
+                                        if ($setdate->day) {
+                                            $param['start_day'] = $setdate->day;
+                                        }
+                                    }
+                                    if (isset($attributes['start_time'])) {
+                                        $settime = new CB_Time();
+                                        if ($settime->parse($attributes['start_time'])) {
+                                            if ( ! is_null($settime->hour)) {
+                                                $param['start_hour']
+                                                    = $settime->hour;
+                                            }
+                                            if ( ! is_null($settime->minute)) {
+                                                $param['start_minute']
+                                                    = $settime->minute;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    require_once('cbpapi/error_code.csp');
+                                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                        null, ['param' => 'start_date']);
+                                }
+                                if (isset($attributes['end_date'])) {
+                                    $enddate = new CB_Date();
+                                    if ($enddate->parse($attributes['end_date'])) {
+                                        if ($enddate->year) {
+                                            $param['end_year'] = $enddate->year;
+                                        }
+                                        if ($enddate->month) {
+                                            $param['end_month']
+                                                = $enddate->month;
+                                        }
+                                        if ($enddate->day) {
+                                            $param['end_day'] = $enddate->day;
+                                        }
+                                    }
+                                }
+                                if (isset($attributes['end_time'])) {
+                                    $endtime = new CB_Time();
+                                    if ($endtime->parse($attributes['end_time'])) {
+                                        if ( ! is_null($endtime->hour)) {
+                                            $param['end_hour'] = $endtime->hour;
+                                        }
+                                        if ( ! is_null($endtime->minute)) {
+                                            $param['end_minute']
+                                                = $endtime->minute;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if ($type) {
+                            $param['type'] = $type;
+                            $param['week'] = $type;
+                        }
+                        if ($wday) {
+                            $param['wday'] = $wday;
+                        }
+                        if ($day) {
+                            $param['day'] = $day;
+                        }
+                    }
+
+                    // GTM-1136
+                    if ($element['node_name'] == 'file') {
+                        if (array_key_exists('attributes', $element)) {
+                            $file_attr = $element['attributes'];
+                            if ( ! array_key_exists('id', $file_attr)) {
+                                require_once('cbpapi/error_code.csp');
+                                cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                    null, ['param' => 'file_id']);
+                            }
+                            if ( ! array_key_exists('name', $file_attr)) {
+                                require_once('cbpapi/error_code.csp');
+                                cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                    null, ['param' => 'file_name']);
+                            }
+                            if ( ! array_key_exists('children', $element)
+                                 || ! is_array($element['children'])
+                                 || ! array_key_exists('text',
+                                    $element['children'][0])
+                            ) {
+                                require_once('cbpapi/error_code.csp');
+                                cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                    null, ['param' => 'file_body']);
+                            }
+                            $param['files'][$file_attr['id']] = [
+                                'file_id'   => $file_attr['id'],
+                                'name'      => $file_attr['name'],
+                                'size'      => array_key_exists('size',
+                                    $file_attr) ? $file_attr['size'] : null,
+                                'mime_type' => array_key_exists('mime_type',
+                                    $file_attr) ? $file_attr['mime_type']
+                                    : null,
+                                'content'   => $element['children'][0]['text']
+                            ];
+                        }
+                    }
+
+                    if ($element['node_name'] == 'remove_file_id') {
+                        if (array_key_exists('text', $element)) {
+                            $param['remove_file_ids'][$element['text']]
+                                = $element['text'];
+                        }
+                    }
+                    // End GTM-1136
+                }
+            }
+
+            if ($event_type == 'banner') {
+                $param['BN'] = '1';
+                if (array_key_exists('private', $param)) {
+                    unset($param['private']);
+                }
+                if (array_key_exists('sITEM', $param)) {
+                    unset($param['sITEM']);
+                }
+            }
+            if ($event_type == 'temporary') {
+                $param['temporary_adjust_search'] = '1';
+                $param['datetimes'] = $datetimes;
+            }
+            if ($event_type == 'repeat') {
+                $param['RP'] = '1';
+            }
+            $params[] = $param;
+        }
+
+        return $params;
+    }
+
+    /**
+     *  commit schedule tables
+     */
+    public function saveNow()
+    {
+        $locator = GRN_ApplicationLocator::instance();
+        $manager = $locator->getTableManager('schedule');
+        $manager->registerNowAndUpdateNowAll();
+    }
+
+    /**
+     *  commit schedule tables
+     */
+    public function commit()
+    {
+        if (class_exists('CB_TransactionManager')) {
+            $tm = CB_TransactionManager::getInstance();
+
+            // commit remained transacions if any
+            $tm->commit();
+
+            unset($tm);
+        }
+    }
+
+    /**
+     * Generate notification when add/remove follow
+     */
+    public function createFollowNotify(
+        &$login,
+        $event,
+        $event_id,
+        $follow,
+        $date = null,
+        $mode = GRN_SCHEDULE_NOTIFY_FOLLOWENTRY
+    ) {
+        $tsex = new CB_TimeStampEx();
+        $notify_date = $tsex->getDate();
+        if (is_null($date)) {
+            $date = $tsex->getDate();
+        }
+        if ( ! ($notify_date->compare($date) > 0)) {
+            require_once('schedule/notification.csp');
+            $util = GRN_Schedule_Notify_Logic::getInstance();
+
+            require_once('schedule/application.csp');
+            $app = GRN_Schedule_Application::getInstance();
+
+            if ($event->users && count($event->users) > 0) {
+                $title
+                    = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+                $app->setNotify($event->users, $login, $event, $date, $title,
+                    $follow, $mode, $tsex);
+            }
+
+            // 通知先の指定がある場合
+            if ($event->private && is_array($event->notify_address)
+                && count($event->notify_address) > 0
+            ) {
+                $title
+                    = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+                $app->sendNotificationsToPublic($login, $event, $date, $follow,
+                    $tsex, $title, false, false, $mode);
+            }
+        }
+    }
+
+    public function translateDateToUserTimezone($event_id, $date)
+    {
+        if (is_null($date)) {
+            return null;
+        }
+
+        assert('$date instanceof CB_Date');
+
+        require_once('schedule/application.csp');
+        $app = GRN_Schedule_Application::getInstance();
+        if ( ! is_numeric($event_id)) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        //GRN2-3599
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login = $uum->getLoginUser();
+        $event = $app->getEvent($login, $event_id);
+        //GRN2-3599
+
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        if ( ! $event instanceof GRN_Schedule_RepeatEvent) {
+            cb_throw_error(E_GRN_SCHD_IS_NOT_REPEAT_EVENT);
+        }
+
+        require_once('schedule/repeat_event_logic.csp');
+        $repeat_logic = GRN_Schedule_RepeatEventLogic::getInstance();
+
+        return $repeat_logic->translateRepeatDateToUserTimezone($event, $date);
+    }
+
+    //GTM-1136
+    public function getFile($event_id, $file_id)
+    {
+        $login = cb_get_login_user();
+
+        if ( ! $event_id) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        require_once('schedule/application.csp');
+        $app = GRN_Schedule_Application::getInstance();
+        if ( ! ($event = $app->getEvent($login, $event_id))) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        require_once('schedule/access_logic.csp');
+        $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $dynamic_roles = $uum->listGrantedRoles();
+        $access = $acc_logic->getEventAccess($login, $event, ['read'],
+            $dynamic_roles);
+        if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_FILE_VIEW);
+        }
+
+        if ( ! $file_id) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_FILE);
+        }
+        require_once('schedule/file.csp');
+        $fm = GRN_Schedule_FileManager::getInstance();
+        if ( ! ($file = $fm->getFile($event_id, $file_id))) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_FILE);
+        }
+
+        return $file;
+    }
+
+    public function getFiles($event_id, $throw_error = true)
+    {
+        $login = cb_get_login_user();
+
+        if ( ! $event_id) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+            } else {
+                return [];
+            }
+        }
+        require_once('schedule/application.csp');
+        $app = GRN_Schedule_Application::getInstance();
+        if ( ! ($event = $app->getEvent($login, $event_id, null,
+            CB_DATABASE_SHARED_LOCK, $throw_error))
+        ) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+            } else {
+                return [];
+            }
+        }
+        require_once('schedule/access_logic.csp');
+        $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $dynamic_roles = $uum->listGrantedRoles();
+        $access = $acc_logic->getEventAccess($login, $event, ['read'],
+            $dynamic_roles);
+        if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_SCHD_ACCESSDENY_FILE_VIEW);
+            } else {
+                return [];
+            }
+        }
+
+        require_once('schedule/file.csp');
+        $fm = GRN_Schedule_FileManager::getInstance();
+
+        return $file = $fm->getFiles($event_id);
+    }
+
+    public function getEventIDFromFile($file_id)
+    {
+        if ( ! $file_id) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_FILE);
+        }
+        $db = $this->_getDBConnection();
+        $condition = cb_queryf($db, "col_file = '@S' ", $file_id);
+        $query = "SELECT * from tab_grn_schedule_filerelation WHERE ";
+        $ret = $db->query($query . $condition);
+        $event_id = null;
+        if ($row = $db->fetch_assoc($ret)) {
+            $event_id = $row['col_event'];
+        }
+
+        return $event_id;
+    }
+    //End GTM-1136
+
+    /**
+     * @param string $event_id
+     * @param string $facility_id
+     * return array temporaryevent date id list
+     */
+    public function getTempraryEventDateID($event_id, $facility_id)
+    {
+        $db = $this->_getDBConnection();
+        $query = cb_queryf($db,
+            'SELECT ' .
+            'r.col_date as did ' .
+            'FROM tab_grn_schedule_eventmember m ' .
+            'LEFT JOIN tab_grn_schedule_temporaryeventrelation r ' .
+            'ON r.col_member = m._id ' .
+            'WHERE m.col_event = \'@S\' AND m.col_facility =\'@S\'',
+            $event_id, $facility_id);
+        $ret = $db->query($query);
+        $dateIDList = [];
+        while ($row = $db->fetch_assoc($ret)) {
+            $dateIDList[$row['did']] = $row['did'];
+        }
+
+        return $dateIDList;
+    }
+}
+
+
+class GRN_Schedule_CBPAPI_FreeTimeSearchLogic extends CB_ModuleBase
+{
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        parent::__construct(GRN_SCHEDULE_MODULE_ID . '.cbpapi_freetime_search');
+    }
+
+    /**
+     * @access private
+     */
+    var $_candidates_count = 0;
+    /**
+     * @access private
+     */
+    var $_candidate_list = [];
+
+    /**
+     * @return GRN_Schedule_CBPAPI_FreeTimeSearchLogic
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_Schedule_CBPAPI_FreeTimeSearchLogic();
+        }
+
+        return $_instance;
+    }
+
+    /**
+     * @param  array  $candidates
+     * @param  int    $term_hour
+     * @param  int    $term_minute
+     * @param  array  $member_id_list
+     * @param  array  $facility_id_list
+     * @param  string $facility_search_method
+     *
+     * @return array    Free time candidate list.
+     *    $facility_id is facility's _id or GRN_SCHD_ADJUST_NO_FACILITY
+     *
+     *    array( $facility_id1 => array( 'date' => $date_object,
+     *                                   'set_time' => $time_object,
+     *                                   'end_time' => $time_object),
+     *           $facility_id2 => array( 'date' => $date_object,
+     *                                   'set_time' => $time_object,
+     *                                   'end_time' => $time_object),
+     *           ...
+     *           $facility_idN => array( 'date' => $date_object,
+     *                                   'set_time' => $time_object,
+     *                                   'end_time' => $time_object)
+     *    )
+     */
+    function searchFreeTimes(
+        $candidates = [],
+        $term_hour = 0,
+        $term_minute = 0,
+        $member_id_list = [],
+        $facility_id_list = [],
+        $facility_search_method = 'OR'
+    ) {
+
+        $candidate_list = [];
+
+        $this->_candidates_count = 0;
+        $this->_candidate_list = [];
+
+        // create term's TimeSpan
+        // 検索する時間帯のTimeSpanを作成
+        $term_span = $this->_createTermSpan($term_hour, $term_minute);
+        if ($term_span <= 0) {
+            return [];
+        }
+
+        $target_datetime_count = count($candidates);
+        if ($target_datetime_count <= 0) {
+            return [];
+        }
+
+        // No facility search
+        // 施設を一つも選んでいない時はユーザーだけで検索する
+        if (count($facility_id_list) <= 0) {
+            foreach ($candidates as $datetime) {
+                $user_freetimes
+                    = $this->_createUsersFreeTimeList($member_id_list,
+                    $datetime['setdatetime'],
+                    $datetime['enddatetime']);
+
+                $candidate_list = $this->_createCandidateList($user_freetimes,
+                    GRN_SCHD_ADJUST_NO_FACILITY,
+                    $datetime,
+                    $term_span);
+
+                if ($this->_candidates_count
+                    >= GRN_SCHD_ADJUST_MAX_CANDIDATES
+                ) {
+                    return $this->_candidate_list;
+                }
+            }
+
+            return $candidate_list;
+        }
+
+        if (strcasecmp($facility_search_method, 'OR') === 0) {
+            // OR Search for facilities
+            // OR検索(一つの施設を使用する)
+
+            // user freetime caching
+            $user_freetime_cache = [];
+
+            foreach ($facility_id_list as $faid) {
+                for ($i = 0; $i < $target_datetime_count; $i++) {
+                    $set_datetime = $candidates[$i]['setdatetime'];
+                    $end_datetime = $candidates[$i]['enddatetime'];
+                    $facility_freetimes
+                        = $this->_createFacilityFreeTimeList($faid,
+                        $set_datetime,
+                        $end_datetime);
+                    if (count($facility_freetimes) <= 0) {
+                        continue;
+                    }
+
+                    for ($j = 0; $j < $target_datetime_count; $j++) {
+                        if (array_key_exists($j, $user_freetime_cache)
+                            === false
+                        ) {
+                            // user freetime caching
+                            // 施設 * 候補日で繰り返すことになるのでユーザーの空き時間をキャッシュ
+                            $set_datetime = $candidates[$j]['setdatetime'];
+                            $end_datetime
+                                = $candidates[$j]['enddatetime'];
+                            $user_freetimes
+                                = $this->_createUsersFreeTimeList($member_id_list,
+                                $set_datetime,
+                                $end_datetime);
+                            $user_freetime_cache[$j] = $user_freetimes;
+                        } else {
+                            $user_freetimes = $user_freetime_cache[$j];
+                        }
+
+                        if (count($user_freetimes) <= 0) {
+                            continue;
+                        }
+
+                        $merge_freetimes
+                            = $this->_mergeFreetimes($user_freetimes,
+                            $facility_freetimes);
+                        $candidate_list
+                            = $this->_createCandidateList($merge_freetimes,
+                            $faid,
+                            $candidates[$j],
+                            $term_span);
+
+                        if ($this->_candidates_count
+                            >= GRN_SCHD_ADJUST_MAX_CANDIDATES
+                        ) {
+                            return $candidate_list;
+                        }
+                    }
+                }
+            }
+            unset($user_freetime_cache);
+        } else {
+            // AND Search for facilities
+            // AND検索(全ての施設を使用する)
+            foreach ($candidates as $datetime) {
+                $facilities_freetimes
+                    = $this->_createFacilitiesFreeTimeList($facility_id_list,
+                    $datetime['setdatetime'],
+                    $datetime['enddatetime']);
+
+                if (count($facilities_freetimes) <= 0) {
+                    continue;
+                }
+
+                $user_freetimes
+                    = $this->_createUsersFreeTimeList($member_id_list,
+                    $datetime['setdatetime'],
+                    $datetime['enddatetime']);
+
+                if (count($user_freetimes) <= 0) {
+                    continue;
+                }
+
+                $merge_freetimes = $this->_mergeFreetimes($user_freetimes,
+                    $facilities_freetimes);
+                $candidate_list = $this->_createCandidateList($merge_freetimes,
+                    GRN_SCHD_ADJUST_NO_FACILITY,
+                    $datetime,
+                    $term_span);
+
+                if ($this->_candidates_count
+                    >= GRN_SCHD_ADJUST_MAX_CANDIDATES
+                ) {
+                    return $candidate_list;
+                }
+
+            }
+        }
+
+        return $candidate_list;
+    }
+
+    /**
+     * Get the candidates count
+     *
+     * @return int candidates count
+     */
+    function getCandidatesCount()
+    {
+        return $this->_candidates_count;
+    }
+
+    /**
+     * Create candidate datetime from freetime list
+     * 空き時間から候補日時を作成
+     *
+     * @access private
+     */
+    function _createCandidateList($freetimes, $faid, $datetime, $term_span)
+    {
+        // validate check
+        if ($term_span <= 0) {
+            return $this->_candidate_list;
+        }
+        if (array_key_exists('setdatetime', $datetime) === false) {
+            return $this->_candidate_list;
+        }
+
+        if (array_key_exists($faid, $this->_candidate_list) !== true) {
+            $this->_candidate_list[$faid] = [];
+        }
+
+        $candidate_set_time = new CB_Time();
+        $candidate_end_time = new CB_Time();
+        $set_tsex = new CB_TimeStampEx();
+        $end_tsex = new CB_TimeStampEx();
+
+        foreach ($freetimes as $start => $end) {
+            $freetime_span = $end - $start;
+            if ($freetime_span < $term_span) {
+                continue;
+            }
+
+            $candidate_date = $datetime['setdatetime']->getDate();
+            while ($freetime_span >= $term_span) {
+                $set_tsex->unix_ts = $start;
+                $end_tsex->unix_ts = $start + $term_span;
+
+                $candidate_set_time = $set_tsex->getTime();
+                $candidate_end_time = $end_tsex->getTime();
+
+                $this->_candidate_list[$faid][] = [
+                    'date'     => $candidate_date,
+                    'set_time' => $candidate_set_time,
+                    'end_time' => $candidate_end_time
+                ];
+
+                $this->_candidates_count++;
+                if ($this->_candidates_count
+                    >= GRN_SCHD_ADJUST_MAX_CANDIDATES
+                ) {
+                    return $this->_candidate_list;
+                }
+
+                $start = $end_tsex->unix_ts;
+                $freetime_span = $end - $start;
+            }
+        }
+
+        return $this->_candidate_list;
+    }
+
+    /**
+     * create term's timespan
+     * 検索する空き時間のTimeStampを生成する
+     *
+     * @access private
+     */
+    function _createTermSpan($term_hour = 0, $term_minute = 0)
+    {
+        $t = new CB_Time();
+        $t->hour = $term_hour;
+        $t->minute = $term_minute;
+        $term = new CB_TimeEx($t);
+
+        $term_span = $term->getInterval(new CB_Time());
+
+        return $term_span->toSeconds();
+    }
+
+    /**
+     * Create users free time list
+     * 指定されたユーザー/組織の空き時間のリストを生成する
+     *
+     * @access private
+     */
+    function _createUsersFreeTimeList(
+        $user_id_list,
+        $set_datetime,
+        $end_datetime
+    ) {
+        require_once('schedule/search_logic.csp');
+        $search_logic = GRN_Schedule_AdjustSearchLogic::getInstance();
+
+        return $search_logic->_createUsersFreeTimeList($user_id_list,
+            $set_datetime, $end_datetime);
+    }
+
+    /**
+     * Create facility(one facility) free time list
+     * 指定された施設IDの施設の空き時間リストを生成する
+     *
+     * @access private
+     */
+    function _createFacilityFreeTimeList($faid, $set_datetime, $end_datetime)
+    {
+        $facility_freetimes = [];
+
+        $set_timestamp = new CB_TimeStampEx();
+        $set_timestamp->setDateTime($set_datetime);
+
+        $end_timestamp = new CB_TimeStampEx();
+        $end_timestamp->setDateTime($end_datetime);
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('schedule');
+
+        $query = 'SELECT ' .
+                 'datetime.col_setdatetime, datetime.col_enddatetime ' .
+                 'FROM tab_grn_schedule_event AS event ' .
+                 'LEFT JOIN tab_grn_schedule_eventdatetime AS datetime ' .
+                 'ON event._id = datetime.col_event ' .
+                 'LEFT JOIN tab_grn_schedule_eventmember AS member ' .
+                 'ON event._id = member.col_event ' .
+                 'WHERE ' .
+                 '( ' .
+                 '( ( datetime.col_setdatetime <= ' . $set_timestamp->unix_ts
+                 . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime >' . $set_timestamp->unix_ts
+                 . ' ) ) ' .
+                 'OR ' .
+                 '( ( datetime.col_setdatetime <  ' . $end_timestamp->unix_ts
+                 . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime >= ' . $end_timestamp->unix_ts
+                 . ' ) ) ' .
+                 'OR ' .
+                 '( ( datetime.col_setdatetime >=  ' . $set_timestamp->unix_ts
+                 . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime <= ' . $end_timestamp->unix_ts
+                 . ' ) ) ' .
+                 ')';
+
+        $query .= " AND ( member.col_facility = '" . $dbconn->escape($faid)
+                  . "') ";
+        $query .= 'ORDER BY datetime.col_setdatetime ASC, datetime.col_enddatetime DESC;';
+
+        $result = $dbconn->query($query);
+        if ($result === false) {
+            $dbconn->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+
+        // create not freetime list
+        // 空き時間のリストを作るために空いていない時間のリストを作る
+        $tmp_start = null;
+        $tmp_end = null;
+        $facility_notfreetimes = [];
+        while (($row = $dbconn->fetch_assoc($result)) != false) {
+            if (is_null($tmp_start) || is_null($tmp_end)) {
+                $tmp_start = $row['col_setdatetime'];
+                $tmp_end = $row['col_enddatetime'];
+            } else {
+                /*
+                 * $tmp_start                        $tmp_end
+                 *    |-------------------------------------|
+                 * $row['col_setdatetime']   $row['col_enddatetime']
+                 *    |------------------------------|
+                 */
+                if ($tmp_start === $row['col_setdatetime']) {
+                    continue;
+                } /*
+                 * $tmp_start    $tmp_end
+                 *    |-------------|
+                 *                    $row['col_setdatetime']     $row['col_enddatetime']
+                 *                          |------------------------------------|
+                 */
+                elseif ($tmp_end < $row['col_setdatetime']) {
+                    $tmp_start = $row['col_setdatetime'];
+                    $tmp_end = $row['col_enddatetime'];
+                } /*
+                 * $tmp_start                        $tmp_end
+                 *    |----------------------------------|
+                 *     $row['col_setdatetime']     $row['col_enddatetime']
+                 *          |------------------------------------|
+                 */
+                elseif ($tmp_start < $row['col_setdatetime']
+                        && $tmp_end < $row['col_enddatetime']
+                ) {
+                    $tmp_end = $row['col_enddatetime'];
+                } else {
+                    continue;
+                }
+            }
+            $facility_notfreetimes[$tmp_start] = $tmp_end;
+        }
+
+        $dbconn->free_result($result);
+        unset($dbconn);
+
+        // create freetime list
+        // 空いていない時間のリストから空き時間リストを作成
+        $set_freetime = $set_timestamp->unix_ts;
+        $end_freetime = $end_timestamp->unix_ts;
+        $last_notfreetime_end = $set_timestamp->unix_ts;
+        foreach ($facility_notfreetimes as $start => $end) {
+            /*
+             *           $start              $end
+             *             |-------------------|
+             * $set_freetime
+             *     |-------------
+             */
+            if ($start > $set_freetime) {
+                $end_freetime = $start;
+                $facility_freetimes[$set_freetime] = $end_freetime;
+                $set_freetime = $end;
+                $end_freetime = $end_timestamp->unix_ts;
+            } /*
+             *    $start         $end
+             *       |-------------|
+             *    $set_freetime
+             *       |-----------
+             *    or
+             *      $set_freetime
+             *            |-------------
+             */
+            elseif ($start <= $set_freetime) {
+                $set_freetime = $end;
+            }
+
+            $last_notfreetime_end = $end;
+        }
+
+        if ($last_notfreetime_end < $end_timestamp->unix_ts) {
+            $facility_freetimes[$last_notfreetime_end]
+                = $end_timestamp->unix_ts;
+        }
+
+        // Caring for facility without schedule
+        // スケジュールが無い場合の対処
+        if (count($facility_notfreetimes) <= 0) {
+            $facility_freetimes[$set_timestamp->unix_ts]
+                = $end_timestamp->unix_ts;
+        }
+
+        return $facility_freetimes;
+    }
+
+    /**
+     * Merge freetime of users and facility
+     * ユーザー/組織の空き時間リストと施設の空き時間リストをマージする
+     *
+     * @access private
+     */
+    function _mergeFreeTimes($user_freetimes, $facility_freetimes)
+    {
+        if (count($user_freetimes) <= 0) {
+            return $facility_freetimes;
+        }
+        if (count($facility_freetimes) <= 0) {
+            return $user_freetimes;
+        }
+
+        $merge_freetimes = [];
+
+        $tmp_start = 0;
+        $tmp_end = 0;
+        foreach ($facility_freetimes as $fstart => $fend) {
+            foreach ($user_freetimes as $ustart => $uend) {
+                if (($ustart <= $fstart && $uend > $fstart)
+                    || ($ustart < $fend
+                        && $uend >= $fend)
+                    || ($ustart >= $fstart && $uend <= $fend)
+                ) {
+                    // Use the narrower time
+                    // より狭いほうの時間を採用
+                    $tmp_start = ($ustart > $fstart) ? $ustart
+                        : $fstart;
+                    $tmp_end = ($uend < $fend) ? $uend
+                        : $fend;
+                    $merge_freetimes[$tmp_start] = $tmp_end;
+                }
+            }
+        }
+
+        return $merge_freetimes;
+    }
+
+    /**
+     * Create facilities free time list
+     * 指定された施設IDのリストから空き時間のリストを生成する
+     *
+     * @access private
+     */
+    function _createFacilitiesFreeTimeList(
+        $facility_id_list,
+        $set_datetime,
+        $end_datetime
+    ) {
+        $facilities_freetimes = [];
+
+        $set_timestamp = new CB_TimeStampEx();
+        $set_timestamp->setDateTime($set_datetime);
+
+        $end_timestamp = new CB_TimeStampEx();
+        $end_timestamp->setDateTime($end_datetime);
+
+        // no facilities id
+        // 施設IDが一つも無い
+        if (count($facility_id_list) <= 0) {
+            return [$set_timestamp->unix_ts => $end_timestamp->unix_ts];
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('schedule');
+
+        $query = 'SELECT ' .
+                 'datetime.col_setdatetime, datetime.col_enddatetime ' .
+                 'FROM tab_grn_schedule_event AS event ' .
+                 'LEFT JOIN tab_grn_schedule_eventdatetime AS datetime ' .
+                 'ON event._id = datetime.col_event ' .
+                 'LEFT JOIN tab_grn_schedule_eventmember AS member ' .
+                 'ON event._id = member.col_event ' .
+                 'WHERE ' .
+                 '( ' .
+                 '( ( datetime.col_setdatetime <= ' . $set_timestamp->unix_ts
+                 . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime >' . $set_timestamp->unix_ts
+                 . ' ) ) ' .
+                 'OR ' .
+                 '( ( datetime.col_setdatetime <  ' . $end_timestamp->unix_ts
+                 . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime >= ' . $end_timestamp->unix_ts
+                 . ' ) ) ' .
+                 'OR ' .
+                 '( ( datetime.col_setdatetime >=  ' . $set_timestamp->unix_ts
+                 . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime <= ' . $end_timestamp->unix_ts
+                 . ' ) ) ' .
+                 ')';
+
+        $query .= ' AND ( ';
+
+        $condition = '';
+        $multi_condition = false;
+        foreach ($facility_id_list as $faid) {
+            if ($multi_condition) {
+                $condition .= ", '" . $dbconn->escape($faid) . "'";
+            } else {
+                $condition .= "'" . $dbconn->escape($faid) . "'";
+                $multi_condition = true;
+            }
+        }
+        $query .= 'member.col_facility IN(' . $condition . ')';
+
+        $query .= ' ) ';
+        $query .= 'ORDER BY datetime.col_setdatetime ASC, datetime.col_enddatetime DESC;';
+
+        $result = $dbconn->query($query);
+        if ($result === false) {
+            $dbconn->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+
+        // create not freetime list
+        // 空き時間のリストを作るために空いていない時間のリストを作る
+        $tmp_start = null;
+        $tmp_end = null;
+        $facilities_notfreetimes = [];
+        while (($row = $dbconn->fetch_assoc($result)) != false) {
+            if (is_null($tmp_start) || is_null($tmp_end)) {
+                $tmp_start = $row['col_setdatetime'];
+                $tmp_end = $row['col_enddatetime'];
+            } else {
+                /*
+                 * $tmp_start                        $tmp_end
+                 *    |-------------------------------------|
+                 * $row['col_setdatetime']   $row['col_enddatetime']
+                 *    |------------------------------|
+                 */
+                if ($tmp_start === $row['col_setdatetime']) {
+                    continue;
+                } /*
+                 * $tmp_start    $tmp_end
+                 *    |-------------|
+                 *                    $row['col_setdatetime']     $row['col_enddatetime']
+                 *                          |------------------------------------|
+                 */
+                elseif ($tmp_end < $row['col_setdatetime']) {
+                    $tmp_start = $row['col_setdatetime'];
+                    $tmp_end = $row['col_enddatetime'];
+                } /*
+                 * $tmp_start                        $tmp_end
+                 *    |----------------------------------|
+                 *     $row['col_setdatetime']     $row['col_enddatetime']
+                 *          |------------------------------------|
+                 */
+                elseif ($tmp_start < $row['col_setdatetime']
+                        && $tmp_end < $row['col_enddatetime']
+                ) {
+                    $tmp_end = $row['col_enddatetime'];
+                } else {
+                    continue;
+                }
+            }
+            $facilities_notfreetimes[$tmp_start] = $tmp_end;
+        }
+
+        $dbconn->free_result($result);
+        unset($dbconn);
+
+        // create freetime list
+        // 空いていない時間のリストから空き時間リストを作成
+        $set_freetime = $set_timestamp->unix_ts;
+        $end_freetime = $end_timestamp->unix_ts;
+        $last_notfreetime_end = $set_timestamp->unix_ts;
+        foreach ($facilities_notfreetimes as $start => $end) {
+            /*
+             *           $start              $end
+             *             |-------------------|
+             * $set_freetime
+             *     |-------------
+             */
+            if ($start > $set_freetime) {
+                $end_freetime = $start;
+                $facilities_freetimes[$set_freetime] = $end_freetime;
+                $set_freetime = $end;
+                $end_freetime = $end_timestamp->unix_ts;
+            } /*
+             *    $start         $end
+             *       |-------------|
+             *    $set_freetime
+             *       |-----------
+             *      or
+             *      $set_freetime
+             *            |-------------
+             */
+            elseif ($start <= $set_freetime) {
+                $set_freetime = $end;
+            }
+
+            $last_notfreetime_end = $end;
+        }
+
+        if ($last_notfreetime_end < $end_timestamp->unix_ts) {
+            $facilities_freetimes[$last_notfreetime_end]
+                = $end_timestamp->unix_ts;
+        }
+
+        // Caring for facilities without schedule
+        // スケジュールが無い施設への対処
+        if (count($facilities_notfreetimes) <= 0) {
+            $facilities_freetimes[$set_timestamp->unix_ts]
+                = $end_timestamp->unix_ts;
+        }
+
+        return $facilities_freetimes;
+    }
+}
+
+
+function schedule_parse_datetime($obj_date, $time = null, $timezone = null)
+{
+    if (is_null($timezone)) {
+        $I18N = CB_I18N::getInstance();
+        $timezone = $I18N->getCurrentTimezone();
+    }
+    $timestamp = new CB_TimeStampEx();
+    $timestamp->setTimeZone('UTC');
+    if (is_object($obj_date)) {
+        if (is_a($obj_date, 'CB_DateTime')) {
+            $timestamp->setDateTime($obj_date);
+        } elseif (is_a($obj_date, 'CB_Date')) {
+            $datetime = new CB_DateTime();
+            if (is_null($time) || ! is_a($time, 'CB_Time')) {
+                $datetime->second = 0;
+                $datetime->minute = 0;
+                $datetime->hour = 0;
+                $datetime->day = $obj_date->day;
+                $datetime->month = $obj_date->month;
+                $datetime->year = $obj_date->year;
+                $timestamp->setDateTime($datetime);
+
+            } elseif (is_a($time, 'CB_Time')) {
+                $datetime->second = $time->second;
+                $datetime->minute = $time->minute;
+                $datetime->hour = $time->hour;
+                $datetime->day = $obj_date->day;
+                $datetime->month = $obj_date->month;
+                $datetime->year = $obj_date->year;
+                $timestamp->setDateTime($datetime);
+            }
+        }
+    }
+    $timestamp->setTimeZone($timezone);
+
+    return $timestamp->getDateTime();
+}
+
+/**
+ * Checking whether the login user is an attendee of event or not.
+ *
+ * @param    $login        CB_User      Login User
+ * @param    $new_event    object       Event to check
+ *
+ * @return   bool          TRUE | FALSE
+ */
+function grn_schedule_is_event_user(&$login, &$new_event)
+{
+    $creator =& $new_event->creator;
+    if ($creator && $creator->getOID() == $login->getOID()) {
+        return true;
+    }
+    if (is_array($new_event->users) && count($new_event->users)) {
+        foreach (array_keys($new_event->users) as $key) {
+            $tmp =& $new_event->users[$key];
+            if ($tmp && ($tmp->getOID() == $login->getOID())) {
+                return true;
+            }
+        }
+    }
+    if (is_array($new_event->notify_address)
+        && count($new_event->notify_address)
+    ) {
+        foreach (array_keys($new_event->notify_address) as $key) {
+            $tmp =& $new_event->notify_address[$key];
+            if ($tmp && ($tmp->getOID() == $login->getOID())) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+function grn_cbpapi_get_facilitygroups_by_id_list(array $groupList)
+{
+    $app_locator = GRN_ApplicationLocator::instance();
+    $db = $app_locator->getConnection('schedule');
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    $dynamic_roles = $uum->listGrantedRoles();
+    $i18n = CB_I18N::getInstance();
+    require_once('schedule/access_logic.csp');
+    $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+
+    $query = cb_queryf($db,
+        'SELECT fg._id,IFNULL(fgl.col_name, fg.col_name) AS col_name,fg.col_mtime,fg.col_list_index,fg.col_parent FROM tab_grn_facility_facilitygroup fg LEFT JOIN (tab_grn_facility_facilitygroup_local fgl INNER JOIN tab_cb_language_status l ON fgl.language_id = l._id AND l.col_language = \'@S\')  ON fg._id = fgl.parent_id WHERE fg._id IN (@A) ORDER BY fg.col_list_index, fg._id ',
+        $i18n->getCurrentLanguage(),
+        $groupList
+    );
+    $result = $db->query($query);
+    if ($result === false) {
+        $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+    }
+    $groups = [];
+    while ($row = $db->fetch_assoc($result)) {
+        $groups[$row['_id']] = [
+            'id'      => $row['_id'],
+            'name'    => $row['col_name'],
+            'version' => $row['col_mtime'],
+            'order'   => $row['col_list_index'],
+            'parent'  => $row['col_parent'],
+        ];
+        $groups[$row['_id']]['children'] = [];
+        $groups[$row['_id']]['facilities'] = [];
+    }
+    $db->free_result($result);
+
+    // アクセス権でアクセスできる施設グループをチェック
+    $groups = $acc_logic->evaluateAccessesById($login, $groups, ['read'],
+        $dynamic_roles, 'facilitygroup');
+
+    // 施設グループの子施設グループ一括取得
+    $query = cb_queryf($db,
+        'SELECT _id,col_parent FROM tab_grn_facility_facilitygroup WHERE col_parent IN (@A) ORDER BY col_parent,col_list_index',
+        array_keys($groups));
+    $result = $db->query($query);
+    if ($result === false) {
+        $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+    }
+    $child_groups = [];
+    while ($row = $db->fetch_assoc($result)) {
+        $child_groups[$row['_id']] = $row;
+    }
+    $db->free_result($result);
+
+    // 施設グループのアクセス権チェック
+    $child_groups = $acc_logic->evaluateAccessesById($login, $child_groups,
+        ['read'], $dynamic_roles, 'facilitygroup');
+
+    // 子施設グループの設定
+    foreach ($child_groups as $row) {
+        if (isset($groups[$row['col_parent']])) {
+            $groups[$row['col_parent']]['children'][] = $row['_id'];
+        }
+    }
+
+    // 所属施設の取得
+    $query = cb_queryf($db,
+        'SELECT col_facility,col_group FROM tab_grn_facility_facilitygrouprelation WHERE col_group IN (@A) ORDER BY col_group,col_facility_list,col_facility',
+        array_keys($groups));
+    $result = $db->query($query);
+    if ($result === false) {
+        $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+    }
+    $facilities = [];
+    while ($row = $db->fetch_assoc($result)) {
+        $facilities[$row['col_facility']] = $row;
+    }
+    // アクセス権チェック
+    $facilities = $acc_logic->evaluateAccessesById($login, $facilities,
+        ['read'], $dynamic_roles, 'facility');
+
+    // 施設の設定
+    foreach ($facilities as $row) {
+        if (isset($groups[$row['col_group']])) {
+            $groups[$row['col_group']]['facilities'][]['id']
+                = $row['col_facility'];
+        }
+    }
+    $db->free_result($result);
+
+    return $groups;
+}

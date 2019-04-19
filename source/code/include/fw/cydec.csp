@@ -1,0 +1,240 @@
+<?php
+
+define('CB_REQUEST_DOMAIN_HEADER', 'X-CYDEC-DOMAIN');
+define('CB_DOMAIN_HEADER', 'HTTP_X_CYDEC_DOMAIN');
+define('CB_SESSION_NO_PROLONGING_HEADER',
+    'HTTP_X_CYBOZU_SESSION_NO_PROLONGING');
+define('DEFAULT_SESSION_EXPIRE_TIME', 86400);
+
+class CB_CyDECUtil
+{
+    private static $_instance = null;
+
+    private function __construct()
+    {
+    }
+
+    /**
+     * @return CB_CyDECUtil
+     */
+    public static function getInstance()
+    {
+        if (is_null(self::$_instance)) {
+            self::$_instance = new CB_CyDECUtil();
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * @return string
+     */
+    public function getDomainID()
+    {
+        if (array_key_exists(CB_DOMAIN_HEADER, $_SERVER)) {
+            return $_SERVER[CB_DOMAIN_HEADER];
+        }
+        $domain_id = getenv('CB_DOMAIN_ID');
+        if ($domain_id !== false) {
+            return $domain_id;
+        }
+
+        // return dummy domain for command-line.
+        return 'cb';
+    }
+
+    /**
+     * @return string
+     */
+    public function getConfigDir()
+    {
+        global $G_config_common;
+        $path = $G_config_common->get('Forest', 'config_dir');
+        assert('is_dir($path)');
+
+        return $path;
+    }
+
+    /**
+     * @return string
+     */
+    public function getDomainConfigDir()
+    {
+        return $this->getConfigDir() . DIRECTORY_SEPARATOR
+               . self::getDomainID();
+    }
+
+    /**
+     * @param string $name
+     *
+     * @return string
+     */
+    public function getConfig($name)
+    {
+        return $this->getDomainConfigDir() . DIRECTORY_SEPARATOR . $name;
+    }
+
+    /**
+     * @param string $name
+     *
+     * @return string
+     */
+    public function getGaroonConfig($name)
+    {
+        return $this->getDomainConfigDir() . DIRECTORY_SEPARATOR .
+               'garoon' . DIRECTORY_SEPARATOR . $name;
+    }
+
+    private $_conn = [];
+
+    /**
+     * @param string $dbname
+     * @param bool   $autocommit
+     *
+     * @return mysqli
+     */
+    public function getDatabase($dbname, $autocommit = false)
+    {
+        if (array_key_exists($dbname, $this->_conn)) {
+            return $this->_conn[$dbname];
+        }
+
+        if (preg_match('/^[a-z]+$/', $dbname) == 0) {
+            die('Invalid database name: ' . $dbname);
+        }
+        $domain_id = $this->getDomainID();
+        $db = sprintf('%s_%s', $domain_id, $dbname);
+        $json = file_get_contents($this->getConfig($dbname . '.json'));
+        if ($json === false) {
+            die("Could not read " . $dbname . ".json");
+        }
+        $definitions = json_decode($json, true);
+        if ($definitions === null
+            || ( ! array_key_exists('map', $definitions))
+        ) {
+            die("Invalid json contents.");
+        }
+        $params = array_shift($definitions['map']);
+        $params = $params[0];
+        // Use @ to suppress warning messages.
+        // eg. Warning: mysqli::mysqli(): (HY000/2002): Connection refused
+        $conn = @new mysqli($params['host'], $params['username'],
+            $params['password'], $db, $params['port']);
+        if ($conn->connect_error) {
+            $this->throwDbError($conn, false, $params['host'], $db);
+        }
+        $conn->autocommit($autocommit);
+        $this->_conn[$dbname] = $conn;
+
+        return $conn;
+    }
+
+    /**
+     * @param mysqli      $conn
+     * @param string|bool $query
+     * @param string|bool $host
+     * @param string|bool $dbname
+     */
+    public static function throwDbError($conn, $query, $host, $dbname)
+    {
+        if ($conn->connect_error) {
+            $errno = $conn->connect_errno;
+            $errmsg = $conn->connect_error;
+        } else {
+            $errno = $conn->errno;
+            $errmsg = $conn->error;
+        }
+
+        $info = [
+            'msg'    => $errmsg,
+            'host'   => $host,
+            'dbname' => $dbname,
+            'query'  => $query
+        ];
+
+        $errorCode = sprintf('DB%05d', abs($errno));
+        if (self::hasErrorResource($errorCode)) {
+            cb_throw_error($errorCode, $info, $info, $info, $info);
+        } else {
+            require_once('fw/error_code.csp');
+            cb_throw_error(E_DATABASE_GENERAL_ERROR, ['errorCode' => $errno],
+                $info, $info, $info);
+        }
+    }
+
+    /**
+     * @param string $errorCode
+     *
+     * @return bool
+     */
+    private static function hasErrorResource($errorCode)
+    {
+        require_once('fw/i18n.csp');
+        require_once('fw/error_message.csp');
+        $i18n = CB_I18N::getInstance();
+        $module = substr($errorCode, 0, -CB_ERROR_CODE_LENGTH);
+        $key = substr($errorCode, -CB_ERROR_CODE_LENGTH);
+        $resource = $i18n->getResource('error', $module, $key, false);
+
+        return is_array($resource);
+    }
+
+    public function getLogDir()
+    {
+        global $G_config_common;
+        $path = $G_config_common->get('Forest', 'log_dir');
+        assert('is_dir($path)');
+
+        return $path;
+    }
+
+    /**
+     * @param string $name
+     *
+     * @return string
+     */
+    public function getLog($name)
+    {
+        return $this->getLogDir() . DIRECTORY_SEPARATOR . $name .
+               '.' . $this->getDomainID() . "." . date("Ymd") . '.log';
+    }
+
+
+    /**
+     * @param string $prefix
+     * @param int    $expire
+     *
+     * @return \grn\cydec\yrmcds\SessionClient
+     * @throws grn\grn\GrnException
+     */
+    public function getYrmcdsSessionClient(
+        $prefix,
+        $expire = DEFAULT_SESSION_EXPIRE_TIME
+    ) {
+        global $G_config_common;
+        $path = $G_config_common->get('Forest', 'config_dir');
+        $json = file_get_contents($path . DIRECTORY_SEPARATOR
+                                  . 'memcache.json');
+        if ($json === false) {
+            die("Could not read memcache.json");
+        }
+        $t = json_decode($json, true);
+        if ($t === null) {
+            throw new \grn\grn\GrnException(E_COMMON_INVALID_JSON);
+        }
+
+        $c = new \yrmcds\Client($t['host'], $t['port'], $t['host'], $prefix);
+
+        return new grn\cydec\yrmcds\SessionClient($c, $expire);
+    }
+
+    /**
+     * @return bool
+     */
+    public static function getIsSessionNoProlonging()
+    {
+        $no_prolonging = cb_at($_SERVER, CB_SESSION_NO_PROLONGING_HEADER);
+
+        return $no_prolonging === 'true';
+    }
+}

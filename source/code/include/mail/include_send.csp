@@ -1,0 +1,3437 @@
+<?php
+
+use grn\fts\Application as FtsApplication;
+use grn\fts\mail\IndexService;
+
+/**
+ * メール送信ロジック
+ */
+
+require_once('fw/i18n.csp');
+require_once('fw/mail_message.csp');
+require_once('mail/utility.csp');
+
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+ * メール送信ロジック
+ */
+class GRN_Mail_SendLogic
+{
+
+    /**
+     * Return singleton.
+     *
+     * @return GRN_Mail_SendLogic
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_Mail_SendLogic();
+        }
+
+        return $_instance;
+    }
+
+    function __construct()
+    {
+        $this->_utility = GRN_Mail_Utility::getInstance();
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    // メンバ変数
+    /**
+     * @access private
+     */
+    var $_utility = null;
+
+    //////////////////////////////////////////////////////////////////////////
+    // private method
+
+
+    /**
+     * 再送信/転送時の添付ファイルの再利用
+     *
+     * @param CB_User             $user
+     * @param GRN_Mail_Message    $mail
+     * @param boolean             $b_draft     下書きメールからの再利用フラグ
+     * @param string              $action      操作した内容（'forward' / 'reuse'）
+     * @param GRN_Mail_Message    $origin_mail 再送信/転送元のメールオブジェクト
+     * @param string[]|null       $reuse_fids  再送信/転送元のファイル情報ID or null
+     * @param int                 $send_limit  サイズ制限値(Byte)
+     * @param int                 $size        添付ファイルサイズの合計を受け取る
+     * @param GRN_Mail_FileBody[] $file_rows   添付ファイルオブジェクトの配列を受け取る
+     * @param string              $error       エラー発生時にエラー番号を受け取る
+     * @param array               $diagnosis   エラー情報を受け取る
+     * @param array               $cause       エラー情報を受け取る
+     * @param bool                $b_save_files
+     *
+     * @return  boolean 成否
+     */
+    function _reuseFiles(
+        & $user,
+        & $mail,
+        $b_draft,
+        $action,
+        & $origin_mail,
+        $reuse_fids,
+        $send_limit,
+        & $size,
+        & $file_rows,
+        & $error,
+        & $diagnosis,
+        & $cause,
+        $b_save_files = true
+    ) {
+        if ( ! is_object($user) || ! is_object($mail)
+             || ( ! $b_draft
+                  && ! is_string($action))
+             || ! is_array($reuse_fids)
+             || (count($reuse_fids) == 0)
+        ) {
+            return true;
+        }
+
+        $sent = $origin_mail->isSent();
+
+        if ( ! is_a($origin_mail, 'GRN_Mail_Message')) {
+            return true;
+        }
+
+        // 添付ファイルがない、または削除された
+        if ($sent || $b_draft) {
+            if ( ! $origin_mail->fileExists()) {
+                return true;
+            }
+        } else {
+            if ( ! $origin_mail->sourceDataExists()) {
+                return true;
+            }
+        }
+
+        if ($b_draft) {
+            // ドラフト/プレビューの添付ファイルを取得
+            $rowset = $origin_mail->getFileBodyRowSet();
+        } elseif ($action == 'forward') {
+            if ($sent) {
+                // 送信メールは転送不可
+                return true;
+            }
+
+            // 転送元添付ファイルを取得
+            $rowset = $origin_mail->getFileInfoRowSet();
+        } elseif ($action == 'reuse') {
+            if ( ! $sent) {
+                // 受信メールは再送信不可
+                return true;
+            }
+
+            // 再送信元添付ファイルを取得
+            $rowset = $origin_mail->getFileBodyRowSet();
+        } else {
+            return true;
+        }
+
+        $ts = new CB_TimeStamp;
+        $ts->unix_ts = time();
+
+        $mail_logic = $this->_utility->getMailLogic();
+
+        if (is_array($reuse_fids) && count($reuse_fids) > 0) {
+            $condition = [];
+            foreach ($reuse_fids as $reuse_fid) {
+                $condition[] = $rowset->queryf("'@S'", $reuse_fid);
+            }
+            $reuse_file_condition = sprintf('_id IN ( %s )',
+                implode(', ', $condition));
+            $rowset->addCondition($reuse_file_condition);
+        }
+
+        /** @var GRN_Mail_FileBody|GRN_Mail_FileInfo $reuse_row */
+        while ( ! is_null($reuse_row = $rowset->iterate())) {
+            // 転送添付ファイルをファイルに保存する
+            // ドラフト/再送信添付ファイルをファイルに保存する
+            if ($b_draft || ($action == 'reuse')) {
+                // ファイル用データオブジェクト生成
+                $table_name = grn_mail_get_personal_tablename($user->getOID(),
+                    GRN_MAIL_FILEBODY_TABLE);
+                $table = $this->_utility->getTableInfo($table_name);
+                /** @var GRN_Mail_FileBody $file_row */
+                $file_row = $table->newRow();
+                if (is_object($file_row)) {
+                    $file_row->copy($reuse_row);
+                    if (is_a($mail, GRN_MAIL_TEMPORARY_MESSAGE_TABLE)) {
+                        $file_row->set('temporary_mail', $mail);
+                    } elseif (is_a($mail, GRN_MAIL_MESSAGE_TABLE)) {
+                        $file_row->set('mail', $mail);
+                    }
+                    $file_row->set('user', $user);
+                    $file_row->set('timestamp', $ts);
+                    $file_row->registerNow();
+                    $file_size = $file_row->get('size');
+                }
+            } else {
+                $file_properties = $reuse_row->getDataProperties();
+                $file_properties['timestamp'] = $ts;
+                $file_body
+                    = $mail_logic->getMailFileBody($origin_mail->getOID(),
+                    $file_properties['part_no']);
+                $file_content = $file_body->getContent();
+                $file_row = $this->_saveForwardFile($user,
+                    $mail, $file_properties, $file_content);
+                $file_size = $file_properties['size'];
+            }
+
+            if ( ! is_object($file_row)) {
+                // エラー
+                $error = E_GRN_MAIL_FAILED_TO_ADD_FILE_DATA;
+
+                return false;
+            }
+
+            if ($b_save_files) {
+                // サイズチェック
+                if (($send_limit > 0) && ($file_size > $send_limit)) {
+                    $error = E_GRN_MAIL_SEND_LIMIT;
+                    if ($send_limit >= 1048576) {
+                        $send_limit_for_view = ($send_limit / 1048576) . 'MB';
+                    } elseif ($send_limit >= 1024) {
+                        $send_limit_for_view = ($send_limit / 1024) . 'KB';
+                    } else {
+                        $send_limit_for_view = $send_limit . 'byte';
+                    }
+                    $diagnosis = ['limit' => $send_limit_for_view];
+                    $cause = ['limit' => $send_limit_for_view];
+
+                    return false;
+                }
+            }
+
+            $size += $file_size;
+            $file_rows[$file_row->getOID()] = clone $file_row;
+        }
+
+        return true;
+    }
+
+    /**
+     * 転送添付ファイルをファイルに保存する
+     *
+     * @access  private
+     *
+     * @param CB_User          $user
+     * @param GRN_Mail_Message $mail
+     * @param array            $properties   ファイルの情報
+     * @param string           $file_content ファイルの内容
+     *
+     * @return GRN_Mail_FileBody|null
+     */
+    function _saveForwardFile($user, & $mail, & $properties, & $file_content)
+    {
+        assert('is_object( $user )');
+        assert('is_object( $mail )');
+        assert('is_array( $properties )');
+
+        // ファイル用データオブジェクト生成
+        $table_name = grn_mail_get_personal_tablename($user->getOID(),
+            GRN_MAIL_FILEBODY_TABLE);
+        $table = $this->_utility->getTableInfo($table_name);
+        /** @var GRN_Mail_FileBody $row */
+        $row = $table->newRow();
+        if ( ! is_object($row)) {
+            // エラー
+            {
+                $___ret = null;
+
+                return $___ret;
+            }
+        }
+
+        // Create Temporary File
+        $file_name = $this->_utility->makeTempFile($row, $file_content);
+
+        // Create Dummy $_FILES Data
+        $dummy_file = [];
+        $dummy_file['name'] = $properties['name'];
+        $dummy_file['tmp_name'] = $file_name;
+        $dummy_file['error'] = 0;
+        $dummy_file['type'] = $properties['mime'];
+        $dummy_file['size'] = filesize($file_name);
+        $dummy_file['is_temporary_file'] = true;
+
+        $properties['size'] = filesize($file_name);
+        $row->initialize($user, $mail, $properties);
+        $row->copyFile($dummy_file, $user, $mail, $properties['timestamp']);
+
+        return $row;
+    }
+
+    // 古いテンポラリメールデータを削除
+    // 登録してから2日経過したものが対象
+    function _deleteOldTemporaryMailDatas($span = 172800)
+    {
+        $now = time();
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login = $uum->getLoginUser();
+        $rowset
+            = new CB_RowSet(cb_class2table(GRN_MAIL_TEMPORARY_MESSAGE_TABLE));
+        $rowset->addCondition($rowset->queryf("col_user = '@S' AND col_timestamp < '@S'",
+            $login->getOID(), ($now - $span)));
+        $rowset->addOrderColumn('col_timestamp', false);
+        $rowset->addOrderColumn(null, false);
+        $rowset->deleteAllMatched(100);
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    // public method
+
+    /**
+     * X-Mailer文字列を生成する
+     *
+     * @return  string
+     */
+    function makeXMailer()
+    {
+        $x_mailer = GRN_MAIL_X_MAILER_PREFIX;
+
+        $app = $this->_utility->getMailApp();
+        $version = $app->getConfig('version');        // メーラーバージョン
+        if (is_string($version) && (strlen($version) > 0)) {
+            $x_mailer = $x_mailer . ' ' . $version;
+        }
+
+        return $x_mailer;
+    }
+
+    /**
+     * メールメッセージオブジェクトの作成
+     *
+     * @param CB_User             $user
+     *
+     * @param array               $properties           プロパティ
+     *                                                  $properties['subject']              標題
+     *                                                  $properties['data']                 本文
+     *                                                  $properties['html_data']            HTML本文
+     *                                                  $properties['from']                 From
+     *                                                  $properties['to']                   To
+     *                                                  $properties['cc']                   Cc
+     *                                                  $properties['bcc']                  Bcc
+     *                                                  $properties['in_reply_to']          In-Reply-To
+     *                                                  $properties['reply_to']             Reply-To
+     *                                                  $properties['confirmation_request'] 開封確認要求フラグ（戻りは自動的に自分）
+     *
+     * @param GRN_Mail_FileBody[] $file_rows            添付ファイルオブジェクトの配列
+     *
+     * @param array               $confirmation_content 開封確認情報
+     *                                                  $confirmation_content['final_recipient']    CB_MailAddress}
+     *                                                  $confirmation_content['disposition']        array
+     *                                                  $confirmation_content['option_field']       array
+     *
+     * @param string              $charset
+     *
+     * @return CB_MailMessage
+     */
+    function &composeMail(
+        $user,
+        & $properties,
+        & $file_rows,
+        $confirmation_content = null,
+        $charset = null
+    ) {
+        // メール使用停止設定チェック
+        $system_config = $this->_utility->getSystemConfig();
+        if ( ! $system_config->canUseMail()) {
+            cb_throw_error(E_GRN_MAIL_CANNOT_USE);
+        }
+
+        // メール作成クラス
+        $comp = new CB_MailComposer();
+        $comp->setSubject(CB_MailComposer::escapeHalfWidthKana($properties['subject'],
+            $charset));
+        $comp->setTextBody(CB_MailComposer::escapeHalfWidthKana($properties['data'],
+            $charset));
+
+        // HTML
+        if (array_key_exists('html_data', $properties)
+            && ! is_null($properties['html_data'])
+        ) {
+            $comp->setHTMLBody(CB_MailComposer::escapeHalfWidthKana($properties['html_data'],
+                $charset));
+        }
+
+        // From
+        $from_count = 0;
+        if (array_key_exists('from', $properties)
+            && ! is_null($properties['from'])
+        ) {
+            $from_list
+                =& CB_MailAddress::static_parse_list([$properties['from']]);
+            foreach (array_keys($from_list) as $key) {
+                $from_count++;
+                $from_address =& $from_list[$key];
+                $comp->setFrom($from_address);
+            }
+        }
+
+        if ($from_count == 0) {
+            // Fromが指定されていない
+            cb_throw_error(E_GRN_MAIL_FROM_IS_NOT_SPECIFIED);
+        }
+
+        require_once('fw/string_util.csp');
+
+        // Sender
+        if (array_key_exists('sender', $properties)
+            && ! is_null($properties['sender'])
+        ) {
+            $sender_list
+                =& CB_MailAddress::static_parse_list([$properties['sender']]);
+            foreach (array_keys($sender_list) as $key) {
+                $sender_address =& $sender_list[$key];
+                $comp->setHeader(new CB_MailHeader('Sender',
+                    CB_MailAddress::static_format($sender_address)));
+                break;  // 1つのみ
+            }
+        }
+
+        $address_count = 0;
+
+        // To
+        if (array_key_exists('to', $properties)
+            && ! is_null($properties['to'])
+        ) {
+            $to_list =& CB_MailAddress::static_parse_list([$properties['to']],
+                null, true, false, true);
+            foreach (array_keys($to_list) as $key) {
+                $address_count++;
+                $to_address =& $to_list[$key];
+                // Validation check E-mail Address
+                $this->_utility->checkEmailValid($to_address->address, true);
+                $comp->addTo($to_address);
+            }
+        }
+
+        // Cc
+        if (array_key_exists('cc', $properties)
+            && ! is_null($properties['cc'])
+        ) {
+            $cc_list =& CB_MailAddress::static_parse_list([$properties['cc']],
+                null, true, false, true);
+            foreach (array_keys($cc_list) as $key) {
+                $address_count++;
+                $cc_address =& $cc_list[$key];
+                // Validation check E-mail Address
+                $this->_utility->checkEmailValid($cc_address->address, true);
+                $comp->addCc($cc_address);
+            }
+        }
+
+        // Bcc
+        if (array_key_exists('bcc', $properties)
+            && ! is_null($properties['bcc'])
+        ) {
+            $bcc_list =& CB_MailAddress::static_parse_list([$properties['bcc']],
+                null, true, false, true);
+            foreach (array_keys($bcc_list) as $key) {
+                $address_count++;
+                $bcc_address =& $bcc_list[$key];
+                // Validation check E-mail Address
+                $this->_utility->checkEmailValid($bcc_address->address, true);
+                $comp->addBcc($bcc_address);
+            }
+        }
+
+        // references
+        if (array_key_exists('references', $properties)
+            && is_string($properties['references'])
+        ) {
+            $comp->setIdentificationFields('References',
+                $properties['references']);
+        }
+
+        if ($address_count == 0) {
+            // アドレスが指定されていない
+            cb_throw_error(E_GRN_MAIL_ADDRESS_IS_NOT_SPECIFIED);
+        }
+
+        // Reply-To
+        if (array_key_exists('reply_to', $properties)
+            && ! is_null($properties['reply_to'])
+        ) {
+            $reply_to_list
+                =& CB_MailAddress::static_parse_list([$properties['reply_to']]);
+            foreach (array_keys($reply_to_list) as $key) {
+                $reply_to_address =& $reply_to_list[$key];
+                $comp->addReplyTo($reply_to_address);
+            }
+        }
+
+        // In-Reply-To
+        if (array_key_exists('in_reply_to', $properties)
+            && ! is_null($properties['in_reply_to'])
+        ) {
+            $comp->setIdentificationFields('In-Reply-To',
+                $properties['in_reply_to']);
+        }
+
+        // X-Mailer
+        $x_mailer = $this->makeXMailer();
+        $comp->setHeader(new CB_MailHeader('X-Mailer', $x_mailer));
+
+        // Message-Id
+        if (isset($properties['message_id'])
+            && (strlen($properties['message_id']) > 0)
+        ) {
+            $comp->setIdentificationFields('Message-ID',
+                $properties['message_id']);
+        }
+
+        // 開封確認要求
+        if ($system_config->canUserUseConfirm()) {
+            $personal_config = $this->_utility->getPersonalConfig($user);
+            if ($personal_config->useConfirmMail()) {
+                if (array_key_exists('confirmation_request', $properties)
+                    && ! is_null($properties['confirmation_request'])
+                    && $properties['confirmation_request']
+                ) {
+                    //GRN2-1380
+                    if (isset($properties['api_confirm_reply_to'])
+                        && ! is_null($properties['api_confirm_reply_to'])
+                        && $properties['api_confirm_reply_to']
+                    ) {
+                        $notify_to_list
+                            =& CB_MailAddress::static_parse_list([$properties['api_confirm_reply_to']]);
+                    } else {
+                        // Fromに返すように要求
+                        $notify_to_list
+                            =& CB_MailAddress::static_parse_list([$properties['from']]);
+                    }
+                    //GRN2-1380
+                    foreach (array_keys($notify_to_list) as $key) {
+                        $notify_to_address =& $notify_to_list[$key];
+                        $comp->setDispositionNotificationTo($notify_to_address);
+                        break;
+                    }
+                }
+            }
+
+            // 開封通知パートを追加
+            if (is_array($confirmation_content)) {
+                if (isset($confirmation_content['final_recipient'])
+                    && isset($confirmation_content['disposition'])
+                    && isset($confirmation_content['option_field'])
+                ) {
+                    $comp->setDispositionNotification($confirmation_content['final_recipient'],
+                        $confirmation_content['disposition'],
+                        $confirmation_content['option_field']);
+                }
+            }
+        }
+
+        // 添付ファイル
+        if (is_array($file_rows) && (count($file_rows) > 0)) {
+            foreach (array_keys($file_rows) as $file_key) {
+                $file_row = $file_rows[$file_key];
+                if (is_object($file_row)) {
+                    $data
+                        = CB_ServerFileUtil::fileGetContents($file_row->getTmpName());
+                    $comp->addAttachFile($file_row->get('name'), $data,
+                        $file_row->getMIMEType());
+                }
+            }
+        }
+
+        $ret = $comp->getMailMessage();
+
+        return $ret;
+    }
+
+    /**
+     * メールの送信
+     *
+     * @param CB_User           $user          送信するユーザー
+     * @param string            $account_id    送信に使用するアカウントID
+     * @param array             $properties    プロパティ
+     *                                         $properties['subject']          標題
+     *                                         $properties['data']             本文
+     *                                         $properties['html_data']        HTML本文
+     *                                         $properties['from']             From
+     *                                         $properties['to']               To
+     *                                         $properties['cc']               Cc
+     *                                         $properties['bcc']              Bcc
+     *                                         $properties['sign_data']        署名
+     *                                         $properties['in_reply_to']      In-Reply-To
+     *                                         $properties['reply_to']         Reply-To
+     *                                         $properties['confirmation_req'] 開封確認要求フラグ（戻りは自分）
+     *                                         ...その他、GRN_Mail_Messageを参照のこと
+     * @param array             $files         添付ファイル（$_FILES)
+     * @param string|null       $draft_id
+     * @param string|null       $action        操作した内容（'reply-all' / 'reply' / 'forward' / 'reuse'）
+     * @param string|null       $origin_mid    返信/転送元のメールID
+     * @param string[]|null     $reuse_fids    再送信/転送元のファイル情報ID
+     * @param boolean           $b_save_object 送信メールをオブジェクトとして保存するするか(default:TRUE)
+     * @param boolean           $b_save_files  送信メールの添付ファイル実体を保存するか(default:TRUE)。$b_save_objectがFALSEの場合は無視
+     * @param boolean           $b_throw_error エラー発生時に例外をスローするか(default:TRUE)
+     * @param string|null       $locale        ロケール文字列またはnull（デフォルトロケールを使用する場合）
+     * @param bool              $b_tmp_files
+     * @param string|null       $position      mail signature position
+     * @param array|string|null $data
+     *
+     * @return string|bool $b_save_objectがTRUEの場合はオブジェクトID(string) or FALSEの場合は成否（boolean）
+     */
+    function sendMail(
+        & $user,
+        $account_id,
+        & $properties,
+        & $files,
+        $draft_id = null,
+        $action = null,
+        $origin_mid = null,
+        $reuse_fids = null,
+        $b_save_object = true,
+        $b_save_files = true,
+        $b_throw_error = true,
+        $locale = null,
+        $b_tmp_files = false,
+        $position = null,
+        $data = null
+    ) {
+        $connection_info = $this->openConnection($account_id);
+        $send_result = $this->sendMailSingle(
+            $connection_info,
+            $user,
+            $properties,
+            $files,
+            $draft_id,
+            $action,
+            $origin_mid,
+            $reuse_fids,
+            $b_save_object,
+            $b_save_files,
+            $b_throw_error,
+            $locale,
+            $b_tmp_files,
+            $position,
+            $data);
+        $this->closeConnection($connection_info);
+
+        return $send_result;
+    }
+
+    /**
+     * Connecting with mail server
+     *
+     * @param int     $account_id    mail account id
+     * @param boolean $b_throw_error throw error or not
+     *
+     * @return array|false
+     */
+    function openConnection($account_id, $b_throw_error = true, $timeout = null)
+    {
+        // メール使用停止設定チェック
+        $system_config = $this->_utility->getSystemConfig();
+        if ( ! $system_config->canUseMail()) {
+            if ($b_throw_error) {
+                cb_throw_error(E_GRN_MAIL_CANNOT_USE);
+            } else {
+                return false;
+            }
+        }
+
+        // メールアカウントデータを取得
+        $account = $system_config->_getAccountRow($account_id);
+        if (is_null($account)) {
+            if ($b_throw_error) {
+                cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+            } else {
+                return false;
+            }
+        }
+
+        $account_info =& $account->getAccountInfo();
+        if (is_null($account_info)) {
+            if ($b_throw_error) {
+                cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+            } else {
+                return false;
+            }
+        }
+
+        // POP before SMTP
+        // メールサーバーと接続
+        $connection_logic = $this->_utility->getConnectionLogic($account);
+        if ($connection_logic->connectToSmtpServer($timeout) !== true) {
+            // 接続失敗
+            if ($b_throw_error) {
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_CONNECT_SMTP_SERVER, null,
+                    ['cause' => $connection_logic->formatErrors()]);
+            } else {
+                return false;
+            }
+        }
+
+        return [
+            'connection'    => $connection_logic,
+            'account'       => $account,
+            'account_info'  => $account_info,
+            'system_config' => $system_config
+        ];
+    }
+
+    /**
+     * Closing connection with mail server
+     *
+     * @param array $connection_info
+     *
+     * @return void
+     */
+    function closeConnection($connection_info)
+    {
+        // サーバーから切断
+        if (isset($connection_info['connection'])) {
+            $connection_info['connection']->disconnectFromSmtpServer();
+        }
+    }
+
+
+    /**
+     * Sending single mail, using with openConnection and closeConnection
+     *
+     * @param array             $connection_info
+     * @param CB_User           $user          送信するユーザー
+     * @param array             $properties    プロパティ
+     *                                         $properties['subject']          標題
+     *                                         $properties['data']             本文
+     *                                         $properties['html_data']        HTML本文
+     *                                         $properties['from']             From
+     *                                         $properties['to']               To
+     *                                         $properties['cc']               Cc
+     *                                         $properties['bcc']              Bcc
+     *                                         $properties['sign_data']        署名
+     *                                         $properties['in_reply_to']      In-Reply-To
+     *                                         $properties['reply_to']         Reply-To
+     *                                         $properties['confirmation_req'] 開封確認要求フラグ（戻りは自分）
+     *                                         ...その他、GRN_Mail_Messageを参照のこと
+     * @param array             $files         添付ファイル（$_FILES)
+     * @param string|null       $draft_id
+     * @param string|null       $action        操作した内容（'reply-all' / 'reply' / 'forward' / 'reuse'）
+     * @param string|null       $origin_mid    返信/転送元のメールID
+     * @param string[]|null     $reuse_fids    再送信/転送元のファイル情報ID
+     * @param boolean           $b_save_object 送信メールをオブジェクトとして保存するするか(default:TRUE)
+     * @param boolean           $b_save_files  送信メールの添付ファイル実体を保存するか(default:TRUE)。$b_save_objectがFALSEの場合は無視
+     * @param boolean           $b_throw_error エラー発生時に例外をスローするか(default:TRUE)
+     * @param string|null       $locale        ロケール文字列またはnull（デフォルトロケールを使用する場合）
+     * @param bool              $b_tmp_files
+     * @param string|null       $position      mail signature position
+     * @param array|string|null $data
+     *
+     * @return array|string|bool Return if an error occurs and $connection_info['forward-auto'] is TRUE.
+     *                           The structure is as belows.
+     *                           $error['code'] string
+     *                           $error['diagnosis'] string
+     *                           $error['cause'] string
+     *
+     *                           Return string(object id) if $b_save_object is TRUE.
+     *                           Return bool(succeed or not) if $b_save_object is FALSE.
+     */
+    function sendMailSingle(
+        $connection_info,
+        & $user,
+        & $properties,
+        & $files,
+        $draft_id = null,
+        $action = null,
+        $origin_mid = null,
+        $reuse_fids = null,
+        $b_save_object = true,
+        $b_save_files = true,
+        $b_throw_error = true,
+        $locale = null,
+        $b_tmp_files = false,
+        $position = null,
+        $data = null
+    ) {
+        if ( ! $connection_info) {
+            return false;
+        }
+
+        $error = 0;
+        // checking forward auto
+        $isForwardAuto = isset($connection_info['forward-auto']) && $connection_info['forward-auto'] ? true : false;
+
+        $system_config = $connection_info['system_config'];
+        $connection_logic = $connection_info['connection'];
+        $account = $connection_info['account'];
+        $account_info = $connection_info['account_info'];
+
+        // メール使用停止設定チェック
+        assert('is_object( $user )');
+        assert('is_array( $properties )');
+
+
+        require_once('fw/string_util.csp');
+
+        if (isset($properties['to'])) {
+            if ( ! is_string($properties['to']) || (strlen($properties['to']) == 0)) {
+                unset($properties['to']);
+            } else {
+                $properties['to'] = cb_trim($properties['to']);
+            }
+        }
+
+        if (isset($properties['cc'])) {
+            if ( ! is_string($properties['cc']) || (strlen($properties['cc']) == 0) ) {
+                unset($properties['cc']);
+            } else {
+                $properties['cc'] = cb_trim($properties['cc']);
+            }
+        }
+
+        if (isset($properties['bcc'])) {
+            if ( ! is_string($properties['bcc']) || (strlen($properties['bcc']) == 0)) {
+                unset($properties['bcc']);
+            } else {
+                $properties['bcc'] = cb_trim($properties['bcc']);
+            }
+        }
+
+        if (( ! isset($properties['to']) || (strlen($properties['to']) == 0))
+            && ( ! isset($properties['cc']) || (strlen($properties['cc']) == 0))
+            && ( ! isset($properties['bcc']) || (strlen($properties['bcc']) == 0))
+        ) {
+            if ($isForwardAuto) {
+                $error = E_COMMON_MISSING_MANDATORY;
+            } elseif ($b_throw_error) {
+                cb_throw_error(E_COMMON_MISSING_MANDATORY);
+            } else {
+                return false;
+            }
+        }
+
+
+        if (isset($properties['to'])) {
+            // Validation check E-mail Address
+            $this->_utility->checkEmailValid($properties['to']);
+        }
+
+        if (isset($properties['cc'])) {
+            $this->_utility->checkEmailValid($properties['cc']);
+        }
+
+        if (isset($properties['bcc'])) {
+            $this->_utility->checkEmailValid($properties['bcc']);
+        }
+
+        $personal_config = $this->_utility->getPersonalConfig($user);
+
+        // サイズ制限取得
+        $user_id = $user->getOID();
+        $size_settings = null;
+        $system_config->getSizeUserLimitSetting($size_settings, $user_id);
+
+        // 総サイズチェック（上書きを除く）
+        $user_limit = $size_settings['user_limit_' . $user_id];
+        if ($user_limit > 0) {
+            $user_limit *= 1024 * 1024;     // MB -> Byte
+            $total_size = $personal_config->getMailSize(null);
+
+            // 総メールサイズチェック
+            $this->_utility->checkTotalSize($user_limit, $total_size);
+        }
+
+        $send_limit = $size_settings['send_limit_' . $user_id];
+        if ($send_limit > 0) {
+            $send_limit *= 1024;
+        }            // KB -> Byte
+
+        // --------------------------------------------------------------------
+        if ( ! array_key_exists('from', $properties)) {
+            if (is_null($account_info->email) || (strlen($account_info->email) == 0)) {
+                if ($isForwardAuto) {
+                    $error = E_COMMON_MISSING_MANDATORY;
+                } elseif ($b_throw_error) {
+                    cb_throw_error(E_COMMON_MISSING_MANDATORY);
+                } else {
+                    return false;
+                }
+            }
+
+            $from_name = $account_info->getFrom($user);
+            if ( ! is_null($from_name) && (mb_strlen($from_name) > 0)) {
+                $from_name = GRN_Mail_Utility::static_escapeDisplayName($from_name);
+                $temp_from = GRN_Mail_Utility::static_addNameQuotation($from_name, 'add');
+                $temp_from .= ' ' . GRN_Mail_Utility::static_addEmailBracket($account_info->email, 'add');
+                $properties['from'] = $temp_from;
+            } else {
+                $properties['from'] = $account_info->email;
+            }
+
+            $properties['from'] = cb_trim($properties['from']);
+            if (strlen($properties['from']) == 0) {
+                if ($isForwardAuto) {
+                    $error = E_COMMON_MISSING_MANDATORY;
+                } elseif ($b_throw_error) {
+                    cb_throw_error(E_COMMON_MISSING_MANDATORY);
+                } else {
+                    return false;
+                }
+            }
+        }
+
+        $size = 0;
+        $mail_body_size = 0;
+
+        $source_data = '';
+
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+
+        // 通信エラーの原因
+        $diagnosis = null;
+        $cause = null;
+
+        // メールデータテーブルにデータを追加
+        $table_name = grn_mail_get_personal_tablename($user->getOID(), GRN_MAIL_MESSAGE_TABLE);
+        $table = $this->_utility->getTableInfo($table_name);
+        /** @var GRN_Mail_Message $row */
+        $row = $table->newRow();
+        if ( ! is_object($row)) {
+            // データ追加失敗
+            $error = E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA;
+        }
+
+        if ( ! is_null($draft_id) && (strlen($draft_id) == 0)) {
+            $draft_id = null;
+        }
+
+        $draft_mail = null;
+        $origin_mail = null;
+        $mail_logic = $this->_utility->getMailLogic();
+        if ($error === 0) {
+            // 書きかけメールからの送信
+            if ( ! is_null($draft_id)) {
+                // 書きかけメール取得
+                $draft_mail =& $mail_logic->_getMailRow($draft_id);
+                if ( ! is_object($draft_mail)) {
+                    $error = E_GRN_MAIL_MAIL_DATA_NOT_FOUND;
+                } else {
+                    $action = $draft_mail->get('action');
+                    $origin_mail = $draft_mail->get('origin_mail');
+                    if (is_object($origin_mail)) {
+                        $origin_mid = $origin_mail->getOID();
+                    }
+                }
+            }
+
+            if ($error === 0) {
+                // 返信/転送元操作
+                if (is_string($action) && is_string($origin_mid) && ! is_object($origin_mail)) {
+                    // 返信/転送元のメール取得
+                    $origin_mail = $mail_logic->_getMailRow($origin_mid);
+                }
+
+                if (is_object($draft_mail)) {
+                    // 下書きメールから取得
+                    $properties['references'] = $draft_mail->get('references');
+                    $properties['in_reply_to'] = $draft_mail->get('in_reply_to');
+                } elseif (is_object($origin_mail)) {
+                    // 元メールから取得
+                    $origin_references = $origin_mail->get('references');
+                    $origin_message_id = $origin_mail->get('message_id');
+
+                    // 元メールのMessage-Id
+                    if (is_string($origin_message_id) && (strlen($origin_message_id) > 0) ) {
+                        // Referencesの先頭に追加
+                        if (strlen($origin_references) > 0) {
+                            $references = $origin_message_id . ' ' . $origin_references;
+                        } else {
+                            $references = $origin_message_id;
+                        }
+
+                        $properties['references'] = $references;
+
+                        // 返信操作
+                        if (($action == 'reply') || ($action == 'reply-all')) {
+                            // in-reply-to
+                            $in_reply_to = $isForwardAuto ? $origin_mail->get('in_reply_to') : $origin_message_id;
+                            $properties['in_reply_to'] = $in_reply_to;
+                        }
+                    }
+                }
+
+                // ロケール
+                if (is_null($locale)) {
+                    // ロケールの取得
+                    $i18n = CB_I18N::getInstance();
+                    $locale = $i18n->getCurrentLanguage();
+                }
+
+                // 添付ファイル
+                $file_rows = [];
+            }
+
+            if ($error === 0) {
+                if ( ! is_null($draft_id)) {
+                    // 書きかけメールから
+                    $this->_reuseFiles($user, $row, true, $action, $draft_mail,
+                        $reuse_fids, $send_limit, $size, $file_rows, $error,
+                        $diagnosis, $cause, $b_save_files);
+                } elseif (($action == 'forward') || ($action == 'reuse')) {
+                    // 送信メールから
+                    $this->_reuseFiles($user, $row, false, $action,
+                        $origin_mail, $reuse_fids, $send_limit, $size,
+                        $file_rows, $error, $diagnosis, $cause, $b_save_files);
+                }
+            }
+
+            if ($error === 0) {
+                if (is_array($files) && (count($files) > 0)) {
+                    $table_name = grn_mail_get_personal_tablename($user->getOID(), GRN_MAIL_FILEBODY_TABLE);
+                    $table = $this->_utility->getTableInfo($table_name);
+                    foreach (array_keys($files) as $fn) {
+                        if (is_array($files[$fn]) && isset($files[$fn]['error'])
+                            && $files[$fn]['error'] != UPLOAD_ERR_OK
+                        ) {
+                            continue;
+                        }
+
+                        // ファイルデータ追加
+                        $file_row = $table->newRow();
+                        if ( ! is_object($file_row)) {
+                            // エラー
+                            $error = E_GRN_MAIL_FAILED_TO_ADD_FILE_DATA;
+                            break;
+                        }
+
+                        $file_row->set('mail', $row);
+                        $file_row->set('user', $user);
+
+                        // サイズチェック
+                        if (is_array($files[$fn])) {
+                            $file_size = $files[$fn]['size'];
+                        } elseif (is_a($files[$fn], 'CB_ServerFile')) {
+                            $file_size = $files[$fn]->get('size');
+                        } else {
+                            assert('is_string( $files[$fn] )');
+                            $file_size = filesize($files[$fn]);
+                        }
+
+                        if (($send_limit > 0) && ($file_size > $send_limit)) {
+                            $error = E_GRN_MAIL_SEND_LIMIT;
+                            if ($send_limit >= 1048576) {
+                                $send_limit_for_view = ($send_limit / 1048576) . 'MB';
+                            } elseif ($send_limit >= 1024) {
+                                $send_limit_for_view = ($send_limit / 1024) . 'KB';
+                            } else {
+                                $send_limit_for_view = $send_limit . 'byte';
+                            }
+                            $diagnosis = ['limit' => $send_limit_for_view];
+                            $cause = ['limit' => $send_limit_for_view];
+                            break;
+                        }
+
+                        $size += $file_size;
+                        $file_row->copyFile($files[$fn], $user, $row, $ts);
+                        $file_row->registerNow();
+                        if ($b_tmp_files) {
+                            // 送信メールを作成するとき、一時添付ファイルを参照する
+                            $file_rows[$file_row->getOID()] =& $files[$fn];
+                        } else {
+                            $file_rows[$file_row->getOID()] = clone $file_row;
+                        }
+                    }
+
+                    if (($error === 0) && (count($file_rows) > 0)) {
+                        $row->set('attached', true);
+                    }
+                }
+            }
+        }
+
+        if ($error === 0) {
+            if ($position === null || $position == "") {
+                $position = "bottom";
+            }
+
+            // 署名を本文に追加
+            if (array_key_exists('sign_data', $properties)) {
+                if (is_string($properties['sign_data']) && 0 < strlen($properties['sign_data'])) {
+                    if (strtolower($position) == "bottom" || is_null($action) || $action == "reuse") {
+                        if (strlen($properties['data']) > 0) {
+                            $properties['data'] .= "\r\n";
+                        }
+
+                        // 署名を本文に追加
+                        $properties['data'] .= $properties['sign_data'];
+                    } else {
+                        if ( ! is_null($data) && ! is_array($data)) {
+                            $properties['data'] = ! $isForwardAuto && isset($properties['html_data'])
+                                ? grn_strip_tags($data)
+                                : $data;
+                        }
+                    }
+
+                }
+            }
+
+            // 本文禁則処理
+            require_once('grn/word_util.csp');
+            $fold_words = new GRN_FoldWords;
+            $fold_words->setLineWidth(GRN_MAIL_LINE_WIDTH);
+            $fold_words->setExtendNum(0);
+            $fold_words->setShortenNum(0);
+            $properties['data'] = $fold_words->fold($properties['data']);
+
+            // サイズ
+            $mail_body_size = strlen($properties['data']);
+            $size += $mail_body_size;
+            if (array_key_exists('html_data', $properties)) {
+                if (strtolower($position) == "bottom" || is_null($action) || $action == "reuse") {
+                    $properties['html_data'] .= '<br>';
+                    if (array_key_exists('sign_data', $properties)) {
+                        $properties['html_data'] .= nl2br(htmlspecialchars($properties['sign_data']));
+                    }
+                } else {
+                    if ( ! is_null($data)) {
+                        if (is_array($data)) {
+                            $properties['html_data'] = $data['data'];
+                            $properties['data'] = $data['data_plain_text'];
+                        } else {
+                            $properties['html_data'] = $data;
+                        }
+                    }
+                }
+
+                // HTML本文禁則処理
+                $fold_words->setShortenNum(GRN_MAIL_LINE_WIDTH);
+                $fold_words->setWordWrap('');
+                $fold_words->setEscapeMeta('.\!+*?[]^$()=!|:');
+                $fold_words->setNoEnd($fold_words->getNoEnd() . '<');
+                $properties['html_data'] = $fold_words
+                    ->fold(mb_ereg_replace("<[^<.]+>", "\\0\n", $properties['html_data']));
+                $size += strlen($properties['html_data']);
+            }
+
+            // サイズチェック
+            if (($send_limit > 0) && ($size > $send_limit)) {
+                $error = E_GRN_MAIL_SEND_LIMIT;
+                if ($send_limit >= 1048576) {
+                    $send_limit_for_view = ($send_limit / 1048576) . 'MB';
+                } elseif ($send_limit >= 1024) {
+                    $send_limit_for_view = ($send_limit / 1024) . 'KB';
+                } else {
+                    $send_limit_for_view = $send_limit . 'byte';
+                }
+
+                $diagnosis = ['limit' => $send_limit_for_view];
+                $cause = ['limit' => $send_limit_for_view];
+            }
+        }
+
+        // Message-Id
+        $message_id = cb_mail_create_message_id();
+        $properties['message_id'] = $message_id;
+
+        if ($error === 0) {
+            $general_settings = null;
+            $personal_config->getGeneralSetting($general_settings);
+
+            // メールメッセージオブジェクトの作成
+            $charset = $general_settings['charset'] ?? null; //Avoid PHP notice.
+            $mailMessage =& $this->composeMail($user, $properties, $file_rows, null, $charset);
+            if ( ! is_object($mailMessage)) {
+                // メールメッセージの作成に失敗
+                $error = E_GRN_MAIL_FAILED_TO_CREATE_MAIL_MESSAGE;
+            }
+
+            // 文字コードを設定
+            if (strcmp($general_settings['charset'], 'auto') != 0) {
+                $mailMessage->setForceEncoding($general_settings['charset']);
+            }
+
+            require_once('fw/i18n.csp');
+            $i18n = CB_I18N::getInstance();
+            $locale = $i18n->getCurrentLanguage();
+            $source_data =& $mailMessage->getSourceData($locale, CB_MAIL_ENC_B, true);
+            $size = strlen($source_data);
+
+            // サイズチェック
+            if (($send_limit > 0) && ($size > $send_limit)) {
+                $error = E_GRN_MAIL_SEND_LIMIT;
+                if ($send_limit >= 1048576) {
+                    $send_limit_for_view = ($send_limit / 1048576) . 'MB';
+                } elseif ($send_limit >= 1024) {
+                    $send_limit_for_view = ($send_limit / 1024) . 'KB';
+                } else {
+                    $send_limit_for_view = $send_limit . 'byte';
+                }
+                $diagnosis = ['limit' => $send_limit_for_view];
+                $cause = ['limit' => $send_limit_for_view];
+            }
+        }
+
+        if ($error === 0) {
+            // 一旦全てのエラーをクリア
+            $connection_logic->clearErrors();
+
+            // メールを送信キューに登録
+            $mailMessages = [$mailMessage];
+            if ($connection_logic->sendMailToSmtpServer($mailMessages, $locale) != count($mailMessages)) {
+                // メール送信失敗
+                $error = E_GRN_MAIL_FAILED_TO_SEND_MAIL;
+                $cause = ['cause' => $connection_logic->formatErrors()];
+            }
+        }
+
+        if ($error === 0) {
+            $properties['timestamp'] = $ts;
+            $properties['send_ts'] = $ts;
+            $properties['read_ts'] = $ts;
+            $properties['sent'] = true;
+
+            // メールデータの初期化
+            if ($row->initialize($user, $properties) === false) {
+                // データ追加失敗
+                $error = E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA;
+            }
+        }
+
+        if ($error === 0) {
+            // 開封確認
+            if ($system_config->canUserUseConfirm()) {
+                if (isset($properties['confirmation_request'])
+                    && ! is_null($properties['confirmation_request'])
+                    && $properties['confirmation_request']
+                ) {
+                    $row->setConfirmationRequest();
+
+                    // 開封確認要求テーブルに追加
+                    $mail_logic->_addConfirmRequestRow($user, $row);
+                }
+            }
+
+            //$row->set( 'charset', cb_mail_get_charset( $locale ) );
+
+            // 送信箱
+            $folder_logic = $this->_utility->getFolderLogic();
+            $folder = $folder_logic->_getSpecialFolderRow($account, GRN_MAIL_FOLDER_CODE_SENTBOX);
+            $row->moveFolder($folder);
+
+            // 返信/転送元操作
+            if (is_object($origin_mail)) {
+                // 返信/転送元のメール取得
+                $row->set('origin_mail', $origin_mail);
+
+                // 返信/転送元に操作をセット
+                $origin_mail->set('action', $action);
+
+
+                // スレッド処理
+            }
+
+            $row->updateNow();
+
+            // メールを実際に送信
+            if ($connection_logic->commitSmtpServer() != true) {
+                // メール送信失敗
+                $error = E_GRN_MAIL_FAILED_TO_SEND_MAIL;
+            }
+        }
+
+
+        // エラー発生
+        if ($error !== 0) {
+            // return error
+            if ($isForwardAuto) {
+                return [
+                    'code'      => $error,
+                    'diagnosis' => $diagnosis,
+                    'cause'     => $cause
+                ];
+            } else {
+                // 処理中断
+                $connection_logic->abortSmtpServer();
+                if ($b_throw_error) {
+                    cb_throw_error($error, $diagnosis, $cause);
+                } else {
+                    return false;
+                }
+            }
+
+        }
+
+        if ($b_save_object) {
+            $save_mail_source = true;
+
+            if ( ! $b_save_files) {
+                // 送信メールの添付ファイルを保存しない
+                $row->deleteFileBodyFiles();
+
+                // 添付ファイルがあるが、保存しない
+                if (count($file_rows) > 0) {
+                    $save_mail_source = false;
+                }
+            }
+
+            // メールソースの保存
+            if ($save_mail_source) {
+                $mail_logic->_saveSourceFile($user, $row, $source_data);
+            } else {
+                // 本文をメールサイズとする
+                $size = $mail_body_size;
+            }
+
+            // メールサイズセット
+            $row->set('size', $size);
+
+            // アカウントのメールサイズを更新
+            //$account->setMailSize( $account->getMailSize() + $size );
+            $mail_size = $account->getMailSize();
+            $mail_size = bcadd($mail_size, $size);
+            $account->setMailSize($mail_size);
+            $account->updateNow();
+
+            // 送受信記録を使用する設定
+            if ($system_config->canUserUseHistory()) {
+                $address_history_logic = $this->_utility->getAddressHistoryLogic();
+            }
+
+            $row->runArticleHook('create');
+
+            //Full Text Search
+            if (FtsApplication::isAvailable()) {
+                $searchService = new IndexService();
+                $searchService->createMessageIndex($row);
+                $fileBodyRowSet = $row->getFileBodyRowSet();
+                while ($fileBodyRow = $fileBodyRowSet->iterate()) {
+                    if ( ! is_null($fileBodyRow->get('blob'))) {
+                        $searchService->createSendFileIndex($fileBodyRow);
+                    }
+                }
+            }
+
+            return $row->getOID();
+        }
+
+        $row->delete();
+
+        return true;
+    }
+
+    /**
+     * プレビューからのメールの送信
+     *
+     * @param CB_User           $user         送信するユーザー
+     * @param string            $tmpid        一時メールデータID
+     * @param boolean           $b_save_files 送信メールの添付ファイル実体を保存するか(default:TRUE)
+     * @param string|null       $locale       ロケール文字列またはnull（デフォルトロケールを使用する場合）
+     * @param string|null       $position     mail signature position
+     * @param array|string|null $data
+     *
+     * @return string  オブジェクトID
+     */
+    function sendPreviewMail(
+        & $user,
+        $tmpid,
+        $b_save_files = true,
+        $locale = null,
+        $position = null,
+        $data = null
+    ) {
+        // メール使用停止設定チェック
+        $system_config = $this->_utility->getSystemConfig();
+        if ( ! $system_config->canUseMail()) {
+            cb_throw_error(E_GRN_MAIL_CANNOT_USE);
+        }
+
+        assert('is_object( $user )');
+        assert('is_string( $tmpid )');
+
+        $mail_logic = $this->_utility->getMailLogic();
+        $preview_mail = $mail_logic->_getTemporaryMailRow($tmpid);
+        if (is_null($preview_mail)) {
+            cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+        }
+
+        // メールアカウントデータを取得
+        $account = $preview_mail->get('temp_account');
+        if ( ! is_object($account)) {
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+
+        $account_info = $account->getAccountInfo();
+        if (is_null($account_info)) {
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+
+        $properties = [];
+
+        require_once('fw/string_util.csp');
+
+        // from
+        if (is_null($account_info->email)
+            || (strlen($account_info->email) == 0)
+        ) {
+            // 必須項目エラー
+            cb_throw_error(E_COMMON_MISSING_MANDATORY);
+        }
+
+        $from_name = $account_info->getFrom($user);
+        if ( ! is_null($from_name) && (mb_strlen($from_name) > 0)) {
+            $from_name = GRN_Mail_Utility::static_escapeDisplayName($from_name);
+            $properties['from']
+                = GRN_Mail_Utility::static_addNameQuotation($from_name,
+                'add');
+            if (strlen($properties['from']) > 0) {
+                $properties['from'] .= ' ';
+            }
+
+            $properties['from'] .= GRN_Mail_Utility::static_addEmailBracket($account_info->email,
+                'add');
+        } else {
+            $properties['from'] = $account_info->email;
+        }
+
+        if (strlen($properties['from']) == 0) {
+            // 必須項目エラー
+            cb_throw_error(E_COMMON_MISSING_MANDATORY);
+        }
+
+        // 宛先
+        $properties['to'] = $preview_mail->get('to');
+        if (is_string($properties['to']) && (strlen($properties['to']) > 0)) {
+            $properties['to'] = cb_trim($properties['to']);
+        }
+
+        $properties['cc'] = $preview_mail->get('cc');
+        if (is_string($properties['cc']) && (strlen($properties['cc']) > 0)) {
+            $properties['cc'] = cb_trim($properties['cc']);
+        }
+
+        $properties['bcc'] = $preview_mail->get('bcc');
+        if (is_string($properties['bcc']) && (strlen($properties['bcc']) > 0)) {
+            $properties['bcc'] = cb_trim($properties['bcc']);
+        }
+
+        if ((strlen($properties['to']) == 0) && (strlen($properties['cc']) == 0)
+            && (strlen($properties['bcc']) == 0)
+        ) {
+            // 必須項目エラー
+            cb_throw_error(E_COMMON_MISSING_MANDATORY);
+        }
+
+        if (isset($properties['to'])) {
+            // Validation check E-mail Address
+            $this->_utility->checkEmailValid($properties['to']);
+        }
+
+        if (isset($properties['cc'])) {
+            $this->_utility->checkEmailValid($properties['cc']);
+        }
+
+        if (isset($properties['bcc'])) {
+            $this->_utility->checkEmailValid($properties['bcc']);
+        }
+
+        $properties['subject'] = $preview_mail->get('subject');
+
+        $personal_config = $this->_utility->getPersonalConfig($user);
+
+        // サイズ制限取得
+        $user_id = $user->getOID();
+        $system_config->getSizeUserLimitSetting($size_settings, $user_id);
+
+        // 総サイズチェック（上書きを除く）
+        $user_limit = $size_settings['user_limit_' . $user_id];
+        if ($user_limit > 0) {
+            $user_limit *= 1024 * 1024;     // MB -> Byte
+            $total_size = $personal_config->getMailSize(null);
+
+            // 総メールサイズチェック
+            $this->_utility->checkTotalSize($user_limit, $total_size);
+        }
+
+        $send_limit = $size_settings['send_limit_' . $user_id];
+        if ($send_limit > 0) {
+            $send_limit *= 1024;
+        }            // KB -> Byte
+
+
+        // --------------------------------------------------------------------
+
+        $size = 0;
+        $mail_body_size = 0;
+        $error = 0;
+        $source_data = '';
+
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+
+        // 通信エラーの原因
+        $diagnosis = null;
+        $cause = null;
+
+        ////////////////////////////////////////////////////////////////////////
+
+        // POP before SMTP
+
+
+        // メールサーバーと接続
+        $connection_logic = $this->_utility->getConnectionLogic($account);
+        if ($connection_logic->connectToSmtpServer() !== true) {
+            // 接続失敗
+            cb_throw_error(E_GRN_MAIL_FAILED_TO_CONNECT_SMTP_SERVER, null,
+                ['cause' => $connection_logic->formatErrors()]);
+        }
+
+        // メールデータテーブルにデータを追加
+        $table_name = grn_mail_get_personal_tablename($user->getOID(),
+            GRN_MAIL_MESSAGE_TABLE);
+        $table = $this->_utility->getTableInfo($table_name);
+        /** @var GRN_Mail_Message $row */
+        $row = $table->newRow();
+        if ( ! is_object($row)) {
+            // データ追加失敗
+            $error = E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA;
+        }
+
+        if ($error === 0) {
+            $action = $preview_mail->get('action');
+            $properties['references'] = $preview_mail->get('references');
+            $properties['in_reply_to'] = $preview_mail->get('in_reply_to');
+
+            // ロケール
+            if (is_null($locale)) {
+                // ロケールの取得
+                $i18n = CB_I18N::getInstance();
+                $locale = $i18n->getCurrentLanguage();
+            }
+
+            // 添付ファイル
+            $file_rows = [];
+
+            if ($error === 0) {
+                $reuse_fids = [];
+                $filebody_rowset = $preview_mail->getFileBodyRowSet();
+                $filebody_rowset->setOidOnly();
+                while ( ! is_null($filebody_id = $filebody_rowset->iterate())) {
+                    $reuse_fids[] = $filebody_id;
+                }
+                $filebody_rowset->destroy();
+
+                // 一時メールから
+                if (count($reuse_fids) > 0) {
+                    $this->_reuseFiles($user, $row, true, null, $preview_mail,
+                        $reuse_fids, $send_limit, $size, $file_rows, $error,
+                        $diagnosis, $cause, $b_save_files);
+                }
+
+                $row->set('attached', count($file_rows) > 0);
+            }
+        }
+
+        if ($error === 0) {
+            // 本文
+            $properties['data'] = $preview_mail->get('data');
+            $properties['html_data'] = $preview_mail->get('html_data');
+
+            // 署名本文
+            $sign_data = $preview_mail->get('sign_data');
+            if ($position === null || $position == "") {
+                $position = "bottom";
+            }
+            if (is_string($sign_data) && 0 < strlen($sign_data)) {
+                if (strtolower($position) == "bottom"
+                    || is_null($preview_mail->get('action'))
+                    || $preview_mail->get('action') == "reuse"
+                ) {
+                    if (strlen($properties['data']) > 0) {
+                        $properties['data'] .= "\r\n";
+                    }
+
+                    // 署名を本文に追加
+                    $properties['data'] .= $sign_data;
+                }//top
+                else {
+                    if ( ! is_null($data) && ! is_array($data)) {
+                        $properties['data'] = $data;
+                    }
+                }
+
+                if (isset($properties['html_data'])
+                    &&
+                    ! is_null($properties['html_data'])
+                ) {
+
+
+                    if (strtolower($position) == "bottom"
+                        || is_null($preview_mail->get('action'))
+                        || $preview_mail->get('action') == "reuse"
+                    ) {
+                        $properties['html_data'] .= nl2br(htmlspecialchars($sign_data));
+                    } else {
+                        if ( ! is_null($data)) {
+                            if (is_array($data)) {
+                                $properties['html_data'] = $data['data'];
+                                $properties['data']
+                                    = $data['data_plain_text'];
+                            } else {
+                                $properties['html_data'] = $data;
+                            }
+                        }
+                    }
+
+                }
+            }
+
+            // 本文禁則処理
+            require_once('grn/word_util.csp');
+            $fold_words = new GRN_FoldWords;
+            $fold_words->setLineWidth(GRN_MAIL_LINE_WIDTH);
+            $fold_words->setExtendNum(0);
+            $fold_words->setShortenNum(0);
+            $properties['data'] = $fold_words->fold($properties['data']);
+
+            // サイズ
+            $mail_body_size = strlen($properties['data']);
+            $size += $mail_body_size;
+            if (isset($properties['html_data'])
+                && ! is_null($properties['html_data'])
+            ) {
+                $properties['html_data'] = '<html><body>'
+                                           . $properties['html_data']
+                                           . '</body></html>';
+                // HTML本文禁則処理
+                $fold_words->setShortenNum(GRN_MAIL_LINE_WIDTH);
+                $fold_words->setWordWrap('');
+                $fold_words->setEscapeMeta('.\!+*?[]^$()=!|:');
+                $fold_words->setNoEnd($fold_words->getNoEnd() . '<');
+                $properties['html_data']
+                    = $fold_words->fold(mb_ereg_replace("<[^<.]+>", "\\0\n",
+                    $properties['html_data']));
+                $size += strlen($properties['html_data']);
+            }
+
+            // サイズチェック
+            if (($send_limit > 0) && ($size > $send_limit)) {
+                $error = E_GRN_MAIL_SEND_LIMIT;
+                if ($send_limit >= 1048576) {
+                    $send_limit_for_view = ($send_limit / 1048576) . 'MB';
+                } elseif ($send_limit >= 1024) {
+                    $send_limit_for_view = ($send_limit / 1024) . 'KB';
+                } else {
+                    $send_limit_for_view = $send_limit . 'byte';
+                }
+                $diagnosis = ['limit' => $send_limit_for_view];
+                $cause = ['limit' => $send_limit_for_view];
+            }
+        }
+
+        // 開封確認
+        if ($system_config->canUserUseConfirm()
+            && $personal_config->useConfirmMail()
+        ) {
+            $properties['confirmation_request']
+                = $preview_mail->get('confirmation_request');
+        }
+
+        // Message-Id
+        $message_id = cb_mail_create_message_id();
+        $properties['message_id'] = $message_id;
+
+        if ($error === 0) {
+            $general_settings = null;
+            $personal_config->getGeneralSetting($general_settings);
+
+            // メールメッセージオブジェクトの作成
+            $charset = $general_settings['charset'] ??
+                       null; //Avoid PHP notice.
+            $mailMessage =& $this->composeMail($user, $properties, $file_rows,
+                null, $charset);
+            if ( ! is_object($mailMessage)) {
+                // メールメッセージの作成に失敗
+                $error = E_GRN_MAIL_FAILED_TO_CREATE_MAIL_MESSAGE;
+            }
+
+            // 文字コードを設定
+            if (strcmp($general_settings['charset'], 'auto') != 0) {
+                $mailMessage->setForceEncoding($general_settings['charset']);
+            }
+
+            require_once('fw/i18n.csp');
+            $i18n = CB_I18N::getInstance();
+            $locale = $i18n->getCurrentLanguage();
+            $source_data =& $mailMessage->getSourceData($locale, CB_MAIL_ENC_B,
+                true);
+            $size = strlen($source_data);
+
+            // サイズチェック
+            if (($send_limit > 0) && ($size > $send_limit)) {
+                $error = E_GRN_MAIL_SEND_LIMIT;
+                if ($send_limit >= 1048576) {
+                    $send_limit_for_view = ($send_limit / 1048576) . 'MB';
+                } elseif ($send_limit >= 1024) {
+                    $send_limit_for_view = ($send_limit / 1024) . 'KB';
+                } else {
+                    $send_limit_for_view = $send_limit . 'byte';
+                }
+                $diagnosis = ['limit' => $send_limit_for_view];
+                $cause = ['limit' => $send_limit_for_view];
+            }
+        }
+
+        if ($error === 0) {
+            // 一旦全てのエラーをクリア
+            $connection_logic->clearErrors();
+
+            // メールを送信キューに登録
+            $mailMessages = [$mailMessage];
+            if ($connection_logic->sendMailToSmtpServer($mailMessages, $locale)
+                != count($mailMessages)
+            ) {
+                // メール送信失敗
+                $error = E_GRN_MAIL_FAILED_TO_SEND_MAIL;
+                $cause = ['cause' => $connection_logic->formatErrors()];
+            }
+        }
+
+        if ($error === 0) {
+            $properties['timestamp'] = $ts;
+            $properties['send_ts'] = $ts;
+            $properties['read_ts'] = $ts;
+            $properties['sent'] = true;
+
+            // メールデータの初期化
+            if ($row->initialize($user, $properties) === false) {
+                // データ追加失敗
+                $error = E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA;
+            }
+        }
+
+        if ($error === 0) {
+            // 開封確認
+            if ($system_config->canUserUseConfirm()) {
+                $confirmation_request
+                    = $preview_mail->get('confirmation_request');
+                if ( ! is_null($confirmation_request)
+                     && $confirmation_request
+                ) {
+                    $row->setConfirmationRequest();
+
+                    // 開封確認要求テーブルに追加
+                    $mail_logic->_addConfirmRequestRow($user, $row);
+                }
+            }
+
+            //$row->set( 'charset', cb_mail_get_charset( $locale ) );
+
+            // 送信箱
+            $folder_logic = $this->_utility->getFolderLogic();
+            $folder = $folder_logic->_getSpecialFolderRow($account,
+                GRN_MAIL_FOLDER_CODE_SENTBOX);
+            $row->moveFolder($folder);
+
+            // ステータスをセット
+            require_once('mail/resources.csp');
+            require_once('mail/status.csp');
+            $status = grn_mail_get_status_row(GRN_MAIL_STATUS_CODE_DEFAULT);
+            $row->set('status', $status->getOID());
+
+            // 返信/転送元操作
+            $origin_mail = $preview_mail->get('origin_mail');
+            if (is_object($origin_mail)) {
+                // 返信/転送元のメール取得
+                $row->set('origin_mail', $origin_mail);
+
+                // 返信/転送元に操作をセット
+                $origin_mail->set('action', $action);
+
+
+                // スレッド処理
+            }
+
+            $row->updateNow();
+
+            // メールを実際に送信
+            if ($connection_logic->commitSmtpServer() != true) {
+                // メール送信失敗
+                $error = E_GRN_MAIL_FAILED_TO_SEND_MAIL;
+            }
+        }
+
+        // エラー発生
+        if ($error !== 0) {
+            // 処理中断
+            $connection_logic->abortSmtpServer();
+            cb_throw_error($error, $diagnosis, $cause);
+        }
+
+        // サーバーから切断
+        $connection_logic->disconnectFromSmtpServer();
+
+        $save_mail_source = true;
+
+        if ( ! $b_save_files) {
+            // 送信メールの添付ファイルを保存しない
+            $row->deleteFileBodyFiles();
+
+            // 添付ファイルがあるが、保存しない
+            if (count($file_rows) > 0) {
+                $save_mail_source = false;
+            }
+        }
+
+        // メールソースの保存
+        if ($save_mail_source) {
+            $mail_logic->_saveSourceFile($user, $row, $source_data);
+        } else {
+            // 本文をメールサイズとする
+            $size = $mail_body_size;
+        }
+
+        // メールサイズセット
+        $row->set('size', $size);
+
+        // アカウントのメールサイズを更新
+        $mail_size = $account->getMailSize();
+        $mail_size = bcadd($mail_size, $size);
+        $account->setMailSize($mail_size);
+        $account->updateNow();
+
+        // 送受信記録を使用する設定
+        if ($system_config->canUserUseHistory()) {
+            $address_history_logic = $this->_utility->getAddressHistoryLogic();
+        }
+
+        $row->runArticleHook('create');
+
+        //Full Text Search
+        if (FtsApplication::isAvailable()) {
+            $searchService = new IndexService();
+            $searchService->createMessageIndex($row);
+            $fileBodyRowSet = $row->getFileBodyRowSet();
+            /** @var GRN_Mail_FileBody $fileBodyRow */
+            while ($fileBodyRow = $fileBodyRowSet->iterate()) {
+                if ( ! is_null($fileBodyRow->get('blob'))) {
+                    $searchService->createSendFileIndex($fileBodyRow);
+                }
+            }
+        }
+        $this->_utility->addIncrementalSearch($properties['to'],
+            $properties['cc'], $properties['bcc']);
+
+        return $row->getOID();
+    }
+
+    /**
+     * 送信メールソースの保存
+     *
+     * @param CB_User          $user
+     * @param GRN_Mail_Message $mail_row
+     * @param CB_MailMessage   $mailMessage
+     * @param int              $size   メールソースサイズ
+     * @param string|null      $locale ロケール (default:null)
+     */
+    function _saveMailSource(
+        & $user,
+        & $mail_row,
+        & $mailMessage,
+        & $size,
+        $locale = null
+    ) {
+        if (is_null($locale)) {
+            require_once('fw/i18n.csp');
+            $i18n = CB_I18N::getInstance();
+            $locale = $i18n->getCurrentLanguage();
+        }
+
+        $mail_logic = $this->_utility->getMailLogic();
+        $source_data =& $mailMessage->getSourceData($locale);
+        $size = strlen($source_data);
+        $mail_logic->_saveSourceFile($user, $mail_row, $source_data);
+    }
+
+    /**
+     * メールの書きかけ保存
+     *
+     * @param CB_User           $user       送信するユーザー
+     * @param string            $account_id 送信に使用するアカウントID
+     * @param array             $properties プロパティ
+     *                                      $properties['subject']          標題
+     *                                      $properties['data']             本文
+     *                                      $properties['html_data']        HTML本文
+     *                                      $properties['sign_id']          署名ID
+     *                                      $properties['sign_data']        署名本文
+     *                                      $properties['to']               To
+     *                                      $properties['cc']               Cc
+     *                                      $properties['bcc']              Bcc
+     *                                      $properties['in_reply_to']      In-Reply-To
+     *                                      $properties['reply_to']         Reply-To
+     *                                      $properties['confirmation_req'] 開封確認要求フラグ
+     *                                      ...その他、GRN_Mail_Messageを参照のこと
+     * @param array             $files      添付ファイル（$_FILES)
+     * @param string|null       $preview_id 上書きするプレビュー用一時メールID or プレビューでない場合はnull
+     * @param string|null       $draft_id   上書きするドラフトID or 新規の場合はnull
+     * @param string|null       $action     操作した内容（'reply-all' / 'reply' / 'forward'） or null
+     * @param string|null       $origin_mid 返信/転送/再送信元のメールID or null
+     * @param string[]|null     $reuse_fids 再送信/転送元のファイル情報ID
+     * @param string|null       $locale     ロケール文字列またはnull（デフォルトロケールを使用する場合）
+     * @param CB_TimeStamp|null $save_ts
+     *
+     * @return string  オブジェクトID
+     */
+    function saveMail(
+        & $user,
+        $account_id,
+        & $properties,
+        & $files,
+        $preview_id = null,
+        $draft_id = null,
+        $action = null,
+        $origin_mid = null,
+        $reuse_fids = null,
+        $locale = null,
+        $save_ts = null
+    ) {
+        // メール使用停止設定チェック
+        $system_config = $this->_utility->getSystemConfig();
+        if ( ! $system_config->canUseMail()) {
+            cb_throw_error(E_GRN_MAIL_CANNOT_USE);
+        }
+
+        assert('is_object( $user )');
+        assert('is_array( $properties )');
+
+        // メールアカウントデータを取得
+        $account = $system_config->_getAccountRow($account_id);
+        if (is_null($account)) {
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+
+        $account_info = $account->getAccountInfo();
+        if (is_null($account_info)) {
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+
+        if ( ! array_key_exists('subject', $properties)) {
+            // 必須項目エラー
+            $properties['subject'] = '';
+        }
+
+        if ( ! is_null($preview_id) && (strlen($preview_id) == 0)) {
+            $preview_id = null;
+        }
+
+        if ( ! is_null($draft_id) && (strlen($draft_id) == 0)) {
+            $draft_id = null;
+        }
+
+        $personal_config = $this->_utility->getPersonalConfig($user);
+
+        // サイズ制限取得
+        $user_id = $user->getOID();
+        $system_config->getSizeUserLimitSetting($size_settings, $user_id);
+
+        // 総サイズチェック（上書きを除く）
+        $user_limit = $size_settings['user_limit_' . $user_id];
+        if (($user_limit > 0) && is_null($draft_id)) {
+            $user_limit *= 1024 * 1024;     // MB -> Byte
+            $total_size = $personal_config->getMailSize(null);
+
+            // 総メールサイズチェック
+            $this->_utility->checkTotalSize($user_limit, $total_size);
+        }
+
+        require_once('fw/string_util.csp');
+
+        $size = 0;
+
+        $ts = null;
+        if (is_object($save_ts) && is_a($save_ts, 'CB_TimeStamp')) {
+            $ts = $save_ts;
+        } else {
+            if (array_key_exists('send_ts', $properties)) {
+                $ts = $properties['send_ts'];
+            }
+            if ( ! is_object($ts) || ! is_a($ts, 'CB_TimeStamp')) {
+                require_once('fw/date.csp');
+                $ts = new CB_TimeStampEx();
+            }
+        }
+
+        ////////////////////////////////////////////////////////////////////////
+
+        $row = null;
+        $preview_mail = null;
+        $draft_mail = null;
+        $origin_mail = null;
+        $mail_logic = $this->_utility->getMailLogic();
+
+        // プレビューの保存
+        if ( ! is_null($preview_id)) {
+            // 一時メール取得
+            $preview_mail = $mail_logic->_getTemporaryMailRow($preview_id);
+            if ( ! is_object($preview_mail)) {
+                cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+            }
+
+            $action = $preview_mail->get('action');
+            $origin_mail = $preview_mail->get('origin_mail');
+
+            if ( ! is_null($draft_id)) {
+                // ドラフトメール取得
+                $draft_mail = $mail_logic->_getMailRow($draft_id);
+                if ( ! is_object($draft_mail)) {
+                    cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+                }
+
+                // ドラフトメールに上書き
+                $row = $draft_mail;
+            } else {
+                // プレビューデータに記録したドラフトメールを取得
+                $draft_mail = $preview_mail->get('temp_draft_mail');
+                if ( ! is_object($draft_mail)) {
+                    // なければメールデータテーブルにドラフトデータを追加
+                    $table_name
+                        = grn_mail_get_personal_tablename($user->getOID(),
+                        GRN_MAIL_MESSAGE_TABLE);
+                    $mail_table = $this->_utility->getTableInfo($table_name);
+                    /** @var GRN_Mail_Message $row */
+                    $row = $mail_table->newRow();
+                    if ( ! is_object($row)) {
+                        // データ追加失敗
+                        cb_throw_error(E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA);
+                    }
+
+                    $draft_mail = $row;
+                } else {
+                    // ドラフトメールに上書き
+                    $row = $draft_mail;
+                }
+            }
+        } elseif ( ! is_null($draft_id)) {
+            // ドラフトメール取得
+            $draft_mail = $mail_logic->_getMailRow($draft_id);
+            if ( ! is_object($draft_mail)) {
+                cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+            }
+
+            $action = $draft_mail->get('action');
+            $origin_mail = $draft_mail->get('origin_mail');
+            if (is_object($origin_mail)) {
+                $origin_mid = $origin_mail->getOID();
+            }
+
+            // ドラフトメールに上書き
+            $row = $draft_mail;
+        } else {
+            // メールデータテーブルにドラフトデータを追加
+            $table_name = grn_mail_get_personal_tablename($user->getOID(),
+                GRN_MAIL_MESSAGE_TABLE);
+            $mail_table = $this->_utility->getTableInfo($table_name);
+            /** @var GRN_Mail_Message $row */
+            $row = $mail_table->newRow();
+            if ( ! is_object($row)) {
+                // データ追加失敗
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA);
+            }
+
+            // 操作元メールを記録
+            if ( ! is_null($origin_mid)) {
+                $origin_mail = $mail_logic->_getMailRow($origin_mid);
+                $row->set('origin_mail', $origin_mail);
+            }
+        }
+
+        $file_count = 0;
+        $deleted_size = 0;  // 下書きメールの添付ファイル、テキスト、書式編集、署名から使用しないファイルを省くサイズ
+
+        // 返信/転送元操作
+        if (is_string($action) && is_string($origin_mid)
+            && ! is_object($origin_mail)
+        ) {
+            // 返信/転送元のメール取得
+            $origin_mail = $mail_logic->_getMailRow($origin_mid);
+        }
+
+        if ( ! is_null($preview_id)) {
+            // ドラフトメールから取得
+            $properties['references'] = $preview_mail->get('references');
+            $properties['in_reply_to'] = $preview_mail->get('in_reply_to');
+        } elseif ( ! is_null($draft_id) && is_object($draft_mail)) {
+            // ドラフトメールから取得
+            $properties['references'] = $draft_mail->get('references');
+            $properties['in_reply_to'] = $draft_mail->get('in_reply_to');
+        } elseif (is_string($action) && is_object($origin_mail)) {
+            // 元メールから取得
+            $origin_references = $origin_mail->get('references');
+            $origin_message_id = $origin_mail->get('message_id');
+
+            // 元メールのMessage-Id
+            if (is_string($origin_message_id)
+                && (strlen($origin_message_id) > 0)
+            ) {
+                // Referencesの先頭に追加
+                if (strlen($origin_references) > 0) {
+                    $references = $origin_message_id . ' ' . $origin_references;
+                } else {
+                    $references = $origin_message_id;
+                }
+
+                $properties['references'] = $references;
+
+                // 返信操作
+                if (($action == 'reply') || ($action == 'reply-all')) {
+                    // in-reply-to
+                    $properties['in_reply_to'] = $origin_message_id;
+                }
+            }
+        }
+
+        // 添付ファイル
+        $file_rows = [];
+
+        if ( ! is_null($preview_id)) {
+            // プレビューデータから不要なファイルを削除
+            // 添付ファイルは一旦全て削除
+            $filebody_rowset = $preview_mail->getFileBodyRowSet();
+            $_draft_mail = $preview_mail->get('temp_draft_mail');
+            while ( ! is_null($filebody_row = $filebody_rowset->iterate())) {
+                if ( ! $filebody_row->delete()) {
+                    cb_throw_error(E_GRN_MAIL_FAILED_TO_DELETE_FILE_DATA);
+                }
+            }
+            $filebody_rowset->destroy();
+            // ドラフトメールの全ての添付ファイルを削除
+            if ( ! is_null($_draft_mail)) {
+                $deleted_size += $_draft_mail->get('size');
+
+                $_draft_mail->deleteFileBodys();
+            }
+        } elseif ( ! is_null($draft_id)) {
+            // ドラフトメールから不要なファイルを削除
+            // 添付ファイルは一旦全て削除
+            $filebody_rowset = $draft_mail->getFileBodyRowSet();
+            while ( ! is_null($filebody_row = $filebody_rowset->iterate())) {
+                $file_size = intval($filebody_row->get('size'));
+                $deleted_size += $file_size;
+                if ( ! $filebody_row->delete()) {
+                    cb_throw_error(E_GRN_MAIL_FAILED_TO_DELETE_FILE_DATA);
+                }
+            }
+
+            $filebody_rowset->destroy();
+
+            $deleted_size += strlen($draft_mail->get('data'));
+            $deleted_size += strlen($draft_mail->get('html_data'));
+            if (array_key_exists('sign_data', $properties)) {
+                $deleted_size += strlen($draft_mail->get('sign_data'));
+            }
+        } elseif (($action == 'forward') || ($action == 'reuse')) {
+            // 受信/送信メールから再利用
+            if ( ! $this->_reuseFiles($user, $row, false, $action, $origin_mail,
+                $reuse_fids, -1, $size, $file_rows, $error, $diagnosis, $cause)
+            ) {
+                cb_throw_error($error, $diagnosis, $cause);
+            }
+
+            $file_count += count($file_rows);
+        }
+
+        if (is_array($files) && (count($files) > 0)) {
+            $table_name = grn_mail_get_personal_tablename($user->getOID(),
+                GRN_MAIL_FILEBODY_TABLE);
+            $filebody_table = $this->_utility->getTableInfo($table_name);
+            foreach (array_keys($files) as $fn) {
+                // ファイルデータ追加
+                $file_row = $filebody_table->newRow();
+                if ( ! is_object($file_row)) {
+                    // エラー
+                    cb_throw_error(E_GRN_MAIL_FAILED_TO_ADD_FILE_DATA);
+                }
+
+                $file_row->set('mail', $row);
+                $file_row->set('user', $user);
+
+                // サイズ
+                if (is_array($files[$fn])) {
+                    $file_size = $files[$fn]['size'];
+                } elseif (is_a($files[$fn], 'CB_ServerFile')) {
+                    $file_size = $files[$fn]->get('size');
+                } else {
+                    assert('is_string( $files[$fn] )');
+                    $file_size = filesize($files[$fn]);
+                }
+                $size += $file_size;
+                $file_row->copyFile($files[$fn], $user, $row, $ts);
+                $file_row->registerNow();
+                $file_rows[$file_row->getOID()] = clone $file_row;
+                $file_count++;
+            }
+        }
+
+        $row->set('attached', $file_count > 0);
+
+        // サイズ
+        $size += strlen($properties['data']);
+        if (array_key_exists('html_data', $properties)) {
+            $size += strlen($properties['html_data']);
+        }
+
+        // 選択署名ID
+        $properties['signature'] = null;
+        if (array_key_exists('sign_id', $properties)
+            && ! is_null($properties['sign_id'])
+        ) {
+            $sign_id = $properties['sign_id'];
+            if ($sign_id != '-1' && strlen($sign_id) > 0) {
+                $signature =& $personal_config->_getSignatureRow($sign_id);
+                $properties['signature'] =& $signature;
+            }
+        }
+
+        // 署名本文
+        if (array_key_exists('sign_data', $properties)
+            && ! is_null($properties['sign_data'])
+        ) {
+            $size += strlen($properties['sign_data']);
+        }
+
+        $properties['action'] = $action;
+        $properties['draft'] = true;
+        $properties['read_ts'] = $ts;
+        $properties['sent'] = true;
+
+        // 書きかけメールからの保存
+        if ( ! is_null($draft_id)) {
+            // メールデータの更新
+            $row->updateProperties($properties);
+
+            $row->set('send_ts', $ts); // 下書き更新日時にあたる
+        } else {
+            // メールデータの初期化
+            if ($row->initialize($user, $properties) === false) {
+                // データ追加失敗
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA);
+            }
+
+            if ( ! $row->getId('folder')) {
+                // まだどこにも保存されていない場合には下書きへ保存
+                $folder_logic = $this->_utility->getFolderLogic();
+                $folder = $folder_logic->_getSpecialFolderRow($account,
+                    GRN_MAIL_FOLDER_CODE_UNSENT);
+                $row->moveFolder($folder);
+
+                $row->set('timestamp', $ts); // 下書き作成日時にあたる
+            }
+            $row->set('send_ts', $ts); // 下書き更新日時にあたる
+        }
+
+        $row->set('size', $size);
+
+        // 返信/転送元操作
+        if (is_null($draft_id) && is_string($action)
+            && is_object($origin_mail)
+        ) {
+            // 返信/転送元のメール取得
+            $row->set('origin_mail', $origin_mail);
+        }
+
+        $row->updateNow();
+
+        // アカウントのメールサイズを更新
+        $mail_size = $account->getMailSize();
+        $mail_size = bcadd($mail_size, $size);
+        $mail_size = bcsub($mail_size, $deleted_size);
+        $account->setMailSize($mail_size);
+        $account->updateNow();
+
+        return $row->getOID();
+    }
+
+    /**
+     * プレビューメール保存
+     *
+     * @param CB_User       $user       送信するユーザー
+     * @param string        $account_id 送信に使用するアカウントID
+     * @param array         $properties プロパティ
+     *                                  $properties['subject']          標題
+     *                                  $properties['data']             本文
+     *                                  $properties['html_data']        HTML本文
+     *                                  $properties['sign_id']          署名ID
+     *                                  $properties['sign_data']        署名本文
+     *                                  $properties['to']               To
+     *                                  $properties['cc']               Cc
+     *                                  $properties['bcc']              Bcc
+     *                                  $properties['in_reply_to']      In-Reply-To
+     *                                  $properties['reply_to']         Reply-To
+     *                                  $properties['confirmation_req'] 開封確認要求フラグ
+     *                                  ...その他、GRN_Mail_Messageを参照のこと
+     * @param array         $files      添付ファイル（$_FILES)
+     * @param string|null   $preview_id 上書きするプレビュー用一時メールID or プレビューでない場合はnull
+     * @param string|null   $draft_id   上書きするドラフトID or 新規の場合はnull
+     * @param string|null   $action     操作した内容（'reply-all' / 'reply' / 'forward'） or null
+     * @param string|null   $origin_mid 返信/転送/再送信元のメールID or null
+     * @param string[]|null $reuse_fids 再送信/転送元のファイル情報ID
+     * @param string|null   $locale     ロケール文字列またはnull（デフォルトロケールを使用する場合）
+     *
+     * @return string  オブジェクトID
+     */
+    function savePreviewMail(
+        & $user,
+        $account_id,
+        & $properties,
+        & $files,
+        $preview_id = null,
+        $draft_id = null,
+        $action = null,
+        $origin_mid = null,
+        $reuse_fids = null,
+        $locale = null
+    ) {
+        // メール使用停止設定チェック
+        $system_config = $this->_utility->getSystemConfig();
+        if ( ! $system_config->canUseMail()) {
+            cb_throw_error(E_GRN_MAIL_CANNOT_USE);
+        }
+
+        assert('is_object( $user )');
+        assert('is_array( $properties )');
+
+        // メールアカウントデータを取得
+        $account = $system_config->_getAccountRow($account_id);
+        if (is_null($account)) {
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+
+        $account_info = $account->getAccountInfo();
+        if (is_null($account_info)) {
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        }
+
+        if ( ! array_key_exists('subject', $properties)) {
+            // 必須項目エラー
+            $properties['subject'] = '';
+        }
+
+        if ( ! is_null($preview_id) && (strlen($preview_id) == 0)) {
+            $preview_id = null;
+        }
+
+        if ( ! is_null($draft_id) && (strlen($draft_id) == 0)) {
+            $draft_id = null;
+        }
+
+        $personal_config = $this->_utility->getPersonalConfig($user);
+
+        // サイズ制限取得
+        $user_id = $user->getOID();
+        $system_config->getSizeUserLimitSetting($size_settings, $user_id);
+
+        require_once('fw/string_util.csp');
+
+        $size = 0;
+
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+
+        ////////////////////////////////////////////////////////////////////////
+
+        $row = null;
+        $preview_mail = null;
+        $draft_mail = null;
+        $origin_mail = null;
+        $mail_logic = $this->_utility->getMailLogic();
+
+        // プレビューの上書き保存
+        if ( ! is_null($preview_id)) {
+            // 一時メール取得
+            $preview_mail = $mail_logic->_getTemporaryMailRow($preview_id);
+            if ( ! is_object($preview_mail)) {
+                cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+            }
+
+            $action = $preview_mail->get('action');
+            $origin_mail = $preview_mail->get('origin_mail');
+
+            // 上書き
+            $row = $preview_mail;
+
+            if ( ! is_null($draft_id)) {
+                // ドラフトメール取得
+                $draft_mail = $mail_logic->_getMailRow($draft_id);
+                if ( ! is_object($draft_mail)) {
+                    cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+                }
+            }
+        } // ドラフトメールからの保存
+        elseif ( ! is_null($draft_id)) {
+            // ドラフトメール取得
+            $draft_mail = $mail_logic->_getMailRow($draft_id);
+            if ( ! is_object($draft_mail)) {
+                cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+            }
+
+            $action = $draft_mail->get('action');
+            $origin_mail = $draft_mail->get('origin_mail');
+        } // 返信/転送メールからの保存
+        elseif ( ! is_null($origin_mid) && ! is_null($action)) {
+            // 操作元メール取得
+            $origin_mail = $mail_logic->_getMailRow($origin_mid);
+            if ( ! is_object($origin_mail)) {
+                cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+            }
+        }
+
+        if (is_null($preview_id)) {
+            // 古いテンポラリメールデータを削除
+            $this->_deleteOldTemporaryMailDatas();
+
+            // テンポラリメールデータテーブルにデータを追加
+            $temp_mail_table
+                = $this->_utility->getTableInfo(GRN_MAIL_TEMPORARY_MESSAGE_TABLE);
+            $row = $temp_mail_table->newRow();
+            if ( ! is_object($row)) {
+                // データ追加失敗
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA);
+            }
+
+            if ( ! is_null($draft_id)) {
+                // ドラフトメールを記録
+                $row->set('temp_draft_mail', $draft_mail);
+            }
+
+            if ( ! is_null($origin_mid) && ! is_null($action)) {
+                $row->set('origin_mail', $origin_mail);
+            }
+        }
+
+        $file_count = 0;
+
+        // references, in_reply_to
+        if (is_null($preview_id) && ! is_null($draft_id)
+            && is_object($draft_mail)
+        ) {
+            // ドラフトメールから取得
+            $properties['references'] = $draft_mail->get('references');
+            $properties['in_reply_to'] = $draft_mail->get('in_reply_to');
+        } elseif (is_null($preview_id) && is_string($action)
+                  && ! is_null($origin_mid)
+                  && is_object($origin_mail)
+        ) {
+            // 操作元メールから取得
+            $origin_references = $origin_mail->get('references');
+            $origin_message_id = $origin_mail->get('message_id');
+
+            // 元メールのMessage-Id
+            if (is_string($origin_message_id)
+                && (strlen($origin_message_id) > 0)
+            ) {
+                // Referencesの先頭に追加
+                if (strlen($origin_references) > 0) {
+                    $references = $origin_message_id . ' ' . $origin_references;
+                } else {
+                    $references = $origin_message_id;
+                }
+
+                $properties['references'] = $references;
+            }
+
+            // 返信操作
+            if (($action == 'reply') || ($action == 'reply-all')) {
+                // in-reply-to
+                $properties['in_reply_to'] = $origin_message_id;
+            }
+        }
+
+        // 添付ファイル
+        $file_rows = [];
+
+        // プレビューの再編集
+        if ( ! is_null($preview_id) && is_object($preview_mail)) {
+            // プレビューメールから不要なファイルを削除
+            // 添付ファイルは一旦全て削除
+            $filebody_rowset = $preview_mail->getFileBodyRowSet();
+            while ( ! is_null($filebody_row = $filebody_rowset->iterate())) {
+                if ( ! $filebody_row->delete()) {
+                    cb_throw_error(E_GRN_MAIL_FAILED_TO_DELETE_FILE_DATA);
+                }
+            }
+
+            $filebody_rowset->destroy();
+        } // ドラフトメールから
+        elseif (is_null($preview_id) && ! is_null($draft_id)
+                && is_object($draft_mail)
+        ) {
+            // ドラフトメールから必要なファイルをコピー
+            // ドラフトメールから再利用
+            if ( ! $this->_reuseFiles($user, $row, true, null, $draft_mail,
+                $reuse_fids, -1, $size, $file_rows, $error, $diagnosis, $cause)
+            ) {
+                cb_throw_error($error, $diagnosis, $cause);
+            }
+
+            $file_count += count($file_rows);
+        } // 転送または再送信
+        elseif (is_null($preview_id) && ($action == 'forward')
+                || ($action == 'reuse')
+        ) {
+            // 受信/送信メールから再利用
+            if ( ! $this->_reuseFiles($user, $row, false, $action, $origin_mail,
+                $reuse_fids, -1, $size, $file_rows, $error, $diagnosis, $cause)
+            ) {
+                cb_throw_error($error, $diagnosis, $cause);
+            }
+
+            $file_count += count($file_rows);
+        }
+
+        // 新たな添付ファイル
+        if (is_array($files) && (count($files) > 0)) {
+            $table_name = grn_mail_get_personal_tablename($user->getOID(),
+                GRN_MAIL_FILEBODY_TABLE);
+            $filebody_table = $this->_utility->getTableInfo($table_name);
+            foreach (array_keys($files) as $fn) {
+                // ファイルデータ追加
+                /** @var GRN_Mail_FileBody $file_row */
+                $file_row = $filebody_table->newRow();
+                if ( ! is_object($file_row)) {
+                    // エラー
+                    cb_throw_error(E_GRN_MAIL_FAILED_TO_ADD_FILE_DATA);
+                }
+
+                $file_row->set('temporary_mail', $row);
+                $file_row->set('user', $user);
+
+                // サイズ
+                if (is_array($files[$fn])) {
+                    $file_size = $files[$fn]['size'];
+                } elseif (is_a($files[$fn], 'CB_ServerFile')) {
+                    $file_size = $files[$fn]->get('size');
+                } else {
+                    assert('is_string( $files[$fn] )');
+                    $file_size = filesize($files[$fn]);
+                }
+                $size += $file_size;
+                $file_row->copyFile($files[$fn], $user, $row, $ts);
+                $file_row->registerNow();
+                $file_rows[$file_row->getOID()] = clone $file_row;
+                $file_count++;
+            }
+        }
+
+        $row->set('attached', $file_count > 0);
+
+        // サイズ
+        $size += strlen($properties['data']);
+        if (array_key_exists('html_data', $properties)) {
+            $size += strlen($properties['html_data']);
+        }
+
+        // 選択署名ID
+        $properties['signature'] = null;
+        if (array_key_exists('sign_id', $properties)
+            && ! is_null($properties['sign_id'])
+        ) {
+            $sign_id = $properties['sign_id'];
+            if ($sign_id != '-1' && strlen($sign_id) > 0) {
+                $signature =& $personal_config->_getSignatureRow($sign_id);
+                $properties['signature'] =& $signature;
+            }
+        }
+
+        // 署名本文
+        if (array_key_exists('sign_data', $properties)
+            && ! is_null($properties['sign_data'])
+        ) {
+            $size += strlen($properties['sign_data']);
+        }
+
+        $properties['action'] = $action;
+        $properties['draft'] = false;
+        $properties['timestamp'] = $ts;
+        $properties['send_ts'] = $ts;
+        $properties['read_ts'] = $ts;
+        $properties['sent'] = true;
+
+        // プレビューの上書き
+        if ( ! is_null($preview_id)) {
+            // プレビューデータの更新
+            $row->updateProperties($properties);
+        } else {
+            // プレビューデータの初期化
+            if ($row->initialize($user, $properties) === false) {
+                // データ追加失敗
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA);
+            }
+        }
+
+        $row->set('temp_account', $account);
+        $row->set('size', $size);
+
+        // 開封確認要求
+        if (array_key_exists('confirmation_request', $properties)) {
+            $row->set('confirmation_request',
+                $properties['confirmation_request']);
+        }
+
+        // 返信/転送元操作
+        if ( ! is_null($draft_id) && is_object($origin_mail)) {
+            // 返信/転送元のメール
+            $row->set('origin_mail', $origin_mail);
+        }
+
+        $row->updateNow();
+
+        return $row->getOID();
+    }
+
+    /**
+     * 返信用TO生成
+     *
+     * @param array $mail_data メールデータ
+     *
+     * @return string
+     */
+    function makeReplyTo($mail_data)
+    {
+        assert('is_array( $mail_data )');
+
+        // reply_to優先
+        $reply_to = $mail_data['reply_to'];
+        if (is_string($reply_to) && (strlen($reply_to) > 0)) {
+            return $reply_to;
+        }
+
+        // from
+        $reply_to = $mail_data['from'];
+        if (is_string($reply_to) && (strlen($reply_to) > 0)) {
+            return $reply_to;
+        }
+
+        return '';
+    }
+
+    /**
+     * 返信用CC生成
+     *
+     * @param array $mail_data     メールデータ
+     * @param array $except_emails 除外するE-Mailアドレス（通常自分）
+     *
+     * @return string
+     */
+    function makeReplyCc($mail_data, $except_emails)
+    {
+        assert('is_array( $mail_data )');
+
+        $to = $mail_data['to'];
+        $cc = $mail_data['cc'];
+
+        if (( ! is_string($to) || (strlen($to) == 0))
+            && ( ! is_string($cc)
+                 || (strlen($cc) == 0))
+        ) {
+            return '';
+        }
+
+        $except_email_array = [];
+        if ( ! is_null($except_emails)) {
+            foreach ($except_emails as $temp_email) {
+                $temp_email = strtolower($temp_email);
+                $temp_email
+                    = GRN_Mail_Utility::static_addEmailBracket($temp_email,
+                    'add');
+                $len = strlen($temp_email);
+                if ($len > 0) {
+                    if ( ! array_key_exists($temp_email, $except_email_array)) {
+                        // 除外リストに追加
+                        $except_email_array[$temp_email] = true;
+                    }
+                }
+            }
+        }
+
+        $reply_cc = '';
+        $reply_cc_array = [];
+
+        $to_array = GRN_Mail_Utility::static_formatAddressString($to, true,
+            true, true, false, 'array', true);
+        foreach (array_keys($to_array) as $key) {
+            $temp_array =& $to_array[$key];
+            if (strlen($temp_array['email']) == 0) {
+                continue;
+            }
+
+            $temp_email = strtolower($temp_array['email']);
+            $temp_email = GRN_Mail_Utility::static_addEmailBracket($temp_email,
+                'add');
+            if (array_key_exists($temp_email, $except_email_array)
+                || array_key_exists($temp_email, $reply_cc_array)
+            ) {
+                // 除外E-Mailアドレスまたは重複
+                continue;
+            }
+
+            $reply_cc_array[$temp_email] = true;
+
+            if (strlen($reply_cc) > 0) {
+                $reply_cc .= ', ';
+            }
+
+            if (strlen($temp_array['name']) > 0) {
+                $name_flag = true;
+                $reply_cc .= $temp_array['name'];
+                $reply_cc .= ' ';
+            }
+            $reply_cc .= $temp_array['email'];
+        }
+
+        $cc_array = GRN_Mail_Utility::static_formatAddressString($cc, true,
+            true, true, false, 'array', true);
+        foreach (array_keys($cc_array) as $key) {
+            $temp_array =& $cc_array[$key];
+            if (strlen($temp_array['email']) == 0) {
+                continue;
+            }
+
+            $temp_email = strtolower($temp_array['email']);
+            $temp_email = GRN_Mail_Utility::static_addEmailBracket($temp_email,
+                'add');
+            if (array_key_exists($temp_email, $except_email_array)
+                || array_key_exists($temp_email, $reply_cc_array)
+            ) {
+                // 除外E-Mailアドレスまたは重複
+                continue;
+            }
+
+            $reply_cc_array[$temp_email] = true;
+
+            if (strlen($reply_cc) > 0) {
+                $reply_cc .= ', ';
+            }
+
+            if (strlen($temp_array['name']) > 0) {
+                $name_flag = true;
+                $reply_cc .= $temp_array['name'];
+                $reply_cc .= ' ';
+            }
+            $reply_cc .= $temp_array['email'];
+        }
+
+        return $reply_cc;
+    }
+
+    /**
+     * 返信用標題生成
+     *
+     * @param array $mail_data メールデータ
+     *
+     * @return string
+     */
+    function makeReplySubject($mail_data)
+    {
+        assert('is_array( $mail_data )');
+
+        $subject = $mail_data['subject'];
+        if ( ! is_string($subject) || (strlen($subject) == 0)) {
+            return 'Re:';
+        }
+
+        require_once('fw/string_util.csp');
+        $subject = cb_trim($subject);
+
+        if (strncasecmp($subject, 're:', 3) != 0) {
+            return 'Re: ' . $subject;
+        } else {
+            return $subject;
+        }
+    }
+
+    /**
+     * 返信用本文生成
+     *
+     * @param array $mail_data  mail data
+     * @param bool  $show_pict  show picture or not
+     * @param bool  $use_editor enable to use rich editor
+     *
+     * @return array    body for replying（'data', 'html_data'）
+     */
+    function makeReplyData(array $mail_data, $show_pict, $use_editor)
+    {
+        $reply_data = '';
+
+        $reply = [];
+        $reply['html_data'] = null;
+        $reply['data'] = null;
+
+        if ($use_editor && strlen($mail_data['html_data']) > 0) {
+            // style of blockquote should be same as web_root/grn/html/component/editor/editor.js
+            $reply_data .= '</div><div></div><blockquote class="blockquote_grn" style="border-left: 2px solid #C9C9C9; margin: 0 0 0 10px; padding-left: 10px;">'
+                           . GRN_Mail_Utility::washHtmlMail($mail_data['html_data'],
+                    $show_pict) . '</blockquote>';
+
+            $info_data = GRN_Mail_Utility::makeReplyInfo($mail_data,
+                true);
+            $info_data = "<div>" . $info_data;
+            $temp = [];
+            $temp[0] = '<div></div><div></div>';//改行を挿入する
+            $temp[1] = $info_data . $reply_data;
+            $temp[2] = '<div></div>';
+            $reply['html_data'] = implode('', $temp);
+        } else {
+            $data = '';
+            $reply_data .= "\r\n";
+            if (strlen($mail_data['html_data']) > 0
+                && strlen($mail_data['data']) == 0
+                && ! cb_is_cellular_page()
+            ) {
+                $lines = explode("\r\n",
+                    grn_strip_tags($mail_data['html_data']));
+                foreach ($lines as $line) {
+                    if ( ! empty($line)) {
+                        $data .= "\r\n " . $line;
+                    }
+                }
+            } else {
+                //! TENTATIVE
+                // 本文の最後に改行がある場合、メールライブラリが最後に変なコードを付けるので
+                // 一時回避しておく
+                $data = $mail_data['data'];
+            }
+            $data = preg_replace('/\x0D\x0D/', "\x0D", $data);
+
+            $data = preg_replace('/(?<!\x0D)\x0A/', "\x0D\x0A", $data);
+
+            $lines = explode("\r\n", $data);
+            foreach ($lines as $line) {
+                $reply_data .= "> " . $line . "\r\n";
+            }
+            $info_data = GRN_Mail_Utility::makeReplyInfo($mail_data, false);
+            $reply['data'] = "\r\n\r\n" . $info_data . $reply_data;//改行を挿入する
+        }
+
+        return $reply;
+    }
+
+    /**
+     * 返信用添付ファイルリスト生成
+     *
+     * @param array $mail_data メールデータ
+     *
+     * @return array 返信用一時添付ファイル
+     */
+    function makeReplyFiles($mail_data)
+    {
+        assert('is_array( $mail_data )');
+
+        $mail_id = $mail_data['id'];
+        $mail_logic = $this->_utility->getMailLogic();
+        $origin_mail = $mail_logic->_getMailRow($mail_id);
+        if ( ! is_object($origin_mail)) {
+            cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+        }
+
+        $reply_files = [];
+
+        // メールソースがなければ抜ける
+        if ( ! $origin_mail->sourceDataExists()) {
+            return $reply_files;
+        }
+
+        // 添付ファイル一覧RowSetを取得
+        $rowset = $origin_mail->getFileInfoRowSet();
+        /** @var GRN_Mail_FileInfo $file_row */
+        while ( ! is_null($file_row = $rowset->iterate())) {
+            // プロパティセット
+            $reply_files[$file_row->getOID()] = $file_row->getDataProperties();
+        }
+
+        return $reply_files;
+    }
+
+    /**
+     * 転送用標題生成
+     *
+     * @param array $mail_data メールデータ
+     *
+     * @return  string
+     */
+    function makeForwardSubject($mail_data)
+    {
+        assert('is_array( $mail_data )');
+
+        $subject = $mail_data['subject'];
+
+        if ( ! is_string($subject) || (strlen($subject) == 0)) {
+            return 'Fwd:';
+        }
+
+        require_once('fw/string_util.csp');
+
+        return 'Fwd: ' . cb_trim($subject);
+    }
+
+    /**
+     * 転送用本文生成
+     *
+     * @param array $mail_data  mail data
+     * @param bool  $show_pict  show picture or not
+     * @param bool  $use_editor enable to use rich editor
+     *
+     * @return array   body for forwarding（'data', 'html_data'）
+     */
+    function makeForwardData(
+        array $mail_data,
+        $show_pict,
+        $use_editor,
+        $automation = false
+    ) {
+        $forward_data = [];
+        $forward_data['html_data'] = null;
+        $forward_data['data'] = null;
+
+        if ($use_editor && strlen($mail_data['html_data']) > 0) {
+            // text/html
+            $html = GRN_Mail_Utility::washHtmlMail($mail_data['html_data'],
+                $show_pict);
+            $data = GRN_Mail_Utility::makeForwardInfo($mail_data, true);
+            $data = "<div>" . $data . "</div>";
+            $temp = [];
+            $temp[0] = '<div></div>';
+            if ( ! $automation) {
+                $temp[0] .= '<div></div>';
+            }
+            $temp[1] = $data;
+            $temp[2]
+                = '<div class="cbmail-quote" style="display: none;"></div>';
+            $temp[3] = $html;
+            $forward_data['html_data'] = implode('', $temp);
+        }
+
+        $data = GRN_Mail_Utility::makeForwardInfo($mail_data, false);
+        if (strlen($mail_data['html_data']) > 0
+            && strlen($mail_data['data']) == 0
+        ) {
+            $lines = explode("\r\n",
+                grn_strip_tags($mail_data['html_data']));
+            foreach ($lines as $line) {
+                if ( ! empty($line)) {
+                    $data .= "\r\n " . $line;
+                }
+            }
+        } else {
+            $data .= $mail_data['data'];
+        }
+        $forward_data['data'] = $data;
+
+        if ( ! $automation) {
+            $forward_data['data'] = "\r\n\r\n" . $forward_data['data'];
+        }
+
+        return $forward_data;
+    }
+
+    /**
+     * 転送用添付ファイルリスト生成
+     *
+     * @param CB_User $user
+     * @param array   $mail_data メールデータ
+     *
+     * @return array[] 転送用一時添付ファイル
+     */
+    function makeForwardFiles(& $user, $mail_data)
+    {
+        assert('is_array( $mail_data )');
+
+        $mail_id = $mail_data['id'];
+        $mail_logic = $this->_utility->getMailLogic();
+        $origin_mail = $mail_logic->_getMailRow($mail_id);
+        if ( ! is_object($origin_mail)) {
+            cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+        }
+
+        $forward_files = [];
+
+        // メールソースがなければ抜ける
+        if ( ! $origin_mail->sourceDataExists()) {
+            return $forward_files;
+        }
+
+        // 添付ファイル一覧RowSetを取得
+        $rowset = $origin_mail->getFileInfoRowSet();
+        $attachments = $origin_mail->getAttachedPartsFromSource();
+
+        require_once('fw/i18n.csp');
+        require_once('mail/resources.csp');
+        /** @var GRN_Mail_FileInfo $file_row */
+        while ( ! is_null($file_row = $rowset->iterate())) {
+            // プロパティセット
+            $file_properties = $file_row->getDataProperties();
+            require_once('grn/file.csp');
+            $file_properties['name']
+                = grn_get_mail_filename($file_properties['name'],
+                $file_properties["mime"]);
+            if ( ! isset($attachments[$file_properties['part_no']])) {
+                cb_throw_error(E_GRN_MAIL_FILE_DATA_NOT_FOUND);
+            }
+            $file_content
+                = $attachments[$file_properties['part_no']]->getContent();
+
+            $forward_files[] = $this->makeFileArray($file_content,
+                $file_properties["name"], $file_properties["mime"], null);
+        }
+
+        return $forward_files;
+    }
+
+    function makeFileArray($file_content, $filename, $mime, $charset)
+    {
+        $tmp_path = tempnam(cb_tmpdir(), "mail");
+        $fp = fopen($tmp_path, "w");
+        if ($fp === false) {
+            // ファイル作成失敗
+            require_once('fw/error_code.csp');
+            cb_throw_error(E_COMMON_FOPEN_WRITE, null, ['file' => $tmp_path]);
+        }
+        if (fwrite($fp, $file_content) === false) {
+            require_once('fw/error_code.csp');
+            cb_throw_error(E_COMMON_TOO_SHORT_STORAGE, null,
+                ['required' => strlen($file_content)],
+                ['dir' => cb_tmpdir()]);
+        }
+        if (fclose($fp) === false) {
+            require_once('fw/error_code.csp');
+            cb_throw_error(E_COMMON_TOO_SHORT_STORAGE, null,
+                ['required' => strlen($file_content)],
+                ['dir' => cb_tmpdir()]);
+        }
+        $size = filesize($tmp_path);
+
+        return [
+            "tmp_name"          => $tmp_path,
+            "name"              => $filename,
+            "type"              => $mime,
+            "charset"           => $charset,
+            "size"              => $size,
+            "is_temporary_file" => true
+        ];
+    }
+
+    /**
+     * 再送信用添付ファイルリスト生成
+     *
+     * @param array $mail_data メールデータ
+     * @param bool  $b_preview
+     *
+     * @return array 再送信用一時添付ファイル
+     */
+    function makeReuseFiles($mail_data, $b_preview = false)
+    {
+        assert('is_array( $mail_data )');
+
+        $mail_id = $mail_data['id'];
+        $mail_logic = $this->_utility->getMailLogic();
+        if ( ! $b_preview) {
+            $origin_mail = $mail_logic->_getMailRow($mail_id);
+        } else {
+            $origin_mail = $mail_logic->_getTemporaryMailRow($mail_id);
+        }
+
+        if ( ! is_object($origin_mail)) {
+            cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+        }
+
+        $reuse_files = [];
+
+        // 添付ファイル一覧RowSetを取得
+        $rowset = $origin_mail->getFileBodyRowSet();
+        /** @var GRN_Mail_FileBody $file_row */
+        while ( ! is_null($file_row = $rowset->iterate())) {
+            if ( ! $file_row->fileExists()) {
+                continue;
+            }
+
+            $file = clone $file_row;
+            require_once('grn/file.csp');
+            $file_name = grn_get_mail_filename($file->get('name'),
+                $file->get('mime'));
+            $file->set('name', $file_name);
+
+            // プロパティセット
+            $reuse_files[$file_row->getOID()] = $file;
+        }
+
+        return $reuse_files;
+    }
+
+    /**
+     * 開封確認送信元への返信
+     *
+     * @param CB_User          $user          ユーザー
+     * @param GRN_Mail_Account $account       アカウント
+     * @param GRN_Mail_Message $mail          受信メール
+     * @param string           $action_mode   'manual' / 'auto'
+     * @param boolean          $b_throw_error エラー発生時に例外をスローするか(default:TRUE)
+     *
+     * @return  boolean
+     */
+    function _sendResponseOfConfirmationMail(
+        & $user,
+        & $account,
+        & $mail,
+        $action_mode,
+        $b_throw_error = true
+    ) {
+        if ( ! is_object($user) || ! is_object($account)
+             || ! is_object($mail)
+        ) {
+            assert('FALSE');
+
+            return false;
+        }
+        if ($account->getID('user') != $user->getOID()) {
+            if ($b_throw_error) {
+                cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+            } else {
+                return false;
+            }
+        }
+        if ($mail->getID('user') != $user->getOID()) {
+            if ($b_throw_error) {
+                cb_throw_error(E_GRN_MAIL_MAIL_ACCESS_DENIED);
+            } else {
+                return false;
+            }
+        }
+
+        $email = $mail->get('confirmation_to');   // 返信先メールアドレス
+        if ( ! is_string($email) || (strlen($email) == 0)) {
+            return false;
+        }
+
+        $result = true;
+
+        $size = 0;
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = time();
+
+        // メールメッセージオブジェクトの作成
+        $file_rows = null;
+        $properties = [];
+
+        $account_info = $account->getAccountInfo();
+        $from_name = $account_info->getFrom($user);
+        if ( ! is_null($from_name) && (mb_strlen($from_name) > 0)) {
+            $from_name = GRN_Mail_Utility::static_escapeDisplayName($from_name);
+            $temp_from
+                = GRN_Mail_Utility::static_addNameQuotation($from_name,
+                'add');
+            $temp_from .= ' '
+                          . GRN_Mail_Utility::static_addEmailBracket($account_info->email,
+                    'add');
+            $properties['from'] = $temp_from;
+        } else {
+            $properties['from'] = $account_info->email;
+        }
+        $properties['from'] = cb_trim($properties['from']);
+
+        $to = $mail->get('confirmation_to');
+        if ( ! is_string($to) || (strlen($to) == 0)) {
+            $to = $mail->get('reply_to');
+            if ( ! is_string($to) || (strlen($to) == 0)) {
+                $to = $mail->get('from');
+            }
+        }
+        $original_to = $to;
+        if ( ! is_string($to)) {
+            $to = '';
+        } else {
+            $to = GRN_Mail_Utility::static_formatAddressString($to, false,
+                false, true, false);
+        }
+
+        $properties['to'] = $to;
+
+        // 標題
+        $subject = $mail->get('subject');
+        if ( ! is_string($subject)) {
+            $subject = '';
+        }
+        $properties['subject'] = cb_plain_msg(GRN_MAIL_MODULE_ID,
+            'confirm_response_subject', ['subject' => $subject]);
+
+        $size += strlen($properties['subject']);
+
+        // 本文
+        $datetime = date('r'); //format defined in RFC 2822
+        $properties['data'] = str_replace('\n', "\r\n",
+            cb_msg(GRN_MAIL_MODULE_ID, 'confirm_response_data',
+                ['datetime' => $datetime]));
+        $size += strlen($properties['data']);
+
+        // 受信メールから取得
+        $mail_references = $mail->get('references');
+        if ( ! is_string($mail_references)) {
+            $mail_references = '';
+        }
+
+        $mail_message_id = $mail->get('message_id');
+        if ( ! is_string($mail_message_id)) {
+            $mail_message_id = '';
+        }
+
+        // 元メールのMessage-Id
+        if (is_string($mail_message_id) && (strlen($mail_message_id) > 0)) {
+            // Message-IDの前後に <> を付加
+            $in_reply_to
+                = GRN_Mail_Utility::static_addEmailBracket($mail_message_id,
+                'add');
+            $properties['in_reply_to'] = $in_reply_to;
+
+            // Referencesの先頭に追加
+            if (strlen($mail_references) > 0) {
+                $references = $in_reply_to . ' ' . $mail_references;
+            } else {
+                $references = $in_reply_to;
+            }
+
+            $properties['references'] = $references;
+        }
+
+        // Message-Id
+        $message_id = cb_mail_create_message_id();
+        $properties['message_id'] = $message_id;
+
+        // 開封通知情報構築
+        $confirmation_content = [];
+        $confirmation_content['final_recipient'] = new CB_MailAddress($to);
+
+        $disposition = [];
+        if (is_string($action_mode)
+            && (strcasecmp($action_mode, 'auto') == 0)
+        ) {
+            $disposition['action-mode'] = 'automatic-action';
+            $disposition['sending-mode'] = 'MDN-sent-automatically';
+            $confirmation_status = 'sent-auto';
+        } else {
+            $disposition['action-mode'] = 'manual-action';
+            $disposition['sending-mode'] = 'MDN-sent-manually';
+            $confirmation_status = 'sent-manual';
+        }
+        $disposition['disposition-type'] = 'displayed';
+
+        $confirmation_content['disposition'] = $disposition;
+
+        $option_field = [];
+        $option_field['original-message-id'] = $mail_message_id;
+
+        $confirmation_content['option_field'] = $option_field;
+
+        $mailMessage =& $this->composeMail($user, $properties, $file_rows,
+            $confirmation_content);
+        if ( ! is_object($mailMessage)) {
+            return false;
+        }
+
+        // メールデータテーブルにデータを追加
+        $table_name = grn_mail_get_personal_tablename($user->getOID(),
+            GRN_MAIL_MESSAGE_TABLE);
+        $table = $this->_utility->getTableInfo($table_name);
+        /** @var GRN_Mail_Message $row */
+        $row = $table->newRow();
+        if ( ! is_object($row)) {
+            // データ追加失敗
+            if ($b_throw_error) {
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA);
+            } else {
+                return false;
+            }
+        }
+
+        // メールサーバーと接続
+        $connection_logic = $this->_utility->getConnectionLogic($account);
+        if ($connection_logic->connectToSmtpServer() !== true) {
+            $row->delete();
+
+            return false;
+        }
+
+        // 一旦全てのエラーをクリア
+        $connection_logic->clearErrors();
+
+        // ロケールの取得
+        $i18n = CB_I18N::getInstance();
+        $locale = $i18n->getCurrentLanguage();
+
+        // メールを送信キューに登録
+        $mailMessages = [$mailMessage];
+        if ($connection_logic->sendMailToSmtpServer($mailMessages, $locale)
+            == count($mailMessages)
+        ) {
+            // メールを実際に送信
+            if ($connection_logic->commitSmtpServer() != true) {
+                $result = false;
+            }
+        } else {
+            $result = false;
+        }
+
+        if ( ! $result) {
+            // 処理中断
+            $row->delete();
+            $connection_logic->abortSmtpServer();
+        }
+
+        // サーバーから切断
+        $connection_logic->disconnectFromSmtpServer();
+
+        if ( ! $result) {
+            // データ追加失敗
+            if ($b_throw_error) {
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA);
+            } else {
+                return false;
+            }
+        }
+
+        $properties['timestamp'] = $ts;
+        $properties['send_ts'] = $ts;
+        $properties['read_ts'] = $ts;
+        $properties['sent'] = true;
+
+        // メールデータの初期化
+        if ($row->initialize($user, $properties) === false) {
+            // データ追加失敗
+            if ($b_throw_error) {
+                cb_throw_error(E_GRN_MAIL_FAILED_TO_ADD_MAIL_DATA);
+            } else {
+                $row->delete();
+
+                return false;
+            }
+        }
+
+        $this->_saveMailSource($user, $row, $mailMessage, $size);
+
+        $row->set('size', $size);
+        $row->set('confirmation_response', true);
+        $row->set('confirmation_org_message_id', $mail_message_id);
+        $row->set('confirmation_final_recipient', $to);
+
+        // 送信箱
+        $folder_logic = $this->_utility->getFolderLogic();
+        $folder =& $folder_logic->_getSpecialFolderRow($account,
+            GRN_MAIL_FOLDER_CODE_SENTBOX);
+        $row->moveFolder($folder);
+
+        // 受信メールと開封通知メールの開封確認ステータス変更
+        $row->set('confirmation_status', $confirmation_status);
+        $mail->set('confirmation_status', $confirmation_status);
+
+        $row->updateNow();
+
+        // ファイルデータ追加
+        $table_name = grn_mail_get_personal_tablename($user->getOID(),
+            GRN_MAIL_FILEBODY_TABLE);
+        $file_table = $this->_utility->getTableInfo($table_name);
+        $file_row = $file_table->newRow();
+        if (is_object($file_row)) {
+            // エラー無視
+            $file_row->set('mail', $row);
+            $file_row->set('user', $user);
+
+            $file_content
+                = sprintf("Final-Recipient: rfc822;%s\nDisposition: %s/%s; displayed\nOriginal-Message-ID: %s\n",
+                $to, $disposition['action-mode'], $disposition['sending-mode'],
+                GRN_Mail_Utility::static_addEmailBracket($mail_message_id,
+                    'add'));
+
+            // サイズ
+            $file_size = strlen($file_content);
+
+            // Create Temporary File
+            $file_name = $this->_utility->makeTempFile($row, $file_content);
+            if ($file_name !== false) {
+                //Create Dummy $_FILES Data
+                $dummy_file = [];
+                $dummy_file['name'] = '';
+                $dummy_file['tmp_name'] = $file_name;
+                $dummy_file['error'] = 0;
+                $dummy_file['type']
+                    = 'message/disposition-notification';
+                $dummy_file['size'] = filesize($file_name);
+                $dummy_file['is_temporary_file'] = true;
+
+                $file_row->copyFile($dummy_file, $user, $row, $ts);
+                $file_row->registerNow();
+            } else {
+                $file_row->delete();
+            }
+        }
+
+        // アカウントのメールサイズを更新
+        $mail_size = $account->getMailSize();
+        $mail_size = bcadd($mail_size, $size);
+        $account->setMailSize($mail_size);
+        $account->updateNow();
+
+        // 送受信記録を使用する設定
+        $system_config = $this->_utility->getSystemConfig();
+        $personal_config = $this->_utility->getPersonalConfig($user);
+        if ($system_config->canUserUseHistory()) {
+            $address_history_logic = $this->_utility->getAddressHistoryLogic();
+        }
+
+        // 開封通知メールデータを追加
+        $mail_logic = $this->_utility->getMailLogic();
+        $mail_logic->_addConfirmResponseRow($user, $row, $mail_message_id, $to,
+            $properties['subject'], $properties['from'], $ts,
+            $ts/*, $request_row*/);
+
+        $row->runArticleHook('create');
+
+        //Full Text Search
+        if (FtsApplication::isAvailable()) {
+            $searchService = new IndexService();
+            $searchService->createMessageIndex($row);
+            $fileBodyRowSet = $row->getFileBodyRowSet();
+            while ($fileBodyRow = $fileBodyRowSet->iterate()) {
+                if ( ! is_null($fileBodyRow->get('blob'))) {
+                    $searchService->createSendFileIndex($fileBodyRow);
+                }
+            }
+        }
+        $this->_utility->addIncrementalSearch($original_to);
+
+        return true;
+    }
+
+    /**
+     * 開封確認送信元への返信
+     *
+     * @param CB_User     $user          ユーザー
+     * @param string      $account_id    アカウントID
+     * @param string|null $mail_id       受信メールID or null
+     * @param string      $action_mode   'manual' / 'auto'
+     * @param boolean     $b_throw_error エラー発生時に例外をスローするか(default:TRUE)
+     *
+     * @return  boolean
+     */
+    function sendResponseOfConfirmationMail(
+        & $user,
+        $account_id,
+        $mail_id,
+        $action_mode,
+        $b_throw_error = true
+    ) {
+        $system_config = $this->_utility->getSystemConfig();
+        $account = $system_config->_getAccountRow($account_id);
+        $mail_logic = $this->_utility->getMailLogic();
+        $mail =& $mail_logic->_getMailRow($mail_id);
+
+        return $this->_sendResponseOfConfirmationMail($user, $account, $mail,
+            $action_mode, $b_throw_error);
+    }
+}

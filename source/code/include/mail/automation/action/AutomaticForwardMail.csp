@@ -1,0 +1,185 @@
+<?php
+
+namespace grn\mail\automation\action;
+
+require_once("mail/mail.csp");
+require_once("mail/include_send.csp");
+require_once("mail/system_config.csp");
+require_once("mail/inspection.csp");
+
+
+class AutomaticForwardMail implements AutomaticAction
+{
+    /** @var  \CB_MailAddress[] */
+    private $forwardTo;
+    /** @var \GRN_Mail_MailLogic */
+    private $mailLogic;
+    /** @var \GRN_Mail_SendLogic */
+    private $sendLogic;
+    /** @var \GRN_Mail_SystemConfig */
+    private $systemConfiguration;
+    /** @var  \grn\mail\automation\action\MailServiceAttackPreventionPolicy */
+    private $mailServiceAttackPreventionPolicy;
+
+    /**
+     * @param $forwardTo
+     */
+    public function __construct(array $forwardTo)
+    {
+        $this->forwardTo = $forwardTo;
+        $this->mailLogic
+            = \GRN_Mail_MailLogic::getInstance();
+        $this->sendLogic
+            = \GRN_Mail_SendLogic::getInstance();
+        $this->systemConfiguration
+            = \GRN_Mail_SystemConfig::getInstance();
+        $this->mailServiceAttackPreventionPolicy
+            = MailServiceAttackPreventionPolicy::create($this->systemConfiguration);
+
+    }
+
+    /**
+     * @param \CB_User $user
+     * @param          $account_id
+     * @param array    $mailIds
+     *
+     * @return mixed|void
+     */
+    public function execute(\CB_User $user, $account_id, array $mailIds)
+    {
+
+        if (empty($mailIds)) {
+            return;
+        }
+
+        if (empty($this->forwardTo)) {
+            return;
+        }
+
+        $to = $this->formatForwardAddressees($account_id);
+        if (empty($to)) {
+            return;
+        }
+
+        // STM-1119
+        $timeout
+            = 300;                                                                     // 5(minutes) × 60(seconds) = 300(seconds)
+        set_time_limit($timeout);
+        $connection_info = $this->sendLogic->openConnection($account_id,
+            true, $timeout);   // STM-1119
+        $connection_info['forward-auto'] = true;
+        foreach ($mailIds as $mailId) {
+            $mailData = $this->mailLogic->getMailData($mailId, true);
+            $files = $this->sendLogic->makeForwardFiles($user, $mailData);
+            $forwardData = $this->formatForwardMail($mailData, $to);
+            $this->forwardMail($connection_info, $user, $mailId, $forwardData,
+                $files);
+        }
+        $this->sendLogic->closeConnection($connection_info);
+    }
+
+    /**
+     * get list of formatted CB_MailAddress
+     *
+     * @param $accountId
+     *
+     * @return array
+     */
+    private function formatForwardAddressees($accountId)
+    {
+        $addressees = [];
+        $filteredForwardToList
+            = $this->mailServiceAttackPreventionPolicy->filterInfiniteLoopAddress($accountId,
+            $this->forwardTo);
+        foreach ($filteredForwardToList as $address) {
+
+            $addressees[] = $address->format();
+        }
+
+        return $addressees;
+    }
+
+    /**
+     * @param       $mailData
+     * @param array $addressees
+     *
+     * @return array
+     */
+    private function formatForwardMail($mailData, array $addressees)
+    {
+        $subject = $this->sendLogic->makeForwardSubject($mailData);
+        $data = $this->sendLogic->makeForwardData(
+            $mailData,
+            $this->systemConfiguration->canUserUseHtmlMailPicture(),
+            $this->systemConfiguration->canUserSendHtmlMail(),
+            true
+        );
+
+        $formatMailData = [
+            "subject" => $subject,
+            "data"    => is_null($data["data"]) ? "" : $data["data"],
+            "to"      => implode($addressees, ",")
+        ];
+
+        if ( ! is_null($data["html_data"])) {
+            $formatMailData["html_data"] = $data["html_data"];
+        }
+
+        return $formatMailData;
+
+    }
+
+    /**
+     * @param array    $connection_info
+     * @param \CB_User $user
+     * @param          $mailId
+     * @param          $mailData
+     * @param          $files
+     */
+    private function forwardMail(
+        $connection_info,
+        \CB_User $user,
+        $mailId,
+        $mailData,
+        $files
+    ) {
+
+        $util = \GRN_Mail_Utility::getInstance();
+        $personal_config = $util->getPersonalConfig($user);
+        $personal_config->getGeneralSetting($general_settings);
+        $result = $this->sendLogic->sendMailSingle($connection_info, $user,
+            $mailData, $files, null, "forward", "{$mailId}", null, true,
+            $general_settings['save_sentfile']);
+        // error occurs
+        if (is_array($result)) {
+            require_once('fw/error_message.csp');
+            $error_message = \CB_ErrorMessage::getFullErrorMessage($result);
+            $mailData['Error'] = $error_message['code'];
+            $mailData['Cause'] = $error_message['cause'];
+            $logger = \GRN_Mail_Inspection::getInstance();
+            $logger->writeWaringLog($this->createWaringMessage($mailData));
+        } elseif ($result) {
+            $util->addIncrementalSearch($mailData["to"]);
+        } else {
+            $logger = \GRN_Mail_Inspection::getInstance();
+            $logger->writeWaringLog($this->createWaringMessage($mailData));
+        }
+    }
+
+    /**
+     * @param array $mailData
+     *
+     * @return string
+     */
+    private function createWaringMessage(array $mailData)
+    {
+        $message = "";
+        foreach ($mailData as $key => $value) {
+            $message .= sprintf("%s:%s,", $key,
+                mb_substr(addslashes($value), 0, 100));
+        }
+
+        return sprintf("[Failed auto mail forwarding] (%s) ", $message);
+    }
+
+}

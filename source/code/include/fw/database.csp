@@ -1,0 +1,5079 @@
+<?php
+
+/**
+ * The persistent layer.
+ *
+ * This file provides abstractions for database API, tables, and rows
+ * as well as miscellaneous SQL operations.
+ *
+ * @package fw.persistent
+ */
+
+// NOTE: Available symbolc types are:
+//       int, char, float, double, blob, time, date, datetime, timestamp,
+//       reference, relation, weak_relation, and list_index.
+//       Some of them are mapped directly to an SQL type.  Others are
+//       wrapped by this middle layer.
+// NOTE: 'float' symbolic type will be mapped onto SQL 'DOUBLE' to
+//       avoid losing precision.
+// NOTE: 'relation' and 'weak_relation' type will be automatically indexed.
+//       This comes from MySQL's foregin key constraints specification.
+//       Indices allow multiple entries by default; To use unique indices,
+//       use type specifier like this:
+//           array( 'type'   => 'relation',
+//                  'to'     => 'foo_table',
+//                  'unique' => TRUE );
+// NOTE: 'reference' type cannot be indexed.
+// NOTE: Table names must be less than 60 charactaers.
+//       This is derived from the hard limit of MySQL(64 characters).
+
+// ToDo: write type specifier syntax.
+//       Especially, type specifier allows ANY key string without '=',
+//       but to provide additional information, users should add 'X-'
+//       as a prefix of the additional key.
+// ToDo: write index specifier syntax.
+// ToDo: write group function specifier syntax.
+
+require_once('fw/database_resource.csp');
+
+require_once('fw/basic_date.csp');
+require_once('fw/transaction.csp');
+require_once('fw/date.csp');
+
+define('CB_DBUSER_HEADER', 'HTTP_X_CB_DBUSER_SUFFIX');
+
+/**
+ * Abstract MySQL API.  Different instances will have different
+ * connections for their own.
+ *
+ * @package fw.persistent
+ */
+class CB_DatabaseConnection
+{
+    const FOREST_GAROONDB_SUFFIX = '_garoon';
+    /**
+     * @access private
+     * @var mysqli|bool
+     */
+    var $_connection = false;
+
+    /**
+     * @access private
+     */
+    var $_logger = null;
+    /**
+     * @access private
+     */
+    var $_nqueries = 0;
+
+    /**
+     * @access private
+     */
+    var $_db_error_logger = null;
+
+    ///// parameters that may be set by the container
+
+    /**
+     * @access private
+     */
+    var $_host;
+    /**
+     * @access private
+     */
+    var $_port;
+    /**
+     * @access private
+     */
+    var $_dbname;
+    /**
+     * @access private
+     */
+    var $_username;
+    /**
+     * @access private
+     */
+    var $_password;
+    /**
+     * @access private
+     */
+    var $_is_plain_password;
+    /**
+     * @access private
+     */
+    var $_isolation = null;
+    /**
+     * @access private
+     */
+    var $_sql_mode = null;
+    /**
+     * @access private
+     */
+    var $_logfile = null;
+    /**
+     * @access private
+     */
+    var $_default_lock = null;
+
+    /**
+     * @access private
+     */
+    var $_db_error_file = null;
+
+    /**
+     * Since this class is managed by the light-weight container,
+     * constructor does nothing.
+     */
+    function __construct()
+    {
+    }
+
+    /**
+     * LWC method to setup the instance.
+     */
+    function boot()
+    {
+        // symbolic to SQL
+        $isolation_levels = [
+            'READ-UNCOMMITTED' => 'READ UNCOMMITTED',
+            'READ-COMMITTED'   => 'READ COMMITTED',
+            'REPEATABLE-READ'  => 'REPEATABLE READ',
+            'SERIALIZABLE'     => 'SERIALIZABLE'
+        ];
+        if ( ! is_null($this->_isolation)) {
+            $this->_isolation = $isolation_levels[$this->_isolation];
+        }
+        if ($this->_default_lock === 'EXCLUSIVE') {
+            $this->_default_lock = CB_DATABASE_EXCLUSIVE_LOCK;
+        } elseif ($this->_default_lock === 'SHARED') {
+            $this->_default_lock = CB_DATABASE_SHARED_LOCK;
+        } elseif ($this->_default_lock === 'NO') {
+            $this->_default_lock = CB_DATABASE_NO_LOCK;
+        } else {
+            $this->_default_lock = CB_DATABASE_NO_LOCK;
+        }
+    }
+
+    /**
+     * @access private
+     */
+    function _initialize()
+    {
+        $host = $this->_host;
+        $dbname = $this->_dbname;
+        $username = $this->_username;
+        $password = $this->getDecodedDBPassword();
+
+        if (defined('ON_FOREST')
+            && strpos($dbname, self::FOREST_GAROONDB_SUFFIX) !== false
+        ) {
+            $username = $this->getForestEnvDbUser($username);
+        }
+
+        if ( ! is_null($this->_db_error_file)) {
+            $this->_db_error_logger = @fopen($this->_db_error_file, 'a');
+            if ( ! is_resource($this->_db_error_logger)) {
+                $this->_db_error_logger = null;
+            }
+        }
+
+        $this->_connection = $this->connect($host, $username, $password);
+        if ($this->_connection === false) {
+            $this->throwConnectionError();
+        }
+
+        if ( ! is_null($this->_logfile)) {
+            $this->_logger = fopen($this->_logfile, 'a');
+            fputs($this->_logger,
+                "\nQuery Log at " . date('Y/m/d H:i:s') . "\n");
+        }
+
+        $selected = @mysqli_select_db($this->_connection, $dbname);
+        if ($selected === false) {
+            $query = "failed select db: USE $dbname;";
+            $this->throwServerError($query);
+        }
+
+        $this->query('ROLLBACK;');
+        if ( ! is_null($this->_isolation)) {
+            $this->query('SET SESSION TRANSACTION ISOLATION LEVEL '
+                         . $this->_isolation . ';');
+        }
+        if ( ! is_null($this->_sql_mode)) {
+            $this->query('SET SESSION sql_mode = \'' . $this->_sql_mode
+                         . '\';');
+        }
+        $this->query('SET AUTOCOMMIT=0;');
+    }
+
+    /**
+     * @return string  return database user name.
+     */
+    private function getForestEnvDbUser($username)
+    {
+        $page = explode('/', cb_get_pagename());
+        if (isset($page[0]) && $page[0] === 'batch'
+            && array_key_exists(CB_DBUSER_HEADER, $_SERVER)
+        ) {
+            return $username . $_SERVER[CB_DBUSER_HEADER];
+        }
+
+        return $username;
+    }
+
+    public function getHostName()
+    {
+        return $this->_host;
+    }
+
+    public function getDatabaseName()
+    {
+        return $this->_dbname;
+    }
+
+    function _getErrorResource($errorCode)
+    {
+        require_once('fw/i18n.csp');
+        require_once('fw/error_message.csp');
+        $i18n = CB_I18N::getInstance();
+        $module = substr($errorCode, 0, -CB_ERROR_CODE_LENGTH);
+        $key = substr($errorCode, -CB_ERROR_CODE_LENGTH);
+        $error_resource = 'error';
+
+        return $i18n->getResource($error_resource, $module, $key, false);
+    }
+
+    /* public API */
+    function connect($host, $user, $password)
+    {
+        // Check IPv6 Address
+        list($host, $port) = $this->_parseHostName($host);
+
+        return @mysqli_connect($host, $user, $password, null, $port);
+    }
+
+    public function reconnect()
+    {
+        if ($this->_connection !== false) {
+            @mysqli_close($this->_connection);
+            $this->_connection = false;
+        }
+
+        $this->_initialize();
+    }
+
+    function commit()
+    {
+        if ($this->_connection === false) {
+            return true;
+        }
+
+        $ret = $this->query('COMMIT;');
+
+        return $ret;
+    }
+
+    function abort()
+    {
+        if ($this->_connection === false) {
+            return true;
+        }
+
+        $ret = $this->query('ROLLBACK;');
+
+        return $ret;
+    }
+
+    function query($query)
+    {
+        if ($this->_connection === false) {
+            $this->_initialize();
+        }
+
+        $ret = @mysqli_query($this->_connection, $query);
+        if ($this->_logger) {
+            $this->_nqueries = $this->_nqueries + 1;
+            $errno = $this->getErrno();
+            $error = $this->getError();
+            $msg = (string)getmypid() . '-'
+                   . (string)($this->_nqueries);
+            $msg .= ": ${query}\n";
+            if ($ret === false) {
+                $msg .= "--- error (${errno}) : ${error}\n";
+            }
+            fputs($this->_logger, $msg);
+            fflush($this->_logger);
+        }
+
+        if ($ret === false) {
+            $this->throwServerError($query);
+        }
+
+        return $ret;
+    }
+
+    function select_format(
+        $query,
+        $offset = 0,
+        $limit = -1,
+        $lock = CB_DATABASE_DEFAULT_LOCK,
+        $append_semicolon = true
+    ) {
+        if ( ! is_numeric($offset) || ! is_numeric($limit)) {
+            cb_throw_error(E_COMMON_INTERNAL);
+        }
+
+        if ($lock === CB_DATABASE_DEFAULT_LOCK) {
+            $lock = $this->_default_lock;
+        }
+        switch ($lock) {
+            case CB_DATABASE_EXCLUSIVE_LOCK:
+                $lock = ' FOR UPDATE';
+                break;
+            case CB_DATABASE_SHARED_LOCK:
+                $lock = ' LOCK IN SHARE MODE';
+                break;
+            case CB_DATABASE_NO_LOCK:
+                $lock = '';
+                break;
+            default:
+                $lock = '';
+        }
+        if ($offset < 0) {
+            $offset = 0;
+        } elseif ($offset > 18446744073709551615) {
+            $offset = '18446744073709551615';
+        }
+        if ($limit < 0 || $limit > 18446744073709551615) {
+            $limit = '18446744073709551615';
+        }
+        $l = " LIMIT ${offset}, ${limit}";
+
+        $result = $query . $l . $lock;
+        if ($append_semicolon) {
+            $result .= ";";
+        }
+
+        return $result;
+    }
+
+    function query_mysqldb($query, $admin_user, $admin_password)
+    {
+        $conn = @mysqli_connect($this->_host, $admin_user, $admin_password,
+            null, $this->_port);
+        if ($conn === false) {
+            $this->throwConnectionError($this->_host, 'mysql');
+        }
+
+        $selected = @mysqli_select_db($conn, 'mysql');
+        if ($selected === false) {
+            $this->throwServerError('USE mysql;', $conn, $this->_host, 'mysql');
+        }
+
+        $ret = @mysqli_query($conn, $query);
+
+        if ($this->_logger) {
+            $this->_nqueries = $this->_nqueries + 1;
+            $errno = $this->getErrno();
+            $error = $this->getError();
+            $msg = (string)getmypid() . '-'
+                   . (string)($this->_nqueries);
+            $msg .= ": ${query}\n";
+            if ($ret === false) {
+                $msg .= "--- error (${errno}) : ${error}\n";
+            }
+            fputs($this->_logger, $msg);
+            fflush($this->_logger);
+        }
+
+        return $ret;
+    }
+
+    /**
+     * @param $result
+     *
+     * @return bool|int
+     */
+    function num_rows($result)
+    {
+        return mysqli_num_rows($result);
+    }
+
+    /**
+     * @return int
+     */
+    function affected_rows()
+    {
+        if ($this->_connection === false) {
+            $this->_initialize();
+        }
+
+        return mysqli_affected_rows($this->_connection);
+    }
+
+    /**
+     * @return string
+     */
+    function get_insert_id()
+    {
+        return (string)mysqli_insert_id($this->_connection);
+    }
+
+    function get_found_rows()
+    {
+        $result = mysqli_query($this->_connection, 'SELECT FOUND_ROWS();');
+        $arr = mysqli_fetch_row($result);
+        mysqli_free_result($result);
+
+        return $arr[0];
+    }
+
+    function free_result($result)
+    {
+        mysqli_free_result($result);
+    }
+
+    /**
+     * @param mysqli_result $result
+     *
+     * @return array|false
+     */
+    function &fetch_row($result)
+    {
+        $ret = mysqli_fetch_row($result);
+        if ( ! $ret) {
+            $ret = false;
+        }
+
+        return $ret;
+    }
+
+    function fetch_assoc($result)
+    {
+        $ret = mysqli_fetch_assoc($result);
+        if ( ! $ret) {
+            $ret = false;
+        }
+
+        return $ret;
+    }
+
+    function fetch_array($result)
+    {
+        $ret = mysqli_fetch_array($result);
+        if ( ! $ret) {
+            $ret = false;
+        }
+
+        return $ret;
+    }
+
+    /**
+     * @param $string
+     *
+     * @return bool|string
+     */
+    function escape($string)
+    {
+        if ($this->_connection === false) {
+            $this->_initialize();
+        }
+
+        return @mysqli_real_escape_string($this->_connection, $string);
+    }
+
+    /**
+     * Escape function for LIKE expression.
+     *
+     * @param string $string
+     *
+     * @return string
+     */
+    function escapeLike($string)
+    {
+        $string = str_replace("\\", "\\\\", $string);
+        $string = $this->escape($string);
+        $string = str_replace('%', "\\%", $string);
+
+        return str_replace('_', "\\_", $string);
+    }
+
+    /**
+     * @param bool        $use_connection
+     * @param mysqli|bool $connection
+     *
+     * @return int
+     */
+    function getErrno($use_connection = true, $connection = false)
+    {
+        if ($use_connection === false) {
+            return mysqli_connect_errno();
+        } elseif ($connection === false) {
+            return mysqli_errno($this->_connection);
+        } else {
+            return mysqli_errno($connection);
+        }
+    }
+
+    /**
+     * @param bool        $use_connection
+     * @param mysqli|bool $connection
+     *
+     * @return string
+     */
+    function getError($use_connection = true, $connection = false)
+    {
+        if ($use_connection === false) {
+            return mysqli_connect_error();
+        } elseif ($connection === false) {
+            return mysqli_error($this->_connection);
+        } else {
+            return mysqli_error($connection);
+        }
+    }
+
+    function throwError($devinfo = null)
+    {
+        $errno = $this->getErrno();
+        $errmsg = $this->getError();
+        if (is_null($devinfo)) {
+            $cause = ['msg' => $errmsg];
+        } else {
+            $cause = $devinfo + ['msg' => $errmsg];
+        }
+
+        $errorCode = sprintf('DB%05d', abs($errno));
+        $errorResource = $this->_getErrorResource($errorCode);
+        if (is_array($errorResource)) {
+            cb_throw_error($errorCode,
+                ['msg' => $errmsg],    // for English locales
+                $cause,
+                null,
+                $devinfo);
+        } else {
+            cb_throw_error(E_DATABASE_GENERAL_ERROR,
+                ['errorCode' => $errno],
+                $cause,
+                null,
+                $devinfo);
+        }
+    }
+
+    function throwConnectionError(
+        $host = false,
+        $dbname = false,
+        $errno = false,
+        $errmsg = false
+    ) {
+        if ($host === false) {
+            $host = $this->_host;
+        }
+        if ($dbname === false) {
+            $dbname = $this->_dbname;
+        }
+
+        if ($errno === false) {
+            $errno = mysqli_connect_errno();
+        }
+        if ($errmsg === false) {
+            $errmsg = mysqli_connect_error();
+            $errmsg = mb_convert_encoding($errmsg, "UTF-8", "EUC-JP,SJIS");
+        }
+
+        $this->errorLog($errno, $errmsg);
+
+        $info = [
+            'msg'    => $errmsg,
+            'host'   => $host,
+            'dbname' => $dbname,
+            'query'  => ''
+        ];
+
+        $errorCode = sprintf('DB%05d', abs($errno));
+        $errorResource = $this->_getErrorResource($errorCode);
+        if (is_array($errorResource)) {
+            cb_throw_error($errorCode,
+                $info,
+                $info,
+                $info,
+                $info);
+        } else {
+            cb_throw_error(E_DATABASE_GENERAL_ERROR,
+                ['errorCode' => $errno],
+                $info,
+                $info,
+                $info);
+        }
+    }
+
+    function throwServerError(
+        $query = '',
+        $connection = false,
+        $host = false,
+        $dbname = false,
+        $errno = false,
+        $errmsg = false
+    ) {
+        if ($connection === false) {
+            $connection = $this->_connection;
+        }
+        if ($host === false) {
+            $host = $this->_host;
+        }
+        if ($dbname === false) {
+            $dbname = $this->_dbname;
+        }
+
+        if ($errno === false) {
+            if ($connection === false) {
+                $errno = mysqli_errno();
+            } else {
+                $errno = mysqli_errno($connection);
+            }
+        }
+        if ($errmsg === false) {
+            if ($connection === false) {
+                $errmsg = mysqli_connect_error();
+            } else {
+                $errmsg = mysqli_error($connection);
+            }
+        }
+
+        $this->errorLog($errno, $errmsg);
+
+        $info = [
+            'msg'    => $errmsg,
+            'host'   => $host,
+            'dbname' => $dbname,
+            'query'  => $query
+        ];
+
+        $errorCode = sprintf('DB%05d', abs($errno));
+        $errorResource = $this->_getErrorResource($errorCode);
+        if (is_array($errorResource)) {
+            cb_throw_error($errorCode,
+                $info,
+                $info,
+                $info,
+                $info);
+        } else {
+            cb_throw_error(E_DATABASE_GENERAL_ERROR,
+                ['errorCode' => $errno],
+                $info,
+                $info,
+                $info);
+        }
+    }
+
+    /**
+     * lwc.iniのパスワードを取得する。
+     * 平文保存フラグがあった場合は、デコードを行わずそのままのパスワードを返す
+     *
+     * @return string
+     */
+    private function getDecodedDBPassword()
+    {
+        if ( ! $this->_is_plain_password) {
+            $password = '';
+            cb_aes_decode('dsanoster', base64_decode($this->_password),
+                $password);
+
+            return $password;
+        }
+
+        return $this->_password;
+
+    }
+
+    /* RDBMS administration methods */
+    function createdb($admin_user, $admin_password)
+    {
+        $conn = @mysqli_connect($this->_host, $admin_user, $admin_password,
+            null, $this->port);
+        if ($conn === false) {
+            $this->throwConnectionError($this->_host, 'mysql');
+        }
+
+        $dbname = $this->_dbname;
+        $dbname = @mysqli_real_escape_string($conn, $dbname);
+
+        $username = $this->_username;
+        $username = @mysqli_real_escape_string($conn, $username);
+        $password = $this->getDecodedDBPassword();
+        $password = @mysqli_real_escape_string($conn, $password);
+
+        $query = "CREATE DATABASE ${dbname};";
+        if (@mysqli_query($conn, $query) === false) {
+            $this->throwServerError($query, $conn);
+        }
+
+        $query
+            = "CREATE USER IF NOT EXISTS '${username}' IDENTIFIED BY '${password}';";
+        if (@mysqli_query($conn, $query) === false) {
+            $this->throwServerError($query, $conn);
+        }
+
+        $query = "GRANT ALL ON ${dbname}.* TO '${username}';";
+        if (@mysqli_query($conn, $query) === false) {
+            $this->throwServerError($query, $conn);
+        }
+
+        if (@mysqli_query($conn, 'FLUSH PRIVILEGES;') === false) {
+            $this->throwServerError($query, $conn);
+        }
+
+        @mysqli_close($conn);
+
+        return true;
+    }
+
+    function dropdb($admin_user, $admin_password)
+    {
+        $conn = @mysqli_connect($this->_host, $admin_user, $admin_password,
+            null, $this->_port);
+        if ($conn === false) {
+            $this->throwConnectionError($this->_host, 'mysql');
+        }
+
+        $dbname = $this->_dbname;
+        $dbname = @mysqli_real_escape_string($conn, $dbname);
+
+        @mysqli_query($conn, "DROP DATABASE ${dbname};");
+
+        @mysqli_close($conn);
+
+        return true;
+    }
+
+    function dbExist($admin_user, $admin_password)
+    {
+        $conn = @mysqli_connect($this->_host, $admin_user, $admin_password,
+            null, $this->_port);
+        if ($conn === false) {
+            $errno = mysqli_connect_errno();
+            $errmsg = mysqli_connect_error();
+            if ($errno === CB_DATABASE_AUTH_FAILED_ERRNO) {
+                return false;
+            }
+            $this->throwConnectionError($this->_host, 'mysql', $errno, $errmsg);
+        }
+
+        $dbname = $this->_dbname;
+        $dbname = @mysqli_real_escape_string($conn, $dbname);
+
+        $ret = @mysqli_query($conn, "CREATE DATABASE ${dbname};");
+        if ($ret != false) {
+            @mysqli_query($conn, "DROP DATABASE ${dbname};");
+        }
+
+        @mysqli_close($conn);
+
+        return ! $ret;
+    }
+
+    /**
+     * @return CB_DatabaseConnection
+     */
+    function getCopy()
+    {
+        $copy = new CB_DatabaseConnection();
+        $copy->_host = $this->_host;
+        $copy->_port = $this->_port;
+        $copy->_dbname = $this->_dbname;
+        $copy->_username = $this->_username;
+        $copy->_password = $this->_password;
+        $copy->_isolation = $this->_isolation;
+        $copy->_is_plain_password = $this->_is_plain_password;
+
+        $copy->_initialize();
+
+        return $copy;
+    }
+
+    function errorLog($errno, $errmsg)
+    {
+        if (is_null($this->_db_error_logger)) {
+            return;
+        }
+
+        /*
+ *  The timezone of $fm doesn't depend on the stetting stored in database to avoid the infinite error loop
+ *  which occurs when database is not available.
+ */
+        $fm = date('Y-m-d H:i:s');
+        $ip = @$_SERVER['REMOTE_ADDR'];
+
+        $log = sprintf("%s\t%s\t%5s\t%s\n", $fm, $ip, $errno, $errmsg);
+
+        fputs($this->_db_error_logger, $log);
+        fflush($this->_db_error_logger);
+    }
+
+    /**
+     * separate Host and Port
+     *
+     * @access private
+     *
+     * @param string $param
+     *
+     * @return array
+     */
+    function _parseHostName($param)
+    {
+        // Check IPv6 Address
+        $port = null;
+        $host = null;
+        if (1
+            == preg_match('/^\[([0-9a-fA-F:]{2,39})(%[0-9a-zA-Z]+)?\](?:\:([0-9]+))?/',
+                $param, $matches)
+        ) {
+            // Yes
+            $host = '[' . $matches[1] . $matches[2];
+            if (isset($matches[2]) && '%' === substr($matches[2], 1)) {
+                $host .= $matches[2];
+            }
+            $host .= ']';
+            if (isset($matches[3])) {
+                $port = $matches[3];
+            }
+        } else {
+            // No IPv4
+            list($host, $port) = explode(':', $param);
+        }
+
+        return [$host, $port];
+    }
+
+    public function format($format, $args)
+    {
+        if ( ! $this->_connection) {
+            $this->_initialize();
+        }
+
+        return cb_cqueryfi($this->_connection, $format, $args);
+    }
+
+    /**
+     * validate length of text : length of text smaller than mediumtext length.
+     *
+     * @param string $text
+     *
+     * @return bool
+     */
+    public function validateMediumTextLength($text)
+    {
+        return strlen($text) < CB_DATABASE_MEDIUMTEXT_LENGTH;
+    }
+}
+
+/**
+ * Abstract MySQL API using persistent connection.
+ * Instances will have the same persistent connection.
+ *
+ * @package fw.persistent
+ */
+class CB_PersistentDatabaseConnection extends CB_DatabaseConnection
+{
+    function __construct()
+    {
+        parent::__construct();
+    }
+
+    /**
+     * @param $host
+     * @param $user
+     * @param $password
+     *
+     * @return mysqli
+     */
+    function connect($host, $user, $password)
+    {
+        list($host, $port) = $this->_parseHostName($host);
+
+        return @mysqli_connect('p:' . $host, $user, $password, null, $port);
+    }
+}
+
+/**
+ * Normalizes a column type declaration.
+ *
+ * @access private
+ *
+ * @param array $typeinfo
+ *
+ * @return array
+ */
+function cb_normalizeColumnType($typeinfo)
+{
+    static $_default_length = [
+        'int'  => 4,
+        'char' => 100,
+        'blob' => 65535
+    ];
+
+    // array to be returned
+    $ret = [];
+
+    assert('array_key_exists("type", $typeinfo)');
+    $type = strtolower($typeinfo['type']);
+
+    // resolve type aliases
+    if ($type === 'text') {
+        $type = 'char';
+    }
+    if ($type === 'float') {
+        $type = 'double';
+    }
+
+    $ret['type'] = $type;
+
+    $lazy = false;
+    if (array_key_exists('lazy', $typeinfo)) {
+        $lazy = $typeinfo['lazy'] ? 1 : 0;
+    } elseif (array_key_exists('delay', $typeinfo)) {
+        // 'delay' is an alias of 'lazy'
+        $lazy = $typeinfo['delay'] ? 1 : 0;
+    }
+    $ret['lazy'] = $lazy;
+
+    $notnull = false;
+    if (array_key_exists('notnull', $typeinfo)) {
+        $notnull = $typeinfo['notnull'];
+    }
+    $ret['notnull'] = $notnull ? 1 : 0;
+
+    $length = 0;
+    if (array_key_exists('length', $typeinfo)) {
+        $length = $typeinfo['length'];
+    } elseif (array_key_exists($type, $_default_length)) {
+        $length = $_default_length[$type];
+    }
+
+    $unsigned = false;
+    if (array_key_exists('unsigned', $typeinfo)) {
+        $unsigned = $typeinfo['unsigned'];
+    }
+
+    switch ($type) {
+        case 'int':
+            switch ($length) {
+                case 1:
+                    $ret['sqltype'] = 'TINYINT';
+                    break;
+                case 2:
+                    $ret['sqltype'] = 'SMALLINT';
+                    break;
+                case 3:
+                    $ret['sqltype'] = 'MEDIUMINT';
+                    break;
+                case 4:
+                    $ret['sqltype'] = 'INT';
+                    break;
+                default:
+                    $ret['sqltype'] = 'BIGINT';
+            }
+            $ret['unsigned'] = $unsigned ? 1 : 0;
+            $ret['length'] = $length;
+            break;
+
+        case 'double':
+            $ret['sqltype'] = 'DOUBLE';
+            $ret['unsigned'] = $unsigned ? 1 : 0;
+            break;
+
+        case 'char':
+            if ($length < 256) {
+                $ret['sqltype'] = "CHAR(${length})";
+            } elseif ($length < 65536) {
+                $ret['sqltype'] = 'TEXT';   // for case-sensitivity
+            } else {
+                $ret['sqltype'] = 'LONGTEXT';   // for case-sensitivity
+            }
+            $ret['length'] = $length;
+            break;
+
+        case 'blob':
+            if ($length < 256) {
+                $ret['sqltype'] = 'TINYBLOB';
+            } elseif ($length < 65536) {
+                $ret['sqltype'] = 'BLOB';
+            } else {
+                $ret['sqltype'] = 'LONGBLOB';
+            }
+            $ret['length'] = $length;
+            break;
+
+        case 'time':
+            $ret['sqltype'] = 'TIME';
+            break;
+
+        case 'date':
+            $ret['sqltype'] = 'DATE';
+            break;
+
+        case 'datetime':
+            $ret['sqltype'] = 'DATETIME';
+            break;
+
+        case 'timestamp':
+            $ret['sqltype'] = 'INT';
+            break;
+
+        case 'list_index':
+            $ret['sqltype'] = 'INT NOT NULL DEFAULT 0x7FFFFFFF';
+            break;
+
+        // special types
+        case 'relation':
+        case 'weak_relation':
+            //assert( 'array_key_exists("to", $typeinfo)' );
+            $ret['to'] = strtolower($typeinfo['to']);
+            $unique = false;
+            $no_foreign_key_check = false;
+            if (array_key_exists('unique', $typeinfo)) {
+                $unique = $typeinfo['unique'];
+            }
+            if (array_key_exists('no_foreign_key_check', $typeinfo)) {
+                $no_foreign_key_check = $typeinfo['no_foreign_key_check'];
+            }
+            $ret['unique'] = $unique ? 1 : 0;
+            $ret['no_foreign_key_check'] = $no_foreign_key_check ? 1 : 0;
+
+            if (array_key_exists('suffix', $typeinfo)) {
+                $suffix = $typeinfo['suffix'];
+                $ret['suffix'] = $suffix ? 1 : 0;
+            }
+            $no_foreign_key_create = false;
+            if (array_key_exists('no_foreign_key_create', $typeinfo)) {
+                $no_foreign_key_create = $typeinfo['no_foreign_key_create'];
+            }
+            $ret['no_foreign_key_create'] = $no_foreign_key_create ? 1 : 0;
+
+            break;
+
+        case 'reference':
+            break;
+
+        default:
+            cb_throw_error(E_CYDE_INVALID_COLUMN_TYPE, null,
+                ['type' => $type]);
+    }
+
+    if (array_key_exists('default', $typeinfo)) {
+        $default = $typeinfo['default'];
+        $ret['sqltype'] .= ' DEFAULT ' . $default;
+    }
+
+    return $ret;
+}
+
+/**
+ * @access private
+ *
+ * @param array $info1
+ * @param array $info2
+ *
+ * @return TRUE iff info1 and info2 specifies the same column type.
+ */
+function cb_equalsColumnInfo($info1, $info2)
+{
+    $info1 = cb_normalizeColumnType($info1);
+    $info2 = cb_normalizeColumnType($info2);
+
+    if (strcmp($info1['type'], $info2['type']) != 0) {
+        return false;
+    }
+    if ($info1['notnull'] != $info2['notnull']) {
+        return false;
+    }
+
+    switch ($info1['type']) {
+        case 'int':
+            if ($info1['unsigned'] != $info2['unsigned']) {
+                return false;
+            }
+        case 'char':
+        case 'blob':
+            if ($info1['length'] != $info2['length']) {
+                return false;
+            }
+
+            return true;
+
+        case 'double':
+            if ($info1['unsigned'] != $info2['unsigned']) {
+                return false;
+            }
+
+            return true;
+
+        case 'relation':
+        case 'weak_relation':
+            if (strcmp($info1['to'], $info2['to']) != 0) {
+                return false;
+            }
+            if ($info1['unique'] != $info2['unique']) {
+                return false;
+            }
+            if ($info1['no_foreign_key_check']
+                != $info2['no_foreign_key_check']
+            ) {
+                return false;
+            }
+            if ($info1['no_foreign_key_create']
+                != $info2['no_foreign_key_create']
+            ) {
+                return false;
+            }
+
+            return true;
+
+        default:
+            return true;
+    }
+}
+
+/**
+ * Normalizes an index type declaration.
+ *
+ * @access private
+ *
+ * @param array $index_info
+ *
+ * @return array
+ */
+function cb_normalizeIndexInfo($index_info)
+{
+    // array to be returned
+    $ret = [];
+
+    assert('array_key_exists("cols", $index_info)');
+    $ret['cols'] = $index_info['cols'];
+
+    $unique = false;
+    if (array_key_exists('unique', $index_info)) {
+        $unique = $index_info['unique'];
+    }
+    $ret['unique'] = $unique ? 1 : 0;
+
+    return $ret;
+}
+
+/**
+ * @access private
+ *
+ * @param $info1
+ * @param $info2
+ *
+ * @return TRUE iff info1 and info2 specifies the same index type.
+ */
+function cb_equalsIndexInfo($info1, $info2)
+{
+    $info1 = cb_normalizeIndexInfo($info1);
+    $info2 = cb_normalizeIndexInfo($info2);
+
+    $cols = (array)$info2['cols'];
+    foreach ((array)$info1['cols'] as $c) {
+        if ( ! array_key_exists($c, $cols)) {
+            return false;
+        }
+        unset($cols[$c]);
+    }
+    if (count($cols) > 0) {
+        return false;
+    }
+
+    return ($info1['unique'] === $info2['unique']);
+}
+
+/**
+ * Manage tables in a database.  Table information are stored in
+ * a special table named '_table_info' (defined as CB_DATABASE_METATABLE).
+ *
+ * @package fw.persistent
+ */
+class CB_TableManager implements CB_Transactional
+{
+    /**
+     * Database connection object which will be given by the container.
+     *
+     * @access private
+     * @var CB_DatabaseConnection
+     */
+    var $_dbconn;
+
+    /**
+     * Read-cache size which will be given by the container.
+     *
+     * @access private
+     */
+    var $_cache_limit;
+
+    /**
+     * Transaction level which is given by the container.
+     *
+     * @access private
+     */
+    var $_level;
+
+    /**
+     * Since this is managed by the light-weight container,
+     * constructor does nothing.
+     */
+    function __construct()
+    {
+    }
+
+    /**
+     * Register this class to the transaction manager with help
+     * of container's auto-boot function.
+     */
+    function boot()
+    {
+        $tm = CB_TransactionManager::getInstance();
+        $tm->register(constant($this->_level), $this);
+
+        $this->_cache_limit = (int)$this->_cache_limit;
+    }
+
+    /**
+     * @return CB_DatabaseConnection
+     */
+    function getDBConnection()
+    {
+        return $this->_dbconn;
+    }
+
+    /**
+     * @param string $table_name
+     *
+     * @return TRUE if named table exists; otherwise returns FALSE.
+     */
+    function tableExists($table_name)
+    {
+        global $G_container_base;
+        $master_db = $G_container_base->getInstance('dbconn');
+        $table_name = $master_db->escape(strtolower($table_name));
+        $query
+            = sprintf("SELECT col_name FROM %s WHERE col_name='${table_name}';",
+            CB_DATABASE_METATABLE);
+        $result = $master_db->query($query);
+
+        $ret = ($master_db->num_rows($result) > 0) ? true : false;
+        $master_db->free_result($result);
+
+        return $ret;
+    }
+
+    /**
+     * @param CB_TableInfo $table_info
+     *                                  An instance of {@link CB_TableInfo} that provides column type
+     *                                  information of the table being created.
+     * @param bool         $ifnotexists Don't create a table if the table already
+     *                                  exists.
+     *
+     * @return bool
+     * @access private
+     */
+    function _createTable($table_info, $ifnotexists)
+    {
+        $ret = true;
+        $db = $this->_dbconn;
+        global $G_container_base;
+        $master_db = $G_container_base->getInstance('dbconn');
+        $columns = $table_info->getColumnInfo();
+        $indices = $table_info->getIndexInfo();
+        $table_name = $master_db->escape($table_info->getTableName());
+        $class_name = $table_info->getClassName();
+        $readonly = $table_info->_isReadOnly();
+        if ( ! is_null($class_name)) {
+            $class_name = $master_db->escape($class_name);
+        }
+
+        $query
+            = sprintf("CREATE TABLE %s %s${table_name} (%s %s NOT NULL AUTO_INCREMENT PRIMARY KEY",
+            ($ifnotexists ? 'IF NOT EXISTS' : ''),
+            CB_DATABASE_TABLE_PREFIX,
+            CB_DATABASE_OID_NAME,
+            CB_DATABASE_OID_TYPE);
+        foreach ($columns as $col_name => $col_info) {
+            $query .= ', ';
+
+            $col_name = $master_db->escape($col_name);
+            $query .= $this->_generateColumnSQL($table_name, $col_name,
+                $col_info);
+        }
+        foreach ($indices as $idx_name => $idx_info) {
+            $query .= ', ';
+
+            $idx_name = $master_db->escape($idx_name);
+            $query .= $this->_generateIndexSQL($idx_name, $idx_info);
+        }
+        $query .= ') ENGINE=InnoDB;';
+
+        $db->query($query);
+
+        // add information on this new table into control table.
+        if ( ! ($ifnotexists && $this->tableExists($table_name))) {
+            $cquery
+                = sprintf("INSERT INTO %s (col_name, col_class, col_readonly, col_columns, col_indices) VALUES ('${table_name}', %s, %d, '%s', '%s');",
+                CB_DATABASE_METATABLE,
+                (is_null($class_name) ? 'NULL' : "'${class_name}'"),
+                ($readonly ? 1 : 0),
+                $master_db->escape($this->_encodeColumnInfo($columns)),
+                $master_db->escape($this->_encodeIndexInfo($indices)));
+
+            $master_db->query($cquery);
+        }
+
+        return $ret;
+    }
+
+    /**
+     * @param CB_TableInfo $table_info
+     *
+     * @return bool
+     * @access private
+     */
+    function _dropTable($table_info)
+    {
+        $db = $this->_dbconn;
+        global $G_container_base;
+        $master_db = $G_container_base->getInstance('dbconn');
+        $table_name = $master_db->escape($table_info->getTableName());
+
+        $query = sprintf("DROP TABLE IF EXISTS %s${table_name};",
+            CB_DATABASE_TABLE_PREFIX);
+        $db->query($query);
+
+        $cquery = sprintf("DELETE FROM %s WHERE col_name='${table_name}';",
+            CB_DATABASE_METATABLE);
+        $master_db->query($cquery);
+
+        return true;
+    }
+
+
+    /**
+     * @param CB_TableInfo $table_info
+     *
+     * @return bool
+     */
+    function _alterTable($table_info)
+    {
+        $db = $this->_dbconn;
+        global $G_container_base;
+        $master_db = $G_container_base->getInstance('dbconn');
+        $table_name = $master_db->escape($table_info->getTableName());
+
+        $query = sprintf("SELECT * FROM %s WHERE col_name='${table_name}';",
+            CB_DATABASE_METATABLE);
+        $result = $master_db->query($query);
+        if ($master_db->num_rows($result) == 0) {
+            cb_throw_error(E_CYDE_TABLE_NOT_FOUND, null,
+                ['table' => $table_name]);
+
+            return false;
+        }
+        $r = $master_db->fetch_assoc($result);
+        $master_db->free_result($result);
+        $old_columns = $this->_decodeColumnInfo($r['col_columns']);
+        $old_indices = $this->_decodeIndexInfo($r['col_indices']);
+
+        $new_columns = $table_info->getColumnInfo();
+        $new_indices = $table_info->getIndexInfo();
+
+        // flag to show any table type change is detected.
+        $doAlter = false;
+
+        // check columns to be removed.
+        $del_cols = [];
+        $old_cols = array_keys($old_columns);
+        foreach ($old_cols as $c) {
+            if ( ! array_key_exists($c, $new_columns)) {
+                $del_cols[] = $c;
+                $doAlter = true;
+            }
+        }
+
+        // check indices to be removed.
+        $del_idxs = [];
+        $old_idxs = array_keys($old_indices);
+        foreach ($old_idxs as $i) {
+            if ( ! array_key_exists($i, $new_indices)) {
+                $del_idxs[] = $i;
+                $doAlter = true;
+            }
+        }
+
+        // remove columns and indices
+        $query = sprintf("ALTER TABLE %s${table_name} ",
+            CB_DATABASE_TABLE_PREFIX);
+        $toPutComma = false;
+        foreach ($del_cols as $c) {
+            if ($toPutComma) {
+                $query .= ', ';
+            } else {
+                $toPutComma = true;
+            }
+
+            $c = $master_db->escape($c);
+            $col_info = $old_columns[$c];
+            if (strcmp($col_info['type'], 'reference') === 0) {
+                $query .= sprintf("DROP %s${c}, DROP %s${c}",
+                    CB_DATABASE_REFERENCE_TABLE,
+                    CB_DATABASE_REFERENCE_ID);
+            } elseif ((strcmp($col_info['type'], 'relation') === 0)
+                      || (strcmp($col_info['type'], 'weak_relation') === 0)
+            ) {
+                $query .= sprintf("DROP FOREIGN KEY %s${table_name}_${c}, DROP %s${c}",
+                    CB_DATABASE_CONSTRAINT_PREFIX,
+                    CB_DATABASE_COLUMN_PREFIX);
+            } else {
+                $query .= sprintf("DROP %s${c}",
+                    CB_DATABASE_COLUMN_PREFIX);
+            }
+        }
+        foreach ($del_idxs as $i) {
+            if ($toPutComma) {
+                $query .= ', ';
+            } else {
+                $toPutComma = true;
+            }
+
+            $i = $master_db->escape($i);
+            $query .= sprintf("DROP INDEX %s${i}", CB_DATABASE_INDEX_PREFIX);
+        }
+
+        // add/alter columns
+        $toAddColumn = [];
+        foreach ($new_columns as $col_name => $col_info) {
+            if (array_key_exists($col_name, $old_columns)) {
+                $old_col_info = $old_columns[$col_name];
+
+                // CHANGE if not match
+                if ( ! cb_equalsColumnInfo($col_info, $old_col_info)) {
+                    $doAlter = true;
+                    if ($toPutComma) {
+                        $query .= ', ';
+                    } else {
+                        $toPutComma = true;
+                    }
+
+                    if ((strcmp($col_info['type'], 'reference') === 0)
+                        || (strcmp($col_info['type'], 'relation') === 0)
+                        || (strcmp($col_info['type'], 'weak_relation') === 0)
+                        || (strcmp($old_col_info['type'], 'reference') === 0)
+                        || (strcmp($old_col_info['type'], 'relation') === 0)
+                        || (strcmp($old_col_info['type'], 'weak_relation')
+                            === 0)
+                    ) {
+
+                        $toAddColumn[] = $col_name;
+                        $col_name = $master_db->escape($col_name);
+                        if (strcmp($old_col_info['type'], 'reference') === 0) {
+                            $query .= sprintf("DROP %s${col_name}, DROP %s${col_name}",
+                                CB_DATABASE_REFERENCE_TABLE,
+                                CB_DATABASE_REFERENCE_ID);
+                        } else {
+                            $query .= sprintf("DROP %s${col_name}",
+                                CB_DATABASE_COLUMN_PREFIX);
+                        }
+
+                    } else {
+                        $col_name = $master_db->escape($col_name);
+                        $query .= sprintf("CHANGE %s${col_name} %s",
+                            CB_DATABASE_COLUMN_PREFIX,
+                            CB_DATABASE_COLUMN_PREFIX,
+                            $this->_generateColumnSQL($table_name, $col_name,
+                                $col_info));
+                    }
+                }
+
+            } else {
+                // ADD
+                $doAlter = true;
+                if ($toPutComma) {
+                    $query .= ', ';
+                } else {
+                    $toPutComma = true;
+                }
+
+                $col_name = $master_db->escape($col_name);
+                $query .= $this->_generateColumnSQL($table_name, $col_name,
+                    $col_info, 'ADD ');
+            }
+        }
+
+        // add/drop indices
+        $toAddIndex = [];
+        foreach ($new_indices as $idx_name => $idx_info) {
+            if (array_key_exists($idx_name, $old_indices)) {
+                $old_idx_info = $old_indices[$idx_name];
+                // DROP if not match
+                if ( ! cb_equalsIndexInfo($idx_info, $old_idx_info)) {
+                    $doAlter = true;
+                    if ($toPutComma) {
+                        $query .= ', ';
+                    } else {
+                        $toPutComma = true;
+                    }
+
+                    $toAddIndex[] = $idx_name;
+                    $idx_name = $master_db->escape($idx_name);
+                    $query .= sprintf("DROP INDEX %s${idx_name}",
+                        CB_DATABASE_INDEX_PREFIX);
+                }
+            } else {
+                // ADD new one
+                $doAlter = true;
+                if ($toPutComma) {
+                    $query .= ', ';
+                } else {
+                    $toPutComma = true;
+                }
+                $idx_name = $master_db->escape($idx_name);
+                $query .= $this->_generateIndexSQL($idx_name, $idx_info,
+                    'ADD ');
+            }
+        }
+
+        // wrap up
+        if ($doAlter) {
+            $query .= ';';
+            $db->query($query);
+        }
+        if ((count($toAddColumn) + count($toAddIndex)) > 0) {
+            $query = sprintf("ALTER TABLE %s${table_name} ",
+                CB_DATABASE_TABLE_PREFIX);
+            $toPutComma = false;
+
+            foreach ($toAddColumn as $col_name) {
+                if ($toPutComma) {
+                    $query .= ', ';
+                } else {
+                    $toPutComma = true;
+                }
+
+                $col_info = $new_columns[$col_name];
+                $col_name = $master_db->escape($col_name);
+                $query .= $this->_generateColumnSQL($table_name, $col_name,
+                    $col_info, 'ADD ');
+            }
+            foreach ($toAddIndex as $idx_name) {
+                if ($toPutComma) {
+                    $query .= ', ';
+                } else {
+                    $toPutComma = true;
+                }
+
+                $idx_info = $new_indices[$idx_name];
+                $idx_name = $master_db->escape($idx_name);
+                $query .= $this->_generateIndexSQL($idx_name, $idx_info,
+                    'ADD ');
+            }
+
+            $query .= ';';
+            $db->query($query);
+        }
+
+        // Update meta table information.  This is always done
+        // to reflect changes that do not affect real table types.
+        // Such changes include adding/droping 'delay' properties to/from
+        // abstract column types, for example.
+        $cquery
+            = sprintf("UPDATE %s SET col_columns='%s', col_indices='%s' WHERE col_name='${table_name}';",
+            CB_DATABASE_METATABLE,
+            $this->_encodeColumnInfo($new_columns),
+            $this->_encodeIndexInfo($new_indices));
+        $master_db->query($cquery);
+
+        return true;
+    }
+
+    /**
+     * @access private
+     *
+     * @param CB_TableInfo $table_info
+     *
+     * @return bool
+     */
+    function _optimizeTable($table_info)
+    {
+        $db = $this->_dbconn;
+        $table_name = $db->escape($table_info->getTableName());
+
+        $query = sprintf("ALTER TABLE %s${table_name} ENGINE=InnoDB;",
+            CB_DATABASE_TABLE_PREFIX);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwServerError($query);
+        }
+
+        return true;
+    }
+
+    protected function _createTableInfo($table_name)
+    {
+        return new CB_TableInfo($this, $table_name, $this->_cache_limit);
+    }
+
+    /**
+     * @var CB_TableInfo[]
+     * @access private
+     */
+    var $_tablemap = [];
+
+    public function createTableInfo($table_name)
+    {
+        $table_name = strtolower($table_name);
+        if (array_key_exists($table_name, $this->_tablemap)) {
+            return $this->_tablemap[$table_name];
+        }
+
+        $info = $this->_createTableInfo($table_name);
+        $this->_tablemap[$table_name] = $info;
+
+        return $info;
+    }
+
+    /**
+     * @param $table_name
+     *
+     * @return CB_TableInfo|GRN_TableInfo
+     *
+     * The instance of CB_TableInfo that represents the named table.
+     * If the named table does not exist, the returned CB_TableInfo
+     * will have neither columns nor indices.
+     */
+    function getTableInfo($table_name)
+    {
+        $table_name = strtolower($table_name);
+        if (array_key_exists($table_name, $this->_tablemap)) {
+            return $this->_tablemap[$table_name];
+        }
+
+        require_once('fw/persistent.csp');
+        $temp = explode(CB_PERSISTENT_NAMESEPARATOR, $table_name);
+        if (is_array($temp) && count($temp) > 1) {
+            $class_name = $temp[0];
+            $suffix = $temp[1];
+        } else {
+            $class_name = $table_name;
+            $suffix = '';
+        }
+        $tabinfo = cb_class2table_generic($this, $class_name, $suffix);
+
+        return $tabinfo;
+    }
+
+    /**
+     * Internal API to commit database changes.  Do not call this directly!
+     * To commit changes manually, use {@link CB_TransactionManager}.
+     */
+    public function commit()
+    {
+        foreach (array_keys($this->_tablemap) as $key) {
+            $table_info = $this->_tablemap[$key];
+            if ( ! $table_info->_commit()) {
+                $this->abort();
+
+                return false;
+            }
+        }
+
+        if ( ! $this->_dbconn->commit()) {
+            $this->abort();
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Internal API to abort database changes.  Do not call this directly!
+     * To abort changes manually, use {@link CB_TransactionManager}.
+     */
+    public function abort()
+    {
+        foreach (array_keys($this->_tablemap) as $key) {
+            $table_info = $this->_tablemap[$key];
+            $table_info->_abort();
+        }
+
+        $this->_dbconn->abort();
+    }
+
+    /// private API
+
+    /**
+     * @access private
+     *
+     * @param array $column_info
+     *
+     * @return string
+     */
+    function _encodeColumnInfo($column_info)
+    {
+        $toPutComma = false;
+        $str_column_info = '';
+        foreach ($column_info as $name => $info) {
+            if ($toPutComma) {
+                $str_column_info .= ',';
+            } else {
+                $toPutComma = true;
+            }
+
+            $str_column_info .= $name;
+            foreach ($info as $key => $value) {
+                if (is_bool($value)) {
+                    $value = $value ? 1 : 0;
+                }
+                $str_column_info .= " ${key}=${value}";
+            }
+        }
+
+        return $str_column_info;
+    }
+
+    /**
+     * @access private
+     *
+     * @param array $str_column_info
+     *
+     * @return array
+     */
+    function _decodeColumnInfo($str_column_info)
+    {
+        $column_info = [];
+
+        $cols = explode(',', $str_column_info);
+        foreach ($cols as $col) {
+            if (strlen($col) === 0) {
+                continue;
+            }
+
+            $c = explode(' ', $col);
+            $size = count($c);
+            if ($size < 2) {
+                die('invalid column info string: ' . $str_column_info);
+            }
+            $name = $c[0];
+            $info = [];
+            for ($i = 1; $i < $size; $i++) {
+                $kv = explode('=', $c[$i]);
+                if (count($kv) != 2) {
+                    die('invalid column info string: ' . $str_column_info);
+                }
+                $info[$kv[0]] = $kv[1];
+            }
+            $column_info[$name] = $info;
+        }
+
+        ksort($column_info);
+
+        return $column_info;
+    }
+
+    /**
+     * @access private
+     *
+     * @param array $index_info
+     *
+     * @return string
+     */
+    function _encodeIndexInfo($index_info)
+    {
+        $toPutComma = false;
+        $str_index_info = '';
+        foreach ($index_info as $name => $info) {
+            if ($toPutComma) {
+                $str_index_info .= ',';
+            } else {
+                $toPutComma = true;
+            }
+
+            $str_index_info .= $name;
+            foreach ($info as $key => $value) {
+                if (is_array($value)) {
+                    foreach ($value as $vv) {
+                        $str_index_info .= " ${key}=${vv}";
+                    }
+                } else {
+                    $str_index_info .= " ${key}=${value}";
+                }
+            }
+        }
+
+        return $str_index_info;
+    }
+
+    /**
+     * @access private
+     *
+     * @param array $str_index_info
+     *
+     * @return array
+     */
+    function _decodeIndexInfo($str_index_info)
+    {
+        $index_info = [];
+
+        $idxs = explode(',', $str_index_info);
+        foreach ($idxs as $idx) {
+            if (strlen($idx) === 0) {
+                continue;
+            }
+
+            $c = explode(' ', $idx);
+            $size = count($c);
+            if ($size < 1) {
+                die('invalid index info string: ' . $str_index_info);
+            }
+            $name = $c[0];
+            $info = [];
+            for ($i = 1; $i < $size; $i++) {
+                $kv = explode('=', $c[$i]);
+                if (count($kv) != 2) {
+                    die('invalid index info string: ' . $str_index_info);
+                }
+                if (strlen(trim($kv[1])) < 1) {
+                    $kv[1] = null;
+                }
+                if (array_key_exists($kv[0], $info)) {
+                    $va = $info[$kv[0]];
+                    if (is_array($va)) {
+                        $info[$kv[0]][] = $kv[1];
+                    } else {
+                        $info[$kv[0]] = [$va, $kv[1]];
+                    }
+                } else {
+                    $info[$kv[0]] = $kv[1];
+                }
+            }
+            $index_info[$name] = $info;
+        }
+
+        ksort($index_info);
+
+        return $index_info;
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $table_name
+     * @param string $col_name
+     * @param array  $col_info
+     * @param string $prefix
+     *
+     * @return string
+     */
+    function _generateColumnSQL($table_name, $col_name, $col_info, $prefix = '')
+    {
+        $col_info = cb_normalizeColumnType($col_info);
+
+        if (strcmp($col_info['type'], 'list_index') === 0) {
+            return $sql = sprintf("${prefix}%s${col_name} %s",
+                CB_DATABASE_COLUMN_PREFIX,
+                $col_info['sqltype']);
+        }
+
+        $notnull = '';
+        if ($col_info['notnull']) {
+            $notnull = ' NOT NULL';
+        }
+
+        if (array_key_exists('sqltype', $col_info)) {
+            $sqltype = $col_info['sqltype'];
+            $sql = sprintf("${prefix}%s${col_name} ${sqltype}",
+                CB_DATABASE_COLUMN_PREFIX);
+            if (array_key_exists('unsigned', $col_info)
+                && $col_info['unsigned']
+            ) {
+                $sql .= ' UNSIGNED';
+            }
+            $sql .= $notnull;
+
+            return $sql;
+        }
+
+        // special types
+        switch ($col_info['type']) {
+            case 'relation':
+            case 'weak_relation':
+                if (array_key_exists('no_foreign_key_create', $col_info)
+                    && $col_info['no_foreign_key_create']
+                ) {
+                    $sqltype = 'BIGINT';
+                    $sql = sprintf("${prefix}%s${col_name} ${sqltype}",
+                        CB_DATABASE_COLUMN_PREFIX);
+                    if (array_key_exists('unsigned', $col_info)
+                        && $col_info['unsigned']
+                    ) {
+                        $sql .= ' UNSIGNED';
+                    }
+                    $sql .= $notnull;
+
+                    return $sql;
+                }
+
+                $action = 'CASCADE';
+                if (strcmp($col_info['type'], 'weak_relation') === 0) {
+                    $action = 'SET NULL';
+                }
+                $to = $col_info['to'];
+                if (array_key_exists('suffix', $col_info)
+                    && $col_info['suffix']
+                ) {
+                    require_once('fw/persistent.csp');
+                    $temp = explode(CB_PERSISTENT_NAMESEPARATOR, $table_name);
+                    if (is_array($temp) && count($temp) > 1) {
+                        $table_suffix = strtolower($temp[1]);
+                        $to = $to . CB_PERSISTENT_NAMESEPARATOR
+                              . $table_suffix;
+                    }
+                }
+
+                $idx_type = 'INDEX';
+                if ($col_info['unique']) {
+                    $idx_type = 'UNIQUE';
+                }
+                $db = $this->_dbconn;
+
+                return sprintf("${prefix}%s${col_name} %s${notnull}, ${prefix}${idx_type} %s${col_name} (%s${col_name}), ${prefix}CONSTRAINT %s${table_name}_${col_name} FOREIGN KEY (%s${col_name}) REFERENCES %s${to} (%s) ON DELETE ${action}",
+                    CB_DATABASE_COLUMN_PREFIX,
+                    CB_DATABASE_OID_TYPE,
+                    CB_DATABASE_CNSTRIDX_PREFIX,
+                    CB_DATABASE_COLUMN_PREFIX,
+                    CB_DATABASE_CONSTRAINT_PREFIX,
+                    CB_DATABASE_COLUMN_PREFIX,
+                    CB_DATABASE_TABLE_PREFIX,
+                    CB_DATABASE_OID_NAME);
+
+            case 'reference':
+                return sprintf("${prefix}%s${col_name} CHAR(60)${notnull}, ${prefix}%s${col_name} %s${notnull}",
+                    CB_DATABASE_REFERENCE_TABLE,
+                    CB_DATABASE_REFERENCE_ID,
+                    CB_DATABASE_OID_TYPE);
+
+            default:
+                assert('FALSE');
+        }
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $idx_name
+     * @param array  $idx_info
+     * @param string $prefix
+     *
+     * @return string
+     */
+    function _generateIndexSQL($idx_name, $idx_info, $prefix = '')
+    {
+        $idx_info = cb_normalizeIndexInfo($idx_info);
+
+        $idx_type = 'INDEX';
+        if ($idx_info['unique']) {
+            $idx_type = 'UNIQUE';
+        }
+        $sql = "${prefix}${idx_type} " . CB_DATABASE_INDEX_PREFIX
+               . "${idx_name} (";
+
+        $toPutComma = false;
+        foreach ((array)$idx_info['cols'] as $col_name) {
+            if ($toPutComma) {
+                $sql .= ', ';
+            } else {
+                $toPutComma = true;
+            }
+            $sql .= is_null($col_name) ? '_id'
+                : (CB_DATABASE_COLUMN_PREFIX . $col_name);
+        }
+
+        return $sql . ')';
+    }
+}
+
+/**
+ * Abstract a database table and table operations.
+ *
+ * @package fw.persistent
+ */
+class CB_TableInfo
+{
+    /**
+     * @access private
+     */
+    var $_table_manager;
+    /**
+     * @access private
+     */
+    var $_dbconn;
+    /**
+     * @access private
+     */
+    var $_table_name;
+    /**
+     * @access private
+     */
+    var $_class_name = null;
+    /**
+     * @access private
+     */
+    var $_readonly = false;
+    /**
+     * @access private
+     */
+    var $_column_info = [];
+    /**
+     * @access private
+     */
+    var $_idx_info = [];
+    /**
+     * @access private
+     */
+    var $_row_seq = 0;
+    /**
+     * @access private
+     */
+    var $_instant_columns = null;
+    /**
+     * @access private
+     */
+    var $_instant_columns_alias = [];
+    /**
+     * @access private
+     */
+    var $_lock = CB_DATABASE_DEFAULT_LOCK;
+    public $_table_original_name = '';
+    public $_suffix = '';
+
+    var $_ignoreLazy = false;
+
+    var $_parsed = false;
+
+    /**
+     * PROTECTED!  DON'T INSTANTIATE THIS DIRECTLY!
+     * Use CB_TableManager::getTableInfo() to obtain one.
+     *
+     * @param CB_TableManager $table_manager
+     * @param string          $table_name
+     * @param                 $cache_limit
+     *
+     * @access private
+     */
+    function __construct($table_manager, $table_name, $cache_limit)
+    {
+        $table_name = strtolower($table_name);
+        $this->_dbconn = $table_manager->getDBConnection();
+        $this->_table_manager = $table_manager;
+        $this->_table_name = $table_name;
+        $this->_cache_limit = $cache_limit;
+
+        $temp = explode(CB_PERSISTENT_NAMESEPARATOR, $table_name);
+        if (is_array($temp) && count($temp) > 1) {
+            $this->_table_original_name = $temp[0];
+            $this->_suffix = $temp[1];
+        } else {
+            $this->_table_original_name = $table_name;
+        }
+    }
+
+    function setLock($lock = CB_DATABASE_DEFAULT_LOCK)
+    {
+        $this->_lock = $lock;
+    }
+
+    /**
+     * @return CB_TableManager
+     */
+    function getTableManager()
+    {
+        return $this->_table_manager;
+    }
+
+    /**
+     * @return CB_DatabaseConnection
+     */
+    function getDBConnection()
+    {
+        return $this->_dbconn;
+    }
+
+    function setIgnoreLazy($ignoreLazy)
+    {
+        $this->_ignoreLazy = $ignoreLazy;
+    }
+
+    /**
+     * Issue a temporary object identifier for rows before registration.
+     */
+    function issueTempId()
+    {
+        $id = $this->_row_seq + 1;
+        $this->_row_seq = $id;
+
+        return $id;
+    }
+
+    function getTableName()
+    {
+        return $this->_table_name;
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $class_name
+     */
+    function _setClassName($class_name)
+    {
+        if (is_null($class_name)) {
+            return;
+        }
+
+        $this->_class_name = $class_name;
+    }
+
+    /**
+     * @access public
+     */
+    public function getClassName()
+    {
+        return $this->_class_name;
+    }
+
+    /**
+     * @access private
+     */
+    function _setReadOnly()
+    {
+        $this->_readonly = true;
+    }
+
+    /**
+     * @access private
+     */
+    function _isReadOnly()
+    {
+        return $this->_readonly;
+    }
+
+    function getColumnInfo($col_name = null)
+    {
+        if (is_null($col_name)) {
+            ksort($this->_column_info);
+
+            return $this->_column_info;
+        } else {
+            if (array_key_exists($col_name, $this->_column_info)) {
+                return $this->_column_info[$col_name];
+            } else {
+                return null;
+            }
+        }
+    }
+
+    function getIndexInfo($idx_name = null)
+    {
+        if (is_null($idx_name)) {
+            ksort($this->_idx_info);
+
+            return $this->_idx_info;
+        } else {
+            if (array_key_exists($idx_name, $this->_idx_info)) {
+                return $this->_idx_info[$idx_name];
+            } else {
+                return null;
+            }
+        }
+    }
+
+    /**
+     * @param string $name     column name
+     * @param array  $typeinfo type specifier array s.t.
+     *                         array( 'type' => 'int', 'unsigned' => TRUE );
+     */
+    function addColumn($name, $typeinfo)
+    {
+        $this->_column_info[$name] = $typeinfo;
+    }
+
+    function delColumn($name)
+    {
+        unset($this->_column_info[$name]);
+    }
+
+    function clearColumns()
+    {
+        $this->_column_info = [];
+    }
+
+    /**
+     * @param string $idx_name Label string of the index.
+     * @param array  $idx_info parameters for the index s.t.
+     *                         array( 'cols'=>array('name', 'date'), 'unique'=>TRUE );
+     */
+    function addIndex($idx_name, $idx_info)
+    {
+        $this->_idx_info[$idx_name] = $idx_info;
+    }
+
+    function delIndex($idx_name)
+    {
+        unset($this->_idx_info[$idx_name]);
+    }
+
+    function clearIndices()
+    {
+        $this->_idx_info = [];
+    }
+
+    // simple redirection
+
+    /**
+     * @param bool $ifnotexists
+     *             Don't create a table if the table already exists.
+     *
+     * @return bool
+     */
+    function createTable($ifnotexists = false)
+    {
+        return $this->_table_manager->_createTable($this, $ifnotexists);
+    }
+
+    function dropTable()
+    {
+        return $this->_table_manager->_dropTable($this);
+    }
+
+    function alterTable()
+    {
+        return $this->_table_manager->_alterTable($this);
+    }
+
+    function optimizeTable()
+    {
+        return $this->_table_manager->_optimizeTable($this);
+    }
+
+    /**
+     * @return TRUE if the table exists; otherwise returns FALSE.
+     */
+    function exists()
+    {
+        return $this->_table_manager->tableExists($this->getTableName());
+    }
+
+    // protected methods
+
+    /**
+     * @access private
+     *
+     * @param array $column_info
+     */
+    function _setColumnInfo($column_info)
+    {
+        $this->_column_info = $column_info;
+    }
+
+    /**
+     * @access private
+     *
+     * @param array $index_info
+     */
+    function _setIndexInfo($index_info)
+    {
+        $this->_idx_info = $index_info;
+    }
+
+    function clearCache()
+    {
+        $this->_instant_columns = null;
+        $this->_instant_columns_alias = null;
+    }
+
+    /**
+     * @access private
+     *
+     * @param string|null $alias
+     *
+     * @return string|null
+     */
+    function _getInstantColumns($alias = null)
+    {
+        if (is_null($alias) && ! is_null($this->_instant_columns)) {
+            return $this->_instant_columns;
+        }
+        if ( ! is_null($alias)
+             && isset($this->_instant_columns_alias[$alias])
+        ) {
+            return $this->_instant_columns_alias[$alias];
+        }
+
+        $instants = [];
+        $noLazy = true;
+        foreach ($this->_column_info as $col_name => $col_info) {
+            if ( ! $this->_ignoreLazy && array_key_exists('lazy', $col_info)
+                 && $col_info['lazy']
+            ) {
+                $noLazy = false;
+            } else {
+                $instants[] = $col_name;
+            }
+        }
+
+        $db = $this->_dbconn;
+        $escaped_name = $db->escape($this->_table_name);
+        if (is_null($alias)) {
+            $tablename = CB_DATABASE_TABLE_PREFIX . $escaped_name;
+        } else {
+            $tablename = $alias;
+        }
+
+        if ($noLazy) {
+            $_instant_columns = "${tablename}.*";
+        } else {
+            $t = sprintf("${tablename}.%s", CB_DATABASE_OID_NAME);
+            foreach ($instants as $i) {
+                $t .= sprintf(",${tablename}.%s${i}",
+                    CB_DATABASE_COLUMN_PREFIX);
+            }
+            $_instant_columns = $t;
+        }
+
+        if (is_null($alias)) {
+            $this->_instant_columns = $_instant_columns;
+        } else {
+            $this->_instant_columns_alias[$alias] = $_instant_columns;
+        }
+
+        return $_instant_columns;
+    }
+
+    // ***** Row operations *****
+
+    /**
+     * @var CB_Row[]
+     * @access private
+     */
+    var $_toRegister = [];
+
+    /**
+     * @access private
+     */
+    var $_toUpdate = [];
+
+    /**
+     * @access private
+     */
+    var $_rowcache = [];
+
+    /**
+     * @access private
+     */
+    var $_cache_limit;
+
+    /**
+     * Insert and return a new row into this table.
+     *
+     * If this is read-only table, this returns FALSE since new
+     * rows are never inserted.
+     *
+     * @param string $oid
+     *  An externally provided Object IDentifier.  Leave this blank
+     *  to issue a unique OID automatically.
+     *
+     * @return CB_Row|mixed
+     *  A new instance of {@link CB_Row} for basic cases, or return
+     *  a new instance of the class set by {@link CB_TableInfo::_setClassName}.
+     *  For read-only tables, this returns FALSE.
+     */
+    function newRow($oid = null)
+    {
+        $row = false;
+        if ($this->_readonly) {
+            return $row;
+        }
+        $row = $this->_newRow($oid);
+
+        return $row;
+    }
+
+    /**
+     * Forcibly insert and return a new row, even if the table is
+     * marked as read-only.
+     * Use this to insert rows into read-only tables.
+     *
+     * @access protected
+     *
+     * @param int $oid
+     *
+     * @return CB_Row
+     */
+    function _newRow($oid = null)
+    {
+        $class_name = $this->_class_name;
+
+        $row = new CB_Row($this);
+        $row->_setOID($oid);
+        $this->_toRegister[$row->getTempId()] = $row;
+
+        // wrap by mapped class
+        if ( ! is_null($class_name)) {
+            $row = new $class_name($row);
+        }
+
+        return $row;
+    }
+
+    /**
+     * Return an instance of {@link CB_Row}, or, if this CB_TableInfo
+     * was gotten by {@link cb_class2table}, an instance of the class
+     * from which this was constructed.
+     *
+     * @param string $oid The OID of a row to be retrieved.
+     * @param array  $rawdata
+     *                    Used internally.  For ordinary usage, leave this NULL.
+     *
+     * @return CB_Row|mixed
+     *         <var>FALSE</var> if specified row is not found.
+     *         Otherwise an instance of {@link CB_Row} or an instance of
+     *         the class named by <var>_class_name</var> if class wrapper
+     *         is set by {@link CB_TableInfo::_setClassName()} method.
+     */
+    function getRow($oid, $rawdata = null)
+    {
+        $row = $this->_getRow($oid, $rawdata);
+        if ($row !== false) {
+            if ( ! is_null($this->_class_name)) {
+                $class_name = $this->_class_name;
+                $row = new $class_name($row);
+            }
+        }
+
+        return $row;
+    }
+
+    /**
+     * Return an instance of {@link CB_Row}.  This method never
+     * wrap row objects in persistent classes.
+     *
+     * @access private
+     *
+     * @param string $oid
+     *           The OID of a row to be retrieved.
+     * @param array  $rawdata
+     *           Used internally.  For ordinary usage, leave this NULL.
+     *
+     * @return CB_Row|false if specified row is not found.
+     */
+    function _getRow($oid, $rawdata = null)
+    {
+        $fail = false;
+        if ( ! $oid) {
+            return $fail;
+        }
+
+        if (array_key_exists($oid, $this->_toUpdate)) {
+            return $this->_toUpdate[$oid];
+        }
+
+        if (array_key_exists($oid, $this->_rowcache)) {
+            return $this->_rowcache[$oid];
+        }
+
+        if ( ! is_null($rawdata)) {
+            $row = new CB_Row($this, $rawdata);
+
+            // cache
+            $this->_cache($row);
+
+            return $row;
+        }
+
+        $db = $this->_dbconn;
+        $escaped_name = $db->escape($this->_table_name);
+        $query
+            = sprintf("SELECT %s FROM %s${escaped_name} WHERE %s='@S'",
+            $this->_getInstantColumns(),
+            CB_DATABASE_TABLE_PREFIX,
+            CB_DATABASE_OID_NAME);
+        $query = cb_queryf($db, $query, $oid);
+        $query = $db->select_format($query, 0, -1, $this->_lock);
+        $result = $db->query($query);
+        if (($result === false) || ($db->num_rows($result) != 1)) {
+            if ($result) {
+                $db->free_result($result);
+            }
+
+            return $fail;
+        }
+
+        $rawdata = $db->fetch_assoc($result);
+        $db->free_result($result);
+        $row = new CB_Row($this, $rawdata);
+
+        // cache
+        $this->_cache($row);
+
+        return $row;
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $oid
+     *
+     * @return mysqli_result|bool
+     */
+    function _deleteRow($oid)
+    {
+        unset($this->_toUpdate[$oid]);
+        unset($this->_rowcache[$oid]);
+
+        $db = $this->_dbconn;
+        $escaped_name = $db->escape($this->_table_name);
+        $oid = $db->escape($oid);
+        $query
+            = sprintf("DELETE FROM %s${escaped_name} WHERE %s='${oid}';",
+            CB_DATABASE_TABLE_PREFIX, CB_DATABASE_OID_NAME);
+
+        return $db->query($query);
+    }
+
+    /**
+     * Return the number of rows in this table.
+     *
+     * This is the fastest method to count rows rather than using {@link CB_RowSet}.
+     */
+    function countRows()
+    {
+        $db = $this->_dbconn;
+        $escaped_name = $db->escape($this->_table_name);
+        $query = sprintf("SELECT COUNT(*) FROM %s${escaped_name}",
+            CB_DATABASE_TABLE_PREFIX);
+        $query = $db->select_format($query, 0, -1, $this->_lock);
+        $result = $db->query($query);
+        if ($result === false) {
+            return false;
+        }
+
+        $arr = $db->fetch_row($result);
+        $db->free_result($result);
+
+        return $arr[0];
+    }
+
+    /**
+     * @param CB_Row $row
+     *
+     * @access private
+     */
+    function _unRegister($row)
+    {
+        $id = $row->getTempId();
+        unset($this->_toRegister[$id]);
+    }
+
+    /**
+     * @param CB_Row $row
+     *
+     * @access private
+     */
+    function _unUpdate($row)
+    {
+        $oid = $row->getOID();
+        unset($this->_toUpdate[$oid]);
+        $this->_cache($row);
+    }
+
+    /**
+     * @access private
+     *
+     * @param CB_Row $row
+     */
+    function _addToUpdate($row)
+    {
+        $oid = $row->getOID();
+        unset($this->_rowcache[$oid]);
+        $this->_toUpdate[$oid] = $row;
+    }
+
+    /**
+     * @param CB_Row $row
+     *
+     * @access private
+     */
+    function _cache($row)
+    {
+        $this->_rowcache[$row->getOID()] = $row;
+        if (count($this->_rowcache) > $this->_cache_limit) {
+            list($key, $val) = each($this->_rowcache);
+            reset($this->_rowcache);
+            unset($this->_rowcache[$key]);
+        }
+    }
+
+    /**
+     * @access private
+     */
+    function _clear()
+    {
+        $this->_toRegister = [];
+        $this->_toUpdate = [];
+        $this->_rowcache = [];
+        $this->_row_seq = 0;
+    }
+
+    /**
+     * stop caching and clear _rowcache cache
+     */
+    public function stopRowCache()
+    {
+        $this->_rowcache = [];
+        $this->_cache_limit = 0;
+    }
+
+    /**
+     * @access private
+     */
+    function _commit()
+    {
+        $no_foreign_key_check = false;
+        $db = $this->_dbconn;
+
+        $col_info = $this->getColumnInfo();
+        $targets = '( _id';
+        foreach (array_keys($col_info) as $name) {
+            $info =& $col_info[$name];
+            $escaped_name = $db->escape($name);
+            if ($info['type'] === 'reference') {
+                $targets .= ', ' . CB_DATABASE_REFERENCE_TABLE . $escaped_name .
+                            ', ' . CB_DATABASE_REFERENCE_ID . $escaped_name;
+            } else {
+                if (
+                    ($info['type'] === 'relation'
+                     || $info['type'] === 'weak_relation')
+                    && array_key_exists('no_foreign_key_check', $info)
+                    && $info['no_foreign_key_check']
+                ) {
+                    $no_foreign_key_check = true;
+                }
+                $targets .= ', ' . CB_DATABASE_COLUMN_PREFIX . $escaped_name;
+            }
+        }
+        $targets .= ' )';
+
+        $escaped_name = $db->escape($this->_table_name);
+        $query = 'INSERT INTO ' . CB_DATABASE_TABLE_PREFIX
+                 . $escaped_name . ' ' . $targets .
+                 ' VALUES ';
+        $empty = true;
+        foreach (array_keys($this->_toRegister) as $key) {
+            $row = $this->_toRegister[$key];
+            $row->_applyModifications();
+            $rawdata = $row->_rawdata;
+
+            $value = '( ' . (is_null($row->_oid) ? 'NULL' : $row->_oid);
+
+            foreach (array_keys($col_info) as $name) {
+                $info = $col_info[$name];
+                if ($info['type'] === 'reference') {
+                    $col_name = CB_DATABASE_REFERENCE_TABLE . $name;
+                    if (array_key_exists($col_name, $rawdata)
+                        && ! is_null($rawdata[$col_name])
+                    ) {
+                        $value .= ', \'' . $db->escape($rawdata[$col_name])
+                                  . '\'';
+                    } elseif (array_key_exists($col_name, $rawdata)
+                              && is_null($rawdata[$col_name])
+                    ) {
+                        $value .= ', NULL';
+                    } else {
+                        $value .= ', DEFAULT';
+                    }
+                    $col_name = CB_DATABASE_REFERENCE_ID . $name;
+                    if (array_key_exists($col_name, $rawdata)
+                        && ! is_null($rawdata[$col_name])
+                    ) {
+                        $value .= ', \'' . $db->escape($rawdata[$col_name])
+                                  . '\'';
+                    } elseif (array_key_exists($col_name, $rawdata)
+                              && is_null($rawdata[$col_name])
+                    ) {
+                        $value .= ', NULL';
+                    } else {
+                        $value .= ', DEFAULT';
+                    }
+                } else {
+                    $col_name = CB_DATABASE_COLUMN_PREFIX . $name;
+                    if (array_key_exists($col_name, $rawdata)
+                        && ! is_null($rawdata[$col_name])
+                    ) {
+                        $value .= ', \'' . $db->escape($rawdata[$col_name])
+                                  . '\'';
+                    } elseif (array_key_exists($col_name, $rawdata)
+                              && is_null($rawdata[$col_name])
+                    ) {
+                        $value .= ', NULL';
+                    } else {
+                        $value .= ', DEFAULT';
+                    }
+                }
+            }
+
+            $value .= ' )';
+
+            if ($empty) {
+                $query .= $value;
+                $empty = false;
+            } else {
+                $query .= ', ' . $value;
+            }
+        }
+
+        if ( ! $empty) {
+            if ($no_foreign_key_check) {
+                $db->query('SET FOREIGN_KEY_CHECKS = 0;');
+            }
+            $query .= ';';
+            if ($db->query($query) === false) {
+                $db->throwServerError($query);
+            }
+            if ($no_foreign_key_check) {
+                $db->query('SET FOREIGN_KEY_CHECKS = 1;');
+            }
+        }
+
+        foreach (array_keys($this->_toUpdate) as $key) {
+            /** @var CB_Row $row */
+            $row = $this->_toUpdate[$key];
+            $row->_update();
+        }
+
+        $this->_clear();
+
+        return true;
+    }
+
+    /**
+     * @access private
+     */
+    function _abort()
+    {
+        $this->_clear();
+    }
+}
+
+/**
+ * Abstract a row in database tables and row operations.
+ *
+ * @package fw.persistent
+ */
+class CB_Row
+{
+    /**
+     * @var CB_DatabaseConnection
+     * @access private
+     */
+    var $_dbconn;
+    /**
+     * @var CB_TableInfo
+     * @access private
+     */
+    var $_table_info;
+    /**
+     * @access private
+     */
+    var $_oid = null;           // id for registered rows.
+    /**
+     * @access private
+     */
+    var $__tmp_id = 0;          // id for rows before registration.
+    /**
+     * @access private
+     */
+    var $_rawdata = [];    // returned values by SQL API.
+    /**
+     * @access private
+     */
+    var $_data = [];       // values used in PHP scripts.
+    /**
+     * @access private
+     */
+    var $_modcols = [];
+    /**
+     * @access private
+     */
+    var $_modified = false;
+    /**
+     * @access private
+     */
+    var $_readonly = false;
+
+    function getTableInfo()
+    {
+        return $this->_table_info;
+    }
+
+    function getOID($force = true)
+    {
+        if (is_null($this->_oid) && $force) {
+            $this->registerNow();
+        }
+
+        return $this->_oid;
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $oid
+     */
+    function _setOID($oid)
+    {
+        $this->_oid = $oid;
+    }
+
+    /**
+     * @access protected
+     */
+    function getTempId()
+    {
+        return $this->__tmp_id;
+    }
+
+    function registerNow()
+    {
+        if ($this->__tmp_id === 0) {
+            return $this->updateNow();
+        }
+
+        $table_info = $this->_table_info;
+        $table_info->_unRegister($this);
+        $ret = $this->_register();
+        $table_info->_cache($this);
+
+        return $ret;
+    }
+
+    function updateNow()
+    {
+        if ($this->__tmp_id != 0) {
+            return $this->registerNow();
+        }
+
+        $table_info = $this->_table_info;
+        $table_info->_unUpdate($this);
+
+        return $this->_update();
+    }
+
+    function delete()
+    {
+        if ($this->_readonly) {
+            return false;
+        }
+
+        return $this->_delete();
+    }
+
+    /**
+     * Forcibly remove a row from a table, even if the table is
+     * marked as read-only.  Use this to remove rows from read-only
+     * tables.
+     *
+     * @access protected
+     */
+    function _delete()
+    {
+        // ToDo: set a mark that this object has been destroyed.
+
+        $table_info = $this->_table_info;
+        if (is_null($this->_oid)) {
+            $table_info->_unRegister($this);
+
+            return true;
+        }
+
+        return $table_info->_deleteRow($this->_oid);
+    }
+
+    function set($col_name, $col_value)
+    {
+        if ($this->_readonly) {
+            return false;
+        }
+
+        return $this->_set($col_name, $col_value);
+    }
+
+    /**
+     * @param              $col_name
+     * @param mixed|CB_Row $col_value
+     *
+     * @return bool
+     */
+    function _set($col_name, $col_value)
+    {
+        global $G_config_common;
+
+        $table_info = $this->_table_info;
+        $col_info = $table_info->getColumnInfo($col_name);
+        if (is_null($col_info)) {
+            return false;
+        }
+
+        if ($G_config_common->get('Global', 'debug')
+            & ERROR_TRACE_LOG_FLAG_213
+        ) {
+            // enable error check for debug versions.
+            if ( ! is_null($col_value)) {
+                switch ($col_info['type']) {
+                    case 'int':
+                    case 'float':
+                    case 'double':
+                    case 'char':
+                    case 'blob':
+                    case 'list_index':
+                        if ( ! is_scalar($col_value)) {
+                            ob_start();
+                            var_dump($col_value);
+                            $valueinfo = ob_get_contents();
+                            ob_end_clean();
+
+                            $table_name = $table_info->getTableName();
+                            cb_throw_error(E_CYDE_VALUE_TYPE_NOT_VALID,
+                                null,
+                                [
+                                    'table_name' => $table_name,
+                                    'col_name'   => $col_name,
+                                    'col_type'   => $col_info['type'],
+                                    'info'       => $valueinfo
+                                ]);
+                        }
+                        break;
+
+                    case 'date':
+                        if ( ! (is_object($col_value)
+                                && is_a($col_value, 'CB_Date'))
+                        ) {
+                            ob_start();
+                            var_dump($col_value);
+                            $valueinfo = ob_get_contents();
+                            ob_end_clean();
+
+                            $table_name = $table_info->getTableName();
+                            cb_throw_error(E_CYDE_VALUE_TYPE_NOT_VALID,
+                                null,
+                                [
+                                    'table_name' => $table_name,
+                                    'col_name'   => $col_name,
+                                    'col_type'   => $col_info['type'],
+                                    'info'       => $valueinfo
+                                ]);
+                        }
+                        break;
+
+                    case 'time':
+                        if ( ! (is_object($col_value)
+                                && is_a($col_value, 'CB_Time'))
+                        ) {
+                            ob_start();
+                            var_dump($col_value);
+                            $valueinfo = ob_get_contents();
+                            ob_end_clean();
+
+                            $table_name = $table_info->getTableName();
+                            cb_throw_error(E_CYDE_VALUE_TYPE_NOT_VALID,
+                                null,
+                                [
+                                    'table_name' => $table_name,
+                                    'col_name'   => $col_name,
+                                    'col_type'   => $col_info['type'],
+                                    'info'       => $valueinfo
+                                ]);
+                        }
+                        break;
+
+                    case 'datetime':
+                        if ( ! (is_object($col_value)
+                                && is_a($col_value, 'CB_DateTime'))
+                        ) {
+                            ob_start();
+                            var_dump($col_value);
+                            $valueinfo = ob_get_contents();
+                            ob_end_clean();
+
+                            $table_name = $table_info->getTableName();
+                            cb_throw_error(E_CYDE_VALUE_TYPE_NOT_VALID,
+                                null,
+                                [
+                                    'table_name' => $table_name,
+                                    'col_name'   => $col_name,
+                                    'col_type'   => $col_info['type'],
+                                    'info'       => $valueinfo
+                                ]);
+                        }
+                        break;
+
+                    case 'timestamp':
+                        if ( ! (is_object($col_value)
+                                && is_a($col_value, 'CB_TimeStamp'))
+                        ) {
+                            ob_start();
+                            var_dump($col_value);
+                            $valueinfo = ob_get_contents();
+                            ob_end_clean();
+
+                            $table_name = $table_info->getTableName();
+                            cb_throw_error(E_CYDE_VALUE_TYPE_NOT_VALID,
+                                null,
+                                [
+                                    'table_name' => $table_name,
+                                    'col_name'   => $col_name,
+                                    'col_type'   => $col_info['type'],
+                                    'info'       => $valueinfo
+                                ]);
+                        }
+                        break;
+
+                    case 'relation':
+                    case 'weak_relation':
+                        if ( ! (is_object($col_value)
+                                && (is_a($col_value, 'CB_Row')
+                                    || is_a($col_value, 'CB_PersistentBase')))
+                        ) {
+                            ob_start();
+                            var_dump($col_value);
+                            $valueinfo = ob_get_contents();
+                            ob_end_clean();
+
+                            $table_name = $table_info->getTableName();
+                            cb_throw_error(E_CYDE_VALUE_TYPE_NOT_VALID,
+                                null,
+                                [
+                                    'table_name' => $table_name,
+                                    'col_name'   => $col_name,
+                                    'col_type'   => $col_info['type'],
+                                    'info'       => $valueinfo
+                                ]);
+                        }
+                        $ti2 = $col_value->getTableInfo();
+
+                        $to = $col_info['to'];
+                        if (array_key_exists('suffix', $col_info)
+                            && $col_info['suffix']
+                        ) {
+                            if (isset($ti2->_suffix)
+                                && strlen($ti2->_suffix) > 0
+                            ) {
+                                require_once('fw/persistent.csp');
+                                $to = $to . CB_PERSISTENT_NAMESEPARATOR
+                                      . $ti2->_suffix;
+                            }
+                        }
+
+                        if (strcasecmp($to, $ti2->getTableName()) != 0) {
+                            ob_start();
+                            var_dump($col_value);
+                            $valueinfo = ob_get_contents();
+                            ob_end_clean();
+
+                            $table_name = $table_info->getTableName();
+                            cb_throw_error(E_CYDE_VALUE_TYPE_NOT_VALID,
+                                null,
+                                [
+                                    'table_name' => $table_name,
+                                    'col_name'   => $col_name,
+                                    'col_type'   => $col_info['type'],
+                                    'info'       => $valueinfo
+                                ]);
+                        }
+                        break;
+
+                    case 'reference':
+                        if ( ! (is_object($col_value)
+                                && method_exists($col_value, "getOID")
+                                && method_exists($col_value, "getTableInfo"))
+                        ) {
+                            ob_start();
+                            var_dump($col_value);
+                            $valueinfo = ob_get_contents();
+                            ob_end_clean();
+
+                            $table_name = $table_info->getTableName();
+                            cb_throw_error(E_CYDE_VALUE_TYPE_NOT_VALID,
+                                null,
+                                [
+                                    'table_name' => $table_name,
+                                    'col_name'   => $col_name,
+                                    'col_type'   => $col_info['type'],
+                                    'info'       => $valueinfo
+                                ]);
+                        }
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+        }
+
+        // --------------------------------------------------------
+        // persistent objects are not held to keep object identity.
+        // --------------------------------------------------------
+        if (is_object($col_value)
+            && (is_a($col_value, 'CB_Row')
+                || is_a($col_value, 'CB_PersistentBase'))
+        ) {
+
+            // remove 'null' if it already there.
+            unset($this->_data[$col_name]);
+
+            $ti2 = $col_value->getTableInfo();
+            $tn2 = $ti2->getTableName();
+            $oid = '';
+
+            if ($col_value->getTempId() != 0) {
+                $tm = $table_info->getTableManager();
+                $ti2_ = $tm->getTableInfo($tn2);
+                $row = $ti2_->_toRegister[$col_value->getTempId()];
+                $oid = $row->getOID();
+            } else {
+                $oid = $col_value->getOID();
+            }
+
+            if ($col_info['type'] === 'reference') {
+                $this->_rawdata[CB_DATABASE_REFERENCE_TABLE . $col_name] = $tn2;
+                $this->_rawdata[CB_DATABASE_REFERENCE_ID . $col_name] = $oid;
+            } else {
+                $this->_rawdata[CB_DATABASE_COLUMN_PREFIX . $col_name] = $oid;
+            }
+
+        } else {
+            $this->_data[$col_name] = $col_value;
+        }
+
+        $this->_modcols[$col_name] = 1;
+        if ( ! $this->_modified) {
+            $table_info->_addToUpdate($this);
+            $this->_modified = true;
+        }
+
+        return true;
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $col_name
+     * @param bool   $by_id
+     *
+     * @return bool|CB_Row|mixed|null
+     */
+    function &_get($col_name, $by_id)
+    {
+        $fail = false;
+        $nothing = null;
+        if (array_key_exists($col_name, $this->_data)) {
+            return $this->_data[$col_name];
+        }
+
+        $db = $this->_dbconn;
+        $table_info = $this->_table_info;
+        $table_name = $db->escape($table_info->getTableName());
+        $col_info = $table_info->getColumnInfo($col_name);
+        if (is_null($col_info)) {
+            return $fail;
+        }
+
+        // on demand fetch if column is marked as lazy
+        if (strcmp($col_info['type'], 'reference') === 0) {
+            if ( ! array_key_exists(CB_DATABASE_REFERENCE_TABLE . $col_name,
+                $this->_rawdata)
+            ) {
+                if (is_null($this->_oid)
+                    || ( ! array_key_exists('lazy', $col_info))
+                    || ( ! $col_info['lazy'])
+                ) {
+                    return $fail;
+                }
+
+                $escaped_col_name = $db->escape($col_name);
+                $query
+                    = sprintf("SELECT %s${escaped_col_name}, %s${escaped_col_name} FROM %s${table_name} WHERE %s='%s'",
+                    CB_DATABASE_REFERENCE_TABLE,
+                    CB_DATABASE_REFERENCE_ID,
+                    CB_DATABASE_TABLE_PREFIX,
+                    CB_DATABASE_OID_NAME,
+                    $db->escape($this->_oid));
+                $query = $db->select_format($query, 0, -1,
+                    CB_DATABASE_NO_LOCK);
+                $result = $db->query($query);
+                if (($result === false) || ($db->num_rows($result) != 1)) {
+                    if ($result) {
+                        $db->free_result($result);
+                    }
+
+                    return $fail;
+                }
+                $rawdata = $db->fetch_row($result);
+                $db->free_result($result);
+                $this->_rawdata[CB_DATABASE_REFERENCE_TABLE . $col_name]
+                    = $rawdata[0];
+                $this->_rawdata[CB_DATABASE_REFERENCE_ID . $col_name]
+                    = $rawdata[1];
+            }
+        } else {
+            if ( ! array_key_exists(CB_DATABASE_COLUMN_PREFIX . $col_name,
+                $this->_rawdata)
+            ) {
+                if (is_null($this->_oid)
+                    || ( ! array_key_exists('lazy', $col_info))
+                    || ( ! $col_info['lazy'])
+                ) {
+                    return $fail;
+                }
+
+                $escaped_col_name = $db->escape($col_name);
+                $query
+                    = sprintf("SELECT %s${escaped_col_name} FROM %s${table_name} WHERE %s='%s'",
+                    CB_DATABASE_COLUMN_PREFIX,
+                    CB_DATABASE_TABLE_PREFIX,
+                    CB_DATABASE_OID_NAME,
+                    $db->escape($this->_oid));
+                $query = $db->select_format($query, 0, -1,
+                    CB_DATABASE_NO_LOCK);
+                $result = $db->query($query);
+                if (($result === false) || ($db->num_rows($result) != 1)) {
+                    if ($result) {
+                        $db->free_result($result);
+                    }
+
+                    return $fail;
+                }
+                $rawdata = $db->fetch_row($result);
+                $db->free_result($result);
+                $this->_rawdata[CB_DATABASE_COLUMN_PREFIX . $col_name]
+                    = $rawdata[0];
+            }
+        }
+
+        switch ($col_info['type']) {
+            case 'int':
+            case 'float':
+            case 'double':
+            case 'char':
+            case 'blob':
+            case 'list_index':
+                $rawdata = $this->_rawdata[CB_DATABASE_COLUMN_PREFIX
+                                           . $col_name];
+
+                $this->_data[$col_name] = $rawdata;
+
+                return $rawdata;
+                break;
+
+            case 'date':
+                $rawdata = $this->_rawdata[CB_DATABASE_COLUMN_PREFIX
+                                           . $col_name];
+                if (is_null($rawdata)) {
+                    return $nothing;
+                }
+
+                $date = new CB_Date;
+                $date->parse($rawdata);
+                $this->_data[$col_name] = $date;
+
+                return $date;
+                break;
+
+            case 'time':
+                $rawdata = $this->_rawdata[CB_DATABASE_COLUMN_PREFIX
+                                           . $col_name];
+                if (is_null($rawdata)) {
+                    return $nothing;
+                }
+
+                $time = new CB_Time;
+                $time->parse($rawdata);
+                $this->_data[$col_name] = $time;
+
+                return $time;
+                break;
+
+            case 'datetime':
+                $rawdata = $this->_rawdata[CB_DATABASE_COLUMN_PREFIX
+                                           . $col_name];
+                if (is_null($rawdata)) {
+                    return $nothing;
+                }
+
+                $datetime = new CB_DateTime;
+                $datetime->parse($rawdata);
+                $this->_data[$col_name] = $datetime;
+
+                return $datetime;
+                break;
+
+            case 'timestamp':
+                $rawdata = $this->_rawdata[CB_DATABASE_COLUMN_PREFIX
+                                           . $col_name];
+                if (is_null($rawdata)) {
+                    return $nothing;
+                }
+
+                $timestamp = new CB_TimeStamp;
+                $timestamp->unix_ts = $rawdata;
+                $this->_data[$col_name] = $timestamp;
+
+                return $timestamp;
+                break;
+
+            case 'relation':
+            case 'weak_relation':
+                $rawdata = $this->_rawdata[CB_DATABASE_COLUMN_PREFIX
+                                           . $col_name];
+
+                $to_cb_user = strcasecmp($col_info['to'], 'cb_user') === 0
+                    ? true : false;
+
+                // return the object ID
+                // tab_cb_user へのリレーションの場合は、削除フラグを見る必要があるので、
+                // ここでは値を返すことができない。
+                if ($by_id && ! $to_cb_user) {
+                    return $rawdata;
+                }
+
+                if (is_null($rawdata)) {
+                    return $nothing;
+                }
+
+                $to = $col_info['to'];
+                if (array_key_exists('suffix', $col_info)
+                    && $col_info['suffix']
+                ) {
+                    if (isset($table_info->_suffix)
+                        && strlen($table_info->_suffix) > 0
+                    ) {
+                        require_once('fw/persistent.csp');
+                        $to = $to . CB_PERSISTENT_NAMESEPARATOR
+                              . $table_info->_suffix;
+                    }
+                }
+
+                $tm = $table_info->getTableManager();
+                $ti2 = $tm->getTableInfo($to);
+                $row = $ti2->getRow($rawdata);
+                // we dont hold persistent objects to keep identity
+                if ($to_cb_user) {
+                    if (isset($row->__row->_rawdata)
+                        && ! is_null($row->__row->_rawdata['col_deleted'])
+                    ) {
+                        return $nothing;
+                    }
+                }
+
+                if ($by_id) {
+                    // ここに入るのは tab_cb_user へのリレーションで、かつ $by_id が TRUE に
+                    // なっているもののみ。
+                    $id = $row->getOID();
+
+                    return $id;
+                } else {
+                    return $row;
+                }
+                break;
+
+            case 'reference':
+                $tbname = $this->_rawdata[CB_DATABASE_REFERENCE_TABLE
+                                          . $col_name];
+                $tbid = $this->_rawdata[CB_DATABASE_REFERENCE_ID . $col_name];
+                if (is_null($tbname)) {
+                    return $nothing;
+                }
+
+                $tm = $table_info->getTableManager();
+                $ti2 = $tm->getTableInfo($tbname);
+                $row = $ti2->getRow($tbid);
+
+                // we dont hold persistent objects to keep identity
+                return $row;
+                break;
+
+            default:
+                assert('FALSE');
+
+                return $fail;
+        }
+    }
+
+    /**
+     * Return the named column value as is set by {@link CB_Row::set}.
+     *
+     * @param  string $col_name The column name.
+     *
+     * @return CB_Row|mixed       The column value, or
+     *                            FALSE if no such column exists.
+     */
+    function &get($col_name)
+    {
+        $col =& $this->_get($col_name, false);
+
+        return $col;
+    }
+
+    /**
+     * Return the named column value in the same way {@link CB_Row::get}
+     * does, except for it does return the object ID for relations and
+     * weak_relations.
+     *
+     * @param  string $col_name The column name.
+     *
+     * @return mixed              The column value, object ID, or
+     *                            FALSE if no such column exists.
+     */
+    function getId($col_name)
+    {
+        $id = $this->_get($col_name, true);
+
+        return $id;
+    }
+
+    /**
+     * PROTECTED!  DON'T INSTANTIATE THIS DIRECTLY!
+     * Use CB_TableInfo::getRow() to obtain one.
+     *
+     * @access   private
+     *
+     * @param CB_TableInfo $table_info
+     * @param  array|null  $rawdata
+     */
+    function __construct($table_info, $rawdata = null)
+    {
+        $this->_dbconn = $table_info->getDBConnection();
+        $this->_table_info = $table_info;
+        $this->_readonly = $table_info->_isReadOnly();
+
+        if (is_null($rawdata)) {
+            $this->__tmp_id = $table_info->issueTempId();
+            $this->_modified = true;
+
+        } else {
+            $this->_rawdata = $rawdata;
+            $this->_oid = $rawdata[CB_DATABASE_OID_NAME];
+        }
+    }
+
+    /**
+     * @access private
+     */
+    function _applyModifications()
+    {
+        if ( ! $this->_modified) {
+            return;
+        }
+
+        $table_info = $this->_table_info;
+        $column_info = $table_info->getColumnInfo();
+
+        foreach ($this->_data as $col_name => $col_value) {
+            if (array_key_exists($col_name, $column_info)) {
+                $col_info = $column_info[$col_name];
+                switch ($col_info['type']) {
+                    case 'int':
+                    case 'float':
+                    case 'double':
+                    case 'char':
+                    case 'blob':
+                    case 'list_index':
+                        $this->_rawdata[CB_DATABASE_COLUMN_PREFIX . $col_name]
+                            = $col_value;
+                        break;
+
+                    case 'date':
+                    case 'time':
+                    case 'datetime':
+                        if (is_null($col_value)) {
+                            $this->_rawdata[CB_DATABASE_COLUMN_PREFIX
+                                            . $col_name]
+                                = null;
+                        } else {
+                            $this->_rawdata[CB_DATABASE_COLUMN_PREFIX
+                                            . $col_name]
+                                = $col_value->format();
+                        }
+                        break;
+
+                    case 'timestamp':
+                        if (is_null($col_value)) {
+                            $this->_rawdata[CB_DATABASE_COLUMN_PREFIX
+                                            . $col_name]
+                                = null;
+                        } else {
+                            $this->_rawdata[CB_DATABASE_COLUMN_PREFIX
+                                            . $col_name]
+                                = $col_value->unix_ts;
+                        }
+                        break;
+
+                    case 'relation':
+                    case 'weak_relation':
+                        assert('is_null($col_value)');
+                        $this->_rawdata[CB_DATABASE_COLUMN_PREFIX . $col_name]
+                            = null;
+                        break;
+
+                    case 'reference':
+                        assert('is_null($col_value)');
+                        $this->_rawdata[CB_DATABASE_REFERENCE_TABLE . $col_name]
+                            = null;
+                        $this->_rawdata[CB_DATABASE_REFERENCE_ID . $col_name]
+                            = null;
+                        break;
+
+                    default:
+                        assert('FALSE');
+                }
+            }
+        }
+    }
+
+    /**
+     * @access private
+     */
+    function _register()
+    {
+        $no_foreign_key_check = false;
+
+        $this->_applyModifications();
+
+        $db = $this->_dbconn;
+        $table_info = $this->_table_info;
+
+        $col_info = $table_info->getColumnInfo();
+        foreach (array_keys($col_info) as $name) {
+            $info =& $col_info[$name];
+            if (($info['type'] === 'relation'
+                 || $info['type'] === 'weak_relation')
+                && array_key_exists('no_foreign_key_check', $info)
+                && $info['no_foreign_key_check']
+            ) {
+                $no_foreign_key_check = true;
+            }
+        }
+
+        $escaped_name = $db->escape($table_info->getTableName());
+        $query = sprintf("INSERT INTO %s${escaped_name} SET _id=%s",
+            CB_DATABASE_TABLE_PREFIX,
+            (is_null($this->_oid) ? 'NULL' : $this->_oid));
+        foreach ($this->_rawdata as $key => $value) {
+            if (strcmp($key, CB_DATABASE_OID_NAME) === 0) {
+                continue;
+            }
+            $key = $db->escape($key);
+            if (is_null($value)) {
+                $query .= ", ${key}=NULL";
+            } else {
+                $value = $db->escape($value);
+                $query .= ", ${key}='${value}'";
+            }
+        }
+        $query .= ';';
+
+        if ($no_foreign_key_check) {
+            $db->query('SET FOREIGN_KEY_CHECKS = 0;');
+        }
+        if ($db->query($query) === false) {
+            $db->throwServerError($query);
+        }
+        if ($no_foreign_key_check) {
+            $db->query('SET FOREIGN_KEY_CHECKS = 1;');
+        }
+
+        if (is_null($this->_oid)) {
+            $this->_oid = $db->get_insert_id();
+        }
+        $this->__tmp_id = 0;
+        $this->_modcols = [];
+        $this->_modified = false;
+
+        return true;
+    }
+
+    /**
+     * @access private
+     */
+    function _update()
+    {
+        $no_foreign_key_check = false;
+
+        if ( ! $this->_modified) {
+            return;
+        }
+
+        $this->_applyModifications();
+
+        $db = $this->_dbconn;
+        $table_info = $this->_table_info;
+        $escaped_name = $db->escape($table_info->getTableName());
+        $modrawkeys = [];
+        foreach (array_keys($this->_modcols) as $key) {
+            if (strcmp($key, CB_DATABASE_OID_NAME) === 0) {
+                continue;
+            }
+            $col_info = $table_info->getColumnInfo($key);
+            if (is_null($col_info)) {
+                continue;
+            }
+            if (strcmp($col_info['type'], 'reference') === 0) {
+                $modrawkeys[] = CB_DATABASE_REFERENCE_TABLE . $key;
+                $modrawkeys[] = CB_DATABASE_REFERENCE_ID . $key;
+            } else {
+                if (
+                    (strcmp($col_info['type'], 'relation') === 0
+                     || strcmp($col_info['type'], 'weak_relation') === 0)
+                    && array_key_exists('no_foreign_key_check', $col_info)
+                    && $col_info['no_foreign_key_check']
+                ) {
+                    $no_foreign_key_check = true;
+                }
+                $modrawkeys[] = CB_DATABASE_COLUMN_PREFIX . $key;
+            }
+        }
+        assert('count($modrawkeys) > 0');
+
+        $query = sprintf("UPDATE %s${escaped_name} SET",
+            CB_DATABASE_TABLE_PREFIX);
+        $toPutComma = false;
+        foreach ($modrawkeys as $key) {
+            $value = $this->_rawdata[$key];
+
+            if ($toPutComma) {
+                $query .= ',';
+            } else {
+                $toPutComma = true;
+            }
+
+            $key = $db->escape($key);
+            if (is_null($value)) {
+                $query .= " ${key}=NULL";
+            } else {
+                $value = $db->escape($value);
+                $query .= " ${key}='${value}'";
+            }
+        }
+        $query .= sprintf(" WHERE %s='%s';", CB_DATABASE_OID_NAME,
+            $db->escape($this->_oid));
+
+        if ($no_foreign_key_check) {
+            $db->query('SET FOREIGN_KEY_CHECKS = 0;');
+        }
+        if ($db->query($query) === false) {
+            $db->throwServerError($query);
+        }
+        if ($no_foreign_key_check) {
+            $db->query('SET FOREIGN_KEY_CHECKS = 1;');
+        }
+        $this->_modcols = [];
+        $this->_modified = false;
+
+        return true;
+    }
+
+    /**
+     * Obtain exclusive or shared lock on this row.
+     *
+     * @param int $lock
+     */
+    function lock($lock = CB_DATABASE_EXCLUSIVE_LOCK)
+    {
+        $db = $this->_dbconn;
+        $escaped_name = $db->escape($this->_table_info->_table_name);
+        $oid = $this->_oid;
+        $query
+            = sprintf("SELECT %s FROM %s${escaped_name} WHERE %s='${oid}'",
+            $this->_table_info->_getInstantColumns(),
+            CB_DATABASE_TABLE_PREFIX,
+            CB_DATABASE_OID_NAME);
+        $query = $db->select_format($query, 0, -1, $lock);
+        $result = $db->query($query);
+        assert($result !== false);
+        $this->_rawdata = $db->fetch_assoc($result);
+        $db->free_result($result);
+        $this->_data = [];
+    }
+}
+
+
+/**
+ * Format an SQL query by replacing @S with properly escaped SQL
+ * string, @L with properly escaped SQL LIKE expression,
+ *
+ * @A with properly escaped SQL IN clause.  This works as
+ * a printf group function.  A '@' character should be escaped as '@@'
+ * in $format.
+ * <br>
+ * ex. cb_queryf("col_name LIKE '@L%' AND col_mail = '@S' AND _id IN (@A)", 'ab%3', 'foo@bar.com', array(1, 2, 3));
+ *
+ * @param CB_DatabaseConnection $db     The database connection object.
+ * @param string                $format query format.
+ *                                      (param string $param,...   parameters for $format.)
+ *
+ * @return string             A properly escaped SQL query string.
+ */
+function cb_queryf($db, $format /*, $param1, $param2, ... */)
+{
+    $args = func_get_args();
+    array_shift($args);
+    array_shift($args);
+
+    return cb_vqueryf($db, $format, $args);
+}
+
+/**
+ * Format an SQL query by replacing @S with properly escaped SQL
+ * string, @L with properly escaped SQL LIKE expression,
+ *
+ * @A with properly escaped SQL IN clause.  This works as
+ * a printf group function.  A '@' character should be escaped as '@@'
+ * in $format.
+ * <br>
+ * ex. cb_vqueryf("col_name LIKE '@L%' AND col_mail = '@S' AND _id IN (@A)",
+ *                array('ab%3', 'foo@bar.com', array(1, 2, 3)) );
+ *
+ * @param CB_DatabaseConnection $db     The database connection object.
+ * @param string                $format query format.
+ * @param array                 $args   parameters for $format.
+ *
+ * @return string             A properly escaped SQL query string.
+ */
+function cb_vqueryf($db, $format, $args)
+{
+    if ($db->_connection === false) {
+        $db->_initialize();
+    }
+
+    return cb_cqueryfi($db->_connection, $format, $args);
+
+}
+
+/**
+ * Abstract SELECT operation.
+ * This class represents set of rows in a given table.
+ *
+ * @package fw.persistent
+ */
+class CB_RowSet
+{
+    /**
+     * @var $_dbconn CB_DatabaseConnection
+     * @access private
+     */
+    var $_dbconn;
+    /**
+     * @var $_table_info CB_TableInfo
+     * @access private
+     */
+    var $_table_info;
+
+    /**
+     * Creates an abstract set of rows that implements search
+     * against the table specified by $table_info.
+     *
+     * @param CB_TableInfo $table_info
+     *  An instance of {@link CB_TableInfo}.
+     * @param string       $alias
+     *  The table's alias name. If NULL alias isn't used.
+     *  Default value is NULL.
+     */
+    function __construct($table_info, $alias = null)
+    {
+        $this->_dbconn = $table_info->getDBConnection();
+        $this->_table_info = $table_info;
+        $this->_alias = $alias;
+        $this->_lock = $table_info->_lock;
+    }
+
+    // Search conditions
+
+    /**
+     * @access private
+     */
+    var $_join_tables = [];    // for JOIN table
+    /**
+     * @access private
+     */
+    var $_conditions = []; // condition clauses for AND
+    /**
+     * @access private
+     */
+    var $_orderby = [];    // for sorting
+    /**
+     * @access private
+     */
+    var $_offset = 0;           // for LIMIT
+    /**
+     * @access private
+     */
+    var $_limit = -1;           // for LIMIT
+    /**
+     * @access private
+     */
+    var $_calcAll = false;      // use SQL_CALC_FOUND_ROWS
+    /**
+     * @access private
+     */
+    var $_foundrows = false;        // result of SQL_CALC_FOUND_ROWS
+    /**
+     * @access private
+     */
+    var $_lock = CB_DATABASE_DEFAULT_LOCK;
+    /**
+     * @access private
+     */
+    var $_select = true;
+    /**
+     * @access private
+     */
+    var $_oid_only = false;
+    /**
+     * @access private
+     */
+    var $_group_functions = null;
+    /**
+     * @access private
+     */
+    var $_group_by_columns = null;
+    /**
+     * @access private
+     */
+    var $_having = '';
+    /**
+     * @access private
+     */
+    var $_alias = null;
+
+    function setLock($lock = CB_DATABASE_DEFAULT_LOCK)
+    {
+        $this->_lock = $lock;
+    }
+
+    /**
+     * Adds the table specified by <var>tableinfo</var>,
+     * and joins it on the condition specified by <var>$conditions</var>,
+     * using the join type specified by <var>$type</var>
+     *
+     * @param CB_TableInfo $table_info
+     *  The table which are joined.
+     * @param string       $conditions
+     *  Condition on which the table are joined.If NULL no condition.
+     *  Default value is NULL.
+     * @param string       $type
+     *  A join type which are used.
+     *  Default value is 'LEFT JOIN'.
+     * @param string       $alias
+     *  The table's alias name. If NULL alias isn't used.
+     *  Default value is NULL.
+     */
+    function addJoin(
+        $table_info,
+        $conditions = null,
+        $type = CB_DATABASE_INNER_JOIN,
+        $alias = null
+    ) {
+        $this->_join_tables[] = [
+            'table' => $table_info,
+            'on'    => $conditions,
+            'type'  => $type,
+            'alias' => $alias
+        ];
+    }
+
+    /**
+     * @param string $condition
+     *  An SQL expression that may appear in WHERE clause.
+     */
+    function addCondition($condition)
+    {
+        $this->_conditions[] = $condition;
+    }
+
+    /**
+     * Specifies the ORDER BY column.
+     *
+     * @param string $col_name
+     *  The column's internal name such as 'tab_cb_user.col_name' that
+     *  which will be embedded in the SQL directly.
+     * @param bool   $reverse
+     *  If not <var>FALSE</var>, the result will be returned in reverse order.
+     */
+    function addOrderColumn($col_name, $reverse = false)
+    {
+        $this->_orderby[] = [$col_name, $reverse];
+    }
+
+    /**
+     * Limits the number of rows to return.
+     *
+     * @param int $offset
+     *  The offset of the first row to return.  The offset of the
+     *  initial row is 0 (not 1).
+     * @param int $limit
+     *  The number of rows to be retrieved.  Specify '-1' to retrieve
+     *  all rows after <var>offset</var>.
+     */
+    function limit($offset = 0, $limit = 21)
+    {
+        $this->_offset = $offset;
+        $this->_limit = $limit;
+    }
+
+    /**
+     * Calculates the number of rows that match conditions regardless
+     * of search number limitation.
+     *
+     * <p style="color: red;">
+     *  WARNING: This may introduce heavy load!!
+     * </p>
+     *
+     * @param bool $calcAll
+     *  If not <var>FALSE</var>, the search will calculate the number
+     *  of matched rows.
+     *
+     * @see CB_RowSet::limit()
+     */
+    function setCalcAllMatched($calcAll)
+    {
+        $this->_calcAll = $calcAll;
+    }
+
+    // Search implementation
+
+    /**
+     * @access private
+     */
+    var $_result = false;
+
+    /**
+     * Return the number of rows in the result set.
+     *
+     * @return int
+     *  The number of rows in the result set, or <var>FALSE</var>
+     *  if search has failed.
+     */
+    function count()
+    {
+        if ($this->_result === false) {
+            $this->_search();
+        }
+
+        if ($this->_result === false) {
+            return false;
+        }
+
+        return $this->_dbconn->num_rows($this->_result);
+    }
+
+    /**
+     * Return the total number of rows matching given conditions,
+     * regardless of search count limitation.
+     *
+     * @return int
+     *  The number of rows matching given conditions, or <var>FALSE</var>
+     *  if search has failed.
+     */
+    function countAllMatched()
+    {
+        if ($this->_foundrows === false) {
+            $this->_search();
+        }
+
+        if ($this->_foundrows === false) {
+            return false;
+        }
+
+        return intval($this->_foundrows);
+    }
+
+    /**
+     * !!! WARNING !!!  DON'T USE THIS UNLESS YOU COMPLETELY KNOW WHAT
+     * YOU WILL BE DOING.  TAKE SPECIAL CARE THAT SOME OBJECTS NEED TO BE
+     * DELETED BY THEIR delete() METHODS WHERE THEY WILL DO SOME
+     * FINALIZATION (for example, delete a file) WITHIN PHP.
+     *
+     * Delete rows matching given conditions.  Number of rows to be
+     * deleted may be limited by <var>howmany</var>.  Sorting
+     * are also applied to determine in which order rows are deleted.
+     *
+     * To delete the oldest row, for example, you should call
+     * addOrderColumn with the name of a timestamp column and
+     * specify 1 to <var>howmany</var>.
+     *
+     * @param $howmany
+     *        The number of rows to be deleted, or <var>0</var>
+     *        to delete all matching rows.
+     *
+     * @return bool
+     *         The number of deleted rows, or <var>FALSE</var> if
+     *         deletion fails.  Take care to use '===' operator to
+     *         see <var>FALSE</var>, since this may return 0.
+     */
+    function deleteAllMatched($howmany = 0)
+    {
+        $db = $this->_dbconn;
+        $table_info = $this->_table_info;
+        $table_name = $db->escape($table_info->getTableName());
+        $query = 'DELETE FROM ' . CB_DATABASE_TABLE_PREFIX . $table_name;
+
+        if (count($this->_conditions) > 0) {
+            $query .= ' WHERE ';
+            $toPutAnd = false;
+            foreach ($this->_conditions as $condition) {
+                if ($toPutAnd) {
+                    $query .= 'AND ';
+                } else {
+                    $toPutAnd = true;
+                }
+                $query .= "(${condition})";
+            }
+        }
+
+        if (count($this->_orderby) > 0) {
+            $query .= ' ORDER BY ';
+            $toPutComma = false;
+            foreach ($this->_orderby as $ob) {
+                if ($toPutComma) {
+                    $query .= ', ';
+                } else {
+                    $toPutComma = true;
+                }
+
+                if (is_null($ob[0])) {
+                    $ob[0] = '_id';
+                }
+
+                $query .= $ob[0];
+                if ($ob[1]) {
+                    $query .= ' DESC';
+                }
+            }
+        }
+
+        if ($howmany > 0) {
+            $query .= ' LIMIT ' . ((int)$howmany);
+        }
+        $query .= ';';
+
+        $result = $db->query($query);
+        if ($result === false) {
+            return false;
+        }
+
+        return $db->affected_rows();
+    }
+
+    /**
+     * Do search.
+     *
+     * @access private
+     */
+    function _search()
+    {
+        $db = $this->_dbconn;
+        if ($this->_result != false) {
+            $db->free_result($this->_result);
+        }
+
+        $table_info = $this->_table_info;
+        if ($this->_alias == null) {
+            $table_name = CB_DATABASE_TABLE_PREFIX
+                          . $db->escape($table_info->getTableName());
+        } else {
+            $table_name = $this->_alias;
+        }
+
+        if ($this->_select) {
+            $target = $this->_oid_only
+                ?
+                ($table_name . '.' . CB_DATABASE_OID_NAME)
+                :
+                $table_info->_getInstantColumns($this->_alias);
+            $query = $this->_constructQuery($target, false);
+        } else {
+            $target = '';
+            $delim = '';
+            //group_functions
+            if (is_array($this->_group_functions)) {
+                foreach ($this->_group_functions as $key => $value) {
+                    assert('!is_numeric($key)');
+                    $target .= "$delim$value AS $key";
+                    $delim = ', ';
+                }
+            }
+            //group_by_columns
+            if (is_array($this->_group_by_columns)) {
+                foreach ($this->_group_by_columns as $key => $value) {
+                    assert('!is_numeric($key)');
+                    $target .= "$delim$value AS $key";
+                    $delim = ', ';
+                }
+            }
+            $query = $this->_constructQuery($target, true);
+        }
+
+        $this->_result = $db->query($query);
+
+        if ($this->_result === false) {
+            $db->throwServerError($query);
+        }
+
+        if ($this->_calcAll) {
+            $this->_foundrows = $db->get_found_rows();
+        }
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $select
+     * @param bool   $calc
+     *
+     * @return string
+     */
+    function _constructQuery($select, $calc)
+    {
+        $db = $this->_dbconn;
+        $table_info = $this->_table_info;
+
+        $table_name = $db->escape($table_info->getTableName());
+        $query = sprintf("SELECT%s%s %s FROM ",
+            ($this->_calcAll ? ' SQL_CALC_FOUND_ROWS' : ''),
+            ((( ! $calc) && (count($this->_join_tables) > 0)) ? ' DISTINCT'
+                : ''),
+            $select);
+
+        $alias = $this->_alias;
+        $table_name = CB_DATABASE_TABLE_PREFIX .
+                      $db->escape($table_info->getTableName()) .
+                      (is_null($alias) ? '' : " AS $alias");
+
+        $from = $table_name;
+        $keys = array_keys($this->_join_tables);
+        $begin = '';
+        $end = '';
+        foreach ($keys as $key) {
+            $from = $begin . $from . $end;
+            $begin = '(';
+            $end = ')';
+
+            $info =& $this->_join_tables[$key];
+            /** @var CB_TableInfo $table_info */
+            $table_info = $info['table'];
+            $table_name = $db->escape($table_info->getTableName());
+            $conditions = $info['on'];
+            $type = $info['type'];
+            $alias = $info['alias'];
+
+            $from .= " $type " . CB_DATABASE_TABLE_PREFIX . $table_name .
+                     (is_null($alias) ? '' : " AS $alias") .
+                     (is_null($conditions) ? '' : " ON $conditions");
+        }
+        $query .= $from;
+
+        if (count($this->_conditions) > 0) {
+            $query .= ' WHERE ';
+            $toPutAnd = false;
+            foreach ($this->_conditions as $condition) {
+                if ($toPutAnd) {
+                    $query .= 'AND ';
+                } else {
+                    $toPutAnd = true;
+                }
+                $query .= "(${condition})";
+            }
+        }
+
+        // GROUP BY
+        if ($calc) {
+            $query .= $this->_constructCalc();
+        }
+
+        if (count($this->_orderby) > 0) {
+            $query .= ' ORDER BY ';
+            $toPutComma = false;
+            foreach ($this->_orderby as $ob) {
+                if ($toPutComma) {
+                    $query .= ', ';
+                } else {
+                    $toPutComma = true;
+                }
+
+                if (is_null($ob[0])) {
+                    $ob[0] = '_id';
+                }
+
+                $query .= $ob[0];
+                if ($ob[1]) {
+                    $query .= ' DESC';
+                }
+            }
+        }
+
+        $query = $db->select_format($query, $this->_offset, $this->_limit,
+            $this->_lock);
+
+        return $query;
+    }
+
+    /**
+     * @access private
+     */
+    function _constructCalc()
+    {
+        $query = '';
+
+        //group by
+        if (is_array($this->_group_by_columns)) {
+            $delim = ' GROUP BY ';
+            foreach ($this->_group_by_columns as $column) {
+                $query .= $delim . $column;
+                $delim = ' , ';
+            }
+        }
+
+        //having
+        $query .= $this->_having;
+
+        return $query;
+    }
+
+    //// Implement iteration interface.
+
+    /**
+     * Iterates over all rows that match the given conditions.
+     * This returns <var>null</var> when no more rows are available;
+     * otherwise returns an instance of {@link CB_Row}.
+     *
+     * @return CB_Row|null
+     */
+    function iterate()
+    {
+        $nothing = null;
+        if ($this->_result === false) {
+            $this->_search();
+        }
+        if ($this->_result === false) {
+            return $nothing;
+        }
+
+        $rawdata = $this->_dbconn->fetch_assoc($this->_result);
+        if ($rawdata === false) {
+            $this->_dbconn->free_result($this->_result);
+            $this->_result = false;
+
+            return $nothing;
+        }
+
+        if ( ! $this->_select) {
+            return $rawdata;
+        } elseif ($this->_oid_only) {
+            return $rawdata[CB_DATABASE_OID_NAME];
+        } else {
+            $table_info = $this->_table_info;
+            $ret = $table_info->getRow($rawdata[CB_DATABASE_OID_NAME],
+                $rawdata);
+            if ( ! $ret) {
+                $ret = null;
+            }
+
+            return $ret;
+        }
+    }
+
+    /**
+     * Call this to interrupt iterations in progress.
+     * Unless this is called, the memory area that hold search results
+     * will not be reclaimed.
+     */
+    function destroy()
+    {
+        if ($this->_result !== false) {
+            $this->_dbconn->free_result($this->_result);
+            $this->_result = false;
+            $this->_foundrows = false;
+        }
+    }
+
+    //// Implement group operation API
+
+    /**
+     * Make iterate() to return object ID instead of CB_Row object.
+     */
+    function setOidOnly()
+    {
+        $this->_oid_only = true;
+    }
+
+    /**
+     * Applies group functions.
+     * This method will apply group functions
+     *
+     * @param array  $group_functions
+     *  An immaginary array that the key is the column's alias name,
+     *  and the value is string which represents a group function.
+     *  Only when the key is string, the alias name is valid.
+     *  For example:<BR>
+     *  array('count_every_day' => 'COUNT(*)','AVG(tab_log.col_guest_age)');
+     * @param array  $group_by_columns
+     *  An immaginary array that the key is the column's alias name,
+     *  and the value is string which represents a GROUP BY column.
+     *  Only when the key is string, the alias name is valid.
+     *  If NULL no group by.
+     *  Default value is NULL.
+     *  For example:<BR>
+     *  array('date' => 'tab_log.col_date','tab_log.col_year');
+     * @param string $conditions
+     *  Condition on which function are applied.
+     *  IF NULL no condtion.
+     *  Default value is NULL.
+     */
+    function applyGroupFunctions(
+        $group_functions,
+        $group_by_columns = null,
+        $conditions = null
+    ) {
+        $this->_group_functions = $group_functions;
+        $this->_group_by_columns = $group_by_columns;
+        if ( ! is_null($conditions)) {
+            $this->_having = " HAVING $conditions";
+        }
+        $this->_select = false;
+    }
+
+    /**
+     * Format an SQL query by replacing @S with properly escaped SQL
+     * string, @L with properly escaped SQL LIKE expression,
+     *
+     * @A with properly escaped SQL IN clause.  This works as
+     * as a printf group function.  A '@' character should be escaped as
+     * '@@' in $format.
+     *
+     * @param string $format query format.
+     *                       (param string $param,...   parameters for $format.)
+     *
+     * @return string             A properly escaped SQL query string.
+     */
+    function queryf($format /* , $param1, $param2, ... */)
+    {
+        $args = func_get_args();
+        array_shift($args);
+
+        return cb_vqueryf($this->_dbconn, $format, $args);
+    }
+}
+
+/**
+ * Abstract SELECT operation.
+ * This class represents set of rows in multiple joined tables.
+ *
+ * @package fw.persistent
+ */
+class CB_MultiRowSet
+{
+    /**
+     * @access private
+     */
+    var $_dbconn = null;
+    /**
+     * @access private
+     */
+    var $_srctable = null;
+    /**
+     * @access private
+     */
+    var $_joins = [];
+    /**
+     * @access private
+     */
+    var $_group_functions = null;
+    /**
+     * @access private
+     */
+    var $_group_by_columns = null;
+    /**
+     * @access private
+     */
+    var $_from = '';
+    /**
+     * @access private
+     */
+    var $_where = '';
+    /**
+     * @access private
+     */
+    var $_having = '';
+    /**
+     * @access private
+     */
+    var $_group_by = '';
+    /**
+     * @access private
+     */
+    var $_order_by = '';
+    /**
+     * @access private
+     */
+    var $_select_target = '';
+    /**
+     * @access private
+     */
+    var $_offset = 0;           // for LIMIT
+    /**
+     * @access private
+     */
+    var $_limit = -1;           // for LIMIT
+    /**
+     * @access private
+     */
+    var $_calcAll = false;      // use SQL_CALC_FOUND_ROWS
+    /**
+     * @access private
+     */
+    var $_oid_only = false;
+    /**
+     * @access private
+     */
+    var $_result = false;
+    /**
+     * @access private
+     */
+    var $_foundrows = false;
+    /**
+     * @access private
+     */
+    var $_select = true;
+    /**
+     * @access private
+     */
+    var $_begin = '';
+    /**
+     * @access private
+     */
+    var $_end = '';
+    /**
+     * @access private
+     */
+    var $_lock = CB_DATABASE_DEFAULT_LOCK;
+
+    /**
+     * Creates an instance including the table specified by $tableinfo.
+     *
+     * @param CB_TableInfo $tableinfo
+     *  The table which are targets of selection.
+     * @param string       $alias
+     *  The table's alias name. If NULL alias isn't used.
+     *  Default value is NULL.
+     */
+    function __construct($tableinfo, $alias = null)
+    {
+        //_tableinfo to be tableinfo
+        $this->_srctable = ['table' => $tableinfo, 'alias' => $alias];
+        $this->_dbconn = $tableinfo->getDBConnection();
+        $this->_lock = $tableinfo->_lock;
+
+        //initialize from
+        $this->_from = CB_DATABASE_TABLE_PREFIX
+                       . $this->_dbconn->escape($tableinfo->getTableName()) .
+                       (is_null($alias) ? '' : " AS $alias");
+    }
+
+    function setLock($lock = CB_DATABASE_DEFAULT_LOCK)
+    {
+        $this->_lock = $lock;
+    }
+
+    /**
+     * @param string $condition
+     *  An SQL expression that may appear in WHERE clause.
+     */
+    function addCondition($condition)
+    {
+        $delim = ($this->_where === '') ? ' WHERE ' : ' AND ';
+        $this->_where .= $delim . "($condition)";
+    }
+
+    /**
+     * Adds the table specified by <var>tableinfo</var>,
+     * and joins it on the condition specified by <var>$conditions</var>,
+     * using the join type specified by <var>$type</var>
+     *
+     * @param CB_TableInfo $tableinfo
+     *  The table which are joined.
+     * @param string       $conditions
+     *  Condition on which the table are joined.If NULL no condition.
+     *  Default value is NULL.
+     * @param string       $type
+     *  A join type which are used.
+     *  Default value is 'LEFT JOIN'.
+     * @param string       $alias
+     *  The table's alias name. If NULL alias isn't used.
+     *  Default value is NULL.
+     */
+    function addJoin(
+        $tableinfo,
+        $conditions = null,
+        $type = CB_DATABASE_INNER_JOIN,
+        $alias = null
+    ) {
+        $this->_joins[] = [
+            'table' => $tableinfo,
+            'alias' => $alias
+        ];
+
+        //append table to from
+        $this->_from = $this->_begin . $this->_from . $this->_end;
+        $this->_begin = '(';
+        $this->_end = ')';
+        $this->_from .= " $type " .
+                        CB_DATABASE_TABLE_PREFIX
+                        . $this->_dbconn->escape($tableinfo->getTableName()) .
+                        (is_null($alias) ? '' : " AS $alias") .
+                        (is_null($conditions) ? '' : " ON $conditions");
+    }
+
+    /**
+     * Specifies the ORDER BY column.
+     *
+     * @param string $order_by_column
+     *  The column's internal name such as 'tab_cb_user.col_name' that
+     *  which will be embedded in the SQL directly.
+     * @param bool   $reverse
+     *  If not <var>FALSE</var>, the result will be returned in reverse order.
+     */
+    function addOrderColumn($order_by_column, $reverse = false)
+    {
+        $delim = ($this->_order_by === '') ? ' ORDER BY ' : ' , ';
+        $this->_order_by .= $delim . $order_by_column;
+        if ($reverse) {
+            $this->_order_by .= ' DESC';
+        }
+    }
+
+    /**
+     * Make iterate() to return object ID instead of CB_Row object.
+     */
+    function setOidOnly()
+    {
+        $this->_oid_only = true;
+    }
+
+    /**
+     * Applies group functions.
+     *
+     * @param array  $group_functions
+     *  An immaginary array that the key is the column's alias name,
+     *  and the value is string which represents a group function.
+     *  Only when the key is string, the alias name is valid.
+     *  For example:<BR>
+     *  array('count_every_day' => 'COUNT(*)','AVG(tab_log.col_guest_age)');
+     * @param array  $group_by_columns
+     *  An immaginary array that the key is the column's alias name,
+     *  and the value is string which represents a GROUP BY column.
+     *  Only when the key is string, the alias name is valid.
+     *  If NULL no group by.
+     *  Default value is NULL.
+     *  For example:<BR>
+     *  array('date' => 'tab_log.col_date','tab_log.col_year');
+     * @param string $conditions
+     *  Condition on which function are applied.
+     *  IF NULL no condition.
+     *  Default value is NULL.
+     */
+    function applyGroupFunctions(
+        $group_functions,
+        $group_by_columns = null,
+        $conditions = null
+    ) {
+        $this->_group_functions = $group_functions;
+        $this->_group_by_columns = $group_by_columns;
+        if ( ! is_null($conditions)) {
+            $this->_having = " HAVING $conditions";
+        }
+        $this->_select = false;
+    }
+
+    /**
+     * Limits the number of rows to return.
+     *
+     * @param int $offset
+     *  The offset of the first row to return.  The offset of the
+     *  initial row is 0 (not 1).
+     * @param int $limit
+     *  The number of rows to be retrieved.  Specify '-1' to retrieve
+     *  all rows after <var>offset</var>.
+     */
+    function limit($offset = 0, $limit = 21)
+    {
+        $this->_offset = $offset;
+        $this->_limit = $limit;
+    }
+
+    /**
+     * Calculates the number of rows that match conditions regardless
+     * of search number limitation.
+     *
+     * <p style="color: red;">
+     *  WARNING: This may introduce heavy load!!
+     * </p>
+     *
+     * @param bool $calcAll
+     *  If not <var>FALSE</var>, the search will calculate the number
+     *  of matched rows.
+     *
+     * @see CB_RowSet::limit()
+     */
+    function setCalcAllMatched($calcAll)
+    {
+        $this->_calcAll = $calcAll;
+    }
+
+    /**
+     * Return the number of rows in the result set.
+     *
+     * @return int
+     *  The number of rows in the result set, or <var>FALSE</var>
+     *  if select or apply functions has failed or has not been executed.
+     */
+    function count()
+    {
+        if ($this->_result === false) {
+            $this->_search();
+        }
+        if ($this->_result === false) {
+            return false;
+        } else {
+            return $this->_dbconn->num_rows($this->_result);
+        }
+    }
+
+    /**
+     * Return the total number of rows matching given conditions,
+     * regardless of search count limitation.
+     *
+     * @return int
+     *  The number of rows matching given conditions, or <var>FALSE</var>
+     *  if select or apply functions has failed or has not been executed.
+     */
+    function countAllMatched()
+    {
+        if ($this->_foundrows === false) {
+            $this->_search();
+        }
+        if ($this->_foundrows === false) {
+            return false;
+        } else {
+            return intval($this->_foundrows);
+        }
+    }
+
+    /**
+     * Call this to interrupt iterations in progress.
+     * Unless this is called, the memory area that hold search results
+     * will not be reclaimed.
+     */
+    function destroy()
+    {
+        if ($this->_result !== false) {
+            $this->_dbconn->free_result($this->_result);
+            $this->_result = false;
+            $this->_foundrows = false;
+        }
+    }
+
+    /**
+     * Iterates result rows.
+     * This method must be called after call of select() or applyGroupFunctions(),
+     * and so this method returns the result of each methods.
+     *
+     * @return array
+     *  If select() is executed and $oid_only = TRUE, returns such an array:<BR>
+     *  array('tablename or aliasname' => $oid,...)<BR>
+     *  If select() is executed and $oid_only = FALSE, returns such an array:<BR>
+     *  array('tablename or aliasname' => $row,...)<BR>
+     *  If applyGroupFunctions is executed, returns such an array:<BR>
+     *  array('COUNT(*)' => 5,'date',...)<BR>
+     *  <BR>
+     *  *1 $oid is string object.<BR>
+     *  *2 $row is CB_Row object.<BR>
+     */
+    function &iterate()
+    {
+        $nothing = null;
+        if ($this->_result === false) {
+            $this->_search();
+        }
+        if ($this->_result === false) {
+            return $nothing;
+        }
+
+        if ( ! $this->_select) {
+            $rawdata = $this->_dbconn->fetch_assoc($this->_result);
+            if ($rawdata !== false) {
+                return $rawdata;
+            }
+        } else {
+            $rawdata = $this->_dbconn->fetch_row($this->_result);
+        }
+
+        if ($rawdata === false) {
+            $this->_dbconn->free_result($this->_result);
+            $this->_result = false;
+
+            return $nothing;
+        }
+
+        if ($this->_oid_only) {
+            $c = 0;
+
+            //src table
+            $info = $this->_srctable;
+            /** @var CB_TableInfo $tableinfo */
+            $tableinfo = $info['table'];
+            $alias = $info['alias'];
+            $tablename = is_null($alias) ? $tableinfo->getTableName()
+                : $alias;
+            $ret[$tablename] =& $rawdata[$c++];
+
+            //join tables
+            $keys = array_keys($this->_joins);
+            foreach ($keys as $key) {
+                $info = $this->_joins[$key];
+                $tableinfo = $info['table'];
+                $alias = $info['alias'];
+                $tablename = is_null($alias) ? $tableinfo->getTableName()
+                    : $alias;
+                $ret[$tablename] =& $rawdata[$c++];
+            }
+
+            return $ret;
+        }
+
+        $c = 0;
+
+        //src table
+        $info =& $this->_srctable;
+        /** @var CB_TableInfo $tableinfo */
+        $tableinfo = $info['table'];
+        $alias = $info['alias'];
+        $tablename = is_null($alias)
+            ? $tableinfo->getTableName() : $alias;
+        $ret[$tablename][CB_DATABASE_OID_NAME] =& $rawdata[$c++];
+        $columnlist = $tableinfo->getColumnInfo();
+        $columnnames = array_keys($columnlist);
+        foreach ($columnnames as $name) {
+            $column =& $columnlist[$name];
+            if (array_key_exists('lazy', $column) && $column['lazy']) {
+                continue;
+            } else {
+                $ret[$tablename][CB_DATABASE_COLUMN_PREFIX . $name]
+                    =& $rawdata[$c++];
+            }
+        }
+
+        $ret[$tablename]
+            = $tableinfo->getRow($ret[$tablename][CB_DATABASE_OID_NAME],
+            $ret[$tablename]);
+
+        //join tables
+        $keys = array_keys($this->_joins);
+        foreach ($keys as $key) {
+            $info =& $this->_joins[$key];
+            $tableinfo = $info['table'];
+            $alias = $info['alias'];
+            $tablename = is_null($alias)
+                ? $tableinfo->getTableName() : $alias;
+            $ret[$tablename][CB_DATABASE_OID_NAME] =& $rawdata[$c++];
+            $columnlist
+                = $tableinfo->getColumnInfo();
+            $columnnames = array_keys($columnlist);
+            foreach ($columnnames as $name) {
+                $column =& $columnlist[$name];
+                if (array_key_exists('lazy', $column) && $column['lazy']) {
+                    continue;
+                } else {
+                    $ret[$tablename][CB_DATABASE_COLUMN_PREFIX . $name]
+                        =& $rawdata[$c++];
+                }
+            }
+
+            $ret[$tablename]
+                = $tableinfo->getRow($ret[$tablename][CB_DATABASE_OID_NAME],
+                $ret[$tablename]);
+        }
+
+        return $ret;
+    }
+
+    /**
+     * @access private
+     */
+    function _search()
+    {
+        //reset result
+        $this->destroy();
+
+        //get query
+        if ($this->_select) {
+            $query = $this->_constructSelectQuery();
+        } else {
+            $query = $this->_constructCalcQuery();
+        }
+
+        //execute query
+        $this->_executeQuery($query);
+    }
+
+    /**
+     * @access private
+     */
+    function _constructSelectTarget()
+    {
+        $this->_select_target = 'SELECT ' . ($this->_calcAll === true
+                ? 'SQL_CALC_FOUND_ROWS ' : '');
+
+        //src table
+        $info =& $this->_srctable;
+        /** @var CB_TableInfo $tableinfo */
+        $tableinfo = $info['table'];
+        $alias = $info['alias'];
+        $tablename = is_null($alias)
+            ?
+            CB_DATABASE_TABLE_PREFIX
+            . $this->_dbconn->escape($tableinfo->getTableName())
+            :
+            $alias;
+
+        $this->_select_target .= "$tablename." . CB_DATABASE_OID_NAME;
+        if ( ! $this->_oid_only) {
+            $columnlist = $tableinfo->getColumnInfo();
+            $columnnames = array_keys($columnlist);
+            foreach ($columnnames as $name) {
+                $column =& $columnlist[$name];
+                if (array_key_exists('lazy', $column) && $column['lazy']) {
+                    continue;
+                } else {
+                    $this->_select_target .= " , $tablename."
+                                             . CB_DATABASE_COLUMN_PREFIX
+                                             . $this->_dbconn->escape($name);
+                }
+            }
+        }
+
+        //join tables
+        $keys = array_keys($this->_joins);
+        foreach ($keys as $key) {
+            $info =& $this->_joins[$key];
+            $tableinfo = $info['table'];
+            $alias = $info['alias'];
+            $tablename = is_null($alias)
+                ?
+                CB_DATABASE_TABLE_PREFIX
+                . $this->_dbconn->escape($tableinfo->getTableName())
+                :
+                $alias;
+
+            $this->_select_target .= " , $tablename." . CB_DATABASE_OID_NAME;
+            if ( ! $this->_oid_only) {
+                $columnlist = $tableinfo->getColumnInfo();
+                $columnnames = array_keys($columnlist);
+                foreach ($columnnames as $name) {
+                    $column =& $columnlist[$name];
+                    if (array_key_exists('lazy', $column) && $column['lazy']) {
+                        continue;
+                    } else {
+                        $this->_select_target .= " , $tablename."
+                                                 . CB_DATABASE_COLUMN_PREFIX
+                                                 . $this->_dbconn->escape($name);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * @access private
+     */
+    function _constructCalcTarget()
+    {
+        $this->_select_target = 'SELECT ' . ($this->_calcAll === true
+                ? 'SQL_CALC_FOUND_ROWS ' : '');
+
+        $delim = '';
+        //group_functions
+        if (is_array($this->_group_functions)) {
+            foreach ($this->_group_functions as $key => $value) {
+                assert('!is_numeric($key)');
+                $this->_select_target .= "$delim$value AS $key";
+                $delim = ', ';
+            }
+        }
+        //group_by_columns
+        if (is_array($this->_group_by_columns)) {
+            foreach ($this->_group_by_columns as $key => $value) {
+                assert('!is_numeric($key)');
+                $this->_select_target .= "$delim$value AS $key";
+                $delim = ', ';
+            }
+        }
+    }
+
+    /**
+     * @access private
+     */
+    function _constructGroupBy()
+    {
+        //set group by
+        $this->_group_by = '';
+
+        if (is_array($this->_group_by_columns)) {
+            $delim = ' GROUP BY ';
+            foreach ($this->_group_by_columns as $column) {
+                $this->_group_by .= $delim . $column;
+                $delim = ' , ';
+            }
+        }
+    }
+
+    /**
+     * @access private
+     */
+    function _constructSelectQuery()
+    {
+        //construct and return query string
+        $this->_constructSelectTarget();
+
+        return
+            $this->_dbconn->select_format($this->_select_target .
+                                          ' FROM ' . $this->_from .
+                                          $this->_where .
+                                          $this->_order_by,
+                $this->_offset,
+                $this->_limit,
+                $this->_lock);
+    }
+
+    /**
+     * @access private
+     */
+    function _constructCalcQuery()
+    {
+        //construct and return query string
+        $this->_constructCalcTarget();
+        $this->_constructGroupBy();
+
+        return
+            $this->_dbconn->select_format($this->_select_target .
+                                          ' FROM ' . $this->_from .
+                                          $this->_where .
+                                          $this->_group_by .
+                                          $this->_having .
+                                          $this->_order_by,
+                $this->_offset,
+                $this->_limit,
+                $this->_lock);
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $query
+     */
+    function _executeQuery($query)
+    {
+        $db = $this->_dbconn;
+        $this->_result = $db->query($query);
+        if ($this->_result === false) {
+            $db->throwServerError($query);
+        }
+        if ($this->_calcAll) {
+            $this->_foundrows = $db->get_found_rows();
+        }
+    }
+
+    /**
+     * Format an SQL query by replacing @S with properly escaped SQL
+     * string, @L with properly escaped SQL LIKE expression,
+     *
+     * @A with properly escaped SQL IN clause.  This works as
+     * as a printf group function.  A '@' character should be escaped as
+     * '@@' in $format.
+     *
+     * @param string $format query format.
+     *                       (param string $param,...   parameters for $format.)
+     *
+     * @return string             A properly escaped SQL query string.
+     */
+    function queryf($format /* , $param1, $param2, ... */)
+    {
+        $args = func_get_args();
+        array_shift($args);
+
+        return cb_vqueryf($this->_dbconn, $format, $args);
+    }
+}
+
+function cb_get_user_tables()
+{
+    global $G_config_common;
+    $user_tables = $G_config_common->get('Database', 'user_tables');
+    if (is_null($user_tables) || $user_tables < 1) {
+        $user_tables = CB_DATABASE_DEFAULT_USER_TABLES;
+    }
+
+    return $user_tables;
+}
+
+function cb_is_db_result($val)
+{
+    return is_object($val);
+}
+
+/**
+ * Get DB Server timestamp
+ *
+ * @return int Returns the DB server current time measured in the number of seconds since the Unix Epoch on success or -1 on failure.
+ */
+function cb_get_db_timestamp()
+{
+    global $G_db_timestamp;
+    if ( ! isset($G_db_timestamp)) {
+        $G_db_timestamp = _cb_get_db_timestamp();
+    }
+
+    return $G_db_timestamp;
+}
+
+function _cb_get_db_timestamp()
+{
+    global $G_container_base;
+    $conn = $G_container_base->getInstance('dbconn');
+
+    $result = $conn->query('SELECT UNIX_TIMESTAMP()');
+    if (cb_is_db_result($result)) {
+        $row = $conn->fetch_row($result);
+        $conn->free_result($result);
+
+        return (int)$row[0];
+    }
+
+    assert('FALSE');
+    cb_throw_error();
+}
+
+

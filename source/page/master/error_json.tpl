@@ -1,0 +1,1 @@
+{ldelim}"code": "{$ErrorNumber|escape:javascript}", "diagnosis": "{$ErrorDiag|escape:javascript}", "cause": "{$ErrorCause|escape:javascript}", "counter_measure": "{$ErrorCounterMeasure|escape:javascript}", "developer_info": "{$ErrorDeveloperInfo|escape:javascript}", "backtrace": "{$ErrorDetailTable|escape:javascript}", "input": "{$ErrorInput|escape:javascript}"{rdelim}

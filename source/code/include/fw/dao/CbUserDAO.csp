@@ -1,0 +1,193 @@
+<?php
+
+use grn\system\sandbox\SandboxConstants;
+
+require_once('fw/database.csp');
+require_once('fw/bean/CbUser.csp');
+
+class CbUserDAO
+{
+    private $postfix = '';
+
+    /**
+     * @param int $sandbox
+     */
+    public function __construct($sandbox = SandboxConstants::NO_SANDBOX_MODE)
+    {
+        $this->postfix = ($sandbox === SandboxConstants::SANDBOX_MODE
+            ? "_sandbox" : "");
+    }
+
+    /** ***************************************************** */
+    /** -----             OTHER TABLE JOIN          --------- */
+    /** ***************************************************** */
+    /**
+     * @param $inDataObj
+     * @param $inUserArray
+     *
+     * @return CBUser[]
+     */
+    public function getUserPrimaryGroupListByIds($inDataObj, $inUserArray)
+    {
+        $cbUserArray
+            = $this->getUserPrimaryGroupListByIdsFromUserInfo($inDataObj,
+            $inUserArray);
+
+        $userIds = [];
+        foreach ($cbUserArray as $user) {
+            $userIds[] = $user->getId();
+        }
+
+        $inUsersHaveNoPrimaryGroupArray = array_diff($inUserArray, $userIds);
+
+        $cbUserArray = array_merge(
+            $cbUserArray,
+            $this->findUserPrimaryGroupListByIdsFromRelation($inDataObj,
+                $inUsersHaveNoPrimaryGroupArray)
+        );
+
+        return $cbUserArray;
+    }
+
+    /**
+     * ユーザ情報に紐づく優先する組織(tab_grn_userinfo.col_primary_group)を取得する
+     *
+     * @param $inDataObj
+     * @param $inUserArray
+     *
+     * @return CbUser[]
+     */
+    public function getUserPrimaryGroupListByIdsFromUserInfo(
+        $inDataObj,
+        $inUserArray
+    ) {
+        if (empty($inUserArray)) {
+            return [];
+        }
+
+        /* @var CB_DatabaseConnection $inDb */
+        $inDb = $inDataObj['db'];
+        $inLanguage = (array_key_exists('language', $inDataObj))
+            ? $inDataObj['language'] : null;
+
+        $query = "SELECT ui.col_user AS _id";
+        $query .= ", g._id AS group_id";
+        $query .= ", IFNULL(cl.col_name, g.col_name) AS group_col_name";
+        $query .= " FROM tab_grn_userinfo AS ui LEFT JOIN tab_cb_usergrouprelation ugr ON ui.col_primary_group = ugr._id";
+        $query .= ", tab_cb_group g LEFT JOIN (tab_cb_group_local cl INNER JOIN tab_cb_language_status l ON cl.language_id = l._id AND l.col_language = '"
+                  . $inDb->escape($inLanguage) . "') ON g._id = cl.parent_id";
+        $query .= " WHERE ugr.col_group = g._id";                           //優先する組織が設定済みのユーザー
+        $query .= " AND ui.col_user IN (@A)";
+        $query .= " ORDER BY _id";
+
+        $query = $inDb->format($query, [$inUserArray]);
+
+        $result = $inDb->query($query);
+
+        if ($result === false) {
+            //Throw Query Error
+            $inDb->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        $cbUserArray = [];
+        while ($rawdata = $inDb->fetch_assoc($result)) {
+            $cbUser = new CbUser($rawdata);
+            $cbUserArray[] = $cbUser;
+        }
+        $inDb->free_result($result);
+
+        return $cbUserArray;
+    }
+
+    /**
+     * 組織に1つ以上所属しているユーザーのうち、
+     * 複数組織に所属している場合は
+     *  表示順が最少の組織
+     *  表示順が最少が複数ある場合は、その中で組織IDが最少の組織を取得する
+     *
+     * 優先する組織が未設定のユーザーに対して関数を実行するようにすること
+     *
+     * @param $inDataObj
+     * @param $inUserArray
+     *
+     * @return CbUser[]
+     */
+    public function findUserPrimaryGroupListByIdsFromRelation(
+        $inDataObj,
+        $inUserArray
+    ) {
+        if (empty($inUserArray)) {
+            return [];
+        }
+
+        /* @var CB_DatabaseConnection $inDb */
+        $inDb = $inDataObj['db'];
+        $inLanguage = (array_key_exists('language', $inDataObj))
+            ? $inDataObj['language'] : null;
+
+        $p = $this->postfix;
+
+        $query = " SELECT ugr.col_user AS _id";
+        $query .= ", g._id AS group_id";
+        $query .= ", IFNULL(cl.col_name, g.col_name) AS group_col_name";
+        $query .= " FROM tab_cb_usergrouprelation{$p} ugr";
+        $query .= ", tab_cb_group{$p} g LEFT JOIN (tab_cb_group_local{$p} cl INNER JOIN tab_cb_language_status l ON cl.language_id = l._id AND l.col_language = '"
+                  . $inDb->escape($inLanguage) . "') ON g._id = cl.parent_id";
+        $query .= ", (SELECT ugr1st._id";                                                              //ユーザー毎の表示順が最小の組織IDが最小のリレーションID
+        $query .= "   FROM tab_cb_usergrouprelation{$p} ugr1st";
+        $query .= "   ,  (SELECT ugr2nd.col_user, MIN(ugr2nd.col_group) as col_group";                 //ユーザー毎の表示順が最小の組織IDが最小の組織
+        $query .= "       FROM tab_cb_usergrouprelation{$p} ugr2nd";
+        $query .= "       ,  (SELECT ugr3rd.col_user, MIN(ugr3rd.col_group_list) as col_group_list";   //組織に1つ以上所属しているユーザーで、ユーザー毎の表示順が最小の組織
+        $query .= "           FROM tab_cb_usergrouprelation{$p} ugr3rd";
+        $query .= "           WHERE ugr3rd.col_user IN (@A)";
+        $query .= "           GROUP BY ugr3rd.col_user) join3rd";
+        $query .= "       WHERE ugr2nd.col_user = join3rd.col_user";
+        $query .= "       AND ugr2nd.col_group_list = join3rd.col_group_list";
+        $query .= "       GROUP BY ugr2nd.col_user) join2nd";
+        $query .= "   WHERE ugr1st.col_user = join2nd.col_user";
+        $query .= "   AND ugr1st.col_group = join2nd.col_group) join1st";
+        $query .= " WHERE g._id = ugr.col_group";
+        $query .= " AND ugr._id = join1st._id";
+        $query .= " ORDER BY _id";
+
+        $query = $inDb->format($query, [$inUserArray]);
+
+        $result = $inDb->query($query);
+
+        if ($result === false) {
+            //Throw Query Error
+            $inDb->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        $cbUserArray = [];
+        while ($rawdata = $inDb->fetch_assoc($result)) {
+            $cbUser = new CbUser($rawdata);
+            $cbUserArray[] = $cbUser;
+        }
+        $inDb->free_result($result);
+
+        return $cbUserArray;
+    }
+
+    /**
+     * @param $inDataObj
+     * @param $displayNameLanguageId
+     *
+     * @return bool
+     */
+    public function resetNicknameAndDisplayNameLanguage(
+        $inDataObj,
+        $displayNameLanguageId
+    ) {
+        /* @var CB_DatabaseConnection $inDb */
+        $inDb = $inDataObj['db'];
+        $query
+            = "UPDATE tab_cb_user SET col_nickname = '', col_display_name_language='{$inDb->escape($displayNameLanguageId)}' ORDER BY _id;";
+        $result = $inDb->query($query);
+        if ($result === false) {
+            $inDb->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        return true;
+    }
+}

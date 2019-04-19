@@ -1,0 +1,416 @@
+<?php
+
+/**
+ * @author  Y.Tanaka        2005/01
+ * @package grn.cellular
+ */
+
+require_once('grn/application.csp');
+require_once('grn/ui.csp');
+
+use grn\grn\access\service\AppAccess;
+use grn\grn\access\utility\AppAvailabilityUtil;
+
+define('GRN_CELLULAR_APPLICATION_ID', 'cellular');
+define('GRN_CELLULAR_LICENSE_ID', 6);
+
+/**
+ * @package grn.cellular
+ */
+class GRN_Cellular extends GRN_ApplicationBase
+{
+    private static $_instance = null;
+
+    /**
+     * @return GRN_Cellular
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    function __construct()
+    {
+        parent::__construct('cellular');
+    }
+
+    public function initialize()
+    {
+        parent::initialize();
+
+        // 認証の設定
+        require_once('grn/authentication.csp');
+        $authentication_service = GRN_Authentication_Service::getInstance();
+
+        // delete old methods
+        foreach ($authentication_service->getLoginMethodList() as $login_method) {
+            if ($login_method->getDriverType() === GRN_AUTH_LOGIN_CELLULAR) {
+                $authentication_service->deleteLoginMethod($login_method->getOID());
+            }
+        }
+        foreach (
+            $authentication_service->getAuthenticateMethodList() as
+            $authenticate_method
+        ) {
+            if ($authenticate_method->getDriverType()
+                === GRN_AUTH_AUTHENTICATE_CELLULAR
+            ) {
+                $authentication_service->deleteAuthenticateMethod($authenticate_method->getOID());
+            }
+        }
+
+        // 標準の認証データベースの取得
+        $default_repository_method
+            = $authentication_service->getDefaultRepositoryMethod();
+
+        $uum = cb_lwc_uum();
+        $administrator = $uum->getUser(GRN_UUM_ADMINISTRATION_USER);
+        $dummy_settings = [];
+        // ログイン認証
+        $login_method
+            = $authentication_service->addLoginMethod(cb_msg(GRN_AUTH_LOGIN_CELLULAR,
+            'name'),
+            GRN_AUTH_LOGIN_CELLULAR,
+            $dummy_settings,
+            $default_repository_method);
+        $login_method->set(GRN_AUTH_PROPERTY_CREATOR, $administrator);
+        $login_method->set(GRN_AUTH_PROPERTY_CREATOR_NAME,
+            $administrator->get('display_name'));
+        $login_method->set(GRN_AUTH_PROPERTY_CREATOR_FOREIGN_KEY,
+            $administrator->get('foreign_key'));
+        $login_method->set(GRN_AUTH_PROPERTY_MODIFIER, $administrator);
+        $login_method->set(GRN_AUTH_PROPERTY_MODIFIER_NAME,
+            $administrator->get('display_name'));
+        $login_method->set(GRN_AUTH_PROPERTY_MODIFIER_FOREIGN_KEY,
+            $administrator->get('foreign_key'));
+
+        // セッション認証
+        $authenticate_method
+            = $authentication_service->addAuthenticateMethod(cb_msg(GRN_AUTH_AUTHENTICATE_CELLULAR,
+            'name'),
+            GRN_AUTH_AUTHENTICATE_CELLULAR,
+            $dummy_settings,
+            $default_repository_method);
+        $authenticate_method->set(GRN_AUTH_PROPERTY_CREATOR, $administrator);
+        $authenticate_method->set(GRN_AUTH_PROPERTY_CREATOR_NAME,
+            $administrator->get('display_name'));
+        $authenticate_method->set(GRN_AUTH_PROPERTY_CREATOR_FOREIGN_KEY,
+            $administrator->get('foreign_key'));
+        $authenticate_method->set(GRN_AUTH_PROPERTY_MODIFIER, $administrator);
+        $authenticate_method->set(GRN_AUTH_PROPERTY_MODIFIER_NAME,
+            $administrator->get('display_name'));
+        $authenticate_method->set(GRN_AUTH_PROPERTY_MODIFIER_FOREIGN_KEY,
+            $administrator->get('foreign_key'));
+    }
+
+    function getSystemConfig(& $user)
+    {
+        require_once('cellular/config.csp');
+
+        $cm = GRN_Cellular_ConfigManager::getInstance();
+        $is_admin = $this->isAdmin($user);
+        $ret = $cm->getSystemConfig($is_admin);
+
+        return $ret;
+    }
+
+    /**
+     * @param CB_User $user
+     *
+     * @return GRN_Cellular_UserConfig
+     */
+    function getUserConfig(CB_User $user)
+    {
+        require_once('cellular/config.csp');
+
+        $cm = GRN_Cellular_ConfigManager::getInstance();
+        $ret = $cm->getUserConfig($user);
+
+        return $ret;
+    }
+
+    /**
+     * ユーザーが利用可能かを判定する
+     *
+     * @param object CB_User $user
+     *
+     * @return bool
+     */
+    function isAvailableFor($user)
+    {
+        return $this->isLicensedUser($user);
+    }
+
+    /**
+     * ライセンス情報を取得する
+     *
+     * @return FALSE or Array
+     */
+    function getLicenseInfo()
+    {
+        require_once('grn/license.csp');
+        $lm = GRN_LicenseManager::getInstance();
+        $license = $lm->getLicense(GRN_LICENSE_BASESYSTEM);
+
+        if ( ! is_array($license) || 0 == count($license)) {
+            return false;
+        }
+
+        if ($lm->isDemoLicense($license['type'])) {
+            // 試用期間を不正に延ばそうとした場合（試用開始日時 > 現在日時）
+            if (time() < $license['register']->unix_ts) {
+                $license['remind_days'] = -1;
+            } // 試用期間過ぎた場合
+            else {
+                $license['remind_days'] = $lm->getRemindDays($license['limit']);
+            }
+        } else {
+            $license['remind_days']
+                = $lm->getRemindDays($license['service_limit'],
+                GRN_LICENSE_SERVICE_EXPIRED_OFFSET);
+        }
+
+        return $license;
+    }
+
+    /**
+     * ユーザが利用可能かを判定する
+     *
+     * @param object CB_User    $user
+     *
+     * @return bool
+     */
+    function isLicensedUser($user)
+    {
+        if ( ! $user) {
+            return false;
+        }
+
+        if ( ! $this->isLicensed()) {
+            return false;
+        }
+
+        $lic = $this->getLicenseInfo();
+        if ( ! is_array($lic) || 0 == count($lic)) {
+            return false;
+        }
+
+        require_once('grn/license.csp');
+        $lm = GRN_LicenseManager::getInstance();
+        if ( ! $lm->isDemoLicense($lic['type'])) {
+            return AppAccess::isAppAvailableInternalAccess($this->__app_id);
+        }
+
+        return true;
+    }
+
+    function isLicensed()
+    {
+        $lic = $this->getLicenseInfo();
+        if ( ! is_array($lic) || 0 == count($lic)) {
+            return false;
+        }
+
+        return GRN_LICENSE_EXPIRED != $this->getStatus($lic);
+    }
+
+    function getStatus($license_info)
+    {
+        static $_status = null;
+        if ( ! is_null($_status)) {
+            return $_status;
+        }
+        $_status = GRN_LICENSE_SUCCESS;
+
+        if (0 > $license_info['remind_days']) {
+            $_status = GRN_LICENSE_EXPIRED;
+        }
+
+        return $_status;
+    }
+
+    /**
+     * システム設定トップ
+     */
+    function getSystemConfigArray()
+    {
+        //GTM-529
+        if (defined('ON_FOREST')) {
+            return [
+                'cellular_config' =>
+                    [
+                        [
+                            'page' => 'cellular/system/common_set',
+                            'icon' => 'general32'
+                        ],
+                    ],
+            ];
+        }
+
+        return [
+            'cellular_config' =>
+                [
+                    [
+                        'page' => 'cellular/system/common_set',
+                        'icon' => 'general32'
+                    ],
+                    [
+                        'page' => 'cellular/system/login_url',
+                        'icon' => 'smarturl32'
+                    ],
+                    [
+                        'page' => 'cellular/system/login_method_view',
+                        'icon' => 'auth_publish32'
+                    ],
+                ],
+        ];
+    }
+
+    /**
+     * 個人設定トップ
+     */
+    function getPersonalConfigArray()
+    {
+        //GTM-529
+        return [
+            'cellular_config' =>
+                [
+                    [
+                        'page' => 'cellular/personal/account',
+                        'icon' => 'smartaccount32'
+                    ],
+                    [
+                        'page' => 'cellular/personal/send_url',
+                        'icon' => 'smarturl32'
+                    ],
+                ],
+        ];
+    }
+
+    /**
+     * @access private
+     */
+    function &_loadComponent($app_id)
+    {
+        require_once('fw/plugin.csp');
+        $loader = new CB_PluginLoader('grn.' . $app_id . '.cellular');
+        $component =& $loader->loadDriver('component');
+        unset($loader);
+
+        if ( ! $component) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        return $component;
+    }
+
+    /**
+     * @access private
+     */
+    var $_applications = null;
+
+
+    /**
+     * @access private
+     */
+    function _constructApplicationList()
+    {
+        if ( ! is_null($this->_applications)) {
+            return;
+        }
+
+        $logged_in_id = cb_get_login_user()->getOID();
+        $app_ids
+            = AppAccess::getAllAppIdsAvailableByUserId($logged_in_id);
+        $this->_applicatons = [];
+
+        foreach ($app_ids as $app_id) {
+            $component =& $this->_loadComponent($app_id);
+
+            if ( ! $component) {
+                continue;
+            }
+
+            if ( ! $component->isAvailable()) {
+                continue;
+            }
+
+            $this->_applications[$app_id] =& $component;
+        }
+    }
+
+    function isAvailable($app_id)
+    {
+        $this->_constructApplicationList();
+
+        return array_key_exists($app_id, $this->_applications);
+    }
+
+    function getAvailableApplicationIds()
+    {
+        $this->_constructApplicationList();
+
+        return array_keys($this->_applications);
+    }
+
+    function getComponent($app_id)
+    {
+        $this->_constructApplicationList();
+
+        return array_key_exists($app_id, $this->_applications)
+            ? $this->_applications[$app_id] : null;
+    }
+
+    /**
+     * @return GRN_Cellular_ComponentBase[]|null
+     */
+    function getComponents()
+    {
+        $this->_constructApplicationList();
+
+        return $this->_applications;
+    }
+
+    /**
+     * GRN2-6659( GRN35-652 )
+     *
+     * @return bool
+     */
+    public function isAutoLogin()
+    {
+        require_once('cellular/config.csp');
+        $config = GRN_Cellular_SystemConfig::getInstance();
+        $auto_login_info = $config->getAllowAutoLogin();
+
+        return ($auto_login_info['allow_auto_login'] == 1);
+    }
+
+    /**
+     * GRN2-6659( GRN35-652 )
+     *
+     * @param string $token
+     */
+    public function updateAutoLoginExpiration($token)
+    {
+        global $G_config_common;
+        $token_expiration = $G_config_common->get('Cellular',
+            'token_expiration');
+        require_once('cellular/token.csp');
+        $cellular_token = new GRN_Cellular_Token();
+        $data = $cellular_token->checkTokenUser($token);
+        if ($data != false) {
+            $cellular_token->update($data);
+            setcookie('token_id_cellular', $token,
+                time() + (60 * 60 * 24 * $token_expiration));
+        }
+    }
+}
+
+

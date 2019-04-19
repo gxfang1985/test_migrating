@@ -1,0 +1,331 @@
+<?php
+
+namespace grn\schedule\screen\mobile;
+
+use grn\grn\mobile\MobileDisplayUserList;
+use grn\schedule\bean\AttendanceStatusCondition;
+use grn\schedule\bean\AttendanceStatus;
+use grn\schedule\AttendanceStatusLogic;
+
+class ScheduleAttendeeList extends MobileScheduleScreenBase
+{
+    const REQUEST_PAGE = 'schedule/mobile/ajax/attendee_list';
+    private $_is_from_ajax;
+
+    public function __construct($input)
+    {
+        parent::__construct($input);
+
+        $this->setMobileFooterBar();
+    }
+
+    public function fetch()
+    {
+        //Get login info
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login = $uum->getLoginUser();
+        $login_id = $login->getOID();
+        //Get event ID
+        $input = $this->getInput();
+        $this->checkArgFromInput([self::ARG_EVENT, self::ARG_BEGIN_DATE],
+            $input);
+        $event_id = $this->getEvent();
+        $user_id = cb_at($input, self::ARG_USER_ID);
+        $group_id = cb_at($input, self::ARG_GROUP_ID);
+        $referer_key = cb_at($input, self::ARG_REFERER_KEY);
+        $tab_id = cb_at($input, self::ARG_TAB_ID);
+
+        if ( ! $event_id) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        //Get begin date(bdate)
+        $str_date = $this->getBDateStr();
+        $date = new \CB_Date();
+        if ( ! $date->parse($str_date)) {
+            $date = null;
+        }
+
+        //Get event
+        require_once('schedule/application.csp');
+        $app = \GRN_Schedule_Application::getInstance();
+        $event = $app->getEvent($login, $event_id, $date, CB_DATABASE_NO_LOCK,
+            false, GRN_SCHEDULE_GET_MEMBER_ID);
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        //Check View right of appointment
+        require_once('schedule/access_logic.csp');
+        $acc_logic = \GRN_Schedule_Access_Logic::getInstance();
+        $dynamic_roles = $uum->listGrantedRoles();
+        $access = $acc_logic->getEventAccessByID($login, $event,
+            ['read'], $dynamic_roles);
+
+        if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+        }
+
+        $members = [];
+        $event_members = ['users' => [], 'groups' => []];
+        //Attendee is group
+        if (is_array($event->groups)) {
+            foreach ($event->groups as $object_id) {
+                $members['g' . $object_id] = $object_id;
+                $event_members['groups'][$object_id] = $object_id;
+            }
+        }
+        //Attendee is user.
+        if (is_array($event->users)) {
+            foreach ($event->users as $object_id) {
+                $members[$object_id] = $object_id;
+                $event_members['users'][$object_id] = $object_id;
+            }
+        }
+
+        //Check conflict user
+        $conflict_users = [];
+        if ((is_a($event, 'GRN_Schedule_NormalEvent')
+             && is_a($event->setdatetime, 'CB_DateTime'))
+            || is_a($event, 'GRN_Schedule_RepeatEvent')
+        ) {
+            // Check Access right
+            if (count($event_members['groups']) > 0) {
+                $event_members['groups']
+                    = $acc_logic->evaluateAccessesById($login,
+                    $event_members['groups'], ['read'], $dynamic_roles,
+                    'group');
+            }
+
+            if (count($event_members['users']) > 0) {
+                $event_members['users']
+                    = $acc_logic->evaluateAccessesById($login,
+                    $event_members['users'], ['read'], $dynamic_roles, 'user');
+            }
+
+            if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+                $setdatetime = $event->setdatetime;
+                $enddatetime = $event->enddatetime;
+                if (is_null($enddatetime)) {
+                    $enddatetime = $event->setdatetime;
+                }
+
+                if ( ! $date) {
+                    $tsex = new \CB_TimeStampEx();
+                    $date = $tsex->getDate();
+                }
+
+                if (($app->compareDate($date, $setdatetime) < 0)
+                    || ($app->compareDate($date, $enddatetime) > 0)
+                ) {
+                    $date->year = $setdatetime->year;
+                    $date->month = $setdatetime->month;
+                    $date->day = $setdatetime->day;
+                }
+
+                if ($app->compareDate($date, $setdatetime) !== 0) {
+                    $setdatetime->year = $date->year;
+                    $setdatetime->month = $date->month;
+                    $setdatetime->day = $date->day;
+                    $setdatetime->hour = 0;
+                    $setdatetime->minute = 0;
+                    $setdatetime->second = 0;
+                }
+
+                if ($app->compareDate($date, $enddatetime) !== 0) {
+                    $workdate = clone $date;
+                    cb_date_move_days($workdate, 1);
+                    $enddatetime->year = $workdate->year;
+                    $enddatetime->month = $workdate->month;
+                    $enddatetime->day = $workdate->day;
+                    $enddatetime->hour = 0;
+                    $enddatetime->minute = 0;
+                    $enddatetime->second = 0;
+                }
+            } else {
+                if ( ! $date) {
+                    $tsex = new \CB_TimeStampEx();
+                    $date = $tsex->getDate();
+                }
+                require_once('schedule/repeat_event_logic.csp');
+                $repeat_logic = \GRN_Schedule_RepeatEventLogic::getInstance();
+                $event_date = $repeat_logic->getRepeatFirstDate($event,
+                    $date);
+
+                $setdatetime = &$event_date['setdatetime'];
+                $enddatetime = &$event_date['enddatetime'];
+            }
+
+            require_once('schedule/system_logic.csp');
+            $systemlogic = \GRN_Schedule_SystemLogic::getInstance();
+            $hiddenprivate = $systemlogic->getHiddenPrivate();
+
+            // get attendees, who were conflicted.
+            $conflict_users = $app->conflictMembersEvent($login, $event_members,
+                $setdatetime, $enddatetime, $event->id, $event->getEventType(),
+                $hiddenprivate);
+            if ( ! $conflict_users) {
+                $conflict_users = [];
+            }
+        }
+
+        //GTM-1630
+        $attendanceStatusLogic = $this->getAttendanceStatusLogic();
+        $isAttendanceCheckView = $this->isAttendanceCheckView($event);
+
+        $params = [
+            self::ARG_EVENT       => $event_id,
+            self::ARG_BEGIN_DATE  => $str_date,
+            self::ARG_USER_ID     => $user_id,
+            self::ARG_GROUP_ID    => $group_id,
+            self::ARG_REFERER_KEY => $referer_key
+        ];
+
+        // exception
+        if ($this->_is_from_ajax) {
+            //Changing from no using Attendance check to using Attendance check
+            if ($isAttendanceCheckView && is_null($tab_id)) {
+                return [
+                    'redirect' => cb_format_url('schedule/mobile/attendee_list',
+                        $params)
+                ];
+            }
+            //Changing from using Attendance check to no using Attendance check
+            if ( ! $isAttendanceCheckView && ! is_null($tab_id)) {
+                return [
+                    'redirect' => cb_format_url('schedule/mobile/attendee_list',
+                        $params)
+                ];
+            }
+        }
+
+        $count = 0;
+        if ($isAttendanceCheckView) {
+            if ($tab_id == 2) {
+                $attendanceStatus = AttendanceStatus::STATUS_ABSENT;
+            } elseif ($tab_id == 3) {
+                $attendanceStatus = AttendanceStatus::STATUS_UNCONFIRMED;
+            } else {
+                $attendanceStatus = AttendanceStatus::STATUS_ATTENDANT;
+                $tab_id = '1';
+            }
+
+            $attendanceStatusList
+                = $attendanceStatusLogic->getAttendanceStatusListByEventAndStatus($event,
+                $attendanceStatus);
+            $attendanceUserIdList
+                = $this->convertAttendanceStatusListToUserIdList($attendanceStatusList);
+
+            $attend_members = [];
+            foreach ($event_members['users'] as $uid) {
+                if (cb_at($attendanceUserIdList, $uid)) {
+                    $attend_members[$uid] = $uid;
+                }
+            }
+            $display_info = $this->getDisplayMemberList($attend_members);
+
+            $newAttendanceStatusList = [];
+            foreach ($attendanceStatusList as $attendanceStatusObj) {
+                $newAttendanceStatusList[$attendanceStatusObj->getUserId()]
+                    = $attendanceStatusObj;
+            }
+
+            foreach ($display_info as $key => $value) {
+                $display_info[$key]['comment']
+                    = $newAttendanceStatusList[$value['id']]->getMessage();
+            }
+
+            $count = count($attend_members);
+        } else {
+            $display_info = $this->getDisplayMemberList($members);
+            $count = count($members);
+        }
+        foreach ($display_info as $key => $value) {
+            if (substr($key, 0, 1) != 'g'
+                && array_key_exists($value['id'], $conflict_users)
+                && $conflict_users[$value['id']]
+            ) {
+                $display_info[$key]['conflict'] = true;
+            }
+            if (substr($key, 0, 1) == 'g') {
+                $display_info[$key]['isAttendee'] = true;
+            }
+        }
+
+        require_once('grn/smarty.csp');
+        $t = new \GRN_Smarty();
+        $t->assign('is_attendance_check_view', $isAttendanceCheckView);
+        $t->assign('event_id', $event_id);
+        $t->assign('bdate', $str_date);
+        $t->assign('user_id', $user_id);
+        $t->assign('group_id', $group_id);
+        $t->assign('referer_key', $referer_key);
+        $t->assign('tab_id', $tab_id);
+        $t->assign('count', $count);
+        $t->assign('request_page', self::REQUEST_PAGE);
+        $t->assign(MobileDisplayUserList::USER_INFO_LIST, $display_info);
+        if ($this->_is_from_ajax) {
+            $member_referer_key = cb_at($input, "member_referer_key");
+            $t->assign('member_referer_key', $member_referer_key);
+
+            return $t->fetch('grn/mobile_member_list.tpl');
+        } else {
+            $this->assignBreadcrumbUpperPage($t,
+                cb_msg('grn.mobile', 'detail_title'), "schedule/mobile/view",
+                $params);
+            $this->assignBreadcrumbCurrentPage($t,
+                cb_msg('grn.schedule', 'GRN_SCH-43'));
+            $t->assign('offset', $this->getNewOffset());
+            if ($isAttendanceCheckView) {
+                $params[self::ARG_TAB_ID] = $tab_id;
+            }
+
+            require_once('fw/session_manager.csp');
+            $session_manager = \CB_SessionManager::getInstance();
+            $session
+                = $session_manager->getSession("mobile.member_referer");
+            $member_referer_key = md5(uniqid(rand(), true));
+            $member_referer = [];
+            $member_referer["page_name"] = cb_msg("grn.schedule",
+                "GRN_SCH-43");
+            $member_referer["page_path"] = "schedule/mobile/attendee_list";
+            $member_referer["page_params"] = $params;
+            $member_referer["app_id"] = "schedule";
+            $member_referer["access_plugin"] = [
+                "name"         => "schedule",
+                "params"       => [
+                    "action" => [
+                        "read",
+                        "add"
+                    ]
+                ],
+                "session_name" => cb_get_pagename()
+            ];
+            $session->set($member_referer_key, $member_referer);
+            $t->assign('member_referer_key', $member_referer_key);
+            $t->assign('list_title', cb_msg('grn.schedule', 'GRN_SCH-43'));
+
+            $params['member_referer_key'] = $member_referer_key;
+            $t->assign('more_view_args', $params);
+
+            return $t->fetch('schedule/mobile/member_index.tpl');
+        }
+    }
+
+    public function getIsFromAjax()
+    {
+        return $this->_is_from_ajax;
+    }
+
+    public function setIsFromAjax($value)
+    {
+        $this->_is_from_ajax = $value;
+    }
+
+    public function getTitle()
+    {
+        $event = $this->getEventForView();
+
+        return $event->detail . ' - ' . cb_msg('grn.schedule', 'GRN_SCH-43');
+    }
+}

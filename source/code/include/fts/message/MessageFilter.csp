@@ -1,0 +1,284 @@
+<?php
+
+namespace grn\fts\message;
+
+use grn\fts\api\SearchApi;
+use grn\fts\api\SearchApiParameter;
+use grn\fts\Application;
+use grn\fts\exception\NoResultException;
+use grn\fts\Fields;
+use grn\fts\filter\AndFilter;
+use grn\fts\filter\JoinFilter;
+use grn\fts\filter\SearchFilterInterface;
+use grn\fts\filter\TermFilter;
+use grn\fts\filter\TermsFilter;
+use grn\fts\filter\HasParentFilter;
+use grn\fts\FtsProduct;
+use grn\fts\SearchConstants;
+
+require_once('grn/DAOFactory.csp');
+require_once('message/resources.csp');
+require_once('message/folder_logic.csp');
+
+class MessageFilter implements SearchFilterInterface
+{
+    const DEFAULT_MESSAGE_LIMIT = 1000000;
+
+    /** @var string */
+    private $folderId;
+
+    /** @var int */
+    private $messageLimit;
+
+    /**
+     * メッセージのための絞り込み
+     * フォルダが選択されている場合は、そのフォルダのメッセージを検索対象とする
+     *
+     * @param \grn\fts\api\SearchApiParameter $parameter
+     */
+    public function __construct(SearchApiParameter $parameter)
+    {
+        $this->setFolderId($parameter->getMessageFolderId());
+
+        global $G_config_common;
+        $limit = ($G_config_common->get('FTS', 'message_max_message'))
+            ?: self::DEFAULT_MESSAGE_LIMIT;
+        $this->setMessageLimit($limit);
+    }
+
+    /**
+     * @param FtsProduct $fts_product
+     *
+     * @return array|string
+     */
+    public function getQuery(FtsProduct $fts_product)
+    {
+        if ($fts_product->isSolr()) {
+            if (Application::getSchemaVersion() === 1) {
+                return $this->getV1Query($fts_product);
+            } else {
+                return $this->getLatestQuery($fts_product);
+            }
+        } else {
+            return $this->getEsQuery();
+        }
+    }
+
+    /**
+     * @param FtsProduct $fts_product
+     *
+     * @return array|string
+     */
+    private function getV1Query(FtsProduct $fts_product)
+    {
+        $folderId = $this->getFolderId();
+        $messageIds = $this->getMessageIds($folderId);
+
+        if (count($messageIds) === 0) {
+            throw new NoResultException();
+        }
+
+        if (count($messageIds) > $this->getMessageLimit()) {
+            SearchApi::setLimitFlag(true);
+            $messageIds = array_slice($messageIds, 0, $this->getMessageLimit());
+        }
+
+        $filter = new AndFilter();
+        $filter->addFilter(new TermFilter(Fields::appName(),
+            SearchConstants::APPLICATION_MESSAGE));
+        $filter->addFilter(new TermsFilter(Fields::messageId(), $messageIds));
+
+        return $filter->getQuery($fts_product);
+    }
+
+    /**
+     * @param FtsProduct $fts_product
+     *
+     * @return array|string
+     */
+    private function getLatestQuery(FtsProduct $fts_product)
+    {
+        $folderId = $this->getFolderId();
+        $folderLogic = new \GRN_Message_FolderLogic();
+
+        if ( ! is_null($folderId)) {
+            $folderType = $folderLogic->getFolderType(cb_get_login_user(),
+                $folderId);
+            if ($folderType === false
+                || $folderType === GRN_MESSAGE_GARBAGEFOLDER
+                || $folderType === GRN_MESSAGE_DRAFTFOLDER
+            ) {
+                throw new NoResultException();
+            }
+        } else {
+            $folderId = $folderLogic->getSpecificFolderID(cb_get_login_user(),
+                GRN_MESSAGE_ROOTFOLDER);
+        }
+
+        $folderIds = array_merge([$folderId],
+            $this->getAllSubFolderIds([$folderId]));
+
+        $filter = new AndFilter();
+        $filter->addFilter(new TermFilter(Fields::appName(),
+            SearchConstants::APPLICATION_MESSAGE));
+        $filter->addFilter(
+            new JoinFilter(Fields::messageId(), Fields::messageId(),
+                Fields::folderId(), $folderIds)
+        );
+
+        return $filter->getQuery($fts_product);
+    }
+
+    /**
+     * @param string|null $folderId
+     *
+     * @return array
+     */
+    private function getMessageIds($folderId)
+    {
+        // If folderId is null, get all messages except draft and trash.
+        $loginId = $this->getLoginUserId();
+        $folderLogic = new \GRN_Message_FolderLogic();
+
+        if (is_null($folderId)
+            || $folderLogic->getFolderType(cb_get_login_user(), $folderId)
+               === GRN_MESSAGE_ROOTFOLDER
+        ) {
+            $dao = $this->getMessageRelationsDAO();
+
+            return $dao->getAllMessageIds($loginId);
+        } else {
+            return $this->getMessageIdsInFolder($folderId, $loginId);
+        }
+    }
+
+    /**
+     * @param string $parentId
+     * @param string $loginId
+     *
+     * @return array
+     */
+    private function getMessageIdsInFolder($parentId, $loginId)
+    {
+        $folderIds = array_merge([$parentId],
+            $this->getAllSubFolderIds([$parentId]));
+        $dao = $this->getMessageRelationsDAO();
+        $messageIds = $dao->getMessageIdsInFolders($folderIds, $loginId);
+
+        return $messageIds;
+    }
+
+    /**
+     * Get all sub folder ids except DRAFT and GABAGE folders.
+     *
+     * @param array $parentIds
+     *
+     * @return array
+     */
+    private function getAllSubFolderIds(array $parentIds)
+    {
+        $dao = $this->getMessageFoldersDAO();
+
+        return $dao->getChildFolderIdsRecursively($parentIds, true);
+    }
+
+    /**
+     * @return \grn\message\dao\GrnMessageFolderMessageRelationsDAO
+     */
+    protected function getMessageRelationsDAO()
+    {
+        $daoFactory = \DAOFactory::getDAOFactory(\DAOFactory::$MYSQL);
+
+        return $daoFactory->getGrnMessageFolderMessageRelationsDAO();
+    }
+
+    /**
+     * @return \grn\message\dao\GrnMessageFoldersDAO
+     */
+    protected function getMessageFoldersDAO()
+    {
+        $daoFactory = \DAOFactory::getDAOFactory(\DAOFactory::$MYSQL);
+
+        return $daoFactory->getGrnMessageFoldersDAO();
+    }
+
+    /**
+     * @return string
+     */
+    protected function getLoginUserId()
+    {
+        $loginUser = cb_get_login_user();
+        assert('$loginUser');
+
+        return $loginUser->getOID();
+    }
+
+    /**
+     * @param string $folderId
+     */
+    private function setFolderId($folderId)
+    {
+        $this->folderId = $folderId;
+    }
+
+    /**
+     * @return string
+     */
+    private function getFolderId()
+    {
+        return $this->folderId;
+    }
+
+    /**
+     * @param int $messageLimit
+     */
+    public function setMessageLimit($messageLimit)
+    {
+        $this->messageLimit = $messageLimit;
+    }
+
+    /**
+     * @return int
+     */
+    public function getMessageLimit()
+    {
+        return $this->messageLimit;
+    }
+
+    /**
+     * @return array|string
+     */
+    private function getEsQuery()
+    {
+        $folder_id = $this->getFolderId();
+        $folder_logic = new \GRN_Message_FolderLogic();
+
+        if ( ! is_null($folder_id)) {
+            $folderType = $folder_logic->getFolderType(cb_get_login_user(),
+                $folder_id);
+            if ($folderType === false
+                || $folderType === GRN_MESSAGE_GARBAGEFOLDER
+                || $folderType === GRN_MESSAGE_DRAFTFOLDER
+            ) {
+                throw new NoResultException();
+            }
+        } else {
+            $folder_id = $folder_logic->getSpecificFolderID(cb_get_login_user(),
+                GRN_MESSAGE_ROOTFOLDER);
+        }
+
+        $root_filter = new AndFilter([
+            new TermFilter(Fields::appName(),
+                SearchConstants::APPLICATION_MESSAGE)
+        ]);
+
+        $folder_ids = array_merge([$folder_id],
+            $this->getAllSubFolderIds([$folder_id]));
+        $parent_type = 'message.folderRelation';
+        $message_folders_filter = new HasParentFilter($parent_type,
+            new TermsFilter(Fields::userFolderIds(), $folder_ids));
+        $root_filter->addFilter($message_folders_filter);
+
+        return $root_filter->getQuery(FtsProduct::elasticsearch());
+    }
+}

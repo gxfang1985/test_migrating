@@ -1,0 +1,469 @@
+<?php
+// Import Organization is restricted operation when there are sandbox settings.
+require_once('system/sandbox/misc.csp');
+\grn\system\sandbox\validateSandboxStatusIsInitial();
+
+require_once('grn/org_privilege.csp');
+$logic = GRN_OrganizationPrivilegeLogic::getInstance();
+$is_admin = $logic->isAdmin();
+
+require_once('grn/nested_set_model.csp');
+$nested_group = GRN_NestedGroup::getInstance();
+
+if ( ! $is_admin) {
+    // 念のため
+    $nested_group->rebuildTree();
+}
+
+$charset = null;
+if (isset($G_INPUT['charset'])) {
+    $charset = $G_INPUT['charset'];
+}
+
+$skip = 0;
+if (isset($G_INPUT['skip'])) {
+    $skip = intval($G_INPUT['skip']);
+}
+
+if ( ! $charset) {
+    global $G_config_common;
+    $charset = $G_config_common->get('I18N', 'default_external_encoding');
+}
+
+//項目情報の取得
+$column_properties = [];
+$column_properties['key'] = [
+    'type'      => 'string',
+    'name'      => cb_msg('grn.common', 'organization_key'),
+    'trim'      => true,
+    'necessary' => false
+];
+$column_properties['name'] = [
+    'type'      => 'string',
+    'name'      => cb_msg('grn.common', 'organization_name'),
+    'trim'      => true,
+    'necessary' => true
+];
+$column_properties['foreign_key'] = [
+    'type'      => 'string',
+    'name'      => cb_msg('grn.common', 'organization_foreign_key'),
+    'trim'      => true,
+    'necessary' => false
+];
+$column_properties['parent_key'] = [
+    'type'      => 'string',
+    'name'      => cb_msg('grn.common', 'organization_parent_key'),
+    'trim'      => true,
+    'necessary' => false
+];
+$column_properties['description'] = [
+    'type'      => 'multiple_string',
+    'name'      => cb_msg('grn.common', 'organization_description'),
+    'trim'      => false,
+    'necessary' => false
+];
+
+global $G_container_base;
+$uum =& $G_container_base->getInstance('uum');
+$user =& $uum->getLoginUser();
+
+//auto_increment値のFIX
+$group_table =& $uum->getGroupTable();
+//masterのconnectionを取得
+$dbconn =& $group_table->getDBConnection();
+$ret = $dbconn->query("SHOW TABLE STATUS LIKE 'tab_cb_group';");
+$dbconn->free_result($ret);
+$ret = $dbconn->query("SHOW TABLE STATUS LIKE 'tab_grn_groupinfo';");
+$dbconn->free_result($ret);
+
+// エラーフックの登録
+require_once('fw/csv.csp');
+$csv = new CB_CSVReader($charset, $filepath);
+
+// 全グループ数
+// $current_groups_number = $uum->getGroupCount();
+// $current_groups_number = '2147483647';
+
+// CSVに存在しない組織を探すために現組織コードを取得
+$old_foreign_key_list = [];
+$parent_key_list = [];
+
+require_once("fw/string_util.csp");
+while (($line = $csv->readLine()) !== false) {
+
+    $line_number = cb_set_csv_line();
+
+    $old_foreign_key = $line[0];
+    if (strlen($old_foreign_key) !== 0 && $old_foreign_key !== "*") {
+
+        $old_foreign_key_list[$old_foreign_key] = $line_number;
+    }
+
+    if (array_key_exists(3, $line)) {
+        $parent_key = $line[3];
+        if (strlen($parent_key) !== 0 && $parent_key !== "*") {
+
+            if ( ! array_key_exists($parent_key, $parent_key_list)) {
+                $parent_key_list[$parent_key] = $line_number;
+            }
+        }
+    }
+}
+
+$old_foreign_keys = array_keys($old_foreign_key_list);
+
+// CSVに存在しない組織コードを削除用として保存する。
+if ($is_admin) {
+    if (count($old_foreign_keys) != 0) {
+        $isInSearch
+            = false;    //FALSE = not in (foreign_key1, foreign_key2, ...)
+        $delete_groups = $uum->getGroupListByForeignKeys($old_foreign_keys,
+            $isInSearch);
+    } else {
+        $delete_groups = $uum->getGroups();
+    }
+} else {
+    $privileged_groups =& $logic->getGroupsWithAuthority($user);
+    $root_groups =& $logic->getRootGroupsWithAuthority($user);
+    $delete_groups = [];
+    $descendants_all = [];
+
+    foreach ($privileged_groups as $gid => $privileged_group) {
+        $foreign_key = $privileged_group->get('foreign_key');
+        $descendants =& $nested_group->getDescendantsByID($gid);
+        $descendant_keys = [];
+
+        foreach ($descendants as $key => $value) {
+            $descendant_keys[$key] = $value->get('foreign_key');
+            $descendants_all[$key] = $value->get('foreign_key');
+        }
+
+        if (array_key_exists($foreign_key, $old_foreign_key_list)) {
+            $diff = array_diff($descendant_keys, $old_foreign_keys);
+            foreach ($diff as $key => $value) {
+                $delete_groups[$key] = $value;
+            }
+        } else {
+            $intersect = array_intersect($descendant_keys, $old_foreign_keys);
+            if (count($intersect) > 0) {
+                $fkey = array_shift($intersect);
+                cb_set_csv_line($old_foreign_key_list[$fkey]);
+                cb_throw_error(E_GRN_CSV_PRIVILEGED_GROUP_IS_NEEDED,
+                    null,
+                    ['parent_key' => $foreign_key]);
+            }
+
+            if (array_key_exists($foreign_key, $parent_key_list)) {
+                cb_set_csv_line($parent_key_list[$foreign_key]);
+                cb_throw_error(E_GRN_CSV_PRIVILEGED_GROUP_IS_NEEDED,
+                    null,
+                    ['parent_key' => $foreign_key]);
+            }
+        }
+    }
+}
+
+// 改めてCSVから組織を読み込む
+$order_list = [0 => []];
+$csv = new CB_CSVReader($charset, $filepath);
+while (($line = $csv->readLine()) !== false) {
+    if ($skip > 0) {
+        $skip--;
+        continue;
+    }
+    $b_create_group = false;
+    $b_move_parentgroup = false;
+    //値の取得
+    $column_count = 0;
+    $column_values = [];
+    $keys = array_keys($column_properties);
+    foreach ($keys as $key) {
+        $prop =& $column_properties[$key];
+        if (array_key_exists($column_count++, $line)) {
+            if (array_key_exists('trim', $prop) && $prop['trim']) {
+                $column_values[$key] = cb_trim($line[$column_count - 1]);
+            } else {
+                $column_values[$key] = $line[$column_count - 1];
+            }
+        } else {
+            $column_values[$key] = '*';
+        }
+        if (array_key_exists('type', $prop)
+            && $prop['type'] === 'multiple_string'
+        ) {
+            if (mb_strlen($column_values[$key]) > 65535) {
+                cb_throw_error(E_GRN_CSV_TOO_LONG_GROUP_PROPERTY,
+                    null,
+                    [
+                        'property' => $prop['name'],
+                        'max'      => number_format(65535)
+                    ],
+                    [
+                        'property' => $prop['name'],
+                        'max'      => number_format(65535)
+                    ]);
+            }
+        } else {
+            if (mb_strlen($column_values[$key]) > 100) {
+                cb_throw_error(E_GRN_CSV_TOO_LONG_GROUP_PROPERTY,
+                    null,
+                    [
+                        'property' => $prop['name'],
+                        'max'      => 100
+                    ],
+                    [
+                        'property' => $prop['name'],
+                        'max'      => 100
+                    ]
+                );
+            }
+        }
+    }
+
+    //現組織コードと新組織コードを空には出来ない
+    if (strlen($column_values['key']) === 0
+        || strlen($column_values['foreign_key']) === 0
+    ) {
+        cb_throw_error(E_GRN_CSV_EMPTY_EACH_GROUP_KEY,
+            null,
+            [
+                'property1' => $column_properties['key']['name'],
+                'property2' => $column_properties['foreign_key']['name']
+            ]);
+    }
+
+    //現組織コードと新組織コードを両方省略は出来ない
+    if ($column_values['key'] === '*'
+        && $column_values['foreign_key'] === '*'
+    ) {
+        cb_throw_error(E_GRN_CSV_MISSING_BOTH_GROUP_KEY,
+            null,
+            [
+                'property1' => $column_properties['key']['name'],
+                'property2' => $column_properties['foreign_key']['name']
+            ],
+            [
+                'property1' => $column_properties['key']['name'],
+                'property2' => $column_properties['foreign_key']['name']
+            ]);
+    }
+
+    // ユーザーのロジックに合わせる
+    $group = null;
+    if ($column_values['key'] !== '*') {
+        $group = $uum->getGroupInfoByForeignKey($column_values['key']);
+        if ( ! $group) {
+            $group = null;
+        }
+
+        if ( ! $is_admin && ! is_null($group)) {
+            if ( ! $logic->isPrivileged($user, $group['_id'])) {
+                cb_throw_error(E_GRN_CSV_NO_GROUP_PRIVILEGE,
+                    null,
+                    ['foreign_key' => $column_values['key']]);
+            }
+        }
+    }
+
+    // 現組織コードの省略 or 現組織が存在せず、新組織が設定されている場合
+    // 新組織名で組織を作成する
+    if ($column_values['key'] === '*'
+        || ($column_values['foreign_key'] !== '*'
+            && is_null($group))
+    ) {
+        //省略プロパティを空にしつつ、必須項目チェック
+        $keys = array_keys($column_properties);
+        foreach ($keys as $key) {
+            $prop =& $column_properties[$key];
+            if ($column_values[$key] === '*') {
+                $column_values[$key] = '';
+            }
+            if (array_key_exists('necessary', $prop) && $prop['necessary']) {
+                if (strlen($column_values[$key]) === 0) {
+                    cb_throw_error(E_GRN_CSV_EMPTY_GROUP_PROPERTY,
+                        null,
+                        ['property' => $prop['name']],
+                        ['property' => $prop['name']]);
+                }
+            }
+        }
+
+        //デフォルト値
+        if (strlen($column_values['parent_key']) === 0) {
+            $column_values['parent_key'] = false;
+        }
+
+        $copy = $column_values;
+        unset($copy['key']);
+        unset($copy['parent_key']);
+        //組織を作成
+        if ( ! ($group = $uum->addGroupDefaultOnly($copy))) {
+            cb_throw_error(E_GRN_CSV_FAILED_GROUP_CREATE);
+        }
+
+        $gid = $group->getOID();
+        $b_create_group = true;
+    } else {
+        // 組織が存在しない場合
+        if (is_null($group)) {
+            cb_throw_error(E_GRN_CSV_GROUP_NOT_FOUND);
+        }
+
+        //デフォルト値
+        if (strlen($column_values['parent_key']) === 0) {
+            $column_values['parent_key'] = false;
+        }
+
+        //省略プロパティをunsetしつつ、必須項目チェック
+        $keys = array_keys($column_properties);
+        foreach ($keys as $key) {
+            $prop =& $column_properties[$key];
+            if ($column_values[$key] === '*') {
+                unset($column_values[$key]);
+            } elseif (array_key_exists('necessary', $prop)
+                      && $prop['necessary']
+            ) {
+                if (strlen($column_values[$key]) === 0) {
+                    cb_throw_error(E_GRN_CSV_EMPTY_GROUP_PROPERTY,
+                        null,
+                        ['property' => $prop['name']],
+                        ['property' => $prop['name']]);
+                }
+            }
+        }
+
+        $copy = $column_values;
+        unset($copy['key']);
+        unset($copy['parent_key']);
+        unset($copy['list_index']);
+        //情報変更
+        if ( ! $uum->setGroupProperties($group['_id'], $copy)) {
+            cb_throw_error(E_GRN_CSV_FAILED_GROUP_UPDATE);
+        }
+
+        $gid = $group['_id'];
+    }
+
+    $group_info =& $uum->getGroupInfo($gid);
+    $parent_id = 0;
+
+
+    $dont_move = false;
+
+    //親組織
+    if (array_key_exists('parent_key', $column_values)) {
+
+        $parent_key = $column_values['parent_key'];
+
+        if ($parent_key === false) {
+            //リセット
+
+            if ( ! $is_admin) {
+                if (array_key_exists($gid, $root_groups)) {
+                    if (is_null($group_info['col_parent'])) {
+                        $dont_move = true;
+                    }
+                }
+
+                if ( ! $dont_move) {
+                    cb_throw_error(E_GRN_CSV_NO_GROUP_PRIVILEGE,
+                        null,
+                        ['foreign_key' => 'root']);
+                }
+            }
+
+            if ( ! $dont_move) {
+                $uum->setParentGroup($gid, null);
+            }
+
+        } else {
+            //セット
+
+            //親組織取得
+            if ( ! ($parent = $uum->getGroupByForeignKey($parent_key))) {
+                cb_throw_error(E_GRN_CSV_GROUP_NOT_FOUND);
+            }
+
+            if ( ! $is_admin) {
+                if (array_key_exists($gid, $root_groups)) {
+                    if ($group_info['col_parent'] == $parent->getOID()) {
+                        $dont_move = true;
+                    } elseif ( ! in_array($parent_key, $descendants_all)) {
+                        cb_throw_error(E_GRN_CSV_NO_GROUP_PRIVILEGE,
+                            null,
+                            ['foreign_key' => $parent_key]);
+                    }
+                } else {
+                    if ( ! in_array($parent_key, $descendants_all)) {
+                        cb_throw_error(E_GRN_CSV_NO_GROUP_PRIVILEGE,
+                            null,
+                            ['foreign_key' => $parent_key]);
+                    }
+                }
+            }
+
+            //循環チェック
+            $_parent = $parent;
+            while ($_parent) {
+                if ($_parent->getOID() === $gid) {
+                    cb_throw_error(E_GRN_CSV_INFINITE_GROUP_LOOP);
+                }
+                $_parent = $_parent->getParent();
+            }
+
+            $parent_id = $parent->getOID();
+            if ( ! $b_create_group && $parent_id !== $group['col_parent']) {
+                $b_move_parentgroup = true;
+            }
+
+            // 親組織が削除対象の場合、エラーにする。
+            if (array_key_exists($parent_id, $delete_groups)) {
+                cb_throw_error(E_GRN_CSV_GROUP_NOT_FOUND);
+            }
+            if ( ! $dont_move) {
+                //親組織をセット
+                $uum->setParentGroup($gid, $parent_id);
+            }
+        }
+    }
+
+    if ( ! $dont_move) {
+        if ( ! array_key_exists($parent_id, $order_list)) {
+            $order_list[$parent_id] = [];
+        }
+        $order_list[$parent_id][] = $gid;
+    }
+
+    // inspection
+    $parent_key = $column_values['parent_key'];
+    if ($parent_key === false) {
+        $parent_key = '';
+    }
+    $uum->execInspection('group', 'import', [
+        'gid'         => $gid,
+        'name'        => $group_info['col_name'],
+        'foreign_key' => $group_info['col_foreign_key'],
+        'parent'      => $parent_key
+    ]);
+}
+
+//保存しておいたCSVに存在しない組織コードを削除する。
+foreach (array_keys($delete_groups) as $dgid) {
+    $uum->removeGroup($dgid);
+}
+
+// 表示順序の設定
+foreach ($order_list as $key => $order) {
+    $list_index = 1;
+    // 順番の設定
+    foreach ($order as $oid) {
+        $properties = ['list_index' => $list_index];
+        $uum->setGroupProperties($oid, $properties);
+        $list_index++;
+    }
+}
+
+// 組織ツリーの再構築
+$nested_group->rebuildTree();
+
+

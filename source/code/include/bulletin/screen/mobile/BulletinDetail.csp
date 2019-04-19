@@ -1,0 +1,249 @@
+<?php
+
+namespace grn\bulletin\screen\mobile;
+
+use grn\grn\Validate;
+use grn\favour\service\FavourService;
+
+class BulletinDetail extends MobileBulletinScreenBase
+{
+    private $is_favour_active;
+    private $is_favour_on;
+
+    public function __construct($input)
+    {
+        parent::__construct($input);
+        $this->checkArgFromInput([self::ARG_ARTICLE_ID], $input);
+        $user = $this->getLoginUser();
+        $article_id = $this->getArticleId();
+        $article = $this->getArticleById($user, $article_id);
+        $this->setArticle($article);
+        $auth = $article->getAuthorities($user);
+        if ($article->get('can_follow') && $auth['follow']) {
+            $this->setMobileFooterBar(['comment' => []]);
+        } else {
+            $this->setMobileFooterBar();
+        }
+
+        $favour_service = new FavourService();
+        $this->is_favour_active = $favour_service->isFavourAppActive();
+        $this->is_favour_on
+            = $favour_service->isAppAllowedRespond('bulletin');
+    }
+
+    public function fetch()
+    {
+        $user = $this->getLoginUser();
+        $article_id = $this->getArticleId();
+
+        $article = $this->getArticle();
+
+        // 記事の表示データ取得
+        require_once('bulletin/controller.csp');
+        $utility = new \GRN_Bulletin_ControllerUtil();
+        $article_for_view = $utility->getArticleView($user, $article, true);
+
+        // 記事が変更されている場合は、記事の内容に変更されたことを示す色をつける
+        if ($article->getReadTimestamp($user) < $article_for_view['mtime']
+            && $user->getOID() !== $article_for_view['modifier_uid']
+        ) {
+            $article_for_view['modified'] = true;
+        }
+
+        // アクセス権を取得
+        $article_for_view['auth'] = $article->getAuthorities($user);
+
+        $users_info = [];
+        $article_for_view['follows'] = $this->getFollowsDisplayInfo($user,
+            $users_info);
+
+        // 記事を既読にする
+        $article->read($user);
+        $article_for_view['can_follow'] = $article->get('can_follow');
+
+        require_once('grn/smarty.csp');
+        $t = new \GRN_Smarty();
+        $t->assign('article', $article_for_view);
+        $t->assign('users_info', $users_info);
+
+        // FAVORITE
+        require_once('star/logic.csp');
+        $star_logic = \GRN_Star_StarLogic::getInstance();
+        $use_star = $star_logic->isActive();
+        $t->assign('use_star', $use_star);
+        if ($use_star) {
+            $t->assign('star_infos',
+                $star_logic->getStatusByIDs($user, 'grn.bulletin',
+                    [$article_id]));
+        }
+        // End FAVORITE
+
+        // for favour
+        $favour_service = new FavourService();
+        $login_id = $user->getOID();
+        if ($this->is_favour_active && $this->is_favour_on) {
+            require_once('bulletin/application.csp');
+            $params = [self::ARG_ARTICLE_ID => $this->getArticleId()];
+            $favour_info
+                = $favour_service->constructFavourInfo(\GRN_Bulletin::GRN_BULLETIN_MODULE_ID,
+                \GRN_Bulletin::FAVOUR_BULLETIN_BODY,
+                $this->getArticleId(),
+                $login_id,
+                $params,
+                \GRN_Bulletin::GRN_BULLETIN_SUB_MODULE_ID);
+            $t->assign('favour_info', $favour_info);
+        }
+
+        $t->assign('offset', $this->getNewOffset());
+        $t->assign('more_view_args', [
+            self::ARG_CATEGORY_ID => cb_at($article_for_view,
+                self::ARG_CATEGORY_ID, ''),
+            self::ARG_ARTICLE_ID  => cb_at($article_for_view,
+                self::ARG_ARTICLE_ID, '')
+        ]);
+        $t->assign('is_favour_active', $this->is_favour_active);
+        $t->assign('is_favour_on', $this->is_favour_on);
+
+        //generate upload ticket
+        include('grn/_upload_prepend.csp');
+
+        $input = $this->getInput();
+        if (array_key_exists('nid', $input)
+            || array_key_exists('nhid', $input)
+        ) {
+            $this->assignBreadcrumbUpperPage($t, '', '', [], true);
+        }
+        $this->assignBreadcrumbCurrentPage($t,
+            cb_msg('grn.mobile', 'detail_title'));
+
+        return $t->fetch('bulletin/mobile/view.tpl');
+    }
+
+    public function fetchCommentForAjax()
+    {
+        $user = $this->getLoginUser();
+
+        $article = $this->getArticle();
+
+        // 記事の表示データ取得
+        require_once('bulletin/controller.csp');
+        $utility = new \GRN_Bulletin_ControllerUtil();
+        $article_for_view = $utility->getArticleView($user, $article, true);
+
+        // 記事を既読にする
+        $article->read($user);
+
+        $users_info = [];
+        $article_for_view['follows'] = $this->getFollowsDisplayInfo($user,
+            $users_info);
+
+        $article_for_view['can_follow'] = $article->get('can_follow');
+        $article_for_view['auth'] = $article->getAuthorities($user);
+
+        require_once('grn/smarty.csp');
+        $t = new \GRN_Smarty();
+        $t->assign('is_favour_active', $this->is_favour_active);
+        $t->assign('is_favour_on', $this->is_favour_on);
+        $t->assign('article', $article_for_view);
+        $t->assign('users_info', $users_info);
+
+        return $t->fetch('bulletin/mobile/comment_list.tpl');
+    }
+
+    /**
+     * Get article follows display information.
+     *
+     * @param     object $user \CB_User
+     * @param     array  & $users_info
+     *
+     * @return    array         $article_follows_for_view   article follows display information.
+     */
+    private function getFollowsDisplayInfo($user, & $users_info)
+    {
+        $input = $this->getInput();
+        $article = $this->getArticle();
+
+        $offset = $this->getArrayValue(self::ARG_NAVI_TAG, $input);
+        if ( ! Validate::isNumber($offset)) {
+            $offset = 0;
+        }
+
+        require_once('bulletin/follow_util.csp');
+        $list = new \GRN_Bulletin_FollowList($user, $article);
+        $list->setOffset(0);
+        $list->setLimit($offset + self::MORE_VIEW_COUNT);
+        $list->setLockMode(CB_DATABASE_NO_LOCK);
+
+        $users_id = [];
+        $article_follows_for_view = [];
+
+        require_once('bulletin/controller.csp');
+        $utility = new \GRN_Bulletin_ControllerUtil();
+
+        while ( ! is_null(($follow =& $list->iterate()))) {
+            $follow_id_sel = $follow->getOID();
+            $article_follows_for_view[$follow_id_sel]
+                = $utility->getFollowView($user, $follow);
+            $users_id[]
+                = $article_follows_for_view[$follow_id_sel]['creator_uid'];
+        }
+
+        $creator = $article->get('creator');
+        if ($creator) {
+            $users_id[] = $creator->getOID();
+        }
+        $modifier = $article->get('modifier');
+        if ($modifier) {
+            $users_id[] = $modifier->getOID();
+        }
+
+        $users_info = $utility->getUserInfoToShowUserName($users_id, $user);
+        $users_info = $this->getUsersInfoType($users_info);
+
+        if (is_array($users_info)) {
+            foreach ($article_follows_for_view as $follow_id => $follow_info) {
+                $uid = $follow_info['creator_uid'];
+                if (array_key_exists($uid, $users_info)
+                    && @ $users_info[$uid]['valid']
+                ) {
+                    $article_follows_for_view[$follow_id]['creator_type']
+                        = $users_info[$uid]['valid'];
+                }
+            }
+        }
+
+        // for favour
+        $favour_service = new FavourService();
+        $login_id = $user->getOID();
+        if ($this->is_favour_active && $this->is_favour_on) {
+            require_once('bulletin/application.csp');
+            foreach ($article_follows_for_view as $comment_key => $comment) {
+                $params = [
+                    self::ARG_ARTICLE_ID => $this->getArticleId(),
+                    self::ARG_FOLLOW_ID  => $comment['follow_id']
+                ];
+                $favour_info
+                    = $favour_service->constructFavourInfo(\GRN_Bulletin::GRN_BULLETIN_MODULE_ID,
+                    \GRN_Bulletin::FAVOUR_BULLETIN_COMMENT,
+                    $comment['follow_id'],
+                    $login_id,
+                    $params,
+                    \GRN_Bulletin::GRN_BULLETIN_SUB_MODULE_ID);
+                $article_follows_for_view[$comment_key]['favour_info']
+                    = $favour_info;
+            }
+        }
+
+        $this->setNewOffset($offset, self::MORE_VIEW_COUNT, $list->count());
+
+        return $article_follows_for_view;
+    }
+
+    public function getTitle()
+    {
+        $article = $this->getArticle();
+        $category = $article->get('category');
+
+        return $category->get('name') . ' - ' . $article->getTitle();
+    }
+}

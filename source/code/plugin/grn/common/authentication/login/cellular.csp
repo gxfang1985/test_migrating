@@ -1,0 +1,235 @@
+<?php
+
+use grn\grn\authentication\policy\LoginUserFindPolicyDefault;
+use grn\grn\authentication\policy\LoginUserFindPolicyInterface;
+
+/**
+ * Smart Login Driver
+ *
+ * @author  Yuichi, Nakamura 2005/02
+ * @version 1.0
+ */
+
+//Include Files
+require_once('grn/authentication.csp');
+
+//String Resources
+define('GRN_AUTH_LOGIN_CELLULAR_LOGIN',
+    'cellular/login.csp');  //Driver Login Page
+define('GRN_AUTH_LOGIN_CELLULAR_PWD_EXPIRED',
+    'cellular/pwd_expired.csp'); //Driver Password Expired Page
+
+class plugin_grn_common_authentication_login_cellular
+    extends GRN_Authentication_Login_DriverBase
+{
+    /** Configuration Parameters **/
+    var $_driver_settings = null;
+
+    /** @var GRN_Authentication_Repository_DriverBase */
+    var $_user_repository = null;
+
+    /** Configuration Complete Flag **/
+    var $_configured = false;
+
+    /**
+     * Constructor
+     *
+     */
+    function __construct()
+    {
+        $noPage = null;
+        //Create Driver Page Setting
+        $driver_page = [
+            GRN_AUTH_PAGE_TYPE_LOGIN           => GRN_AUTH_LOGIN_CELLULAR_LOGIN,
+            GRN_AUTH_PAGE_TYPE_VIEW_SYSTEM     => $noPage,
+            GRN_AUTH_PAGE_TYPE_ADD_SYSTEM      => $noPage,
+            GRN_AUTH_PAGE_TYPE_MODIFY_SYSTEM   => $noPage,
+            GRN_AUTH_PAGE_TYPE_VIEW_PERSONAL   => $noPage,
+            GRN_AUTH_PAGE_TYPE_ADD_PERSONAL    => $noPage,
+            GRN_AUTH_PAGE_TYPE_MODIFY_PERSONAL => $noPage,
+            GRN_AUTH_PAGE_TYPE_PWD_EXPIRED     => GRN_AUTH_LOGIN_CELLULAR_PWD_EXPIRED,
+        ];
+
+        //Initialize Parent Class
+        parent::__construct(cb_msg(GRN_AUTH_LOGIN_CELLULAR, 'name'),
+            GRN_AUTH_LOGIN_CELLULAR,
+            $driver_page
+        );
+    }
+
+    /**
+     * Set Driver Config
+     *
+     * @param  array  $driver_settings //Driver Settings
+     * @param  object $repository      //User Repository Driver Object
+     *
+     * @return bool     $result
+     */
+    function setConfig(& $driver_settings, $repository)
+    {
+        //Check User Repository Driver
+        if ( ! is_object($repository)) {
+            return false;
+        }
+
+        //Set User Repository Driver
+        $this->_user_repository = $repository;
+
+        //Set Configuration Complete Flag
+        $this->_configured = true;
+
+        return true;
+    }
+
+    /**
+     * Get Driver Config
+     *
+     * @return array    $driver_settings    //Driver Settings
+     */
+    function &getConfig()
+    {
+        //Always NULL
+        return $this->_driver_settings;
+    }
+
+    /**
+     * setState
+     */
+    function setState()
+    {
+        global $G_state_set;
+
+        // show copyright
+        $G_state_set->set('copyright_should_be_written', true);
+        // auto close html tag
+        $G_state_set->set('html_should_be_closed', true);
+        // custom error page
+        $G_state_set->set('error_page_type', 'cellular');
+    }
+
+    /**
+     * Login
+     *
+     * @return bool    $result
+     */
+    function login()
+    {
+        $this->setState();
+
+        //Get GRN_UUM Instance
+        global $G_container_base;
+        /** @var GRN_Uum $uum */
+        $uum = $G_container_base->getInstance('uum');
+        //Get User Object
+        $uid = null;
+        $account = null;
+        $user = null;
+        global $G_INPUT;
+
+        //GRN35-652
+        global $G_config_common;
+        $token_expiration = $G_config_common->get('Cellular',
+            'token_expiration');
+        if ($token_expiration != false) {
+            if (array_key_exists("token_id_cellular", $_COOKIE)) {
+                $token_id_cellular = $_COOKIE['token_id_cellular'];
+                require_once("cellular/token.csp");
+                $cellular_token = new GRN_Cellular_Token();
+                $data
+                    = $cellular_token->checkTokenUser($token_id_cellular);
+                if ($data != false) {
+                    $token_expiration = $token_expiration * 86400;
+                    $temp = time()
+                            - $data[$cellular_token::ARRAY_KEY_LAST_TIME_LOGIN];
+                    if ($temp < $token_expiration) //expire
+                    {
+                        $user
+                            = $uum->getUser($data[$cellular_token::ARRAY_KEY_USER]);
+                        $account =& $user->get('foreign_key');
+                        parent::setAccount($account);
+
+                        return true;
+                    }
+                }
+            }
+        }
+        $userFindPolicy = $this->getUserFindPolicy();
+        $user = $userFindPolicy->findUser();
+        $password = $userFindPolicy->getPasswordToken();
+
+        if ( ! $user) {
+            return false;//Login Failed
+        }
+        $account = $user->get('foreign_key');
+        $uid = $user->getOID();
+
+        require_once('grn/system_logic.csp');
+        $system = GRN_System::getInstance();
+        if ( ! $system->getPasswordEmptyLogin()) {
+            if (is_null($password) || strlen($password) === 0) {
+                cb_throw_error(E_GRN_CMMN_AUTH_LOGIN_EMPTY_PASSWORD);
+            }
+        }
+
+        //Authenticate
+        $repository = $this->_user_repository;
+        if ( ! $repository->authenticate($account, $password)) {
+            //Login Failed
+            return false;
+        }
+
+        //Save Login Account and Password
+        parent::setAccount($account);
+        parent::setPassword($password);
+
+        //GRN35-652
+        if (array_key_exists('allow_auto_login', $G_INPUT)) {
+            $token_id_cellular = md5(uniqid(rand(), true));
+            setcookie('token_id_cellular', $token_id_cellular,
+                time() + (60 * 60 * 24 * $token_expiration));
+            require_once("cellular/token.csp");
+            $cellular_token = new GRN_Cellular_Token();
+            $data = [];
+            $data[$cellular_token::ARRAY_KEY_TOKEN] = $token_id_cellular;
+            $data[$cellular_token::ARRAY_KEY_USER] = $uid;
+            $cellular_token->add($data);
+        }
+
+        //GRN35-652
+        return true; //Login Success
+    }
+
+    /**
+     * ユーザーを抽出する処理は、標準認証と同じ
+     *
+     * @return LoginUserFindPolicyInterface
+     */
+    private function getUserFindPolicy()
+    {
+        return LoginUserFindPolicyDefault::getInstance();
+    }
+
+    /**
+     * getPasswordExpirationDays
+     *
+     * @param  int $uid
+     *
+     * @return int $result
+     */
+    function getPasswordExpirationDays($uid)
+    {
+        return $this->_user_repository->getPasswordExpirationDays($uid);
+    }
+
+    /**
+     * Return whether the login driver can use multiple repository or not.
+     *
+     * @return bool
+     */
+    public function canUseMultipleRepository()
+    {
+        return true;
+    }
+}
+
+

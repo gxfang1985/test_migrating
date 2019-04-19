@@ -1,0 +1,127 @@
+<?php
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    global $G_INPUT;
+
+    $folder_id = null;
+    if (array_key_exists('fid', $G_INPUT)) {
+        $folder_id = $G_INPUT['fid'];
+    }
+    $pids = [];
+    if (array_key_exists('pids', $G_INPUT)) {
+        $pids = $G_INPUT['pids'];
+    }
+
+    /**
+     * 制限事項
+     * ・ログインユーザーはフォルダの所有者でない
+     */
+
+    global $G_container_base;
+    $uum =& $G_container_base->getInstance('uum');
+    $login =& $uum->getLoginUser();
+    $user_id = $login->getOID();
+
+    require_once('workflow/folder_logic.csp');
+    $logic = GRN_Workflow_Folder_Logic::getInstance();
+    $folder = $logic->get($user_id, $folder_id);
+    if ( ! is_array($folder) || 0 == count($folder)) {
+        // ログインユーザーはフォルダの所有者でない
+        cb_throw_error(E_GRN_WRKF_FOLDER_INVALID_FOLDER_ID);
+    }
+
+    require_once('workflow/folderrelation_logic.csp');
+    $relation_logic = GRN_Workflow_FolderRelation_Logic::getInstance();
+
+    if ( ! is_array($pids) || empty($pids)) {
+        cb_redirect('workflow/index', ['fid' => $folder_id]);
+    }
+
+    $petition_relation = $relation_logic->getRelationFolderType($folder_id,
+        $pids);
+
+    if (empty($petition_relation)) {
+        cb_redirect('workflow/index', ['fid' => $folder_id]);
+    }
+
+    $delete_pids = [];
+    require_once('workflow/controller_util.csp');
+    require_once('workflow/notification.csp');
+
+    foreach ($petition_relation as $v) {
+        if ($folder['col_folder_type'] == GRN_WORKFLOW_FOLDER_TYPE_IN_ID
+            || $folder['col_folder_type'] == GRN_WORKFLOW_FOLDER_TYPE_FINISH_ID
+            || $folder['col_folder_type'] == GRN_WORKFLOW_FOLDER_TYPE_TEMP_ID
+        ) {
+            $delete_pids[] = $v['petition_id'];
+            $logic = GRN_Workflow_Notification::getInstance();
+            $logic->confirm($user_id, $v['petition_id']);
+        } elseif ($folder['col_folder_type']
+                  == GRN_WORKFLOW_FOLDER_TYPE_OUT_ID
+        ) {
+            $cancel_confirm = false;
+            if (GRN_WORKFLOW_STATUS_IN_PROCESS_CANCEL == $v['status']) {
+                $controller_util
+                    = new GRN_Workflow_ControllerUtil(cb_get_pagename());
+                $path_steps
+                    = $controller_util->getPathInfo($v['petition_id'],
+                    false, CB_DATABASE_NO_LOCK);
+                $path_steps_current = current($path_steps);
+                $path_step
+                    =& $controller_util->getInProcessPathStep($path_steps_current);
+
+                $transactor = [];
+
+                if (false !== $path_step) {
+                    $transactor = $path_step['users'];
+                }
+
+                foreach ($transactor as $path_step_user) {
+                    if (GRN_WORKFLOW_RESULT_CONFIRM
+                        == $path_step_user['col_result']
+                    ) {
+                        $cancel_confirm = true;
+                        break;
+                    }
+                }
+            }
+            if (GRN_WORKFLOW_STATUS_IN_PROCESS_CANCEL == $v['status']
+                && $cancel_confirm
+                || GRN_WORKFLOW_STATUS_UNPROCESSING_CANCEL == $v['status']
+                || GRN_WORKFLOW_STATUS_FINISHED == $v['status']
+                || GRN_WORKFLOW_STATUS_REJECTION == $v['status']
+            ) {
+                $delete_pids[] = $v['petition_id'];
+                $logic = GRN_Workflow_Notification::getInstance();
+                $logic->confirm($user_id, $v['petition_id']);
+            }
+        }
+    }
+
+    if (empty($delete_pids)) {
+        cb_redirect('workflow/index', ['fid' => $folder_id]);
+    }
+
+    $relation_logic->removeList($folder_id, $delete_pids);
+
+    if ($folder['col_folder_type'] == GRN_WORKFLOW_FOLDER_TYPE_TEMP_ID) {
+        require('workflow/auto_schedule_register_logic.csp');
+        $wf_register_logic
+            = GRN_Workflow_Auto_Schedule_Register_Logic::getInstance();
+        $wf_register_logic->multiDelete($delete_pids);
+    }
+
+    //監査する
+    require_once('workflow/inspection.csp');
+    $inspection = GRN_Workflow_Folder_Relation_Inspection::getInstance();
+    if ($inspection->isEnabled()) {
+        $message_type = 'folder_relation_delete_multi';
+        $message_args['foid'] = $folder_id;
+        $message_args['pids'] = $delete_pids;
+        //Record Inspection
+        $inspection->record($message_type, $message_args);
+    }
+    cb_redirect('workflow/index', ['fid' => $folder_id]);
+}
+
+

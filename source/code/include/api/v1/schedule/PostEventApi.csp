@@ -1,0 +1,215 @@
+<?php
+declare(strict_types=1);
+
+namespace grn\api\v1\schedule;
+
+use grn\api\exception\validation\ValidationFailedException;
+use grn\api\RestApi;
+use grn\api\ResponseEntity;
+use grn\api\http\HttpStatus;
+use grn\api\http\response\Record;
+use grn\api\validator\ApiValidator;
+use grn\api\validator\ArrayChecker;
+use grn\api\validator\BooleanChecker;
+use grn\api\validator\schedule\AttachmentsChecker;
+use grn\api\validator\schedule\ScheduleMemberChecker;
+use grn\api\validator\schedule\UseAttendanceCheckChecker;
+use grn\api\validator\schedule\WatchersChecker;
+use grn\api\validator\TypeFieldAndKeyExistsChecker;
+use grn\api\validator\DatetimeRFC3339Checker;
+use grn\api\validator\InArrayChecker;
+use grn\api\validator\StringLengthChecker;
+use grn\api\validator\MultipleNotNullChecker;
+use grn\api\validator\NotNullChecker;
+use grn\api\validator\TimeZoneChecker;
+use grn\api\validator\schedule\EventsCorrelationChecker;
+use grn\schedule\api\adapter\events\PostEventRestAdapter;
+use grn\schedule\api\model\Company;
+use grn\schedule\api\model\DateTime;
+use grn\schedule\api\model\Event;
+use grn\schedule\api\model\Facility;
+use grn\schedule\api\model\Member;
+use grn\schedule\rest_api\EventParamsBuilder;
+use grn\schedule\api\service\EventsService;
+
+require_once('cbpapi/schedule_logic.csp');
+
+class PostEventApi extends RestApi
+{
+    const AVAILABLE_EVENT_TYPES
+        = [
+            Event::EVENT_TYPE_REGULAR,
+            Event::EVENT_TYPE_ALL_DAY
+        ];
+
+    /**
+     * @param array $params
+     *
+     * @return ResponseEntity
+     * @throws ValidationFailedException
+     */
+    public function execute(array $params): ResponseEntity
+    {
+        $validator = $this->createValidator();
+        $validator->validate($this->getInput());
+
+        $login = cb_get_login_user();
+        $event_params_builder = new EventParamsBuilder($this->getInput());
+
+        $events_service = new EventsService();
+        $adapter = new PostEventRestAdapter();
+        $event_id = $events_service->postEvent($login, $event_params_builder->buildPost(), $adapter);
+        $events_service->saveNow();
+        $body = $events_service->getEvent($event_id);
+
+        $http_status = new HttpStatus(HttpStatus::CREATED);
+        $response_entity = new ResponseEntity(new Record($body), $http_status);
+
+        return $response_entity;
+    }
+
+    /**
+     * @return ApiValidator
+     */
+    private function createValidator(): ApiValidator
+    {
+        $validator = new ApiValidator();
+        $validator->addParamValidator(Event::EVENT_TYPE, new NotNullChecker());
+        $validator->addParamValidator(Event::EVENT_TYPE, new InArrayChecker(self::AVAILABLE_EVENT_TYPES));
+
+        $event_type = $this->getParam(Event::EVENT_TYPE);
+        if ($event_type === Event::EVENT_TYPE_REGULAR) {
+            $this->addValidatorsForRegular($validator);
+        } elseif ($event_type === Event::EVENT_TYPE_ALL_DAY) {
+            $this->addValidatorsForAllDay($validator);
+        }
+
+        return $validator;
+    }
+
+    /**
+     * @param ApiValidator $validator
+     */
+    private function addValidatorsForRegular(ApiValidator $validator)
+    {
+        $validator->addParamValidator(Event::EVENT_MENU, new StringLengthChecker(0, 100));
+        $validator->addParamValidator(Event::SUBJECT, new StringLengthChecker(0, 100));
+
+        $validator->addParamValidator(Event::START, new NotNullChecker());
+        $validator->addParamValidator(Event::START, new DatetimeRFC3339Checker(DateTime::DATETIME));
+        $validator->addParamValidator(Event::START, new TimeZoneChecker(DateTime::TIMEZONE));
+
+        $validator->addParamValidator(Event::END, new DatetimeRFC3339Checker(DateTime::DATETIME));
+        $validator->addParamValidator(Event::END, new TimeZoneChecker(DateTime::TIMEZONE));
+
+        $validator->addParamValidator([Event::ATTENDEES, Event::FACILITIES], new MultipleNotNullChecker());
+        $validator->addParamValidator(Event::ATTENDEES,
+            new ScheduleMemberChecker(
+                [
+                    Member::MEMBER_TYPE_USER,
+                    Member::MEMBER_TYPE_ORGANIZATION
+                ],
+                cb_lwc_uum()->isForeignKeyPublic()
+            ));
+        $validator->addParamValidator(Event::FACILITIES,
+            new TypeFieldAndKeyExistsChecker([], [Facility::ID, Facility::CODE]));
+        $validator->addParamValidator(Event::FACILITY_USING_PURPOSE, new StringLengthChecker(0, 65535));
+
+        $validator->addParamValidator(Event::COMPANY_INFO, new ArrayChecker());
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::NAME], new StringLengthChecker(0, 100));
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::ZIP_CODE], new StringLengthChecker(0, 100));
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::ADDRESS], new StringLengthChecker(0, 65535));
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::ROUTE], new StringLengthChecker(0, 65535));
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::ROUTE_TIME], new StringLengthChecker(0, 100));
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::ROUTE_FARE], new StringLengthChecker(0, 100));
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::PHONE], new StringLengthChecker(0, 100));
+
+        $validator->addParamValidator(Event::ATTACHMENTS, new AttachmentsChecker());
+
+        $validator->addParamValidator(Event::NOTES, new StringLengthChecker(0, 65535));
+
+        $validator->addParamValidator(Event::VISIBILITY_TYPE, new InArrayChecker(Event::VISIBILITY_TYPES));
+
+        $validator->addParamValidator(Event::USE_ATTENDANCE_CHECK, new UseAttendanceCheckChecker());
+
+        $validator->addParamValidator(Event::WATCHERS,
+            new ScheduleMemberChecker(
+                [
+                    Member::MEMBER_TYPE_USER,
+                    Member::MEMBER_TYPE_ORGANIZATION,
+                    Member::MEMBER_TYPE_ROLE,
+                ],
+                cb_lwc_uum()->isForeignKeyPublic()
+            ));
+        $validator->addParamValidator(Event::WATCHERS,
+            new TypeFieldAndKeyExistsChecker([], [Member::ID, Member::CODE]));
+        $validator->addParamValidator(Event::WATCHERS, new WatchersChecker());
+
+        $validator->addParamValidator(Event::START_ONLY, new BooleanChecker());
+        $validator->addParamValidator(Event::ALL_DAY, new BooleanChecker());
+        $validator->addApplicationValidator(new EventsCorrelationChecker(EventsCorrelationChecker::CHECK_POST_PARAMS));
+
+        $validator->addParamValidator(Event::ADDITIONAL_ITEM, new ArrayChecker());
+        $validator->addParamValidator([Event::ADDITIONAL_ITEM, Event::ADDITIONAL_ITEM_NAME], new ArrayChecker());
+        $validator->addParamValidator(
+            [
+                Event::ADDITIONAL_ITEM,
+                Event::ADDITIONAL_ITEM_NAME,
+                Event::ADDITIONAL_ITEM_VALUE
+            ],
+            new StringLengthChecker(0, null));
+    }
+
+    /**
+     * @param ApiValidator $validator
+     */
+    private function addValidatorsForAllDay(ApiValidator $validator)
+    {
+        $validator->addParamValidator(Event::EVENT_MENU, new StringLengthChecker(0, 100));
+        $validator->addParamValidator(Event::SUBJECT, new StringLengthChecker(0, 100));
+
+        $validator->addParamValidator(Event::START, new NotNullChecker());
+        $validator->addParamValidator(Event::START, new DatetimeRFC3339Checker(DateTime::DATETIME));
+        $validator->addParamValidator(Event::START, new TimeZoneChecker(DateTime::TIMEZONE));
+
+        $validator->addParamValidator(Event::END, new NotNullChecker());
+        $validator->addParamValidator(Event::END, new DatetimeRFC3339Checker(DateTime::DATETIME));
+        $validator->addParamValidator(Event::END, new TimeZoneChecker(DateTime::TIMEZONE));
+
+        $validator->addParamValidator(Event::ATTENDEES, new NotNullChecker());
+        $validator->addParamValidator(Event::ATTENDEES,
+            new ScheduleMemberChecker(
+                [
+                    Member::MEMBER_TYPE_USER,
+                    Member::MEMBER_TYPE_ORGANIZATION
+                ],
+                cb_lwc_uum()->isForeignKeyPublic()
+            ));
+
+        $validator->addParamValidator(Event::COMPANY_INFO, new ArrayChecker());
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::NAME], new StringLengthChecker(0, 100));
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::ZIP_CODE], new StringLengthChecker(0, 100));
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::ADDRESS], new StringLengthChecker(0, 65535));
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::ROUTE], new StringLengthChecker(0, 65535));
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::ROUTE_TIME], new StringLengthChecker(0, 100));
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::ROUTE_FARE], new StringLengthChecker(0, 100));
+        $validator->addParamValidator([Event::COMPANY_INFO, Company::PHONE], new StringLengthChecker(0, 100));
+
+        $validator->addParamValidator(Event::ATTACHMENTS, new AttachmentsChecker());
+
+        $validator->addParamValidator(Event::NOTES, new StringLengthChecker(0, 65535));
+
+        $validator->addParamValidator(Event::START_ONLY, new BooleanChecker());
+        $validator->addParamValidator(Event::ALL_DAY, new BooleanChecker());
+
+        $validator->addParamValidator(Event::ADDITIONAL_ITEM, new ArrayChecker());
+        $validator->addParamValidator([Event::ADDITIONAL_ITEM, Event::ADDITIONAL_ITEM_NAME], new ArrayChecker());
+        $validator->addParamValidator(
+            [
+                Event::ADDITIONAL_ITEM,
+                Event::ADDITIONAL_ITEM_NAME,
+                Event::ADDITIONAL_ITEM_VALUE
+            ],
+            new StringLengthChecker(0, null));
+    }
+}

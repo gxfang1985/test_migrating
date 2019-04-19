@@ -1,0 +1,527 @@
+<?php
+/**
+ * LDAP User Repository Driver
+ *
+ * @author  Yuichi, Nakamura 2005/02
+ * @version 1.0
+ */
+
+//Include Files
+require_once('fw/ldap.csp');
+require_once('grn/authentication.csp');
+
+//String Resources
+define('GRN_AUTH_REPOSITORY_LDAP_VIEW_SYSTEM',
+    'system/authentication/repository/view_ldap.csp');     //Driver System View Page
+define('GRN_AUTH_REPOSITORY_LDAP_ADD_SYSTEM',
+    'system/authentication/repository/add_ldap.csp');      //Driver System Add Page
+define('GRN_AUTH_REPOSITORY_LDAP_MODIFY_SYSTEM',
+    'system/authentication/repository/modify_ldap.csp');   //Driver System Modify Page
+
+class plugin_grn_common_authentication_repository_ldap
+    extends GRN_Authentication_Repository_DriverBase
+{
+    /** Configuration Parameters **/
+    var $_driver_settings
+        = [
+            'server'            => null,
+            //LDAP Server
+            'port'              => null,
+            //LDAP Server Post
+            'use_anonymous'     => null,
+            //Use Anonymous Connection
+            'account'           => null,
+            //LDAP Account  (Not Anonymous Setting)
+            'password'          => null,
+            //LDAP Password (Not Anonymous Setting)
+            'base_dn'           => null,
+            //BaseDN
+            'search_filter'     => null,
+            //Search Filter
+            'authenticate_type' => null,
+            //Authenticate Type(0:plane text/SASL Digest-MD5)
+            'affix_condition'   => null,
+            'affix_type'        => null,
+            'affix_string'      => null,
+            'affix_strip'       => null,
+        ];
+
+    /** Configuration Complete Flag **/
+    var $_configured = false;
+
+    /** LDAP Connection Handle **/
+    var $_ldap_handle = false;
+
+    function __construct()
+    {
+        $noPage = null;
+        //Create Driver Page Setting
+        $driver_page = [
+            GRN_AUTH_PAGE_TYPE_VIEW_SYSTEM     => GRN_AUTH_REPOSITORY_LDAP_VIEW_SYSTEM,
+            GRN_AUTH_PAGE_TYPE_ADD_SYSTEM      => GRN_AUTH_REPOSITORY_LDAP_ADD_SYSTEM,
+            GRN_AUTH_PAGE_TYPE_MODIFY_SYSTEM   => GRN_AUTH_REPOSITORY_LDAP_MODIFY_SYSTEM,
+            GRN_AUTH_PAGE_TYPE_VIEW_PERSONAL   => $noPage,
+            GRN_AUTH_PAGE_TYPE_ADD_PERSONAL    => $noPage,
+            GRN_AUTH_PAGE_TYPE_MODIFY_PERSONAL => $noPage,
+        ];
+
+        //Initialize Parent Class
+        parent::__construct(cb_msg(GRN_AUTH_REPOSITORY_LDAP, 'name'),
+            GRN_AUTH_REPOSITORY_LDAP,
+            $driver_page
+        );
+    }
+
+    /**
+     * Set Driver Config
+     *
+     * @param  array $driver_settings //Driver Settings
+     *
+     * @return bool     $result
+     */
+    function setConfig(& $driver_settings)
+    {
+        //Check Arguments
+        if ( ! is_array($driver_settings)) {
+            //Driver Configuration Failed
+            return false;
+        }
+        if ( ! array_key_exists('server', $driver_settings)
+             ||
+             ! array_key_exists('port', $driver_settings)
+             ||
+             ! array_key_exists('base_dn', $driver_settings)
+             ||
+             ! array_key_exists('search_filter', $driver_settings)
+        ) {
+            //Driver Configuration Failed
+            return false;
+        }
+        if (array_key_exists('ssl', $driver_settings)) {
+            if ($driver_settings['ssl'] == 0) {
+                if ( ! is_numeric($driver_settings['port'])) {
+                    return false;
+                }
+            }
+        }
+
+
+        //Set Driver Configuration
+        $this->_driver_settings['server'] = $driver_settings['server'];
+        $this->_driver_settings['port'] = $driver_settings['port'];
+        //GRN2-4931
+        $this->_driver_settings['ssl'] = isset($driver_settings['ssl'])
+            ? $driver_settings['ssl'] : 0;
+        $this->_driver_settings['base_dn']
+            = $driver_settings['base_dn'];
+        $this->_driver_settings['search_filter']
+            = $driver_settings['search_filter'];
+        $this->_driver_settings['authenticate_type']
+            = $driver_settings['authenticate_type'];
+        $this->_driver_settings['use_anonymous']
+            = $driver_settings['use_anonymous'];
+        if ($driver_settings['use_anonymous']) {
+            $this->_driver_settings['account'] = null;
+            $this->_driver_settings['password'] = null;
+        } else {
+            $this->_driver_settings['account'] = $driver_settings['account'];
+            $this->_driver_settings['password'] = $driver_settings['password'];
+        }
+
+        $this->_driver_settings['affix_condition'] = cb_at($driver_settings,
+            'affix_condition');
+        if ($this->_driver_settings['affix_condition']) {
+            if ($driver_settings['affix_type'] !== 'prefix'
+                && $driver_settings['affix_type'] !== 'suffix'
+            ) {
+                //Driver Configuration Failed
+                return false;
+            }
+
+            $this->_driver_settings['affix_type']
+                = $driver_settings['affix_type'];
+            $this->_driver_settings['affix_string']
+                = $driver_settings['affix_string'];
+            $this->_driver_settings['affix_strip']
+                = $driver_settings['affix_strip'];
+        } else {
+            $this->_driver_settings['affix_type'] = null;
+            $this->_driver_settings['affix_string'] = null;
+            $this->_driver_settings['affix_strip'] = null;
+        }
+
+        //Set Configuration Complete Flag
+        $this->_configured = true;
+
+        //Driver Configuration Success
+        return true;
+    }
+
+    /**
+     * Get Driver Config
+     *
+     * @return array    $driver_settings    //Driver Settings
+     */
+    function &getConfig()
+    {
+        //Check Configuration Complete Flag
+        if ( ! $this->_configured) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        return $this->_driver_settings;
+    }
+
+    /**
+     * Authenticate
+     *
+     * @param  string $account  User Acount
+     * @param  string $password User Password
+     *
+     * @return bool    $result
+     */
+    function authenticate($account, $password = null, $check_password = true)
+    {
+        //Check Configuration Complete Flag
+        if ( ! $this->_configured) {
+            return false;
+        }
+        //Get LDAP Connection Account & Password
+        $ldap_account = null;
+        $ldap_password = null;
+        if ( ! $this->_driver_settings['use_anonymous']) {
+            $crypt_util = GRN_Authentication_Crypt_Utility::getInstance();
+            $ldap_account =& $this->_driver_settings['account'];
+            $ldap_password
+                = $crypt_util->decrypt2($this->_driver_settings['password']);
+            if (strlen($ldap_password) === 0) {
+                //Authenticate Failed
+                return false;
+            }
+        }
+        $base_dn = $this->_driver_settings['base_dn'];
+        //Connect LDAP Server
+        $server =& $this->_driver_settings['server'];
+        $port =& $this->_driver_settings['port'];
+        $ssl = &$this->_driver_settings['ssl'];
+        if ($this->_open($server, $port, $ssl, $ldap_account, $ldap_password,
+            $base_dn)
+        ) {
+            // Strip account
+            if (cb_at($this->_driver_settings, 'affix_condition')
+                && cb_at($this->_driver_settings, 'affix_strip')
+            ) {
+                $account = $this->stripAccount($account);
+            }
+
+            //Search LDAP User
+            $base_dn =& $this->_driver_settings['base_dn'];
+            $search_filter =& $this->_driver_settings['search_filter'];
+            $user_dn = $this->_search($base_dn, $search_filter, $account);
+            if ($user_dn) {
+                //Check Password Flag
+                $result = true;
+                if ($check_password) {
+                    //Check Password Field
+                    $result = false;
+                    if (strlen($password) !== 0) {
+                        //Bind LDAP User
+                        $authenticate_type
+                            = $this->_driver_settings['authenticate_type'];
+                        switch ($authenticate_type) {
+                            case '0':
+                                //Bind With Plane Text
+                                $result = $this->_bind($user_dn, $password);
+                                break;
+                            case '1':
+                                //Bind With DIGEST-MD5
+                                $result = $this->_bindWithDigestMD5($user_dn,
+                                    $password, $server, $account);
+                                break;
+                            case '2':
+                                //Bind With CRAM-MD5
+                                $result = $this->_bindWithCramMD5($user_dn,
+                                    $password, $account);
+                                break;
+                            default:
+                                assert('FALSE');
+                                break;
+                        }
+                    }
+                }
+
+                //Disconnect LDAP Server
+                $this->_close();
+
+                //Return Authenticate Result
+                return $result;
+            }
+        }
+
+        //Disconnect LDAP Server
+        $this->_close();
+
+        //Authenticate Failed
+        return false;
+    }
+
+    /**
+     * Open LDAP Connection
+     *
+     * @param  string    $server   //LDAP Server
+     * @param int|string $port     //LDAP Port Number
+     * @param            $ssl
+     * @param  string    $account  //LDAP Account
+     * @param  string    $password //LDAP Password
+     * @param null       $base_dn
+     *
+     * @return resource     $ldap_handle             //LDAP Handle
+     */
+    function _open(
+        $server,
+        $port = 389,
+        $ssl,
+        $account = null,
+        $password = null,
+        $base_dn = null
+    ) {
+        //Connect To LDAP Server
+        $uri = $ssl == 1 ? "ldaps://{$server}/" : $server;
+        $ldap_handle = ldap_connect($uri, (int)$port);
+
+        if ( ! $ldap_handle) {
+            return false;
+        }
+
+        //Set LDAP Option
+        ldap_set_option($ldap_handle, LDAP_OPT_PROTOCOL_VERSION,
+            3);     //LDAP Protocol Version
+        ldap_set_option($ldap_handle, LDAP_OPT_DEREF,
+            1);     //LDAP Search Aliase
+        ldap_set_option($ldap_handle, LDAP_OPT_SIZELIMIT,
+            1);     //LDAP Search Result Size Limit
+        ldap_set_option($ldap_handle, LDAP_OPT_TIMELIMIT,
+            60);    //LDAP Search Time Limit
+
+        //Bind for LDAP2
+        if ( ! @ldap_bind($ldap_handle, $account, $password)) {
+            return false;
+        }
+
+        //Set LDAP Handle
+        $this->_ldap_handle = $ldap_handle;
+
+        //Return LDAP Handle
+        return $ldap_handle;
+    }
+
+    /**
+     * Close LDAP Connection
+     *
+     * @return
+     */
+    function _close()
+    {
+        //Check LDAP Handle
+        if ( ! $this->_ldap_handle) {
+            return false;
+        }
+
+        //Unbind LDAP Handle 
+        if ( ! @ldap_unbind($this->_ldap_handle)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Search LDAP User
+     *
+     * @param  string $base_dn       //User Search Base DN
+     * @param  string $serach_filter //Search Condition Filter
+     * @param  string $account       //User Account
+     *
+     * @return string  $user_dn                 //User DN
+     */
+    function _search($base_dn, $search_filter, $account)
+    {
+        //Check LDAP Handle
+        if ( ! $this->_ldap_handle) {
+            return false;
+        }
+        $ldap_handle = $this->_ldap_handle;
+
+        //Create User Search Condition
+        $account = $this->_escape($account);
+        $user_filter = str_replace('%s', $account, $search_filter);
+
+        //Search LDAP Server
+        $attribute = ['dn'];
+        $serach_handle = ldap_search($ldap_handle, $base_dn, $user_filter,
+            $attribute, 1, 1, 60, LDAP_DEREF_NEVER);
+        if ( ! $serach_handle) {
+            return false;
+        }
+
+        //Get First User Entry
+        $user_entry = ldap_first_entry($ldap_handle, $serach_handle);
+        if ( ! $user_entry) {
+            return false;
+        }
+
+        //Get User DN
+        $user_dn = ldap_get_dn($ldap_handle, $user_entry);
+        if ( ! $user_dn) {
+            return false;
+        }
+
+        return $user_dn;
+    }
+
+    /**
+     * Bind LDAP User With Plain Password
+     *
+     * @param  string $user_dn  //User DN
+     * @param  string $password //User Password
+     *
+     * @return string  Bind Result
+     */
+    function _bind($user_dn, $password)
+    {
+        //Check LDAP Handle
+        if ( ! $this->_ldap_handle) {
+            return false;
+        }
+        $ldap_handle = $this->_ldap_handle;
+
+        //Bind With Plain Password
+        if ( ! @ldap_bind($ldap_handle, $user_dn, $password)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Bind LDAP User With DIGEST-MD5 Password
+     *
+     * @param  string $user_dn  //User DN
+     * @param  string $password //User Password
+     * @param  string $server   //Server Name
+     * @param  string $account  //User Account
+     *
+     * @return string  Bind Result
+     */
+    function _bindWithDigestMD5($user_dn, $password, $server, $account = null)
+    {
+        //Check LDAP Handle
+        if ( ! $this->_ldap_handle) {
+            return false;
+        }
+        $ldap_handle = $this->_ldap_handle;
+
+        //Bind With SASL Digest-MD5
+        if ( ! @cb_ldap_digest_md5_sasl_bind($ldap_handle, $user_dn, $password,
+            $server, $account)
+        ) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Bind LDAP User With CRAM-MD5 Password
+     *
+     * @param  string $user_dn  //User DN
+     * @param  string $password //User Password
+     *
+     * @return string  Bind Result
+     */
+    function _bindWithCramMD5($user_dn, $password, $account = null)
+    {
+        //Check LDAP Handle
+        if ( ! $this->_ldap_handle) {
+            return false;
+        }
+        $ldap_handle = $this->_ldap_handle;
+
+        //Bind With SASL Digest-MD5
+        if ( ! @cb_ldap_cram_md5_sasl_bind($ldap_handle, $user_dn, $password,
+            $account)
+        ) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * getPasswordExpirationDays
+     *
+     * @param  int $uid
+     *
+     * @return int $result
+     */
+    function getPasswordExpirationDays($uid)
+    {
+        return true;
+    }
+
+    /**
+     * @param string $account
+     *
+     * @return bool
+     */
+    public function accountIsMatched($account)
+    {
+        if ( ! cb_at($this->_driver_settings, 'affix_condition')) {
+            return true;
+        }
+
+        $affix_string = $this->_driver_settings['affix_string'];
+        if ($this->_driver_settings['affix_type'] === 'suffix') {
+            $affix_string = strrev($affix_string);
+            $account = strrev($account);
+        }
+
+        return (strpos($account, $affix_string) === 0);
+    }
+
+    /**
+     * @param $account
+     *
+     * @return string
+     */
+    private function stripAccount($account)
+    {
+        $affix_string = $this->_driver_settings['affix_string'];
+        if ($this->_driver_settings['affix_type'] === 'prefix') {
+            $account = substr($account, strlen($affix_string));
+        } else {
+            $account = substr($account, 0, -strlen($affix_string));
+        }
+
+        return $account;
+    }
+
+    /**
+     * Escape a string for use in an LDAP filter
+     *
+     * @param string filter
+     *
+     * @return string
+     */
+    protected function _escape($filter)
+    {
+        $patterns = ['\\', '*', '(', ')', "\0"];
+        $replacements = ['\\5c', '\\2a', '\\28', '\\29', '\\00'];
+
+        return str_replace($patterns, $replacements, $filter);
+    }
+}
+
+

@@ -1,0 +1,187 @@
+<?php
+
+use grn\grn\access\service\AppAccess;
+
+require_once('grn/smarty.csp');
+$t = new GRN_Smarty;
+
+////////////////////////////////////////////////////////////////
+
+$bid = isset($G_INPUT['bid']) ? $G_INPUT['bid'] : null;
+if (0 == strlen($bid)) {
+    cb_throw_error(E_GRN_ADDRESS_INVALID_BOOK_ID);
+}
+$cid = isset($G_INPUT['cid']) ? $G_INPUT['cid'] : null;
+if (0 == strlen($cid)) {
+    cb_throw_error(E_GRN_ADDRESS_INVALID_CARD_ID);
+}
+$sort = isset($G_INPUT['sort']) ? $G_INPUT['sort'] : 'mtd';
+$t->assign('sort', $sort);
+
+// アドレス帳を取得する
+require_once('address/application.csp');
+$app_locator = GRN_ApplicationLocator::instance();
+/** @var GRN_Address_Application $app */
+$app = $app_locator->getInstance(GRN_ADDRESS_APPLICATION_ID);
+if ( ! is_object($app) || ! is_a($app, 'GRN_Address_Application')) {
+    cb_throw_error(E_GRN_APPLICATION_NOT_AVAILABLE);
+}
+$book_manager = $app->getBookManager();
+
+// ログインユーザーを取得する
+global $G_container_base;
+$uum = $G_container_base->getInstance('uum');
+$login = $uum->getLoginUser();
+if ( ! is_object($login) || ! is_a($login, 'CB_User')) {
+    cb_throw_error(E_GRN_USER_NOT_FOUND);
+}
+$login_id = $login->getOID();
+require_once('report/resources.csp');
+require_once('grn/application.csp');
+$locator = GRN_ApplicationLocator::instance();
+AppAccess::checkInternalAccess(GRN_REPORT_APPLICATION_ID);
+
+// アドレス帳の設定を取得する
+require_once('address/config.csp');
+$config_manager = GRN_Address_ConfigManager::getInstance();
+$system_config = $config_manager->getSystemConfig();
+$personal_config = $config_manager->getPersonalConfig($login);
+
+// 使用権限を取得する
+require_once('address/access.csp');
+$access_manager = GRN_Address_AccessManager::getInstance();
+if ( ! ($row = $access_manager->getAbstractData(GRN_ADDRESS_AVAILABLE))) {
+    assert('FALSE');
+}
+
+// ダイナミックロールを取得する
+$dynamic_roles = $uum->listGrantedRoles();
+
+// 使用権限を評価する
+$authorities = ['private_address', 'shared_address'];
+$security_model = $access_manager->getSecurityModel($row);
+$access = $access_manager->evaluateAccess($row, $login, $dynamic_roles,
+    $authorities, $security_model);
+
+// 共有アドレス帳の使用権限を評価する
+$authorities = ['shared_address'];
+$access_for_view = [];
+$access_for_view['shared_address'] = $access_manager->isAllowedAccess($access,
+    $authorities, $security_model);
+
+$books = [];
+$allowed_books = [];
+if ($access_for_view['shared_address']) {
+    // 共有アドレスブック一覧を取得する
+    $books = $book_manager->listSharedAddressBooks();
+
+    if (0 < count($books)) {
+        // 閲覧、編集権限を持つ共有アドレスブック一覧を取得する
+        $rows = [];
+        foreach (array_keys($books) as $book_id) {
+            $book = $books[$book_id];
+            $rows[$book_id] = $book->getRow();
+        }
+
+        $authorities = ['browse', 'editing'];
+        $allowed_books = $access_manager->pickAllowedObjects($rows, $login,
+            $dynamic_roles, $authorities);
+    }
+}
+
+// ブックを取得する
+$allowed_count = 0;
+$access_editing = true;
+if ( ! $access_for_view['shared_address']) {
+    cb_throw_error(E_GRN_ADDRESS_ACCESS_DENY_SHARED_ADDRESS);
+}
+
+$book = null;
+if ( ! array_key_exists($bid, $allowed_books)) {
+    // 共有アドレス帳の閲覧権限を評価する
+    if ( ! array_key_exists($bid, $books)) {
+        cb_throw_error(E_GRN_ADDRESS_INVALID_BOOK_ID);
+    }
+    $book = $books[$bid];
+    $row = $book->getRow();
+    $authorities = ['browse'];
+    $access = $access_manager->evaluateAccess($row, $login,
+        $dynamic_roles, $authorities);
+    $security_model = $access_manager->getSecurityModel($row);
+    if ( ! $access_manager->isAllowedAccess($access, $authorities,
+        $security_model)
+    ) {
+        cb_throw_error(E_GRN_ADDRESS_ACCESS_DENY_EDITING);
+    }
+    $access_editing = false;
+} else {
+    $book = $books[$bid];
+}
+$allowed_count = 1;
+
+require_once('address/view_util.csp');
+$view_util = GRN_Address_ViewUtil::getInstance();
+
+// アドレスデータを取得する
+if ( ! ($data = $book->getData($cid))) {
+    cb_throw_error(E_GRN_ADDRESS_CARD_NOT_FOUND);
+}
+$data_for_view = $view_util->getData($data, $bid);
+
+$t->assign('book_id', $bid);
+$t->assign('card_id', $cid);
+$t->assign('access', $access_for_view);
+$t->assign('card', $data_for_view);
+
+require_once('grn/ui.csp');
+$ui_config_manager = GRN_UIConfigManager::getInstance();
+$ui_config = $ui_config_manager->getUserConfig($login);
+
+// n件ナビゲーション情報を取得する
+require_once('grn/controller.csp');
+$controller_util = new GRN_ControllerUtil();
+$offset = $controller_util->getNaviStartPosition();
+$controller_util->setNaviStartPosition($offset);
+$limit = $ui_config->getListMax();
+require_once('report/controller_util.csp');
+$report_util = GRN_Report_Report_Controller_Utility::getInstance();
+$count = $report_util->getViewableReportCountByAddressId($cid, $login);
+$navi = $controller_util->makeNaviInformation($offset, $limit, $count,
+    ['bid' => $bid, 'cid' => $cid, 'sort' => $sort]);
+$t->assign('navi', $navi);
+
+$orders = [];
+$orders[] = ($sort === 'mtu') ? ['report.col_mtime', 'ASC']
+    : ['report.col_mtime', 'DESC'];
+
+$report_list_for_view = $report_util->getViewableReportListViewByAddressId($cid,
+    $login, $offset, $limit, $orders);
+$t->assign('report_list', $report_list_for_view);
+
+$creator_ids = [];
+foreach ($report_list_for_view as $report_view) {
+    $creator_ids[] = $report_view['creator'];
+}
+$creators_info = GRN_ControllerUtil::getUserInfoToShowUserName($creator_ids,
+    $login);
+$t->assign('creators_info', $creators_info);
+
+////////////////////////////////////////////////////////////////
+
+// Smartyにページタイトルを割り当てる
+$page_title = grn_get_page_display_name('address/report_list');
+$t->assign('page_title', $page_title);
+
+// Smartyにサイトポジションを割り当てる
+$page_info = [
+    'index'       => ['sf' => 1, 'bid' => $bid],
+    'view'        => ['bid' => $bid, 'cid' => $cid],
+    'report_list' => null
+];
+require_once('grn/controller.csp');
+$controller_util = new GRN_ControllerUtil();
+$site_position = $controller_util->makeSitePosition('address/', $page_info);
+$t->assign('site_position', $site_position);
+
+// Smartyを実行する
+$t->display(cb_get_pagename() . '.tpl');

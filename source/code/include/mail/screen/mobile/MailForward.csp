@@ -1,0 +1,313 @@
+<?php
+
+namespace grn\mail\screen\mobile;
+
+class MailForward extends MobileMailScreenBase
+{
+    public function fetch()
+    {
+        $user = cb_get_login_user();
+
+        //get config setting
+        $system_config = $this->getSystemConfig();
+        $personal_config = $this->getPersonalConfig();
+        $send_logic = $this->getSendLogic();
+        $mail_logic = $this->getMailLogic();
+        $folder_logic = $this->getFolderLogic();
+        $utility = $this->getUtility();
+
+        $this->sendPrepare();
+
+        $this->_uid = $user->getOID();
+
+        // Smarty をインスタンス化
+        require_once("grn/smarty.csp");
+        $t = new \GRN_Smarty();
+
+        $mail_id = $this->getMailId();
+        $mail_data = $mail_logic->getMailData($mail_id, true);
+        $category_id = $mail_data[self::ARG_DATA_FOLDER_ID];
+        $folder_data = $folder_logic->getFolderData($category_id, false, true);
+        $account_id = $folder_data[self::ARG_DATA_ACCOUNT_ID];
+        $this->setAccountId($account_id);
+        $this->setCategoryId($category_id);
+
+        $doc_name = cb_get_pagename();
+
+        // ユーザー情報
+        $this->_user_for_view = [
+            self::ARG_USER_ID => $this->_uid,
+            self::ARG_NAME    => $user->get('display_name')
+        ];
+
+        $no_setting = $this->getNoSetting();
+        if ($no_setting == 0) {
+            // アカウントデータ取得
+            $account_data = $personal_config->getAccountData($account_id, true,
+                false);
+            if (is_null($account_data) || $account_data['disabled']) {
+                // アカウント停止中
+                cb_throw_error(E_GRN_MAIL_DISABLED_ACCOUNT);
+            }
+
+            //カレントアカウント情報取得
+            $account_info = $this->getAccountInfo($account_id);
+            if ( ! is_null($account_info)) {
+                $this->_user_for_view['from'] = $account_info->getFrom($user);
+                $this->_user_for_view['email'] = $account_info->email;
+                $this->_user_for_view['label'] = '"'
+                                                 . $this->_user_for_view['from']
+                                                 . '" <'
+                                                 . $this->_user_for_view['email']
+                                                 . '>';
+
+                if (strlen($this->_user_for_view['email']) < 1) {
+                    cb_throw_error(E_GRN_MAIL_ACCOUNT_EMAIL_NOT_FOUND);
+                }
+            }
+
+            //get incremental search flg
+            $this->_incremental_search
+                = $utility->checkAvailableForIncrementalSearch($book_ids);
+
+            //署名情報取得
+            $this->_sign_list = $this->getSignatureInfo(null, null, $account_id,
+                $signature_selected_data);
+            $this->_position = $signature_selected_data[self::ARG_POSITION];
+
+            // 転送用本文取得
+            $forward_subject = $send_logic->makeForwardSubject($mail_data);
+            $forward_data = $send_logic->makeForwardData($mail_data, false,
+                false);
+            require_once('grn/controller.csp');
+            $this->_tmp_key = grn_get_temporary_key();
+            $forward_files = grn_init_attached_file($doc_name
+                                                    . $this->_tmp_key,
+                $send_logic->makeForwardFiles($user, $mail_data));
+
+            $this->_mail = [
+                'aid'            => $account_id, //user_account_ID
+                'cid'            => $category_id, //category_ID
+                'mid'            => $mail_id,
+                'to'             => '',
+                'cc'             => '',
+                'bcc'            => '',
+                'subject'        => $forward_subject,
+                'data'           => $forward_data[self::ARG_DATA],
+                'attached_files' => $forward_files,
+                'html_data'      => '',
+                'sign'           => $signature_selected_data
+            ];
+
+            // 送信前確認を行う
+            $personal_config->getGeneralSetting($personal_general_settings);
+            $this->_b_preview = $personal_general_settings['preview'];
+
+            // 開封確認設定
+            $this->_send_set = $system_config->canUserUseConfirm()
+                               && ($personal_config->useConfirmMail());
+        }
+
+        $upper_page = self::PAGE_MAIL_DETAIL;
+        $upper_page_name = cb_msg('grn.mobile', 'detail_title');
+        $page_title = $this->getTitle();
+        $input = $this->getInput();
+        $sp = 0;
+        if (array_key_exists('sp', $input)) {
+            $sp = $input['sp'];
+        }
+        $t->assign('sp', $sp);
+        // set breadcrumb
+        $this->assignBreadcrumbUpperPage($t, $upper_page_name, $upper_page,
+            [self::ARG_MAIL_ID => $mail_id, 'sp' => $sp]);
+        $this->assignBreadcrumbCurrentPage($t, $page_title);
+
+        $this->_assignArguments($t, $no_setting);
+        //generate upload ticket
+        include('grn/_upload_prepend.csp');
+
+        return $t->fetch("{$doc_name}.tpl");
+    }
+
+    public function post($input = null)
+    {
+        $input = $this->getInput();
+
+        //get config setting
+        $personal_config = $this->getPersonalConfig();
+        $utility = $this->getUtility();
+        $send_logic = $this->getSendLogic();
+        $mail_logic = $this->getMailLogic();
+
+        $this->checkArgFromInput([
+            self::ARG_ACCOUNT_ID,
+            self::ARG_CATEGORY_ID,
+            self::ARG_MAIL_ID,
+            self::ARG_USER_ID
+        ],
+            $input);
+        $this->sendPrepare($input);
+
+        $aid = cb_at($input, self::ARG_ACCOUNT_ID);
+        $category_id = cb_at($input, self::ARG_CATEGORY_ID);
+        $origin_mid = cb_at($input, self::ARG_MAIL_ID);
+        $user_id = cb_at($input, self::ARG_USER_ID);
+        $user = $this->getUserInfo($user_id);
+        $command = cb_at($input, self::ARG_COMMAND);
+        $action = cb_at($input, self::ARG_ACTION);
+
+        $to = cb_at($input, self::ARG_TO, '');
+        $cc = cb_at($input, self::ARG_CC, '');
+        $bcc = cb_at($input, self::ARG_BCC, '');
+
+        if (strlen($to) > 0 || strlen($cc) > 0 || strlen($bcc) > 0
+            || strcmp($command, 'draft') === 0
+        ) {
+            $input[self::ARG_RECIPIENT] = 'dummy';
+        }
+
+        // selected signature OID
+        $sign_id = cb_at($input, self::ARG_SIGN, '');
+
+        require_once('mail/include_send.csp');
+
+        $properties = [];
+        $properties[self::ARG_SUBJECT] = cb_at($input, self::ARG_SUBJECT);
+        $properties[self::ARG_TO] = $to;
+        $properties[self::ARG_CC] = $cc;
+        $properties[self::ARG_BCC] = $bcc;
+        $properties[self::ARG_SIGN_DATA] = cb_at($input, self::ARG_SIGN_VALUE,
+            '');
+        $properties[self::ARG_DATA] = cb_at($input, self::ARG_DATA);
+
+        // 署名ID
+        $properties[self::ARG_SIGN_ID] = $sign_id;
+
+        if (array_key_exists(self::ARG_GIVE_OPEN_CHECK, $input)
+            && $input[self::ARG_GIVE_OPEN_CHECK] == 'on'
+        ) {
+            $properties[self::ARG_CONFIRMATION_REQUEST] = 1;
+        } else {
+            $properties[self::ARG_CONFIRMATION_REQUEST] = 0;
+        }
+
+        // attached files
+        require_once('grn/controller.csp');
+        $tmp_key = grn_get_temporary_key();
+        $target_name = 'mail/mobile/forward';
+        $files = grn_get_attached_files($target_name . $tmp_key);
+
+        if (cb_at($input, self::ARG_ATTACHED_FILE)) {
+            require_once('grn/upload.csp');
+            $upload_files = \GRN_UploadFile::getUploadedFiles(cb_at($input,
+                self::ARG_UPLOAD_TICKET), cb_at($input, self::ARG_FILE_INPUT),
+                true);
+            foreach ($upload_files as $fid => $file) {
+                $files[$fid] = $file;
+            }
+        }
+
+        $position = '';
+        if (array_key_exists(self::ARG_POSITION, $input)) {
+            $position = strtolower($input[self::ARG_POSITION]);
+        }
+
+        if ($command == 'send') {
+            if ($position != 'top' || is_null($action) == true
+                || strlen(trim($action)) == 0
+                || $action == 'reuse'
+            ) {
+                $data = null;
+                $position = 'bottom';
+            } else {
+                $position = 'top';
+
+                $mail_data_origin = $mail_logic->getMailData($origin_mid, true);
+                $original_data = $utility->makeForwardInfo($mail_data_origin,
+                    false);
+                $temp_data = cb_at($input, self::ARG_DATA, '');
+                $temp_data = preg_replace("'(?:\r\n|\r|\n)'s", "\r\n",
+                    $temp_data);
+                $temp_data_s = explode($original_data, $temp_data);
+                if (count($temp_data_s) > 1) {
+                    $temp_data_s[0] = preg_replace("'(\r\n)$'s", "",
+                            $temp_data_s[0])
+                                      . "\r\n"
+                                      . preg_replace("'(\r\n)$'s", "",
+                            $properties[self::ARG_SIGN_DATA])
+                                      . "\r\n";
+                    $data = implode($original_data, $temp_data_s);
+                } else {
+                    $data = cb_at($input, self::ARG_DATA, '');
+                    $data = preg_replace("'(\r\n)$'s", "", $data)
+                            . "\r\n"
+                            . $properties[self::ARG_SIGN_DATA];
+                }
+            }
+            $personal_config->getGeneralSetting($general_settings);
+            $send_logic->sendMail($user, $aid, $properties, $files, null,
+                $action, $origin_mid, null, true,
+                $general_settings['save_sentfile'], true, null, false,
+                $position, $data);
+            $utility->addIncrementalSearch($to, $cc, $bcc);
+
+            $redirect_page = self::PAGE_MAIL_LIST;
+            cb_redirect($redirect_page, [
+                self::ARG_ACCOUNT_ID  => $aid,
+                self::ARG_CATEGORY_ID => $category_id
+            ]);
+        } elseif ($command == 'preview') {
+            // メールのプレビュー
+            $temp_mail_id = $send_logic->savePreviewMail($user, $aid,
+                $properties, $files, null, null, $action, $origin_mid);
+
+            $redirect_page = self::PAGE_MAIL_PREVIEW;
+            cb_redirect($redirect_page, [
+                    self::ARG_B_ACCOUNT_ID  => $aid,
+                    self::ARG_B_CATEGORY_ID => $category_id,
+                    self::ARG_B_MAIL_ID     => $temp_mail_id,
+                    self::ARG_SIGN_POSITION => $position,
+                    self::ARG_MAIL_ID       => $origin_mid,
+                    self::ARG_ACTION        => $action
+                ]
+            );
+        } elseif ($command == 'draft') {
+            // メールの保存
+            $send_logic->saveMail($user, $aid, $properties, $files, null, null,
+                $action, $origin_mid);
+
+            // 下書きフォルダへ遷移
+            $folder_logic = $this->getFolderLogic();
+            $folder_data = $folder_logic->getSpecialFolderData($aid,
+                GRN_MAIL_FOLDER_CODE_UNSENT,
+                false);
+
+            $redirect_page = self::PAGE_MAIL_LIST;
+            cb_redirect($redirect_page, [
+                self::ARG_ACCOUNT_ID  => $aid,
+                self::ARG_CATEGORY_ID => $folder_data['id']
+            ]);
+        }
+    }
+
+    /**
+     * set smarty variable
+     */
+    private function _assignArguments($smarty, $no_setting)
+    {
+        $this->assignCommonArgumentsForCreate($smarty, $no_setting);
+
+        $smarty->assign('mid', $this->getMailId());
+        $smarty->assign('action', 'forward');
+        $smarty->assign('tmp_key', $this->_tmp_key);
+    }
+
+    public function getTitle()
+    {
+        $mail_app = $this->getMailApp();
+        $app_name = $mail_app->getName();
+
+        return grn_get_page_display_name(self::PAGE_MAIL_FORWARD,
+            ['app_name' => $app_name]);
+    }
+}

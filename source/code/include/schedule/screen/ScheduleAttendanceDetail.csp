@@ -1,0 +1,550 @@
+<?php
+
+namespace grn\schedule\screen;
+
+use grn\grn\GrnGenericScreenBase;
+use grn\schedule\AttendanceStatusLogic;
+use grn\schedule\bean\AttendanceStatus;
+use grn\schedule\bean\AttendanceStatusCondition;
+use grn\grn\Validate;
+
+require_once('schedule/system_logic.csp');
+require_once('schedule/resources.csp');
+require_once('schedule/error_code.csp');
+require_once('schedule/view_util.csp');
+require_once('schedule/access_logic.csp');
+require_once('schedule/application.csp');
+require_once('fw/session_manager.csp');
+require_once('fw/i18n.csp');
+
+class ScheduleAttendanceDetail extends GrnGenericScreenBase
+{
+    const ARG_EVENT_ID = 'event';
+    const ARG_B_DATE = 'bdate';
+    const ARG_REFERER = 'referer_key';
+    const ARG_SORT = 'sort';
+    const ARG_FILTER = 'filter';
+    const ARG_STATUS = 'status';
+    const ARG_MESSAGE = 'message';
+
+    const STYLE_STATUS_ATTENDANCE = 'attendance';
+    const STYLE_STATUS_ABSENCE = 'absence';
+    const STYLE_STATUS_UNANSWERED = 'unanswered';
+
+    public function fetch()
+    {
+        $login = cb_get_login_user();
+        $input = $this->getInput();
+
+        if ( ! is_object($login) || ! is_a($login, 'CB_User')) {
+            cb_throw_error(E_GRN_USER_NOT_FOUND);
+        }
+
+        $app = \GRN_Schedule_Application::getInstance();
+        $acc_logic = \GRN_Schedule_Access_Logic::getInstance();
+
+        //check system setting
+        $attendance_status_logic = new AttendanceStatusLogic();
+        if ( ! $attendance_status_logic->isEnableAttendanceCheck()) {
+            cb_throw_error(E_GRN_SCHD_SYSTEM_ATTENDANCE_CHECK_OFF);
+        }
+
+        $event_id = cb_at($input, self::ARG_EVENT_ID);
+        $str_date = cb_at($input, self::ARG_B_DATE);
+        $referer_key = cb_at($input, self::ARG_REFERER, null);
+        $sort = cb_at($input, self::ARG_SORT);
+        $filter = intval(cb_at($input, self::ARG_FILTER, 0));
+
+        require_once('grn/smarty.csp');
+        $smarty = new \GRN_Smarty();
+
+        //get event info
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+
+        $date = new \CB_Date();
+        if ( ! $date->parse($str_date)) {
+            $date = null;
+        }
+
+        $event = $app->getEvent($login, $event_id, $date);
+
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        if ( ! $event->isAttendanceCheckEvent()) {
+            cb_throw_error(E_GRN_SCHD_NOT_ATTENDANCE_CHECK);
+        }
+
+        // アクセス権のチェック
+        $dynamic_roles = $uum->listGrantedRoles();
+        $access = $acc_logic->getEventAccess($login, $event, ['read'],
+            $dynamic_roles);
+
+        if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+        }
+
+        $title = html_entity_decode($event->getTitle());
+
+        $is_private = false;
+        if ($event->private == GRN_EVENT_PRIVATE_HIDDEN) {
+            $title .= cb_msg('grn.schedule', 'event_private');
+        } elseif ($event->private == GRN_EVENT_PRIVATE_PRIVATE) {
+            $is_private = true;
+        }
+
+        $allday = ($event->getEventType() & GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+            ? true : false;
+        $is_same_day = false;
+
+        $start_date = $event->setdatetime->format();
+        $end_date = '';
+        if ($event->enddatetime) {
+            $end_date = $event->enddatetime->format();
+        }
+
+        if ($allday) {
+            $tmp_start_date = new \CB_Date();
+            $tmp_start_date->parse($start_date);
+            $tmp_start_datetime
+                = \CB_DateTimeEx::createByDateAndTime($tmp_start_date,
+                \GRN_Schedule_View_Util::getAlldayStartTime());
+            $start_date
+                = \CB_I18N::translateDatetimeTimezone($tmp_start_datetime,
+                $event->timezone,
+                \CB_I18N::getInstance()->getCurrentTimezone());
+            if ($event->enddatetime) {
+                $tmp_end_date = new \CB_Date();
+                $tmp_end_date->parse($end_date);
+                $tmp_end_datetime
+                    = \CB_DateTimeEx::createByDateAndTime($tmp_end_date,
+                    \GRN_Schedule_View_Util::getAlldayEndTime());
+                $end_date
+                    = \CB_I18N::translateDatetimeTimezone($tmp_end_datetime,
+                    $event->timezone,
+                    \CB_I18N::getInstance()->getCurrentTimezone());
+            }
+
+            if ($event->enddatetime
+                && $app->compareDate($start_date, $end_date) === 0
+            ) {
+                $is_same_day = true;
+            }
+        } else {
+            if ($event->enddatetime
+                && $app->compareDate($event->setdatetime, $event->enddatetime)
+                   === 0
+            ) {
+                $is_same_day = true;
+            }
+        }
+
+        //get status list
+        $attendance_status_condition
+            = new AttendanceStatusCondition(['col_event' => $event_id]);
+        if ($sort == 'rtu') {
+            $attendance_status_condition->setSortArray(['col_ctime' => false]);
+        } elseif ($sort == 'rtd') {
+            $attendance_status_condition->setSortArray(['col_ctime' => true]);
+        }
+        $status_list
+            = $attendance_status_logic->getAttendanceStatusListByCondition($attendance_status_condition);
+
+        //get status list count num
+        $max_member_count = 0;
+        if (is_array($event->users)) {
+            $max_member_count += count($event->users);
+        }
+
+        $reply_member_count = 0;
+        $status = [];
+        $user_sort = [];
+        $filter_status = [];
+        $own_status = [];
+
+        if (is_array($status_list)) {
+            foreach ($status_list as $k => $row) {
+                if ( ! $uum->getUserInfo($row->getUserId())) {
+                    continue;
+                }
+                $user_sort[]
+                    = $status[$k]['user'] = $row->getUserId();
+                $status[$k]['status'] = $row->getStatus();
+                $status[$k]['message'] = $row->getMessage();
+                $status[$k]['time'] = '';
+                if ($row->getCreateTime() != '') {
+                    $status[$k]['time'] = new \CB_TimeStamp();
+                    $status[$k]['time']->unix_ts
+                        = intval($row->getCreateTime());
+                }
+
+                if ($row->getStatus() == '1' || $row->getStatus() == '0') {
+                    $reply_member_count++;
+                }
+
+                if ($row->getUserId() == $login->getOID()) {
+                    $own_status['status'] = $row->getStatus();
+                    $own_status['message'] = $row->getMessage();
+                }
+                if (($filter == '1'
+                     && (is_null($row->getStatus())
+                         || strlen($row->getStatus()) == 0))
+                    || ($filter == '2' && $row->getStatus() == '1')
+                    || ($filter == '3' && $row->getStatus() == '0')
+                    || ($filter != '1' && $filter != '2' && $filter != '3')
+                ) {
+                    $filter_status[] = $status[$k];
+                }
+            }
+        }
+
+        $is_no_status_list = count($status) > 0 ? false : true;
+        $is_no_status = count($own_status) > 0 ? false : true;
+        $is_no_filter_status_list = count($filter_status) > 0 ? false : true;
+
+        $schedule_event = [
+            'event_id'         => $event_id,
+            'title'            => $title,
+            'event_detail'     => $event->detail,
+            'event_menu'       => $event->menu,
+            'event_menu_color' => $event->menucolor,
+            'is_private'       => $is_private,
+            'start_date'       => $start_date,
+            'end_date'         => $end_date,
+            'allday'           => $allday,
+            'users_count'      => $max_member_count,
+            'reply_count'      => $reply_member_count,
+            'own_status'       => $own_status,
+            'status_list'      => $filter_status
+        ];
+
+        //update last access time for creator
+        if (is_a($event->creator, 'CB_User')
+            && $event->creator->getOID() == $login->getOID()
+        ) {
+            $attendance_status_logic->setLastAccessTimeForCreator($event_id);
+        }
+
+        // page title
+        $current_page = $this->getTitle();
+
+        $session_manager = \CB_SessionManager::getInstance();
+        $referer_exists = false;
+        if ($referer_key) {
+            $session = $session_manager->getSession('schedule.referer');
+            $referer = $session->get($referer_key);
+            if (is_array($referer)) {
+                if (array_key_exists('page', $referer)
+                    && Validate::isNotNull($referer['page'])
+                ) {
+                    $referer['name']
+                        = grn_get_page_display_name($referer['page']);
+                }
+                $smarty->assign('site_position', [
+                    $referer,
+                    [
+                        'page'        => "schedule/view",
+                        'name'        => grn_get_page_display_name('schedule/view'),
+                        'event'       => $event_id,
+                        'bdate'       => $str_date,
+                        'referer_key' => $referer_key
+                    ],
+                    ['page' => "", 'name' => $current_page]
+                ]);
+                $referer_exists = true;
+            } else {
+                $session
+                    = $session_manager->getSession('schedule.attendance.referer');
+                $referer = $session->get($referer_key);
+                if (is_array($referer)) {
+                    if (array_key_exists('attendance_list', $referer)) {
+                        if (array_key_exists('page', $referer)
+                            && Validate::isNotNull($referer['page'])
+                        ) {
+                            $referer['name']
+                                = grn_get_page_display_name($referer['page']);
+                        }
+                        $attendance_list_parameter
+                            = $referer['attendance_list'];
+                        if (array_key_exists('page', $attendance_list_parameter)
+                            && Validate::isNotNull($attendance_list_parameter['page'])
+                        ) {
+                            $attendance_list_parameter['name']
+                                = grn_get_page_display_name($attendance_list_parameter['page']);
+                        }
+                        unset($referer['attendance_list']);
+                        $smarty->assign('site_position', [
+                            $referer,
+                            $attendance_list_parameter,
+                            ['page' => "", 'name' => $current_page]
+                        ]);
+                    }
+                    $referer_exists = true;
+                }
+            }
+        }
+
+        if ($referer_exists === false) {
+            // site position
+            $smarty->assign('site_position', [
+                [
+                    'page' => "schedule/index",
+                    'name' => grn_get_page_display_name('schedule/schedule_index')
+                ],
+                [
+                    'page'        => "schedule/view",
+                    'name'        => grn_get_page_display_name('schedule/view'),
+                    'event'       => $event_id,
+                    'bdate'       => $str_date,
+                    'referer_key' => $referer_key
+                ],
+                ['page' => "", 'name' => $current_page]
+            ]);
+        }
+
+        $smarty->assign('page_name', cb_get_pagename());
+        $smarty->assign('page_title', $current_page);
+        $smarty->assign('user', $login->getOID());
+        $smarty->assign('schedule_event', $schedule_event);
+        $smarty->assign('is_same_day', $is_same_day);
+        $smarty->assign('no_status_list', $is_no_status_list);
+        $smarty->assign('no_status', $is_no_status);
+        $smarty->assign('no_filter_status_list', $is_no_filter_status_list);
+        $smarty->assign('sort', $sort);
+        $smarty->assign('flip_user_sort', array_flip($user_sort));
+        $smarty->assign('filter', $filter);
+        $smarty->assign('referer_key', $referer_key);
+        $smarty->assign('bdate', $str_date);
+
+        return $smarty->fetch('schedule/attendance_detail.tpl');
+    }
+
+    public function getScheduleAttendanceStatus()
+    {
+        $login = cb_get_login_user();
+        $loginId = $login->getOID();
+        $input = $this->getInput();
+
+        if ( ! is_object($login) || ! is_a($login, 'CB_User')) {
+            cb_throw_error(E_GRN_USER_NOT_FOUND);
+        }
+
+        $app = \GRN_Schedule_Application::getInstance();
+
+        //check system setting
+        $attendance_status_logic = new AttendanceStatusLogic();
+        if ( ! $attendance_status_logic->isEnableAttendanceCheck()) {
+            cb_throw_error(E_GRN_SCHD_SYSTEM_ATTENDANCE_CHECK_OFF);
+        }
+
+        $event_id = cb_at($input, self::ARG_EVENT_ID);
+
+        // イベントのみを取得
+        $event = $app->getEvent($login, $event_id, null, null, false);
+
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        if ( ! $event->isAttendanceCheckEvent()) {
+            cb_throw_error(E_GRN_SCHD_NOT_ATTENDANCE_CHECK);
+        }
+
+        if ( ! isset($event->users[$loginId])) {
+            cb_throw_error(E_GRN_SCHD_NOT_ATTENDEE);
+        }
+
+        $title = html_entity_decode($event->getTitle());
+
+        //get status
+        $status
+            = $attendance_status_logic->getAttendanceStatusByUserIdAndEventId($loginId,
+            $event_id);
+
+        //get event conflict
+        $conflict = false;
+        $systemLogic = \GRN_Schedule_SystemLogic::getInstance();
+        $hiddenPrivate = $systemLogic->getHiddenPrivate();
+
+        $setDateTime = $event->setdatetime;
+        $endDateTime = $event->enddatetime;
+        if (is_null($endDateTime)) {
+            $endDateTime = $event->setdatetime;
+        }
+
+        $tsex = new \CB_TimeStampEx();
+        $date = $tsex->getDate();
+
+        if (($app->compareDate($date, $setDateTime) < 0)
+            || ($app->compareDate($date, $endDateTime) > 0)
+        ) {
+            $date->year = $setDateTime->year;
+            $date->month = $setDateTime->month;
+            $date->day = $setDateTime->day;
+        }
+
+        if ($app->compareDate($date, $setDateTime) !== 0) {
+            $setDateTime->year = $date->year;
+            $setDateTime->month = $date->month;
+            $setDateTime->day = $date->day;
+            $setDateTime->hour = 0;
+            $setDateTime->minute = 0;
+            $setDateTime->second = 0;
+        }
+
+        if ($app->compareDate($date, $endDateTime) !== 0) {
+            $workDate = clone $date;
+            cb_date_move_days($workDate, 1);
+
+            $endDateTime->year = $workDate->year;
+            $endDateTime->month = $workDate->month;
+            $endDateTime->day = $workDate->day;
+            $endDateTime->hour = 0;
+            $endDateTime->minute = 0;
+            $endDateTime->second = 0;
+        }
+
+        $event_members = [
+            'users'  => [intval($loginId) => $loginId],
+            'groups' => []
+        ];
+
+        $temp_conflict = $app->conflictMembersEvent($login, $event_members,
+            $setDateTime, $endDateTime, $event_id, $event->getEventType(),
+            $hiddenPrivate);
+        if (is_array($temp_conflict)
+            && array_key_exists($loginId, $temp_conflict)
+            && $temp_conflict[$loginId]
+        ) {
+            $conflict = true;
+        }
+
+        $schedule_event = [
+            'title'    => $title,
+            'event_id' => $event_id,
+            'status'   => $status->getStatus(),
+            'message'  => $status->getMessage(),
+            'conflict' => $conflict
+        ];
+
+        return $schedule_event;
+    }
+
+    public function post($input = null)
+    {
+        $login = cb_get_login_user();
+        $input = $this->getInput();
+
+        if ( ! is_object($login) || ! is_a($login, 'CB_User')) {
+            cb_throw_error(E_GRN_USER_NOT_FOUND);
+        }
+
+        $app = \GRN_Schedule_Application::getInstance();
+
+        //check system setting
+        $attendance_status_logic = new AttendanceStatusLogic();
+        if ( ! $attendance_status_logic->isEnableAttendanceCheck()) {
+            cb_throw_error(E_GRN_SCHD_SYSTEM_ATTENDANCE_CHECK_OFF);
+        }
+
+        $event_id = cb_at($input, self::ARG_EVENT_ID);
+
+        // イベントのみを取得
+        $event = $app->getEvent($login, $event_id, null, null, false);
+
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        if ( ! $event->isAttendanceCheckEvent()) {
+            cb_throw_error(E_GRN_SCHD_NOT_ATTENDANCE_CHECK);
+        }
+
+        if ( ! isset($event->users[$login->getOID()])) {
+            cb_throw_error(E_GRN_SCHD_NOT_ATTENDEE);
+        }
+
+        //get status
+        $status_data
+            = $attendance_status_logic->getAttendanceStatusByUserIdAndEventId($login->getOID(),
+            $event_id);
+
+        //get post data
+        $post_data['col_event'] = $event_id;
+        $post_data['col_status'] = cb_at($input, self::ARG_STATUS);
+        $post_data['col_message'] = cb_at($input, self::ARG_MESSAGE);
+        $post_data['col_user'] = $login->getOID();
+        $post_data['col_ctime'] = time();
+
+        //update status
+        $attendance_status = new AttendanceStatus($post_data);
+        if ($status_data->getEventId() == '') {
+            $attendance_status_logic->addAttendanceStatus($attendance_status);
+        } else {
+            $attendance_status_logic->editAttendanceStatus($attendance_status);
+        }
+
+        //count reply num
+        $attendance_status_condition
+            = new AttendanceStatusCondition(['col_event' => $event_id]);
+        $status_list
+            = $attendance_status_logic->getAttendanceStatusListByCondition($attendance_status_condition);
+        $reply_member_count = 0;
+        if (is_array($status_list)) {
+            foreach ($status_list as $row) {
+                if ($row->getStatus() != null) {
+                    $reply_member_count++;
+                }
+            }
+        }
+
+        //get update time
+        $timestamp = new \CB_TimeStamp();
+        $timestamp->unix_ts = intval($post_data['col_ctime']);
+        $time = cb_date_format('DateShort_MD', $timestamp) . ' '
+                . cb_date_format('TimeShort_HM', $timestamp);
+
+        $status = $post_data['col_status'] == 'absent' ? 0 : 1;
+
+        require_once('grn/smarty.csp');
+        $smarty = new \GRN_Smarty();
+
+        require_once("plugins/function.grn_format.php");
+        $message_content
+            = smarty_function_grn_format(["body" => $post_data['col_message']],
+            $smarty);
+
+        $schedule_event = [
+            'event_id'     => $event_id,
+            'user_id'      => $login->getOID(),
+            'status'       => $status,
+            'status_style' => $this->getStatusStyle($status),
+            'message'      => $message_content,
+            'status_time'  => $time,
+            'reply_count'  => $reply_member_count
+        ];
+
+        return $schedule_event;
+    }
+
+    public function getTitle()
+    {
+        $page_title = grn_get_current_page_display_name();
+
+        return $page_title;
+    }
+
+    protected function getStatusStyle($status)
+    {
+        $status_style = self::STYLE_STATUS_ATTENDANCE;
+        if (is_null($status) || strlen($status) == 0) {
+            $status_style = self::STYLE_STATUS_UNANSWERED;
+        } elseif ($status === 0) {
+            $status_style = self::STYLE_STATUS_ABSENCE;
+        }
+
+        return $status_style;
+    }
+}

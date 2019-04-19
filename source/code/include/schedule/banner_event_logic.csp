@@ -1,0 +1,309 @@
+<?php
+/**
+ * スケジューラーのバナー予定を管理するメインのロジック
+ *
+ * @author      A.Shima     2004/10/28
+ * @package     grn.schedule
+ */
+
+require_once('schedule/event_base_logic.csp');
+
+/**
+ * @package     grn.schedule
+ */
+class GRN_Schedule_BannerEventLogic extends GRN_Schedule_EventBaseLogic
+{
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        parent::__construct();
+    }
+
+    private static $_instance = null;
+
+    /**
+     * @return GRN_Schedule_BannerEventLogic
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * 日付の登録関数
+     *
+     * @access private
+     *
+     */
+    function _entryEventDate($eventrow, $event)
+    {
+        $datetable = $this->_getDateTable();
+        $daterow = $datetable->newRow();
+
+        return $this->_setEventDate($daterow, $eventrow, $event);
+    }
+
+    /**
+     * 日付の設定
+     *
+     * @access private
+     */
+    function _setEventDate($row, $eventrow, $event)
+    {
+        $row->set(GRN_SCHEDULE_EVENT, $eventrow);
+
+        // 日付の設定
+        $row->set(GRN_SCHEDULE_SETDATE, $event->setdate);
+        $row->set(GRN_SCHEDULE_ENDDATE, $event->enddate);
+
+        if (is_null($event->timezone)) {
+            $I18N = CB_I18N::getInstance();
+            $event->timezone = $I18N->getCurrentTimezone();
+        }
+        if (is_null($event->end_timezone)) {
+            $event->end_timezone = $event->timezone;
+        }
+        $row->set(GRN_SCHEDULE_TIMEZONE, $event->timezone);
+        $row->set(GRN_SCHEDULE_END_TIMEZONE, $event->end_timezone);
+        $row->set(GRN_SCHEDULE_EVENT_TYPE, $event->getEventType());
+
+//        $row->registerNow();
+
+        return true;
+    }
+
+    function _modifyEventDate($eventrow, $event)
+    {
+        $datetable = $this->_getDateTable();
+        $rowset = new CB_RowSet($datetable);
+        $rowset->addCondition($rowset->queryf("col_event = '@S'", $event->id));
+        $row = $rowset->iterate();
+
+        // 日付の設定
+        return $this->_setEventDate($row, $eventrow, $event);
+    }
+
+    /**
+     * イベントの削除
+     *
+     * @param   object CB_User  $user   削除した人
+     * @param   string  $eid                    イベントID
+     * @param   CB_Date $date                   ユーザーのタイムゾーンにおける削除する日付。nullの場合は日付のチェックを行わない
+     * @param   array   $extension_log_messages 削除するときに追加するログメッセージ
+     *
+     * @return  boolean     成功した場合はTRUE、それ以外はFALSE
+     */
+    function deleteEvent(
+        $user,
+        $eid,
+        $date = null,
+        array $extension_log_messages = null
+    ) {
+        $eventtable = $this->_getEventTable();
+        $event = $eventtable->getRow($eid);
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        // 日付がある場合は、日付のチェック
+        if (is_a($date, 'CB_Date')) {
+            $datetable = &$this->_getDateTable();
+            $rowset = new CB_RowSet($datetable);
+
+            $rowset->addCondition($rowset->queryf("col_event = '@S'",
+                $event->getOID()));
+            $row = $rowset->iterate();
+            $setdate = $row->get(GRN_SCHEDULE_SETDATE);
+            $setdate = new CB_DateEx($setdate);
+            $enddate = $row->get(GRN_SCHEDULE_ENDDATE);
+            $enddate = new CB_DateEx($enddate);
+
+            $banner_event = $this->getEvent($eid);
+
+            // 日付が合っていない場合
+            if ( ! $this->isInDateSpan($banner_event, $date)) {
+                cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+            }
+        }
+
+        // ログ
+        $event->onAction('delete');
+
+        //GTM-1136
+        require_once('schedule/file.csp');
+        $fm = GRN_Schedule_FileManager::getInstance();
+        $fm->deleteFiles($eid);
+        //End GTM-1136
+
+        $event->delete();
+
+        return true;
+    }
+
+    /**
+     * イベントの取得
+     *
+     * @param   string  $eid       イベントID
+     * @param   CB_Date $date      ユーザーのタイムゾーンにおけるイベントの日付
+     * @param   int     $lock_mode DBのロックモード
+     * @param   int     $get_mode
+     *
+     * @return  mixed       成功した場合はイベント、それ以外はFALSE
+     */
+    function getEvent(
+        $eid,
+        $date = null,
+        $lock_mode = CB_DATABASE_SHARED_LOCK,
+        $get_mode = GRN_SCHEDULE_GET_MEMBER_OBJECT
+    ) {
+        $eventtable = $this->_getEventTable();
+        $eventrow = $eventtable->getRow($eid);
+        if ( ! $eventrow) {
+            $___ret = false;
+
+            return $___ret;
+        }
+//            cb_throw_error( E_GRN_SCHD_NOTFOUND_EVENT );
+
+        // イベントタイプが同じかどうか
+        $event_type = intval($eventrow->get(GRN_SCHEDULE_EVENT_TYPE));
+        if (($event_type & GRN_SCHEDULE_EVENT_TYPE_BANNER) == 0) {
+            $___ret = false;
+
+            return $___ret;
+        }
+
+        // 入れ物準備
+        $event = new GRN_Schedule_BannerEvent();
+
+        // データの中身の取得
+        $this->_getEventData($eventrow, $event);
+
+        // 時刻データの取得
+        if ( ! $this->_getEventDate($eventrow, $event, $date)) {
+            $___ret = false;
+
+            return $___ret;
+        }
+
+        if ( ! $this->_getEventMember($event, $lock_mode, $get_mode)) {
+            $___ret = false;
+
+            return $___ret;
+        }
+
+//        if( ! $this->_getEventNotifyAddress( $event, $lock_mode, $get_mode ) )
+//            {$___ret = FALSE; return $___ret;} 
+
+        return $event;
+    }
+
+    /**
+     * @access private
+     */
+    function _getEventDate($eventrow, $event, $date)
+    {
+        $datetable = $this->_getDateTable();
+        $rowset = new CB_RowSet($datetable);
+
+        $rowset->addCondition($rowset->queryf("col_event = '@S'", $event->id));
+        $daterow = $rowset->iterate();
+        if (is_null($daterow)) {
+            return false;
+        }
+
+        $event->setdate = $daterow->get(GRN_SCHEDULE_SETDATE);
+        $event->enddate = $daterow->get(GRN_SCHEDULE_ENDDATE);
+        // タイムゾーン
+        $event->timezone = $daterow->get(GRN_SCHEDULE_TIMEZONE);
+        $event->end_timezone = $daterow->get(GRN_SCHEDULE_END_TIMEZONE)
+            ?: $event->timezone;
+
+        if ( ! is_null($date)) {
+            // 時間のチェック
+            if ( ! $this->isInDateSpan($event, $date)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 日付がバナー予定が存在する期間内か判定する
+     *
+     * @param GRN_Schedule_BannerEvent $event
+     * @param CB_Date                  $date ユーザーのタイムゾーンにおける日付
+     *
+     * @return bool
+     */
+    public function isInDateSpan($event, $date)
+    {
+        assert('$event instanceof GRN_Schedule_BannerEvent');
+        assert('$date instanceof CB_Date');
+
+        require_once('schedule/view_util.csp');
+        $setdatetime = CB_DateTimeEx::createByDateAndTime($date,
+            GRN_Schedule_View_Util::getAlldayStartTime());
+        $date_setts = cb_datetime_to_timestamp($setdatetime);
+        $enddatetime = CB_DateTimeEx::createByDateAndTime($date,
+            GRN_Schedule_View_Util::getAlldayEndTime());
+        $date_endts = cb_datetime_to_timestamp($enddatetime);
+
+        $setdatetime = CB_DateTimeEx::createByDateAndTime($event->setdate,
+            GRN_Schedule_View_Util::getAlldayStartTime());
+        $event_setts = cb_datetime_to_timestamp($setdatetime, $event->timezone);
+        $enddatetime = CB_DateTimeEx::createByDateAndTime($event->enddate,
+            GRN_Schedule_View_Util::getAlldayEndTime());
+        $event_endts = cb_datetime_to_timestamp($enddatetime, $event->timezone);
+
+        return ($event_setts <= $date_setts && $date_setts <= $event_endts)
+               || ($event_setts <= $date_endts && $date_endts <= $event_endts);
+    }
+
+    /**
+     * バナー予定の開始日時をユーザーのタイムゾーンで返す
+     *
+     * @param GRN_Schedule_BannerEvent $event
+     *
+     * @return CB_DateTime
+     */
+    public function getStartDateTimeInUserTimezone($event)
+    {
+        assert('$event instanceof GRN_Schedule_BannerEvent');
+
+        require_once('schedule/view_util.csp');
+        $setdatetime = CB_DateTimeEx::createByDateAndTime($event->setdate,
+            GRN_Schedule_View_Util::getAlldayStartTime());
+        $setts = cb_datetime_to_timestamp($setdatetime, $event->timezone);
+
+        return cb_timestamp_to_datetime($setts);
+    }
+
+    /**
+     * 日付をログインユーザーのタイムゾーンから予定のタイムゾーンに変換する
+     *
+     * @param  GRN_Schedule_BannerEvent $event
+     * @param  CB_Date                  $date
+     *
+     * @return CB_Date
+     */
+    public function translateBannerDateToEventTimezone($event, $date)
+    {
+        assert('$event instanceof GRN_Schedule_BannerEvent');
+        assert('$date instanceof CB_Date');
+
+        $translated_date = $this->translateDateToEventTimezone($event, $date);
+
+        return $translated_date;
+    }
+}
+
+

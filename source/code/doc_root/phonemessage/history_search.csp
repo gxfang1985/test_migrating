@@ -1,0 +1,326 @@
+<?php
+
+require_once('grn/application.csp');
+
+require_once('grn/smarty.csp');
+$t = new GRN_Smarty;
+//for escape
+$app_locator = GRN_ApplicationLocator::instance();
+$dbconn =& $app_locator->getConnection('phonemessage');
+
+////////////////////////////////////////////////////////////////
+
+// 電話メモを取得する
+require_once('phonemessage/application.csp');
+$app_locator = GRN_ApplicationLocator::instance();
+/** @var GRN_PhoneMessage_Application $app */
+$app =& $app_locator->getInstance(GRN_PHONEMESSAGE_APPLICATION_ID);
+if ( ! is_object($app) || ! is_a($app, 'GRN_PhoneMessage_Application')) {
+    cb_throw_error(E_GRN_APPLICATION_NOT_AVAILABLE);
+}
+$message_manager =& $app->getMessageManager();
+
+// GET/POSTされたパラメータを取得する
+$cid = null;
+if (array_key_exists('cid', $G_INPUT)) {
+    $cid = $G_INPUT['cid'];
+}
+$gid = null;
+if (array_key_exists('gid', $G_INPUT)) {
+    $gid = $G_INPUT['gid'];
+}
+$uid = null;
+if (array_key_exists('uid', $G_INPUT)) {
+    $uid = $G_INPUT['uid'];
+}
+if (0 == strlen($uid)) {
+    cb_throw_error(E_GRN_PHONEMESSAGE_INVALID_USER_ID);
+}
+
+// ユーザーを取得する
+global $G_container_base;
+$uum =& $G_container_base->getInstance('uum');
+$user =& $uum->getUser($uid);
+if ( ! is_object($user) || ! is_a($user, 'CB_User')) {
+    cb_throw_error(E_GRN_USER_NOT_FOUND);
+}
+
+// ログインユーザーを取得する
+global $G_container_base;
+$uum =& $G_container_base->getInstance('uum');
+$login =& $uum->getLoginUser();
+if ( ! is_object($login) || ! is_a($login, 'CB_User')) {
+    cb_throw_error(E_GRN_USER_NOT_FOUND);
+}
+$login_id = $login->getOID();
+
+if ('sent' == $cid) {
+    if ($uid == $login_id) {
+        //$add_condition = 'col_sender = '.$uid;
+        //Escape
+        $add_condition = cb_queryf($dbconn, "col_sender = '@S'", $uid);
+    } else {
+        cb_throw_error();
+    }
+} else {
+    //$add_condition = 'col_receiver = '.$uid;
+    //Escape
+    $add_condition = cb_queryf($dbconn, "col_receiver = '@S'", $uid);
+}
+
+if (array_key_exists('sf', $G_INPUT)) {
+    // セッションからパラメータを取得する
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session
+        =& $session_manager->getSession('phonemessage/history_search');
+
+    $search_text = $session->get('search_text');
+    $sensitive = $session->get('sensitive');
+    $cid = $session->get('cid');
+    $search_keys = $session->get('search_keys');
+    $status = $session->get('status');
+} else {
+    $search_text = '';
+    if (array_key_exists('search_text', $G_INPUT)) {
+        $search_text = $G_INPUT['search_text'];
+    }
+    $search_text = cb_trim($search_text);
+
+    $search_keys = [];
+    if (array_key_exists('search_keys', $G_INPUT)) {
+        $search_keys = $G_INPUT['search_keys'];
+        foreach ($search_keys as $key => $value) {
+            switch ($key) {
+                case 'message':
+                    $search_keys[$key] = 'message';
+                    break;
+                case 'receiver_name':
+                    $search_keys[$key] = 'receiver_name';
+                    break;
+                case 'sender_name':
+                    $search_keys[$key] = 'sender_name';
+                    break;
+                default:
+                    //$search_keys[$key] = null;
+                    unset($search_keys[$key]);
+                    break;
+            }
+        }
+    }
+
+    $sensitive = false;
+    if (array_key_exists('sensitive', $G_INPUT)) {
+        $sensitive = $G_INPUT['sensitive'];
+    }
+
+    $status = GRN_PHONEMESSAGE_STATUS_ALL;
+    if (array_key_exists('status', $G_INPUT)) {
+        $status = $G_INPUT['status'];
+    }
+
+    $second_search = false;
+    if (array_key_exists('second_search', $G_INPUT)) {
+        $second_search = $G_INPUT['second_search'];
+    }
+    if (0 == strlen($second_search)) {
+        $search_keys = [
+            'message'       => 'message',
+            'receiver_name' => 'receiver_name',
+            'sender_name'   => 'sender_name'
+        ];
+    }
+}
+
+$search_words = [];
+if (0 < strlen($search_text)) {
+    require_once('fw/string_util.csp');
+    $search_words = cb_parse_search_text($search_text);
+}
+
+if (array_search('message', $search_keys)) {
+    $search_keys[] = 'client_name';
+    $search_keys[] = 'matter';
+    $search_keys[] = 'telephone_number';
+}
+
+// 電話メモの設定を取得する
+require_once('grn/ui.csp');
+$ui_config_manager = GRN_UIConfigManager::getInstance();
+$ui_config =& $ui_config_manager->getUserConfig($login);
+
+require_once('phonemessage/controller.csp');
+$controller_util = new GRN_PhoneMessage_ControllerUtil();
+
+$offset = 0;
+$limit = $ui_config->getListMax();
+$message_count = 0;
+$messages_for_view = [];
+$isExistsNextPage = false;
+if (0 < count($search_words) && 0 < count($search_keys)) {
+    // ダイナミックロール一覧を取得する
+    $dynamic_roles = $uum->listGrantedRoles();
+
+    // ユーザー一覧の総数を取得する
+    $order_by = 'col_position, _id';
+    $user_count = $uum->getUserCount();
+    $users = [];
+    if (0 < $user_count) {
+        $users[$uid] =& $uum->getUser($uid);
+    }
+
+    // ユーザー一覧のアクセス権を評価する
+    require_once('phonemessage/access.csp');
+    $access_manager = GRN_PhoneMessage_AccessManager::getInstance();
+    $user_info = $access_manager->getObjectInfo($users);
+    $authorities = ['browse', 'add'];
+    if (0 < count($user_info['objects'])) {
+        $user_info['accesses']
+            = $access_manager->evaluateAccesses($user_info['objects'], $login,
+            $dynamic_roles, $authorities);
+    } else {
+        $user_info['accesses'] = [];
+    }
+
+    // 組織一覧を取得する
+    $groups = $uum->getGroupList();
+
+    // 組織一覧のアクセス権を評価する
+    $group_info = $access_manager->getObjectInfo($groups);
+    if (0 < count($group_info['objects'])) {
+        $group_info['accesses']
+            = $access_manager->evaluateAccesses($group_info['objects'], $login,
+            $dynamic_roles, $authorities);
+    } else {
+        $group_info['accesses'] = [];
+    }
+
+    // スタティックロール一覧を取得する
+    $roles = $uum->listStaticRoles();
+
+    // スタティックロール一覧のアクセス権を評価する
+    $role_info = $access_manager->getObjectInfo($roles);
+    if (0 < count($role_info['objects'])) {
+        $role_info['accesses']
+            = $access_manager->evaluateAccesses($role_info['objects'], $login,
+            $dynamic_roles, $authorities);
+    } else {
+        $role_info['accesses'] = [];
+    }
+
+    // 組織、スタティックロールを考慮し、ユーザーのアクセス権を再評価する
+    $accesses_for_view = $controller_util->evaluateAccesses($users, $user_info,
+        $group_info, $role_info);
+    // 自分自身のアクセス権は無視する
+    if (array_key_exists($login_id, $accesses_for_view)) {
+        $accesses_for_view[$login_id] = [];
+    }
+    if (array_key_exists($uid, $accesses_for_view)) {
+        if (array_key_exists('browse', $accesses_for_view[$uid])) {
+            cb_throw_error(E_GRN_PHONEMESSAGE_ACCESS_DENY_BROWSE);
+        }
+    }
+
+    // 検索条件を生成する
+    switch ($cid) {
+        case GRN_PHONEMESSAGE_CATEGORY_ALL:
+            $condition = cb_queryf($dbconn,
+                "( col_sender = '@S' ) OR ( col_receiver = '@S' )", $uid, $uid);
+            break;
+        case GRN_PHONEMESSAGE_CATEGORY_SENT:
+            $condition = cb_queryf($dbconn, "( col_sender = '@S' )", $uid);
+            break;
+        default:
+            $condition = cb_queryf($dbconn, "( col_receiver = '@S' )", $uid);
+            break;
+    }
+
+    switch ($status) {
+        case GRN_PHONEMESSAGE_STATUS_NOT_CONFIRMED:
+            $condition = '( col_confirm_time IS NULL ) AND ( ' . $condition
+                         . ' )';
+            break;
+        case GRN_PHONEMESSAGE_STATUS_CONFIRMED:
+            $condition = '( col_confirm_time IS NOT NULL ) AND ( ' . $condition
+                         . ' )';
+            break;
+        default:
+            break;
+    }
+
+    $offset = $controller_util->getNaviStartPosition();
+    $controller_util->setNaviStartPosition($offset);
+
+    // 検索してヒットした電話メモ履歴一覧を取得する
+    $real_table_name = $message_manager->getRealTableName();
+    $order_by = $real_table_name . '._id';
+    $messages = $message_manager->getFullTextSearchList($offset,
+        $limit + 1, $order_by,
+        $condition, $search_words, $sensitive, $search_keys);
+    $isExistsNextPage = count($messages) > $limit;
+    if ($isExistsNextPage) {
+        array_pop($messages);
+    }
+    $messages_for_view = $controller_util->listMessages($messages);
+
+    $t->assign('messages', $messages_for_view);
+}
+
+// n件ナビゲーション情報を生成する
+$params = ['sf' => 1, 'gid' => $gid, 'uid' => $uid];
+$view_set = $controller_util->makeSimpleNaviInformation($offset, $limit,
+    count($messages_for_view), $isExistsNextPage, $params);
+
+// カテゴリオプション一覧を取得する
+$category_options = $controller_util->listCategoryOptions($cid,
+    $uid != $login_id);
+
+// 電話メモの状態オプション一覧を取得する
+$status_options = $controller_util->listStatusOptions($status);
+
+// セッションに検索条件を保存する
+require_once('fw/session_manager.csp');
+$session_manager = CB_SessionManager::getInstance();
+$session =& $session_manager->getSession('phonemessage/history_search');
+
+$session->set('search_text', $search_text);
+$session->set('cid', $cid);
+$session->set('sensitive', $sensitive);
+$session->set('search_keys', $search_keys);
+$session->set('status', $status);
+
+$t->assign('category_id', $cid);
+$t->assign('group_id', $gid);
+$t->assign('user_id', $uid);
+$t->assign('search_text', $search_text);
+$t->assign('sensitive', $sensitive);
+$t->assign('search_keys', $search_keys);
+$t->assign('category_options', $category_options);
+$t->assign('status_options', $status_options);
+$t->assign('view_set', $view_set);
+
+////////////////////////////////////////////////////////////////
+
+// Smartyにページタイトルを割り当てる
+$page_title = grn_get_page_display_name('phonemessage/history_search');
+$t->assign('page_title', $page_title);
+
+// Smartyにサイトポジションを割り当てる
+$page_info = [
+    'index'          => ['sf' => 1, 'gid' => $gid],
+    'history'        => [
+        'sf'  => 1,
+        'cid' => $cid,
+        'gid' => $gid,
+        'uid' => $uid
+    ],
+    'history_search' => null
+];
+$site_position = $controller_util->makeSitePosition('phonemessage/',
+    $page_info);
+$t->assign('site_position', $site_position);
+
+// Smartyを実行する
+$t->display(cb_get_pagename() . '.tpl');
+
+

@@ -1,0 +1,385 @@
+<?php
+
+/**
+ * Light Weight Container.
+ *
+ * @author      Yamamoto, Hirotaka      2004/07
+ * @version     1.0
+ * @package     fw.core
+ */
+
+/**
+ * Interface for LWC configuration classes.
+ *
+ * @abstract
+ * @package fw.core
+ */
+class CB_LWContainerConfig
+{
+    function __construct()
+    {
+    }
+
+    /**
+     * Return an associative array that holds configurations for the
+     * object specified by $id.  Keys that the array must have are:
+     * 'class' for the class name of the object.  Keys that the array
+     * may have are 'require' for the file name to be required,
+     * 'singleton' to specify the container should keep a single
+     * instance or not, 'auto_shutdown' to call shutdown() methods of
+     * created objects at the end of the request flow, and
+     * 'prop:(property_name)' to configure an object's property.
+     *
+     * Summary:
+     *   class                 mandatory  the class name
+     *   require               optional   file name to be required.
+     *   singleton             optional   '1' to instantiate only once,
+     *                                    '0' to instantiate everytime.
+     *   auto_shutdown         optional   '1' to shutdown instances,
+     *                                    '0' to leave them.
+     *   prop:(property_name)  optional   object id or string value.
+     *
+     * @param string $id The object id string.
+     *
+     * @return mixed       Array of configurations for the object,
+     *                     or FALSE if there is no configuration.
+     */
+    function getConfig($id)
+    {
+        return false;
+    }
+
+    /**
+     * Set configuration information for the object of $id .
+     * Return FALSE if this config class does not allow modification.
+     *
+     * @param string $id     The object id string.
+     * @param array  $config Configuration array.
+     *
+     * @return bool           TRUE for success; FALSE otherwise.
+     */
+    function setConfig($id, $config)
+    {
+        return false;
+    }
+}
+
+/**
+ * A specific implementation of LWC config class that reads
+ * configuration from a .ini file.
+ *
+ * @package fw.core
+ */
+class CB_LWContainerFileConfig extends CB_LWContainerConfig
+{
+    /**
+     * @access private
+     */
+    var $_config;
+
+    function __construct($ini_file)
+    {
+        parent::__construct();
+        $this->_config = new CB_ConfigManager($ini_file);
+    }
+
+    /**
+     * @param string $id The object id
+     *
+     * @return mixed
+     */
+    function getConfig($id)
+    {
+        $ret = $this->_config->getSection($id);
+        if ($ret !== false) {
+            if ( ! array_key_exists('class', $ret)) {
+                cb_throw_error(E_COMMON_LWC_INVALID_CONFIG, null,
+                    ['id' => $id]);
+            }
+        }
+
+        return $ret;
+    }
+
+    /**
+     * @param string $id
+     * @param array  $config
+     *
+     * @return bool
+     */
+    function setConfig($id, $config)
+    {
+        if ( ! is_array($config)) {
+            return false;
+        }
+        foreach ($config as $key => $value) {
+            if ( ! $this->_config->set($id, $key, $value)) {
+                return false;
+            }
+        }
+        if ( ! $this->_config->save()) {
+            return false;
+        }
+
+        return true;
+    }
+
+    function listConfigs()
+    {
+        return $this->_config->getSections();
+    }
+}
+
+/**
+ * A specific implementation of LWC config class that reads
+ * configuration from directory containing .ini files.
+ *
+ * @package fw.core
+ */
+class CB_LWContainerDirectoryConfig extends CB_LWContainerConfig
+{
+    /**
+     * @access private
+     */
+    var $_config;
+
+    function __construct($ini_dir)
+    {
+        parent::__construct();
+        require_once('fw/config.csp');
+        $this->_config = new CB_ConfigDirectory($ini_dir);
+    }
+
+    /**
+     * @param string $id The object id
+     *
+     * @return mixed
+     */
+    function getConfig($id)
+    {
+        $ret = $this->_config->getSection($id);
+        if ($ret !== false) {
+            if ( ! array_key_exists('class', $ret)) {
+                cb_throw_error(E_COMMON_LWC_INVALID_CONFIG, null,
+                    ['id' => $id]);
+            }
+        }
+
+        return $ret;
+    }
+
+    function listConfigs()
+    {
+        return $this->_config->getSections();
+    }
+}
+
+/**
+ * The light-weight container.
+ *
+ * @package fw.core
+ */
+class CB_LWContainer
+{
+    /**
+     * @access private
+     */
+    var $_base = null;
+    /**
+     * @access private
+     */
+    var $_config;
+
+    /**
+     * The constructor.
+     *
+     * @param object CB_LWContainer  $base_container
+     *        null, or a container in a lower layer.
+     * @param object CB_LWContainerConfig    $config
+     *        Config object.
+     */
+    function __construct($base_container, $config)
+    {
+        $this->initialize($base_container, $config);
+    }
+
+    /**
+     * @access private
+     */
+    var $_singletons = [];
+
+    /**
+     * @access private
+     */
+    var $_to_shutdown = [];
+
+    function initialize($base_container, $config)
+    {
+        if (is_null($config) || ! is_a($config, 'CB_LWContainerConfig')) {
+            cb_throw_error(E_COMMON_LWC_INVALID_CONFIGOBJECT);
+        }
+
+        $this->_base = $base_container;
+        $this->_config = $config;
+        $this->_singletons = [];
+        $this->_to_shutdown = [];
+    }
+
+    /**
+     * @param $id
+     *
+     * @return object
+     */
+    function getInstance($id)
+    {
+        if (array_key_exists($id, $this->_singletons)) {
+            return $this->_singletons[$id];
+        }
+
+        $config = $this->_config->getConfig($id);
+        if ($config === false) {
+            if (is_null($this->_base)) {
+                cb_throw_error(E_COMMON_LWC_OBJECT_NOT_FOUND, null,
+                    ['id' => $id]);
+            } else {
+                $ret = $this->_base->getInstance($id);
+
+                return $ret;
+            }
+        }
+
+        // load required files
+        if (array_key_exists('require', $config)) {
+            foreach (explode(" \t", $config['require']) as $f) {
+                require_once($f);
+            }
+        }
+
+        $class = $config['class'];
+        $obj = new $class;
+
+        // keep single instance if needed
+        if (( ! array_key_exists('singleton', $config))
+            || $config['singleton']
+        ) {
+            $this->_singletons[$id] = $obj;
+        }
+
+        // keep to shutdown if needed
+        if (array_key_exists('auto_shutdown', $config)
+            && $config['auto_shutdown']
+        ) {
+            $this->_to_shutdown[spl_object_hash($obj)] = $obj;
+        }
+
+        // setup properties
+        $obj = $this->applyConfig($obj, $config);
+
+        // auto-boot
+        if (( ! array_key_exists('auto_boot', $config))
+            || $config['auto_boot']
+        ) {
+            $this->invokeBootIfExists($obj);
+        }
+
+        return $obj;
+    }
+
+    public function restartObject($id, $object)
+    {
+        if (array_key_exists(spl_object_hash($object), $this->_to_shutdown)) {
+            $this->invokeShutdownIfExists($object);
+        }
+
+        $config = $this->_config->getConfig($id);
+        $object = $this->applyConfig($object, $config);
+
+        $this->invokeBootIfExists($object);
+
+        return $object;
+    }
+
+    /**
+     *
+     * Apply the configs to the object which is being created.
+     *
+     * @param object $object
+     * @param array  $config
+     */
+    private function applyConfig($object, $config)
+    {
+        foreach ($config as $key => $value) {
+            if ((strncmp($key, 'prop:', 5) === 0) && (strlen($key) > 5)) {
+                $prop = substr($key, 5);
+                $len = strlen($value);
+                if ((strncmp($value, 'ref:', 4) === 0) && ($len > 4)) {
+                    // reference to other object
+                    $ref = substr($value, 4);
+                    $object->$prop = $this->getInstance($ref);
+
+                } elseif ((strncmp($value, 'val:', 4) === 0) && ($len > 4)) {
+                    // string property
+                    $v = substr($value, 4);
+                    $object->$prop = $v;
+
+                } elseif ((strncmp($value, 'value:', 6) === 0) && ($len > 6)) {
+                    // string property
+                    $v = substr($value, 6);
+                    $object->$prop = $v;
+                }
+            }
+        }
+
+        return $object;
+    }
+
+    /**
+     * Test availability of named instance.
+     *
+     * @param string $id Instance ID.
+     *
+     * @return  bool         TRUE if named instance is available;
+     *                       otherwise FALSE.
+     */
+    function isAvailable($id)
+    {
+        if ($this->_config->getConfig($id) !== false) {
+            return true;
+        }
+
+        if (is_null($this->_base)) {
+            return false;
+        }
+
+        return $this->_base->isAvailable($id);
+    }
+
+    function register($id, $config)
+    {
+        $this->_config->setConfig($id, $config);
+    }
+
+    function shutdown()
+    {
+        foreach (array_keys($this->_to_shutdown) as $key) {
+            $obj = $this->_to_shutdown[$key];
+            $this->invokeShutdownIfExists($obj);
+        }
+    }
+
+    private function invokeBootIfExists($object)
+    {
+        if (method_exists($object, 'boot')) {
+            $object->boot();
+        }
+    }
+
+    private function invokeShutdownIfExists($object)
+    {
+        if (method_exists($object, 'shutdown')) {
+            $object->shutdown();
+        }
+    }
+}
+
+

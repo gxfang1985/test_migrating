@@ -1,0 +1,1 @@
+{capture name='grn_system_notification_GRN_SY_NO_1'}{cb_msg module='grn.system.notification' key='GRN_SY_NO-1' replace='true'}{/capture}{include file='grn/std_form.tpl' config_id='system' post_page='system/notification/command_cybozu' explanation=$smarty.capture.grn_system_notification_GRN_SY_NO_1}

@@ -1,0 +1,269 @@
+<?php
+
+use grn\grn\authentication\policy\LoginUserFindPolicyInterface;
+use grn\grn\authentication\policy\LoginUserFindPolicyV1;
+use grn\grn\authentication\policy\slash\SlashSessionManagementAPIRunner;
+use grn\cydec\slash\session\api\SlashSessionManagementAPI;
+
+require_once('grn/authentication.csp');
+
+/**
+ * Class plugin_grn_common_authentication_login_v1
+ * クラウド環境では、ログイン、ログアウト時にSlashへのAPIの実行の処理をおこなう
+ */
+class plugin_grn_common_authentication_login_v1
+    extends GRN_Authentication_Login_DriverBase
+{
+    /** Configuration Parameters **/
+    var $_driver_settings = null;
+
+    /** @var GRN_Authentication_Repository_DriverBase */
+    var $_user_repository = null;
+
+    /** Configuration Complete Flag **/
+    var $_configured = false;
+
+    /**
+     * Constructor
+     *
+     */
+    public function __construct()
+    {
+        $noPage = null;
+        //Create Driver Page Setting
+        $driver_page = [
+            GRN_AUTH_PAGE_TYPE_LOGIN           => $noPage,
+            GRN_AUTH_PAGE_TYPE_VIEW_SYSTEM     => $noPage,
+            GRN_AUTH_PAGE_TYPE_ADD_SYSTEM      => $noPage,
+            GRN_AUTH_PAGE_TYPE_MODIFY_SYSTEM   => $noPage,
+            GRN_AUTH_PAGE_TYPE_VIEW_PERSONAL   => $noPage,
+            GRN_AUTH_PAGE_TYPE_ADD_PERSONAL    => $noPage,
+            GRN_AUTH_PAGE_TYPE_MODIFY_PERSONAL => $noPage,
+            GRN_AUTH_PAGE_TYPE_PWD_EXPIRED     => $noPage,
+        ];
+        //Initialize Parent Class
+        parent::__construct(cb_msg(GRN_AUTH_LOGIN_DESKTOP_API_V1, 'name'),
+            GRN_AUTH_LOGIN_DESKTOP_API_V1,
+            $driver_page
+        );
+    }
+
+    /**
+     * Set Driver Config
+     *
+     * @param array  $driver_settings Driver Settings
+     * @param object $repository      User Repository Driver Object
+     *
+     * @return bool
+     */
+    public function setConfig(& $driver_settings, $repository)
+    {
+        //Check User Repository Driver
+        if ( ! is_object($repository)) {
+            return false;
+        }
+
+        //Set User Repository Driver
+        $this->_user_repository = $repository;
+
+        //Set Configuration Complete Flag
+        $this->_configured = true;
+
+        return true;
+    }
+
+    /**
+     * Get Driver Config
+     *
+     * @return array    $driver_settings    //Driver Settings
+     */
+    public function &getConfig()
+    {
+        if ( ! $this->isEnvironmentAuthentication()) {
+            return $this->_driver_settings; //Always NULL
+        } else {
+            $envDriver = $this->getEnvironmentDriver();
+            if ( ! is_null($envDriver)) {
+                return $envDriver->getConfig();
+            }
+
+            return null;
+        }
+    }
+
+
+    /**
+     * Login
+     *
+     * @return bool    $result
+     */
+    public function login()
+    {
+        if ( ! $this->isEnvironmentAuthentication()) {
+            return $this->defaultLogin();
+        } else {
+            $envDriver = $this->getEnvironmentDriver();
+            if ( ! is_null($envDriver)) {
+                if ($envDriver->login()) {
+                    parent::setAccount($envDriver->getAccount());
+                    parent::setPassword($envDriver->getPassword());
+
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /**
+     * @return bool
+     */
+    private function defaultLogin()
+    {
+        $userFindPolicy = $this->getUserFindPolicy();
+        $user = $userFindPolicy->findUser();
+        if ( ! $user) {
+            return false;//Login Failed
+        }
+
+        $account = $user->get('foreign_key');
+        $password = $userFindPolicy->getPasswordToken();
+
+        require_once('grn/system_logic.csp');
+        $system = GRN_System::getInstance();
+        if ( ! $system->getPasswordEmptyLogin()) {
+            if (is_null($password) || strlen($password) === 0) {
+                cb_throw_error(E_GRN_CMMN_AUTH_LOGIN_EMPTY_PASSWORD);
+            }
+        }
+        $days = $this->getPasswordExpirationDays($user->getOID());
+        if (is_numeric($days) && $days <= 0) {
+            cb_throw_error(E_GRN_PASSWORD_EXPIRED);
+        }
+        //Authenticate
+        $repository = $this->_user_repository;
+        if ( ! $repository->authenticate($account, $password)) {
+            return false;//Login Failed
+        }
+
+        //Save Login Account and Password
+        parent::setAccount($account);
+        parent::setPassword($password);
+
+        return true; //Login Success
+    }
+
+    /**
+     * getPasswordExpirationDays
+     *
+     * @param  int $uid
+     *
+     * @return int $result
+     */
+    public function getPasswordExpirationDays($uid)
+    {
+        if ( ! $this->isEnvironmentAuthentication()) {
+            $repository = $this->_user_repository;
+            $days = $repository->getPasswordExpirationDays($uid);
+            if ($days > 0) {
+                return true;
+            } else {
+                return $days;
+            }
+        } else {
+            $envDriver = $this->getEnvironmentDriver();
+
+            if ( ! is_null($envDriver)) {
+                return $envDriver->getPasswordExpirationDays($uid);
+            }
+
+            return true;
+        }
+    }
+
+    /**
+     * @return void
+     */
+    public function logout()
+    {
+        if ( ! $this->isEnvironmentAuthentication()) {
+            $this->executeLogoutAPI();
+        } else {
+            $envDriver = $this->getEnvironmentDriver();
+            if ( ! is_null($envDriver)) {
+                $envDriver->logout();
+            }
+        }
+    }
+
+    /**
+     * クラウド版では、APIの実行をデコレーターとしてラップする
+     *
+     * @return LoginUserFindPolicyInterface
+     */
+    private function getUserFindPolicy()
+    {
+        $corePolicy = LoginUserFindPolicyV1::getInstance($this->getInput());
+        if ( ! defined('ON_FOREST')) {
+            return $corePolicy;
+        }
+
+        $slashSessionManagementAPI
+            = SlashSessionManagementAPI::getInstance(CB_LocaleManager::getCurrentLanguage());
+
+        return new SlashSessionManagementAPIRunner($corePolicy,
+            $slashSessionManagementAPI);
+    }
+
+    /**
+     * Visible for testing
+     *
+     * @return string
+     */
+    protected function getInput()
+    {
+        return file_get_contents('php://input');
+    }
+
+    /**
+     * Visible for testing
+     *
+     * @return GRN_Authentication_Login_DriverBase|null
+     */
+    protected function getEnvironmentDriver()
+    {
+        if (defined('ON_FOREST')) {
+            // To support environment authentication on forest,
+            // we need to consider how to create session id which is available on Garoon and Slash.
+            return null;
+        }
+
+        $service = GRN_Authentication_Service::getInstance();
+
+        return $service->getActiveLoginDriver(GRN_AUTH_LOGIN_ENVIRONMENT);
+    }
+
+    /**
+     * @return bool
+     */
+    private function isEnvironmentAuthentication()
+    {
+        $json = json_decode($this->getInput(), false);
+        if (isset($json->method) && $json->method === 'environment') {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Return whether the login driver can use multiple repository or not.
+     *
+     * @return bool
+     */
+    public function canUseMultipleRepository()
+    {
+        return true;
+    }
+}

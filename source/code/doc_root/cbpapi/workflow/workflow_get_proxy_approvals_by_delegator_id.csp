@@ -1,0 +1,117 @@
+<?php
+if (isset($cbpapi_service)) {
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+
+    $request = $cbpapi_service->getRequestParameters();
+    if ( ! isset($request['attributes']['delegator_id'])) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'delegator_id']);
+    }
+    $delegator_id = $request['attributes']['delegator_id'];
+    require_once('workflow/config.csp');
+    $configs = GRN_Workflow_Configs::getInstance();
+    $config = $configs->getSystemConfig();
+    if ( ! $config->isProxyApproval($login->getOID(), $delegator_id)) {
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_PETITION_DENY_ACCESS);
+    }
+    if ( ! isset($request['attributes']['start'])) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'start']);
+    }
+    if ( ! ($start
+        = grn_cbpapi_parse_iso8601($request['attributes']['start']))
+    ) {
+        cb_throw_error(E_COMMON_INVALID_DATETIME);
+    }
+
+    $end = null;
+    if (isset($request['attributes']['end'])) {
+        $end = grn_cbpapi_parse_iso8601($request['attributes']['end']);
+    }
+    if ( ! is_a($end, 'CB_DateTime')) {
+        $ts = new CB_TimeStampEx(null, 'UTC');
+        $end = $ts->getDateTime();
+    }
+
+    $start_ex = new CB_DateTimeEx($start);
+    if ($start_ex->compare($end) > 0) {
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_PETITION_INVALID_DATE_TERM);
+    }
+
+    require_once('workflow/controller_util.csp');
+    $folder_util = GRN_Workflow_Folder_Controller_Utility::getInstance();
+
+    //Check Initialize User
+    $initialize_flag = false;
+    if ($folder_util->isInitializeUser($login->getOID())) {
+        $initialize_flag = true;
+        $folder_util->initializeUser($login->getOID());
+    }
+
+    $proxy_approval_folder = null;
+    $petition_id_list = [];
+    $category_id = null;
+    $count
+        = $folder_util->getFolderRelationCount($login->getOID(),
+        GRN_WORKFLOW_FOLDER_PROXY_APPROVAL_ID, $category_id, true);
+    if ( ! $initialize_flag && $count > 0) {
+        $proxy_approval_folder = [];
+        require_once('workflow/folder_logic.csp');
+        $logic = GRN_Workflow_Folder_Logic::getInstance();
+        $proxy_approval_folder = $logic->getByForeignKey($delegator_id,
+            'UNPROCESSED_FOLDER_FOREIGN_KEY');
+
+        //Create Parameter Translation for Petition
+        $translation_map_petition = [
+            'fid'      => 'f__id',                 //Folder ID
+            'name'     => 'f_col_name',            //Folder Name
+            'type'     => 'f_col_folder_type',     //Folder Type
+            'ptid'     => 'p__id',                 //Petition ID
+            'ctime'    => 'p_col_ctime',           //Create Time
+            'fuser_id' => 'f_col_user',
+        ];
+        $petition_list
+            = $folder_util->getViewExOrder($translation_map_petition,
+            $login->getOID(), GRN_WORKFLOW_FOLDER_PROXY_APPROVAL_ID, 0, -1);
+
+        if (is_array($petition_list['folderrelation'])) {
+            $petition_list =& $petition_list['folderrelation'];
+        } else {
+            $petition_list = [];
+        }
+        foreach ($petition_list as $pid => $petition) {
+            $ctime = $petition['ctime'];
+            $ctime = new CB_TimeStampEx($ctime, 'UTC');
+            $dtex = new CB_DateTimeEx($ctime->getDateTime());
+            if ($dtex->compare($start) >= 0 && $dtex->compare($end) <= 0
+                && $delegator_id == $petition['fuser_id']
+            ) {
+                $petition_id_list[$pid] = $petition['ptid'];
+            }
+        }
+    }
+
+    require_once('cbpapi/workflow_logic.csp');
+    $wf_logic = GRN_CBPApi_Workflow_Logic::getInstance();
+    $applications_for_view = [];
+    if (count($petition_id_list) > 0) {
+        $applications_for_view = $wf_logic->getAppsForViewByIds($login,
+            $petition_id_list, $proxy_approval_folder, CB_DATABASE_NO_LOCK);
+    }
+
+    // SOAP response
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty();
+
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('workflow')]);
+    $t->assign('action', $cbpapi_service->getAction());
+    $t->assign('applications', $applications_for_view);
+
+    grn_cbpapi_response($t, __FILE__);
+}

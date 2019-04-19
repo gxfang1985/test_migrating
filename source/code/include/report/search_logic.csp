@@ -1,0 +1,1167 @@
+<?php
+require_once('report/table_manager.csp');
+require_once('report/filter_logic.csp');
+require_once('report/resources.csp');
+
+class GRN_Report_Search_Logic
+{
+    /**
+     *
+     * Enter description here ...
+     *
+     * @param GRN_Report_Search_Criteria $criteria
+     */
+    public static function &search($criteria)
+    {
+        $query = $criteria->toSelectQuery();
+        $database = GRN_Report_Table_Manager::getDataBase();
+
+        $result = $database->query($query);
+
+        $ret = [];
+        $report_ids = [];
+        while ($row = $database->fetch_assoc($result)) {
+            $ret[$row['_id']] = $row;
+            $report_ids[] = $row['_id'];
+        }
+        $database->free_result($result);
+
+        //Set Report Subject Name
+        require_once('controller_util.csp');
+        $report_util = GRN_Report_Report_Controller_Utility::getInstance();
+        $subject_list_for_view =& $report_util->getSubjectList($report_ids);
+
+        foreach ($ret as $key => $value) {
+            if (strlen(@$subject_list_for_view[$value['_id']]) > 0) {
+                $ret[$key]['col_name'] = $subject_list_for_view[$value['_id']];
+            }
+        }
+
+        return $ret;
+    }
+
+    public static function getCount($criteria)
+    {
+        $query = $criteria->toCountQuery();
+        $database = GRN_Report_Table_Manager::getDataBase();
+        $result = $database->query($query);
+        if ($result === false) {
+            $database->throwError(['query' => 'query failed: ' . $query]);
+        }
+        $row = $database->fetch_assoc($result);
+        $database->free_result($result);
+
+        return $row['COUNT( DISTINCT r._id )'];
+    }
+}
+
+
+class GRN_Report_Search_Criteria
+{
+    var $database = null;
+    var $user = null; //検索を実行するユーザー
+    var $keyword = null;
+    var $getLastTimeStamp = null;  //最後に報告書を見た時間を取得するか
+    var $getSubscribe = null;  //通知するかどうかを取得するか
+    var $onlyUnread = false; //未読のもののみを検索する
+    var $target = null; //個人報告書,送信一覧,下書き一覧,全部
+    var $filter_id = null;
+    var $form_id = null;
+    var $form_name = null;
+    var $noScheduleRelation = false;//TRUEの場合、スケジュールに連携していないもののみを取得する
+    var $and_or = GRN_REPORT_FILTER_AND; //$conditionsが指定されている際、and検索なのかor検索なのかを保持する
+    var $conditions = [];
+    var $orders = [];
+    var $index = 0;
+    var $count = 2147483647;
+    var $columns = [];
+    var $report_id_list = [];
+
+    var $_filter = null;
+    var $_isCount = false;
+
+    public $isManage = false;
+
+    private static $conditionTypesRelatedToUser
+        = [
+            GRN_REPORT_FILTER_TYPE_CREATOR,
+            GRN_REPORT_FILTER_TYPE_ANY,
+        ];
+
+    function __construct($user)
+    {
+        assert(! is_null($user));
+
+        $this->user = $user;
+
+        $this->database = GRN_Report_Table_Manager::getDataBase();
+
+        $this->columns
+            = GRN_Report_Table_Manager::getColumnList(GRN_REPORT_TABLE_REPORT,
+            'report');
+
+        //デフォルトのソートルールは、更新日時降順
+        $this->orders[] = ['report.col_mtime', 'DESC'];
+        $this->orders[] = ['report._id', 'DESC'];
+    }
+
+    function toSelectQuery()
+    {
+        return $this->_toQueryHelper(false);
+    }
+
+    function toCountQuery()
+    {
+        return $this->_toQueryHelper(true);
+    }
+
+    function _getSelectColumns()
+    {
+        if ($this->_isCount) {
+            return "report._id";
+        } else //return "report.*";
+        {
+            return implode(', ', $this->columns);
+        }
+    }
+
+    function _toQueryHelper($isCount)
+    {
+        $this->_isCount = $isCount;
+        $this->_init();
+
+        if ( ! $this->columns || count($this->columns) == 0) {
+            $this->columns
+                = GRN_Report_Table_Manager::getColumnList(GRN_REPORT_TABLE_REPORT,
+                'report');
+        }
+
+
+        if ($isCount) {
+            $query = "SELECT "
+                     . " COUNT( DISTINCT r._id )"
+                     . " FROM"
+                     . $this->_getSelectRecordList();
+        } else {
+            $query = "SELECT DISTINCT "
+                     . str_replace("report.", "r.", $this->_getSelectColumns())
+                     . " FROM"
+                     . $this->_getSelectRecordList()
+                     . str_replace("report.", "r.", $this->_getOrderPhrase())
+                     . $this->_getLimitPhrase();
+        }
+
+        return $query;
+    }
+
+    function _getFromPhrase()
+    {
+        if ($this->isUserNameInCondition()) {
+            return "tab_grn_report_report report LEFT JOIN tab_cb_user user ON report.col_creator = user._id ";
+        } else {
+            return "tab_grn_report_report report ";
+        }
+    }
+
+    private function isUserNameInCondition()
+    {
+        foreach ($this->conditions as $eachCondition) {
+            if (in_array($eachCondition['type'],
+                self::$conditionTypesRelatedToUser)
+            ) {
+                return true;
+            }
+        }
+        if (is_array($this->_filter)) {
+            foreach ($this->_filter['conditions'] as $eachCondition) {
+                if (in_array($eachCondition['col_type'],
+                    self::$conditionTypesRelatedToUser)
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    function _getSelectRecordList()
+    {
+        $query = "";
+        switch ($this->target) {
+            //送信一覧
+            case GRN_REPORT_SEARCH_TARGET_SEND:
+                $query = "(" . $this->_getSendReportList() . ")";
+                break;
+
+            //下書き
+            case GRN_REPORT_SEARCH_TARGET_DRAFT:
+                $query = "(" . $this->_getDraftReportList() . ")";
+                break;
+
+            //受信一覧
+            case GRN_REPORT_SEARCH_TARGET_RECEIVED:
+                $query = "(" . $this->_getReceiveReportListQuery() . ")";
+                break;
+
+            //閲覧可能な報告書＋下書き（自分がアクセス可能な全てのレポート）
+            case GRN_REPORT_SEARCH_TARGET_AVAILABLE:
+                $query = "(" . $this->_getAccesibleReportListQuery() . ")"
+                         . " UNION ALL "
+                         . "(" . $this->_getReceiveReportListQuery() . ")"
+                         . " UNION ALL "
+                         . "(" . $this->_getSendReportList() . ")"
+                         . " UNION ALL "
+                         . "(" . $this->_getDraftReportList() . ")";
+                break;
+
+
+            //管理者権限をもつユーザーがアクセスできる報告書
+            case GRN_REPORT_SEARCH_TARGET_OPERATION:
+            case GRN_REPORT_SEARCH_TARGET_SYSTEM:
+                // target が偽装された場合のチェック
+                if ($this->isManage) {
+                    $query = "(" . $this->_getManageAccessReportList() . ")";
+                    break;
+                }
+
+            //閲覧可能な報告書一覧
+            case GRN_REPORT_SEARCH_TARGET_ALL:
+            default:
+                $query = "(" . $this->_getAccesibleReportListQuery() . ")"
+                         . " UNION ALL "
+                         . "(" . $this->_getReceiveReportListQuery() . ")"
+                         . " UNION ALL "
+                         . "(" . $this->_getSendReportList() . ")";
+                break;
+        }
+
+        $uid = $this->user->getOID();
+        if ($this->_isCount) {
+            $query = " (" . $query . ") AS r ";
+        } else {
+            $query = " (" . $query . ") AS r2 ";
+            $query .= " LEFT JOIN tab_grn_report_report AS r ON ( r._id = r2._id )";
+
+            if ($this->getSubscribe) {
+                $query .= " LEFT JOIN tab_grn_report_subscribe subscribe ON (subscribe.col_user = $uid AND r._id = subscribe.col_report) ";
+            }
+        }
+
+        if ($this->onlyUnread || $this->getLastTimeStamp) {
+            $query .= " LEFT JOIN tab_grn_report_readstatus readstatus ON (readstatus.col_user = $uid AND r._id = readstatus.col_report) ";
+        }
+
+        if ($this->onlyUnread) {
+            $query .= " WHERE readstatus.col_report IS NULL";
+        }
+
+        return $query;
+    }
+
+    function _getOrderPhrase()
+    {
+        $query = "";
+        $asc_desc = null;
+        foreach ($this->orders as $order) {
+            if (strlen($query) > 0) {
+                $query .= ",";
+            }
+
+            if (is_null($asc_desc)) {
+                $asc_desc = $order[1];
+            }
+
+            $query .= cb_queryf($this->database, "@S @S", $order[0], $asc_desc);
+        }
+
+        if (strlen($query) > 0) {
+            return cb_queryf($this->database, " ORDER BY @S ", $query);
+        } else {
+            return "";
+        }
+    }
+
+    function _getLimitPhrase()
+    {
+        if (is_numeric($this->count) && $this->count < 214748364
+            && $this->count > 0
+        ) {
+            return cb_queryf($this->database, " LIMIT @S ",
+                sprintf("%u", $this->count));
+        } else {
+            return " LIMIT 2147483647 ";
+        }
+    }
+
+    function _getOffsetPhrase()
+    {
+        if (is_numeric($this->index) && $this->index > 0) {
+            $this->index > 18446744073709551615 ?
+                $this->index = 18446744073709551615 : (int)$this->index;
+
+            return cb_queryf($this->database, " OFFSET @S ", $this->index);
+        }
+    }
+
+    /**
+     * クエリ作成の際に必要な処理を行う。
+     * 現状では、ジョインするテーブルの算出、取得するカラムの算出、フィルタのロードを行う。
+     *
+     * @return unknown_type
+     */
+    function _init()
+    {
+        //load filter if exist
+        if (is_numeric($this->filter_id)) {
+            $logic = GRN_Report_Filter_Logic::getInstance();
+            $filter = $logic->get($this->filter_id);
+
+            if ($filter) {
+                $this->_filter = $filter;
+            }
+        }
+
+        if ($this->onlyUnread || $this->getLastTimeStamp) {
+            $this->columns[] = 'readstatus.col_last_timestamp';
+        }
+
+        if ($this->getSubscribe) {
+            $this->columns[] = 'subscribe.col_subscribe';
+        }
+    }
+
+    /**
+     * 自分が受信した報告書を取得するクエリを返す。
+     * 受信した報告書とは、自分が参加者または通知先に入っていて、下書きでない報告書を指す。
+     */
+    function _getReceiveReportListQuery()
+    {
+        $uid = cb_queryf($this->database, '@S', $this->user->getOID());
+        $query = " SELECT DISTINCT"
+                 . " report._id"
+                 . " FROM "
+                 . $this->_getFromPhrase() . ", "
+                 . " ( "
+                 . " SELECT "
+                 . " notify.col_report AS report_id"
+                 . " FROM "
+                 . " tab_grn_report_notification notify "
+                 . " WHERE "
+                 . " notify.col_user = $uid"
+                 . " UNION ALL"
+                 . " SELECT "
+                 . " member.col_report AS report_id"
+                 . " FROM"
+                 . " tab_grn_report_member member "
+                 . " WHERE "
+                 . " member.col_user = $uid"
+                 . " ) AS ids"
+                 . " WHERE "
+                 . " ( report._id = ids.report_id AND report.col_draft = 0 AND report.col_deleted = 0 ) ";
+
+        $conditon = $this->_getConditionsPhrase();
+        if (strlen($conditon) > 0) {
+            $query .= " AND " . $conditon;
+        }
+
+        if ( ! $this->_isCount) {
+            $query .= $this->_getOrderPhrase()
+                      . $this->_getLimitPhrase()
+                      . $this->_getOffsetPhrase();
+        }
+
+        return $query;
+    }
+
+    /**
+     * アクセス可能な報告書を取得するクエリを返す。
+     * アクセス可能な報告書とは、以下の三つの条件のいずれかを満たした報告書を指す。
+     *
+     * 1. 未分類カテゴリ内の報告書, 公開報告書, 下書きでない, 削除されていない報告書
+     * 2. アクセス可能なカテゴリ内の報告書, 公開報告書, 下書きでない, 削除されていない報告書
+     * 3. 作成者が自分, 下書きでない、削除されていない報告書
+     */
+    function _getAccesibleReportListQuery()
+    {
+        require_once('category_manager_base.csp');
+        $manager = GRN_Report_Category_Manager_Base::getInstance();
+        $category_ids
+            = $manager->getAccessibleCategoryIdList($this->user->getOID());
+
+        $uid = cb_queryf($this->database, '@S', $this->user->getOID());
+
+        $query1 = " SELECT "
+                  . " report._id"
+                  . " FROM "
+                  . $this->_getFromPhrase()
+                  . " WHERE "
+                  . "( "
+                  . " report.col_private = 0 "
+                  . " AND report.col_draft = 0 "
+                  . " AND report.col_deleted = 0"
+                  . " AND report.col_category IS NULL "
+                  . " )";
+
+        $query2 = null;
+        if (count($category_ids) > 0) {
+            $query2 = " SELECT "
+                      . " report._id"
+                      . " FROM "
+                      . $this->_getFromPhrase()
+                      . " WHERE "
+                      . " ("
+                      . " report.col_private = 0 "
+                      . " AND report.col_draft = 0 "
+                      . " AND report.col_deleted = 0"
+                      . " AND report.col_category IN "
+                      . cb_queryf($this->database, "(@S)",
+                    implode(',', $category_ids))
+                      . " )";
+        }
+
+        $condition = $this->_getConditionsPhrase();
+        if (strlen($condition) > 0) {
+            $query1 .= " AND " . $condition;
+            if (strlen($query2) > 0) {
+                $query2 .= " AND " . $condition;
+            }
+        }
+
+        if ( ! $this->_isCount) {
+            $query1 .= $this->_getOrderPhrase()
+                       . $this->_getLimitPhrase()
+                       . $this->_getOffsetPhrase();
+
+            if (strlen($query2) > 0) {
+                $query2 .= $this->_getOrderPhrase()
+                           . $this->_getLimitPhrase()
+                           . $this->_getOffsetPhrase();
+            }
+        }
+
+        if (strlen($query2) > 0) {
+            return " ( " . $query1 . " ) UNION ALL ( " . $query2 . " )";
+        } else {
+            return $query1;
+        }
+    }
+
+    /**
+     * ユーザーが送信した報告書を取得するクエリを返す。
+     * 送信した報告書とは、作成者が指定したユーザーで、下書きでなく、削除されていない報告書である。
+     */
+    function _getSendReportList()
+    {
+        $uid = cb_queryf($this->database, '@S', $this->user->getOID());
+        $query = " SELECT "
+                 . " report._id"
+                 . " FROM "
+                 . $this->_getFromPhrase()
+                 . " WHERE "
+                 . " ( report.col_creator = $uid AND report.col_draft = 0 AND report.col_deleted = 0 )";
+
+        $condition = $this->_getConditionsPhrase();
+        if (strlen($condition) > 0) {
+            $query .= " AND " . $condition;
+        }
+
+        if ( ! $this->_isCount) {
+            $query .= $this->_getOrderPhrase()
+                      . $this->_getLimitPhrase()
+                      . $this->_getOffsetPhrase();
+        }
+
+        return $query;
+    }
+
+    /**
+     * ユーザーが下書き保存した報告書を取得するクエリを返す。
+     * 下書き保存した報告書とは、作成者が指定したユーザーで、下書きで、削除されていない報告書である。
+     */
+    function _getDraftReportList()
+    {
+        $uid = cb_queryf($this->database, '@S', $this->user->getOID());
+        $query = " SELECT "
+                 . " report._id"
+                 . " FROM "
+                 . $this->_getFromPhrase()
+                 . " WHERE "
+                 . " ( report.col_creator = $uid AND report.col_draft = 1 AND report.col_deleted = 0 )";
+
+        $condition = $this->_getConditionsPhrase();
+        if (strlen($condition) > 0) {
+            $query .= " AND " . $condition;
+        }
+
+        if ( ! $this->_isCount) {
+            $query .= $this->_getOrderPhrase()
+                      . $this->_getLimitPhrase()
+                      . $this->_getOffsetPhrase();
+        }
+
+        return $query;
+    }
+
+    /**
+     * 管理者がアクセスできる報告書を取得するクエリを返す。
+     * 管理者がアクセスできる報告書とは、下書きでなく、削除されていない報告書である。
+     */
+    function _getManageAccessReportList()
+    {
+        $query = " SELECT report._id"
+                 . " FROM "
+                 . $this->_getFromPhrase()
+                 . " WHERE "
+                 . " ( report.col_draft = 0 AND report.col_deleted = 0 )";
+
+        $condition = $this->_getConditionsPhrase();
+        if (strlen($condition) > 0) {
+            $query .= " AND " . $condition;
+        }
+
+        if ( ! $this->_isCount) {
+            $query .= $this->_getOrderPhrase()
+                      . $this->_getLimitPhrase()
+                      . $this->_getOffsetPhrase();
+        }
+
+        return $query;
+    }
+
+    function addCondition($type, $value, $condition, $item_id = null)
+    {
+        if ( ! is_array($this->conditions)) {
+            $this->conditions = [];
+        }
+
+        $arr = [];
+        $arr['type'] = $type;
+        $arr['value'] = $value;
+        $arr['condition'] = $condition;
+        if (is_numeric($item_id)) {
+            $arr['item_id'] = $item_id;
+        }
+
+        $this->conditions[] = $arr;
+    }
+
+    function _getConditionsPhrase()
+    {
+        $query = "";
+
+        if ($this->form_id > 0) {
+            if (strlen($query) > 0) {
+                $query .= " AND ";
+            }
+            $query .= cb_queryf($this->database, "report.col_form = '@S'",
+                $this->form_id);
+        }
+
+        if (strlen($this->form_name) > 0) {
+            if (strlen($query) > 0) {
+                $query .= " AND ";
+            }
+            $query .= $this->_conditionToQueryHelper(
+                GRN_REPORT_FILTER_TYPE_FORM_NAME,
+                $this->form_name,
+                GRN_REPORT_FILTER_CONDITION_INCLUDE);
+        }
+
+        if (is_array($this->conditions)) {
+            $cQuery = '';
+
+            require_once('report/controller_util.csp');
+            $filter_util = GRN_Report_Filter_Controller_Utility::getInstance();
+            //Type Info
+            $without_form_name = true;
+            $type_info
+                = $filter_util->getConditionTypeList($without_form_name);
+
+            foreach ($this->conditions as $c) {
+                if ($c['type'] == GRN_REPORT_FILTER_TYPE_ANY) {
+                    $q = '';
+                    foreach ($type_info as $type_item) {
+                        $type = $type_item['value'];
+                        $q_any = '';
+                        if ($type == GRN_REPORT_FILTER_TYPE_CREATE_DATE) {
+                            $value = 0;
+                            if (checkDateFormat($c['value'], $value)) {
+                                switch ($c['condition']) {
+                                    case GRN_REPORT_FILTER_CONDITION_INCLUDE:
+                                        $condition
+                                            = GRN_REPORT_FILTER_CONDITION_EQUAL;
+                                        break;
+                                    case GRN_REPORT_FILTER_CONDITION_NOT_INCLUDE:
+                                        $condition
+                                            = GRN_REPORT_FILTER_CONDITION_NOT_EQUAL;
+                                        break;
+                                }
+
+                                $q_any = $this->_conditionToQueryHelper($type,
+                                    $value, $condition, cb_at($c, 'item_id'));
+                            }
+                        } else {
+                            $q_any = $this->_conditionToQueryHelper($type,
+                                $c['value'], $c['condition'],
+                                cb_at($c, 'item_id'));
+                        }
+                        if (strlen($q_any) > 0) {
+                            if (strlen($q) > 0) {
+                                $q .= " OR ";
+                            }
+                            $q .= $q_any;
+                        }
+                    }
+                    if (strlen($q) > 0) {
+                        $q = "(" . $q . ")";
+                    }
+                } else {
+                    $q = $this->_conditionToQueryHelper($c['type'], $c['value'],
+                        $c['condition'], cb_at($c, 'item_id'));
+                }
+                if (strlen($q) > 0) {
+                    if (strlen($cQuery) > 0) {
+                        $cQuery .= $this->_getAndOrPhrase();
+                    }
+                    $cQuery .= $q;
+                }
+            }
+
+            if (strlen($cQuery) > 0) {
+                if (strlen($query) > 0) {
+                    $query .= " AND ";
+                }
+                $query .= "(" . $cQuery . ")";
+            }
+        }
+
+        if (is_numeric($this->filter_id)) {
+            $filterPhrase = $this->_getFilterIdPhrase();
+            if (strlen($filterPhrase) > 0) {
+                if (strlen($query) > 0) {
+                    $query .= " AND ";
+                }
+
+                $query .= $filterPhrase;
+            }
+        }
+
+        if ($this->noScheduleRelation) {
+            if (strlen($query) > 0) {
+                $query .= " AND ";
+            }
+            $query .= " NOT EXISTS ( SELECT schedule._id FROM tab_grn_report_reportschedulerelations schedule WHERE report._id = schedule.col_report )";
+        }
+
+        if (is_array($this->report_id_list)
+            && count($this->report_id_list) > 0
+        ) {
+            if (strlen($query) > 0) {
+                $query .= " AND ";
+            }
+            $query .= cb_queryf($this->database, "report._id IN (@S)",
+                implode(',', $this->report_id_list));
+        }
+
+        if (strlen($this->keyword) > 0) {
+            $wordPhrase = "";
+            $splitedWords = $this->_getSplitedWords();
+
+            for ($i = 0; $i < count($splitedWords); $i++) {
+                if (strlen($wordPhrase) > 0) {
+                    $wordPhrase .= " AND ";
+                }
+
+                $like = cb_queryf($this->database, "'%@L%'",
+                    $splitedWords[$i]);
+                $wordPhrase .= "("
+                               . " report.col_creator_name LIKE " . $like
+                               . " OR report.col_form_name LIKE " . $like
+                               . " OR report.col_name LIKE " . $like
+                               . " OR EXISTS ( "
+                               . "SELECT _id FROM tab_grn_report_itemdata AS itemdata "
+                               . " WHERE itemdata.col_report = report._id AND itemdata.col_text LIKE "
+                               . $like
+                               . ") OR EXISTS ( "
+                               . "SELECT _id FROM tab_grn_report_follow AS follow "
+                               . " WHERE follow.col_report = report._id AND follow.col_data LIKE "
+                               . $like
+                               . ")"
+                               . ")";
+            }
+
+            if (strlen($wordPhrase) > 0) {
+                if (strlen($query) > 0) {
+                    $query .= " AND ";
+                }
+
+                $query .= "($wordPhrase)";
+            }
+        }
+
+        return $query;
+    }
+
+    function _getAndOrPhrase($value = null)
+    {
+        if (strlen($value) == 0) {
+            $value = $this->and_or;
+        }
+
+        if ($value == GRN_REPORT_FILTER_AND) {
+            return " AND ";
+        } else {
+            return " OR ";
+        }
+    }
+
+    function _conditionToQueryHelper($type, $value, $condition, $item_id = null)
+    {
+        $cQuery = '';
+
+        switch ($type) {
+            case GRN_REPORT_FILTER_TYPE_FORM_NAME:      //フォーム名
+                $cQuery = "report.col_form_name "
+                          . $this->_getCondition($condition, $value);
+                break;
+            case GRN_REPORT_FILTER_TYPE_REPORT_NAME:    //標題
+                $cQuery = "report.col_name " . $this->_getCondition($condition,
+                        $value);
+                break;
+            case GRN_REPORT_FILTER_TYPE_CREATE_DATE:    //作成日
+                $datetime = cb_timestamp_to_datetime($value,
+                    GRN_Report_Item_Util_Date::DEFAULT_TIMEZONE);
+                $current_timezone = CB_I18N::getInstance()
+                                           ->getCurrentTimezone();
+                $value = cb_datetime_to_timestamp($datetime,
+                    $current_timezone);
+                if ($condition == GRN_REPORT_FILTER_CONDITION_EQUAL) {
+                    $start = $value;
+                    $end = $start + 86400;
+                    $cQuery = cb_queryf($this->database,
+                        "(report.col_ctime >= @S AND report.col_ctime < @S)",
+                        $start, $end);
+                } elseif ($condition == GRN_REPORT_FILTER_CONDITION_NOT_EQUAL) {
+                    $start = $value;
+                    $end = $start + 86400;
+                    $cQuery = cb_queryf($this->database,
+                        "(report.col_ctime < @S OR report.col_ctime > @S)",
+                        $start, $end);
+                } else {
+                    $cQuery = "report.col_ctime"
+                              . $this->_getCondition($condition, $value);
+                }
+                break;
+            case GRN_REPORT_FILTER_TYPE_MODIFIED_TIME:
+                if ($condition == GRN_REPORT_FILTER_CONDITION_EQUAL) {
+                    $start = $value;
+                    $end = $start + 86400;
+                    $cQuery = cb_queryf($this->database,
+                        "(report.col_mtime >= @S AND report.col_mtime < @S)",
+                        $start, $end);
+                } elseif ($condition == GRN_REPORT_FILTER_CONDITION_NOT_EQUAL) {
+                    $start = $value;
+                    $end = $start + 86400;
+                    $cQuery = cb_queryf($this->database,
+                        "(report.col_mtime < @S OR report.col_mtime > @S)",
+                        $start, $end);
+                } else {
+                    $cQuery = "report.col_mtime"
+                              . $this->_getCondition($condition, $value);
+                }
+                break;
+            case GRN_REPORT_FILTER_TYPE_CREATOR:        //作成者
+                $cQuery = "(report.col_creator_name"
+                          . $this->_getCondition($condition, $value)
+                          . " OR user.col_nickname"
+                          . $this->_getCondition($condition, $value) . ")";
+                break;
+            case GRN_REPORT_FILTER_TYPE_ITEMDATA:       //項目
+                $cQuery = $this->_createItemdataCondition($condition, $value);
+                break;
+            case GRN_REPORT_FILTER_TYPE_FOLLOW:         //フォロー
+                if ($condition == GRN_REPORT_FILTER_CONDITION_NOT_INCLUDE) {
+                    $cQuery = cb_queryf($this->database,
+                        "report._id NOT IN (SELECT follow2.col_report FROM tab_grn_report_follow AS follow2 WHERE follow2.col_data LIKE '%@L%')",
+                        $value);
+                } else {
+                    $cQuery
+                        = " EXISTS ( SELECT _id FROM tab_grn_report_follow AS follow WHERE follow.col_report = report._id AND follow.col_data"
+                          . $this->_getCondition($condition, $value) . ")";
+                }
+                break;
+            case GRN_REPORT_FILTER_TYPE_ITEMDATA_DETAIL:      //項目(詳細)
+                $cQuery = $this->_createItemdataDetailCondition($item_id,
+                    $condition, $value);
+                break;
+        }
+
+        return $cQuery;
+    }
+
+    function _createItemdataDetailCondition($item_id, $condition, $value)
+    {
+        require_once('report/controller_util.csp');
+        $item_util = new GRN_Report_Item_Controller_Utility();
+        $item_map = ['data_type' => 'data_type'];
+        //TODO ここでロードしなくても前処理で一気にロード可能 欲しいのはdatatypeだけ。
+        $item = $item_util->getView($item_id, $item_map);
+
+        $where = '';
+        switch ($item['data_type']) {
+            case GRN_REPORT_CONDITION_ITEM_STRING_SINGLE:
+            case GRN_REPORT_CONDITION_ITEM_STRING_MULTIPLE:
+            case GRN_REPORT_CONDITION_ITEM_MENU_STRING:
+            case GRN_REPORT_CONDITION_ITEM_RADIO:
+                switch ($condition) {
+                    case GRN_REPORT_FILTER_CONDITION_NOT_EQUAL:
+                        $where = "itemdata2._id NOT IN ("
+                                 . " SELECT "
+                                 . "itemdata3._id "
+                                 . " FROM "
+                                 . " tab_grn_report_itemdata AS itemdata3 "
+                                 . " WHERE "
+                                 . cb_queryf($this->database,
+                                " itemdata3.col_item = @S AND itemdata3.col_text = '@S')",
+                                $item_id, $value);
+                        break;
+                    case GRN_REPORT_FILTER_CONDITION_NOT_INCLUDE:
+                        $where = "itemdata2._id NOT IN ("
+                                 . " SELECT "
+                                 . "itemdata3._id "
+                                 . " FROM "
+                                 . " tab_grn_report_itemdata AS itemdata3 "
+                                 . " WHERE "
+                                 . cb_queryf($this->database,
+                                " itemdata3.col_item = @S AND itemdata3.col_text LIKE '%@L%')",
+                                $item_id, $value);
+                        break;
+                    default:
+                        $where = " itemdata2.col_text "
+                                 . $this->_getCondition($condition, $value);
+                }
+                break;
+
+            case GRN_REPORT_CONDITION_ITEM_DATE:
+                $datetime = cb_timestamp_to_datetime($value,
+                    GRN_Report_Item_Util_Date::DEFAULT_TIMEZONE);
+                $current_timezone = CB_I18N::getInstance()
+                                           ->getCurrentTimezone();
+                $value = cb_datetime_to_timestamp($datetime,
+                    $current_timezone);
+                $start = $value;
+                $end = $start + 86400;
+
+                switch ($condition) {
+                    case GRN_REPORT_FILTER_CONDITION_EQUAL:
+                        $where = cb_queryf($this->database,
+                            " @S <= itemdata2.col_number AND itemdata2.col_number < @S",
+                            $start, $end);
+                        break;
+                    case GRN_REPORT_FILTER_CONDITION_NOT_EQUAL:
+                        $where = cb_queryf($this->database,
+                            "( @S > itemdata2.col_number OR itemdata2.col_number >= @S )",
+                            $start, $end);
+                        break;
+                    default:
+                        $where = " itemdata2.col_number "
+                                 . $this->_getCondition($condition, $value);
+                }
+                break;
+
+            case GRN_REPORT_CONDITION_ITEM_TIME:
+                switch ($condition) {
+                    case GRN_REPORT_FILTER_CONDITION_EQUAL:
+                        if (is_null($value)) {
+                            $where = cb_queryf($this->database,
+                                " itemdata2.col_number IS NULL");
+                        } else {
+                            $where = " itemdata2.col_number "
+                                     . $this->_getCondition($condition, $value);
+                        }
+                        break;
+                    case GRN_REPORT_FILTER_CONDITION_NOT_EQUAL:
+                        if (is_null($value)) {
+                            $where = cb_queryf($this->database,
+                                " itemdata2.col_number IS NOT NULL");
+                        } else {
+                            $where = cb_queryf($this->database,
+                                " ( @S <> itemdata2.col_number OR itemdata2.col_number IS NULL )",
+                                $value);
+                        }
+                        break;
+                    default:
+                        $where = " itemdata2.col_number "
+                                 . $this->_getCondition($condition, $value);
+                }
+                break;
+
+            case GRN_REPORT_CONDITION_ITEM_NUMERIC:
+                $where = " itemdata2.col_number "
+                         . $this->_getCondition($condition, $value);
+                break;
+
+            case GRN_REPORT_CONDITION_ITEM_CHECK:
+                $where = " itemdata2.col_number = " . cb_queryf($this->database,
+                        "'@S'", $value);
+                break;
+
+            case GRN_REPORT_CONDITION_ITEM_FILE:
+                $inPhrase = $value ? " IN " : " NOT IN ";
+                $query = " report._id " . $inPhrase . " ("
+                         . " SELECT"
+                         . " DISTINCT file.col_report"
+                         . " FROM"
+                         . " tab_grn_report_itemdata AS itemdata2"
+                         . " INNER JOIN tab_grn_report_filerelation AS file "
+                         . "ON ( "
+                         . " itemdata2.col_item = "
+                         . cb_queryf($this->database, "@S", $item_id)
+                         . " AND itemdata2._id = file.col_item_data"
+                         . ")"
+                         . ")";
+
+                if ( ! $value) {
+                    $query = "(" . $query . " AND report.col_form = ("
+                             . " SELECT"
+                             . " item.col_form"
+                             . " FROM"
+                             . " tab_grn_report_item AS item"
+                             . " LEFT JOIN tab_grn_report_itemdata AS itemdata2 ON ( itemdata2.col_item = item._id)"
+                             . " WHERE"
+                             . " itemdata2.col_item = "
+                             . cb_queryf($this->database, "@S", $item_id)
+                             . " LIMIT 1"
+                             . "))";
+
+                }
+
+                return $query;
+        }
+
+        if (strlen($where) == 0) {
+            return "";
+        }
+
+        $query = " report._id IN ("
+                 . " SELECT"
+                 . " col_report"
+                 . " FROM"
+                 . " tab_grn_report_itemdata itemdata2"
+                 . " WHERE"
+                 . " itemdata2.col_item = " . cb_queryf($this->database, "@S",
+                $item_id)
+                 . " AND " . $where
+                 . ")";
+
+        return $query;
+    }
+
+    function _getFilterIdPhrase()
+    {
+        //既にフィルタは_init関数によりロードされている。
+        if (is_null($this->_filter)) {
+            return "";
+        }
+
+        $filter = $this->_filter;
+
+        $filterFormPhrase = "";
+        //フォームの絞込みに関するクエリ
+        if ($filter['col_formtype'] == GRN_REPORT_FILTER_FORM_TYPE_NAME) {
+            //フォーム名で検索
+            $filterFormPhrase .= $this->_conditionToQueryHelper(GRN_REPORT_FILTER_TYPE_FORM_NAME,
+                $filter['form_condition']['col_text'],
+                GRN_REPORT_FILTER_CONDITION_INCLUDE);
+        } elseif ($filter['col_formtype']
+                  == GRN_REPORT_FILTER_FORM_TYPE_SELECT
+        ) {
+            //フォームIDを指定
+            $filterFormPhrase .= cb_queryf($this->database,
+                " report.col_form = '@S'",
+                $filter['form_relation']['col_form']);
+        }
+
+        //条件に関するクエリ
+        $filterPhrase = "";
+        $conditions = $filter["conditions"];
+
+        require_once('report/controller_util.csp');
+        $filter_util = GRN_Report_Filter_Controller_Utility::getInstance();
+        //Type Info
+        $without_form_name = true;
+        $type_info
+            = $filter_util->getConditionTypeList($without_form_name);
+
+        foreach ($conditions as $condition) {
+            if ($condition['col_type'] == GRN_REPORT_FILTER_TYPE_ANY) {
+                $cQuery = '';
+                foreach ($type_info as $type_item) {
+                    $type = $type_item['value'];
+                    $cQuery_any = '';
+                    if ($type == GRN_REPORT_FILTER_TYPE_CREATE_DATE) {
+                        $value = 0;
+                        if (checkDateFormat($condition['col_text'], $value)) {
+                            switch ($condition['col_condition']) {
+                                case GRN_REPORT_FILTER_CONDITION_INCLUDE:
+                                    $condition_item
+                                        = GRN_REPORT_FILTER_CONDITION_EQUAL;
+                                    break;
+                                case GRN_REPORT_FILTER_CONDITION_NOT_INCLUDE:
+                                    $condition_item
+                                        = GRN_REPORT_FILTER_CONDITION_NOT_EQUAL;
+                                    break;
+                            }
+
+                            $cQuery_any
+                                = $this->_conditionToQueryHelper(GRN_REPORT_FILTER_TYPE_CREATE_DATE,
+                                $value, $condition_item,
+                                $condition['col_item']);
+                        }
+                    } else {
+                        $value = $condition['col_text'];
+
+                        $cQuery_any = $this->_conditionToQueryHelper($type,
+                            $value, $condition['col_condition'],
+                            $condition['col_item']);
+                    }
+                    if (strlen($cQuery_any) > 0) {
+                        if (strlen($cQuery) > 0) {
+                            $cQuery .= " OR ";
+                        }
+                        $cQuery .= $cQuery_any;
+                    }
+                }
+                if (strlen($cQuery) > 0) {
+                    $cQuery = "(" . $cQuery . ")";
+                }
+            } else {
+                $value = is_null($condition['col_text'])
+                    ? $condition['col_number'] : $condition['col_text'];
+                $cQuery = $this->_conditionToQueryHelper($condition['col_type'],
+                    $value, $condition['col_condition'],
+                    $condition['col_item']);
+            }
+            if (strlen($filterPhrase) > 0) {
+                $filterPhrase .= $this->_getAndOrPhrase($filter['col_or']);
+            }
+
+            $filterPhrase .= $cQuery;
+        }
+
+        if (strlen($filterFormPhrase) > 0) {
+            return $filterFormPhrase . " AND (" . $filterPhrase . ")";
+        } else {
+            return "(" . $filterPhrase . ")";
+        }
+    }
+
+    function _createItemdataCondition($condition, $value)
+    {
+        $query = null;
+        switch ($condition) {
+            case GRN_REPORT_FILTER_CONDITION_NOT_EQUAL:     //異なる
+                $query = "report._id NOT IN ("
+                         . " SELECT"
+                         . " col_report"
+                         . " FROM"
+                         . " tab_grn_report_itemdata itemdata2"
+                         . " WHERE"
+                         . " itemdata2.col_text = " . cb_queryf($this->database,
+                        "'@S'", $value)
+                         . ")";
+                break;
+
+            case GRN_REPORT_FILTER_CONDITION_NOT_INCLUDE:   //含まない
+                $query = "report._id NOT IN ("
+                         . " SELECT"
+                         . " col_report"
+                         . " FROM"
+                         . " tab_grn_report_itemdata itemdata2"
+                         . " WHERE"
+                         . " itemdata2.col_text LIKE "
+                         . cb_queryf($this->database, "'%@L%'", $value)
+                         . ")";
+                break;
+
+            case GRN_REPORT_FILTER_CONDITION_INCLUDE:       //含む
+            case GRN_REPORT_FILTER_CONDITION_EQUAL:         //同じ
+            case GRN_REPORT_FILTER_CONDITION_AFTER:         //始まる
+            case GRN_REPORT_FILTER_CONDITION_BEFORE:        //終わる
+                $query
+                    = " EXISTS( SELECT _id FROM tab_grn_report_itemdata AS itemdata WHERE itemdata.col_report = report._id AND itemdata.col_text "
+                      . $this->_getCondition($condition, $value) . ")";
+                break;
+
+            case GRN_REPORT_FILTER_CONDITION_BIGGER:        //より大きい
+            case GRN_REPORT_FILTER_CONDITION_AND_OVER:      //以上
+            case GRN_REPORT_FILTER_CONDITION_SMALLER:       //より小さい
+            case GRN_REPORT_FILTER_CONDITION_OR_LESS:       //以下
+                $query
+                    = " EXISTS( SELECT _id FROM tab_grn_report_itemdata AS itemdata WHERE itemdata.col_number "
+                      . $this->_getCondition($condition, $value) . ")";
+                break;
+        }
+
+        return $query;
+    }
+
+    //複数単語を分解する。
+    //半角スペース、全角スペースによって分解する
+    function _getSplitedWords()
+    {
+        $wordList = preg_split("# |　#", $this->keyword);
+        $result = [];
+
+        //連続したスペースがあるとempty stringが格納されてしまうので取り除く
+        for ($i = 0; $i < count($wordList); $i++) {
+            if (strlen($wordList[$i]) > 0) {
+                $result[] = $wordList[$i];
+            }
+        }
+
+        return $result;
+    }
+
+    /** Condition (0:include/1:not include/2:equal/3:not equal/4:after
+     * /5:before/6:bigger/7:and over/8:smaller/9:or less)  **/
+    function _getCondition($operator, $value)
+    {
+        $query = '';
+        switch ($operator) {
+            case GRN_REPORT_FILTER_CONDITION_INCLUDE:
+                $query = " LIKE '%@L%'";
+                break;
+            case GRN_REPORT_FILTER_CONDITION_NOT_INCLUDE:
+                $query = " NOT LIKE '%@L%'";
+                break;
+            case GRN_REPORT_FILTER_CONDITION_EQUAL:
+                $query = " = '@L'";
+                break;
+            case GRN_REPORT_FILTER_CONDITION_NOT_EQUAL:
+                $query = " <> '@L'";
+                break;
+            case GRN_REPORT_FILTER_CONDITION_AFTER:
+                $query = " LIKE '@L%'";
+                break;
+            case GRN_REPORT_FILTER_CONDITION_BEFORE:
+                $query = " LIKE '%@L'";
+                break;
+            case GRN_REPORT_FILTER_CONDITION_BIGGER:
+                $query = " > @L";
+                break;
+            case GRN_REPORT_FILTER_CONDITION_AND_OVER:
+                $query = " >= @L";
+                break;
+            case GRN_REPORT_FILTER_CONDITION_SMALLER:
+                $query = " < @L";
+                break;
+            case GRN_REPORT_FILTER_CONDITION_OR_LESS:
+                $query = " <= @L";
+                break;
+        }
+
+        return cb_queryf($this->database, $query, $value);
+    }
+}

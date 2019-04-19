@@ -1,0 +1,328 @@
+<?php
+
+/**
+ * Http Client library.
+ *
+ * @author  Yoshida, Hideyasu   2004/09
+ * @version 1.0
+ * @package fw.http
+ */
+
+require_once('fw/cookie.csp');
+require_once('fw/uri.csp');
+
+/**
+ * A simple HTTP client.
+ *
+ * The class wraps around cURL providing a API for performing
+ * multiple HTTP requests.
+ *
+ * Caution:
+ * cURL cannot send blank HTTP header.
+ * If you add a header with no content as in 'Accept:' (no data on the right side of the colon), the internally used header will get disabled.
+ * ref. http://curl.haxx.se/libcurl/c/CURLOPT_HTTPHEADER.html
+ *
+ * @package fw.http
+ */
+class CB_HttpClient
+{
+    /**
+     * @access private
+     */
+    var $_curl_handle;
+    /**
+     * @var CB_CookieManager
+     * @access private
+     */
+    /**
+     * @var CB_CookiePHPSessionManager|CB_CookieForSingleProcessManager $cm
+     * when this class used by command line, @see CB_CookieForSingleProcessManager
+     * otherwise @see CB_CookiePHPSessionManager
+     */
+    var $_cookie_manager;
+    /**
+     * @access private
+     */
+    var $_status_line;
+    /**
+     * @access private
+     */
+    var $_headers;
+    /**
+     * @access private
+     */
+    var $_body;
+    /**
+     * @access private
+     */
+    var $_options = [];
+
+    /**
+     * @access private
+     */
+    var $_error = [];
+
+    var $_cookies;
+
+    /**
+     * Constructor.
+     */
+    function __construct()
+    {
+        $this->_curl_handle = curl_init();
+        curl_setopt($this->_curl_handle, CURLOPT_SSL_VERIFYHOST, 2);
+        curl_setopt($this->_curl_handle, CURLOPT_SSL_VERIFYPEER, false);
+    }
+
+    /**
+     * This method is automatically called by lightweight container.
+     */
+    function boot()
+    {
+        global $G_state_set;
+        if ($G_state_set->get('command_line')) {
+            $this->_cookie_manager = new CB_CookieForSingleProcessManager();
+        }
+    }
+
+    /**
+     * Executes the operations that have been set up for the
+     * cURL session.
+     *
+     * @param mixed $uri the URI as {@link CB_URI} or string.
+     *
+     * @return bool TRUE if it successds in execute the
+     * operations, FALSE otherwise.
+     */
+    function execute($uri)
+    {
+        if (is_string($uri)) {
+            $uri = new CB_URI($uri);
+        }
+
+        $ch =& $this->_curl_handle;
+
+        $cm = $this->_cookie_manager;
+
+        curl_setopt($ch, CURLOPT_URL, $uri->toString(false));
+
+        $host = $uri->getHost();
+        $path = $uri->getPath();
+
+        $cookies = $cm->findCookies($host, $path, 'https' == $uri->getScheme());
+        if (0 < strlen($cookies)) {
+            curl_setopt($ch, CURLOPT_COOKIE, $cookies);
+        }
+
+        foreach ($this->_options as $key => $value) {
+            curl_setopt($ch, $key, $value);
+        }
+        curl_setopt($ch, CURLOPT_HEADER, 1);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 0);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt($ch, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+
+        // Return the content of a cURL handle.
+        $result = curl_exec($ch);
+        if (false === $result || '' == $result) {
+            $this->_abort();
+
+            return false;
+        }
+
+        if ( ! $this->_parseResponse($host, $path, $result)) {
+            $this->_abort();
+
+            return false;
+        }
+
+        if (301 == $this->_status_line['status-code']
+            || 302 == $this->_status_line['status-code']
+            || 303 == $this->_status_line['status-code']
+        ) {
+            // Create HTTP client for redirection.
+            global $G_container_base;
+            $http_client = $G_container_base->getInstance('http_client');
+
+            foreach ($this->_options as $key => $value) {
+                $http_client->setCurlOption($key, $value);
+            }
+            $uri = new CB_URI($this->_headers['location'][0]);
+            if ( ! $http_client->execute($uri)) {
+                $this->_error = $http_client->getError();
+
+                return false;
+            }
+
+            $this->_status_line = $http_client->getStatusLine();
+            $this->_headers = $http_client->getHeaders();
+            $this->_body = $http_client->getBody();
+        }
+
+        $cm->saveCookies();
+        $this->_cookies = $cm->findCookies($host, $path,
+            'https' == $uri->getScheme());
+
+        curl_close($ch);
+
+        return true;
+    }
+
+    /**
+     * Parses a response.
+     *
+     * @access private
+     *
+     * @param string $host     the host.
+     * @param string $path     the path.
+     * @param string $response to parse.
+     *
+     * @return bool FALSE if the HTTP error, TRUE otherwise.
+     */
+    function _parseResponse($host, $path, $response)
+    {
+        do {
+            list($lines, $response) = explode("\r\n\r\n", $response, 2);
+            if (preg_match("/^(HTTP(?:\/1\.\d+)?)\s+(\d{3})/", $response)) {
+                //squid web proxy server returns duplicated http header when using SSL connection.
+                list($lines, $response) = explode("\r\n\r\n", $response, 2);
+            }
+            $headers = explode("\r\n", $lines);
+            $status_line = array_shift($headers);
+            if ( ! preg_match("/^(HTTP(?:\/1\.\d+)?)\s+(\d{3})/", $status_line,
+                $regs)
+            ) {
+                return false;
+            }
+        } while ('1' == $regs[2]{0});
+
+        $this->_status_line = [
+            'http-version' => $regs[1],
+            'status-code'  => intval($regs[2])
+        ];
+
+        $lines = [];
+        while (null !== ($header = array_shift($headers))) {
+            if ('' == $header) {
+                break;
+            } elseif (preg_match('/^\s/', $header, $regs)) {
+                $lines[count($lines) - 1] .= $header;
+            } else {
+                $lines[] = $header;
+            }
+        }
+
+        $headers = [];
+        foreach (array_keys($lines) as $key) {
+            $line =& $lines[$key];
+
+            $pair = explode(':', $line, 2);
+            if (2 != count($pair)) {
+                return false;
+            }
+
+            $header = strtolower($pair[0]);
+            $value = trim($pair[1]);
+
+            if ('set-cookie' == $header) {
+                $values = explode(',', $value);
+                if (is_array($values)) {
+                    foreach ($values as $value) {
+                        $this->_cookie_manager->parseCookie($host, $path,
+                            $value);
+                    }
+                } else {
+                    $this->_cookie_manager->parseCookie($host, $path, $value);
+                }
+            }
+
+            if ( ! array_key_exists($header, $headers)) {
+                $headers[$header] = [];
+            }
+            $headers[$header][] = $value;
+        }
+
+        $this->_headers =& $headers;
+        $this->_body = $response;
+
+        return true;
+    }
+
+    /**
+     * Internal API to abort cURL session.
+     *
+     * @access private
+     */
+    function _abort()
+    {
+        $ch =& $this->getCurlHandle();
+        $this->_error['errno'] = curl_errno($ch);
+        $this->_error['message'] = curl_error($ch);
+        curl_close($this->_curl_handle);
+    }
+
+    function setCurlOption($key, $value)
+    {
+        $this->_options[$key] = $value;
+    }
+
+    /**
+     * Return a cURL handle.
+     *
+     * @return resource
+     */
+    function &getCurlHandle()
+    {
+        return $this->_curl_handle;
+    }
+
+    /**
+     * Get a status line.
+     *
+     * @return array [  'http-version' => $version,
+     *                  'status-code'=> $statusCode(int) ];
+     */
+    function getStatusLine()
+    {
+        return $this->_status_line;
+    }
+
+    /**
+     * Get the HTTP message headers.
+     * Return an associative array of the header name and value.
+     *
+     * @return array
+     */
+    function getHeaders()
+    {
+        return $this->_headers;
+    }
+
+    /**
+     * Get the HTTP message body.
+     *
+     * @return string
+     */
+    function &getBody()
+    {
+        return $this->_body;
+    }
+
+    /**
+     * Get error of cURL.
+     * Return an associative array of the no and message.
+     *
+     * @return array
+     */
+    function getError()
+    {
+        return $this->_error;
+    }
+
+    public function getCookies()
+    {
+        return $this->_cookies;
+    }
+}
+
+

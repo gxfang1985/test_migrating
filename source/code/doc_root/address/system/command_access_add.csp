@@ -1,0 +1,175 @@
+<?php
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    require_once('_access_util.csp');
+
+    // GET/POSTされたパラメータを取得する
+    $node_id = @ $G_INPUT['nid'];
+    if (0 == strlen($node_id)) {
+        cb_throw_error(E_GRN_ADDRESS_INVALID_BOOK_ID);
+    }
+
+    $text = null;
+    if (array_key_exists('text', $G_INPUT)) {
+        $text = $G_INPUT['text'];
+    }
+
+    $func = $G_INPUT['func'];
+    if ($func == 'search') {
+        cb_redirect('address/system/access_list',
+            ['nid' => $node_id, 'poid' => $poid, 'text' => $text]);
+    }
+
+    $aid = null;
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+
+    $session_name = 'address.system.access_add';
+    $session =& $session_manager->getSession($session_name);
+    $aid = $session->get('target_ids');
+    //if( array_key_exists( 'aid', $G_INPUT ) )
+    //{
+    //    $aid = $G_INPUT['aid'];
+    //}
+    if ( ! is_array($aid) || 0 == count($aid)) {
+        cb_redirect('address/system/access_list',
+            ['nid' => $node_id, 'poid' => $poid, 'text' => $text]);
+    }
+    $authority_browse = 0;
+    if (array_key_exists('authority_browse', $G_INPUT)) {
+        $authority_browse = $G_INPUT['authority_browse'];
+    }
+    $authority_editing = 0;
+    if (array_key_exists('authority_editing', $G_INPUT)) {
+        $authority_editing = $G_INPUT['authority_editing'];
+    }
+
+    // 権限を補完する
+    if (1 == $authority_editing) {
+        $authority_browse = 1;
+    }
+
+    // セキュリティモデルを取得する
+    $row =& $node_row->getRow();
+    require_once('address/access.csp');
+    $access_manager = GRN_Address_AccessManager::getInstance();
+    $security_model = $access_manager->getSecurityModel($row);
+
+    // セキュリティモデルを考慮した権限の値に変換する
+    if (GRN_ADDRESS_SECURITYMODEL_REVOKE == $security_model) {
+        $authorities = [
+            'browse'  => $authority_browse ? 0 : 1,
+            'editing' => $authority_editing ? 0 : 1
+        ];
+    } else {
+        $authorities = [
+            'browse'  => $authority_browse,
+            'editing' => $authority_editing
+        ];
+    }
+
+    // セッションに（GRANTの）権限の値を書き込む
+    //require_once( 'fw/session_manager.csp' );
+    //$session_manager = CB_SessionManager::getInstance();
+    $session =& $session_manager->getSession('address.system.access_list');
+    $session->set('authority_browse', $authority_browse);
+    $session->set('authority_editing', $authority_editing);
+
+    // アクセス権を追加する
+    global $G_container_base;
+    $uum =& $G_container_base->getInstance('uum');
+    require_once('grn/uum_util.csp');
+    $uum_util = GRN_UumUtil::getInstance();
+    $dynamic_roles = $uum_util->listDynamicRoles();
+    require_once('grn/access_resources.csp');
+    foreach (array_keys($aid) as $item) {
+        $ids = explode(':', $item);
+        if (count($ids) < 2) {
+            continue;
+        }
+        $id = $ids[1];
+        $target = null;
+        switch ($ids[0]) {
+            case GRN_ACCESS_TARGET_TYPE_USER:
+                $target =& $uum->getUser($id);
+                break;
+            case GRN_ACCESS_TARGET_TYPE_GROUP:
+                $target =& $uum->getGroup($id);
+                break;
+            case GRN_ACCESS_TARGET_TYPE_STATIC_ROLE:
+                $target =& $uum->getStaticRole($id);
+                break;
+            case GRN_ACCESS_TARGET_TYPE_DYNAMIC_ROLE:
+                if (array_key_exists($id, $dynamic_roles)) {
+                    $target = $id;
+                }
+                break;
+            default:
+                assert('FALSE');
+        }
+
+        if ($target) {
+            $object =& $node_row->getRow();
+            if ($access =& $access_manager->getAccess($object, $target)) {
+                foreach ($authorities as $key => $value) {
+                    $access->set('authority_' . $key, $value);
+                }
+
+                // 監査する
+                require_once('address/inspection.csp');
+                $inspection = GRN_Address_Inspection::getInstance();
+                if ($inspection->isEnabled()) {
+                    $target_name = $access_manager->getTargetName($target);
+                    $target_id = $access_manager->getTargetId($target);
+                    $keys = [];
+                    foreach ($authorities as $key => $value) {
+                        if ($value) {
+                            $keys[] = $key;
+                        }
+                    }
+                    $id_name = '';
+                    $id_value = '';
+                    switch ($target_name) {
+                        case GRN_ADDRESS_TARGET_USER:
+                            $id_name = 'uid';
+                            $id_value = $target_id;
+                            break;
+                        case GRN_ADDRESS_TARGET_GROUP:
+                            $id_name = 'gid';
+                            $id_value = $target_id;
+                            break;
+                        case GRN_ADDRESS_TARGET_STATICROLE:
+                            $id_name = 'rid';
+                            $id_value = $target_id;
+                            break;
+                        case GRN_ADDRESS_TARGET_DYNAMICROLE:
+                            $id_name = 'dynamic_role';
+                            $id_value = $target_id;
+                            break;
+                    }
+                    $section = GRN_ADDRESS_INSPECTION_MODIFY;
+                    $params = [];
+                    $informations = [];
+                    $message = GRN_ADDRESS_INSPECTION_ACCESS;
+                    if (false !== ($index = array_search('operation', $keys))) {
+                        unset($keys[$index]);
+                    }
+                    $informations['auth'] = implode('/', $keys);
+                    $params['bid'] = $object->getOID();
+                    $params[$id_name] = $id_value;
+
+                    $inspection->record($section, $message, $params,
+                        $informations);
+                }
+            } else {
+                $access_manager->addAccess($object, $target, $authorities);
+            }
+            unset($target);
+        }
+    }
+
+    cb_redirect('address/system/access_list',
+        ['nid' => $node_id, 'poid' => $poid, 'text' => $text]);
+}
+
+

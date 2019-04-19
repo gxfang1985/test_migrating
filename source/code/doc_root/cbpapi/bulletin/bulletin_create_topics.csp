@@ -1,0 +1,178 @@
+<?php
+if (isset($cbpapi_service)) {
+    $action = $cbpapi_service->getAction();
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+
+    // get parameters of SOAP message
+    $node_parameters = $cbpapi_service->getRequestParameters();
+    $node_create_topic = $cbpapi_service->selectNodes($node_parameters,
+        'create_topic');
+    if ( ! $node_create_topic) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'create_topic']);
+    }
+    $topics_for_view = [];
+    $aids = [];
+    require_once('cbpapi/bulletin_logic.csp');
+    $cbpapi_bulletin_logic = GRN_CBPApi_Bulletin_Logic::getInstance();
+    foreach (array_keys($node_create_topic) as $create_topic_key) {
+        $params = [];
+        $params
+            = $cbpapi_bulletin_logic->getInputParamerters($cbpapi_service,
+            $node_create_topic[$create_topic_key]);
+        $draft_id = null;
+        $draft_article = null;
+        if (array_key_exists('attributes',
+            $node_create_topic[$create_topic_key])
+        ) {
+            $attributes = $node_create_topic[$create_topic_key]['attributes'];
+            if (array_key_exists('draft_id', $attributes)) {
+                $draft_id = $attributes['draft_id'];
+                require_once('bulletin/draft.csp');
+                $obj_draft = GRN_Bulletin_DraftManager::getInstance();
+                if ( ! ($draft_article = $obj_draft->getDraft($login,
+                    $draft_id))
+                ) {
+                    cb_throw_error(E_GRN_BULLETIN_DRAFT_NOT_FOUND);
+                }
+
+            }
+        }
+        $category = null;
+        $category_id = $params['cid'];
+        require_once('bulletin/category.csp');
+        $category_manager = GRN_Bulletin_CategoryManager::getInstance();
+        if (($category = $category_manager->getCategory($login,
+            $category_id))
+        ) {
+            if ( ! $category->access($login, GRN_BULLETIN_ACCESS_W)) {
+                require_once('bulletin/error_code.csp');
+                cb_throw_error(E_GRN_BULLETIN_CATEGORY_NOT_FOUND);
+            }
+        } else {
+            require_once('bulletin/error_code.csp');
+            cb_throw_error(E_GRN_BULLETIN_CATEGORY_NOT_FOUND);
+        }
+
+        require_once('fw/string_util.csp');
+        $subject = @ cb_trim($params['subject']);
+        if (strlen($subject) <= 0) {
+            require_once('bulletin/error_code.csp');
+            cb_throw_error(E_GRN_BULLETIN_SUBJECT_NOT_INPUTTED);
+        }
+
+        $args = [
+            'subject'    => $subject,
+            'can_follow' => (array_key_exists('can_follow', $params)
+                ? $params['can_follow'] : 0)
+        ];
+
+        $args['data'] = array_key_exists('data', $params) ? $params['data']
+            : null;
+
+        $args['start_timestamp'] = $params['start_datetime'];
+        $args['end_timestamp'] = $params['end_timestamp'];
+        $args['start_is_datetime'] = $params['start_is_datetime'];
+        $args['end_is_datetime'] = $params['end_is_datetime'];
+
+        $args['creator_group_id'] = null;
+        if (array_key_exists('creator_group_id', $params)
+            && $params['creator_group_id']
+        ) {
+            $args['creator_group'] = $params['creator_group_id'];
+        }
+
+        $args['manually_enter_sender'] = $params['manually_enter_sender'];
+
+        // 掲示送信
+        require_once('bulletin/article.csp');
+        $amgr = GRN_Bulletin_ArticleManager::getInstance();
+        $article = $amgr->send($login, $category, $args, null);
+
+        // attached files
+        $attached_files = [];
+        $original_files = [];
+
+        if (isset($draft_article)) {
+            $original_files = $draft_article->getFiles();
+            $remove_file_ids = [];
+            if (array_key_exists('remove_file_ids', $params)) {
+                $remove_file_ids = $params['remove_file_ids'];
+                if (count($remove_file_ids) > 0) {
+                    foreach (array_keys($remove_file_ids) as $remove_key) {
+                        if (array_key_exists($remove_key, $original_files)) {
+                            unset($original_files[$remove_key]);
+                            $draft_article->deleteFile($login, $remove_key);
+                        }
+                    }
+                }
+            }
+
+            // append old attached files to new attached files
+            foreach (array_keys($original_files) as $fid) {
+                $attached_files[$fid] = $original_files[$fid];
+            }
+
+        }
+        // get new attach files
+        if (array_key_exists('files', $params)) {
+            $files = $params['files'];
+            foreach ($files as $file_key => $value) {
+                $attached_files['file' . $file_key]
+                    = cbpapi_upload_file($value);
+            }
+        }
+
+        if (count($attached_files) > 0) {
+            foreach (array_keys($attached_files) as $key) {
+                if (array_key_exists($key, $original_files)) {
+                    // 下書きから送信の場合は下書きの添付ファイルを転用する
+                    $article->attachFile($login, $original_files[$key]);
+                    unset($original_files[$key]);
+                } else {
+                    $article->addFile($login, $attached_files[$key]);
+                }
+            }
+        }
+
+        $aids[] = $article->getOID();
+        // 下書き編集からの場合は送信後に自動削除
+        if (strlen($draft_id) > 0 && $draft_article) {
+            // 下書きの添付ファイルを実体を消さずにクリア
+            $draft_article->releaseFiles($login);
+            $draft_article->delete($login);
+        }
+
+        //send notification
+        if ($article->isPublished()) {
+            require_once('bulletin/notification.csp');
+            $bulletin_notification_listener
+                = new GRN_Bulletin_NotificationListener();
+            $bulletin_notification_listener->registerBackgroundNotification('create',
+                $article,
+                $article->getSenderForNotification($login),
+                $article->get('subject'),
+                $article->get('data'),
+                $article->get('ctime'));
+        } else {
+            //scheduling service, add record
+            $scheduling_event = new grn\bulletin\NotificationSchedulingEvent();
+            $scheduling_event->registerEvent($article->getOID(),
+                $article->get('start_timestamp'));
+        }
+    }
+
+    // get send for view
+    $topics_for_view = $cbpapi_bulletin_logic->getTopicForViewByIds($login,
+        $aids);
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty;
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('bulletin')]);
+    $t->assign('topics', $topics_for_view);
+    $t->assign('action', $action);
+    grn_cbpapi_response($t, __FILE__);
+}
+

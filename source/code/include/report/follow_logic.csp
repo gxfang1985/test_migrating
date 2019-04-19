@@ -1,0 +1,352 @@
+<?php
+/**
+ * Report Application Follow Class
+ *
+ * @author  Shou Aoki 2009/09
+ * @version 1.0
+ * @package grn.report
+ */
+
+/** Report Application **/
+require_once('report/resources.csp');
+require_once('report/follow_logic_base.csp');
+require_once('report/table_manager.csp');
+require_once('report/follow_manager.csp');
+
+/**
+ * Follow Manager Class
+ *
+ * @package grn.report
+ */
+class GRN_Report_Follow_Logic extends GRN_Report_Follow_Logic_Base
+{
+    /**
+     * Constructor
+     *
+     * @return none
+     */
+    function __construct()
+    {
+
+    }
+
+    private static $_instance = null;
+
+    /**
+     * Get Instance
+     *
+     * @return GRN_Report_Follow_Logic
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * get Login User
+     *
+     * @access private
+     * @return object $login_user                //Login User
+     */
+    function _getLoginUser()
+    {
+        //Get UUM Instance
+        global $G_container_base;
+        $grn_uum = $G_container_base->getInstance('uum');
+
+        //Get Login User
+        $login_user = $grn_uum->getLoginUser();
+        if ( ! $login_user) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        //Return Login User
+        return $login_user;
+    }
+
+    /**
+     * Add Follow
+     *
+     * @param  int $report_id     //Report ID
+     * @param  int $property_list //Follow Property
+     *
+     * @return int    $follow_id                   //Follow ID
+     */
+    function add($report_id, $property_list, & $files)
+    {
+        //Check Argument
+        require_once('fw/string_util.csp');
+        require_once('report/error_code.csp');
+        cb_trim_check($report_id,
+            E_GRN_RPRT_FORM_INVALID_ID);                //Report ID
+
+        //Get Report
+        require_once('report/controller_util.csp');
+        $report_util = GRN_Report_Report_Controller_Utility::getInstance();
+        if ( ! ($report = $report_util->getSimpleView($report_id))) {
+            cb_throw_error(E_GRN_RPRT_REPORT_NOT_FOUND);
+        }
+
+        if ($report['enable_follow'] != 1) {
+            cb_throw_error(E_GRN_RPRT_DENY_ADD_FOLLOW);
+        }
+
+        //Create Property List
+        $next_follow_id = $report['last_follow_id']
+                          + 1;
+        $property_list[GRN_REPORT_COLUMN_FOLLOW_ID] = $next_follow_id;
+        $property_list[GRN_REPORT_COLUMN_REPORT] = $report_id;
+
+        //Set Creator
+        GRN_Report_Table_Manager::setCreator($property_list);
+
+        //Against XSS
+        require_once('grn/controller.csp');
+        if (array_key_exists(GRN_REPORT_COLUMN_HTML, $property_list)) {
+            $property_list[GRN_REPORT_COLUMN_HTML]
+                = grn_wash_script_without_style_attribute($property_list[GRN_REPORT_COLUMN_HTML]);
+        }
+
+        //Create New Follow
+        $follow_manager = GRN_Report_Follow_Manager::getInstance();
+        $follow_id = $follow_manager->create($property_list);
+
+        //Create File
+        if ($files) {
+            require_once('report/filerelation_logic.csp');
+            $filerelation_logic = GRN_Report_FileRelation_Logic::getInstance();
+            foreach (array_keys($files) as $key) {
+                if (is_array($files[$key])
+                    && $files[$key]['error'] != UPLOAD_ERR_OK
+                ) {
+                    continue;
+                }
+
+                //Create File Relation
+                $filerelation_logic->addFollowFile($report_id, $follow_id,
+                    $files[$key]);
+            }
+        }
+
+        //Update Report
+        $report_property_list = [];
+        $report_property_list[GRN_REPORT_COLUMN_LAST_FOLLOW_ID]
+            = $next_follow_id;
+        GRN_Report_Table_Manager::setModifier($report_property_list);
+
+        require_once('report/report_manager.csp');
+        $report_logic = GRN_Report_Report_Manager::getInstance();
+        $report_logic->update($report_id, $report_property_list);
+
+        return $follow_id;
+    }
+
+    /**
+     * Delete Follow
+     *
+     * @param int  $follow_id //Follow ID
+     * @param BOOL $result    //Result
+     */
+    function delete($follow_id, $report_id)
+    {
+        //Check Argument
+        require_once('fw/string_util.csp');
+        require_once('report/error_code.csp');
+        cb_trim_check($follow_id,
+            E_GRN_RPRT_FOLLOW_INVALID_ID);        //Follow ID
+
+        //Remove Attached File
+        require_once('report/filerelation_logic.csp');
+        $filerelation_logic = GRN_Report_FileRelation_Logic::getInstance();
+        $filerelation_logic->deleteAllFollowFiles($follow_id);
+
+        //Remove Follow
+        $follow_manager = GRN_Report_Follow_Manager::getInstance();
+        $follow_manager->remove($follow_id);
+
+        require_once('report/report_logic.csp');
+        $report_logic = GRN_Report_Report_Logic::getInstance();
+        $report = $report_logic->get($report_id);
+
+        $follows = $follow_manager->getList($report_id);
+
+        //レポートの通知を受信するユーザーを取得
+        require_once('report/controller_util.csp');
+        $report_util = GRN_Report_Report_Controller_Utility::getInstance();
+        $list = $report_util->getNotificationList($report_id);
+        $notification_userIds = [];
+        foreach ($list as $value) {
+            $notification_userIds[$value] = $value;
+        }
+
+        //ユーザーオブジェクト取得
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $notification_users = [];
+        foreach ($notification_userIds as $user_id) {
+            $notification_users[$user_id] = $uum->getUser($user_id);
+        }
+
+        //通知のロールバック
+        require_once('grn/notification.csp');
+        require_once('report/resources.csp');
+        $notify_service = GRN_Notification_Service::getInstance();
+        $readstatus_util
+            = GRN_Report_ReadStatus_Controller_Utility::getInstance();
+        foreach ($notification_users as $user) {
+            //通知情報の取得
+            $notify_properties = $notify_service->getNotifyDataProperties($user,
+                GRN_REPORT_MODULE_ID, $report_id);
+            if (is_null($notify_properties)) {
+                continue;
+            }
+            $notification_properties =& $this->_updateNotificationInfo($report,
+                $follows, $user, $notify_properties);
+            //時刻を最後に操作された時間にする
+            //$notify_properties->setTimeStampData( $last_modified_ts );
+
+            if ( ! is_null($notification_properties)) {
+                $notify_service->modifyNotifyData($user, $notify_properties,
+                    false, false);
+            } else {
+                $notify_service->deleteNotifyData($user, GRN_REPORT_MODULE_ID,
+                    $report_id);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * $user にとっての直前の通知を返す。削除する場合は null を返す。
+     *
+     * @param array                 $report
+     * @param array                 $follows
+     * @param CB_User               $user
+     * @param GRN_Notification_Data $old_notification_property
+     *
+     * @return GRN_Notification_Data
+     *
+     */
+    function _updateNotificationInfo(
+        $report,
+        $follows,
+        &$user,
+        &$old_notification_property
+    ) {
+        $mtime_check = true;
+        $ctime_check = true;
+
+        $notification_time = null;
+        $notification_abstract = null;
+        $notification_sender_id = null;
+        $notification_sender_name = null;
+
+        require_once("report/notification.csp");
+        $timeline = [];
+        foreach ($follows as $follow) {
+            if ($follow['col_creator'] == $user->getOID()) {
+                continue;
+            }
+            $timeline[$follow['col_ctime']] = [
+                'time'        => $follow['col_ctime'],
+                'sender_id'   => $follow['col_creator'],
+                'sender_name' => $follow['col_creator_name'],
+                'abstract'    => $follow['col_data']
+            ];
+        }
+        if ($report['col_report_mtime'] != $report['col_ctime']) {
+            if ($user->getOID() != $report['col_creator']) {
+                $timeline[$report['col_ctime']] = [
+                    'time'        => $report['col_ctime'],
+                    'sender_id'   => $report['col_creator'],
+                    'sender_name' => $report['col_creator_name'],
+                    'abstract'    => GRN_Report_Notification_Listener::cb_msg('grn.report',
+                        'notify_entry')
+                ];
+            }
+            if ($user->getOID() != $report['col_modifier']) {
+                $timeline[$report['col_report_mtime']] = [
+                    'time'        => $report['col_report_mtime'],
+                    'sender_id'   => $report['col_modifier'],
+                    'sender_name' => $report['col_modifier_name'],
+                    'abstract'    => GRN_Report_Notification_Listener::cb_msg('grn.report',
+                        'notify_modify')
+                ];
+            }
+        } else {
+            if ($user->getOID() != $report['col_creator']) {
+                $timeline[$report['col_ctime']] = [
+                    'time'        => $report['col_ctime'],
+                    'sender_id'   => $report['col_creator'],
+                    'sender_name' => $report['col_creator_name'],
+                    'abstract'    => GRN_Report_Notification_Listener::cb_msg('grn.report',
+                        'notify_entry')
+                ];
+            }
+        }
+
+        if (count($timeline) == 0) {
+            return null;
+        }
+
+        $time_list = array_keys($timeline);
+        rsort($time_list);
+        $timeline_keys = $time_list[0];
+        $notify_data = $timeline[$timeline_keys];
+
+        $old_notification_property->setAbstractData($notify_data['abstract']);
+        $old_notification_property->setSenderData($notify_data['sender_name'],
+            $notify_data['sender_id']);
+        $timestamp = new CB_TimeStamp();
+        $timestamp->unix_ts = $notify_data['time'];
+        $old_notification_property->setTimeStampData($timestamp);
+
+        return $old_notification_property;
+    }
+
+    /**
+     * Set Attache File
+     *
+     * @return int    $follow_id                   //Follow ID
+     *
+     * @param  int $attach_file //Attach File Flag
+     *
+     * @return int    $follow_id                   //Follow ID
+     */
+    function setAttachFile($follow_id, $attach_file, $attach_file_view = null)
+    {
+        //Check Argument
+        require_once('fw/string_util.csp');
+        require_once('report/error_code.csp');
+        cb_trim_check($follow_id,
+            E_GRN_RPRT_FOLLOW_INVALID_ID);            //Follow ID
+
+        //Create Property List
+        $property_list = [
+            GRN_REPORT_COLUMN_ATTACH_FILE      => $attach_file,
+            GRN_REPORT_COLUMN_ATTACH_FILE_VIEW => $attach_file_view,
+        ];
+
+        //Update Follow
+        $follow_manager = GRN_Report_Follow_Manager::getInstance();
+        $follow_id = $follow_manager->update($follow_id, $property_list);
+
+        //Update Report
+        $follow = $this->getDirect($follow_id);
+        require_once('report/report_logic.csp');
+        $report_logic = GRN_Report_Report_Logic::getInstance();
+        $report_logic->update($follow['col_report']);
+
+        return $follow_id;
+    }
+}
+
+

@@ -1,0 +1,250 @@
+<?php
+
+namespace grn\workflow\screen\mobile;
+
+use grn\workflow\screen\mobile\View;
+
+require_once('workflow/controller_util.csp');
+
+class Cancel extends MobileWorkflowScreenBase
+{
+    private $_petition;
+    private $_folder;
+
+    public function __construct($input)
+    {
+        parent::__construct($input);
+        $this->checkArgFromInput([self::ARG_FOLDER_ID, self::ARG_PETITION_ID],
+            $input);
+    }
+
+    public function fetch()
+    {
+        $input = $this->getInput();
+        $this->checkArgFromInput([self::ARG_HANDLE], $input);
+        $folder_id = $this->getFolderId();
+        $petition_id = $this->getPetitionId();
+        $handle = $this->getHandle();
+
+        $this->checkOperational();
+        $petition = $this->getPetition();
+        if ( ! $handle) {
+            if (GRN_WORKFLOW_STATUS_REMAND == $petition['status']) {
+                $handle = true;
+            }
+        }
+        $folder = $this->getFolder();
+
+        require_once('grn/smarty.csp');
+        $t = new \GRN_Smarty();
+        $current_page = $this->getTitle();
+        $upper_page = cb_msg('grn.workflow.mobile', 'detail');
+        $this->assignBreadcrumbUpperPage($t, $upper_page,
+            'workflow/mobile/view',
+            $params = ['fid' => $folder_id, 'pid' => $petition_id]);
+        $this->assignBreadcrumbCurrentPage($t, $current_page);
+
+        $t->assign('petition_id', $petition_id);
+        $t->assign('folder_id', $folder_id);
+        $t->assign('handle', $handle);
+        $t->assign('petition', $petition);
+        $t->assign('folder', $folder);
+        $t->assign('cancel_button',
+            cb_msg('grn.workflow', "cancel_button_{$petition['status']}"));
+
+        return $t->fetch('workflow/mobile/cancel.tpl');
+    }
+
+    public function post($input)
+    {
+        $input = $this->getInput();
+        $this->checkArgFromInput([self::ARG_COMMENT], $input);
+        $petition_id = $this->getPetitionId();
+        $comment = $this->getComment();
+        $handle = $this->getHandle();
+        $user_id = $this->getLoginUserId();
+        $page_name = 'workflow/mobile/cancel';
+
+        $this->checkOperational();
+
+        require_once('workflow/petition_logic.csp');
+        $logic = \GRN_Workflow_Petition_Logic::getInstance();
+        $petition = $logic->get($petition_id);
+
+        // 申請の状況を取り戻し（取り消し）に変更
+        $logic = \GRN_Workflow_Petition_Logic::getInstance();
+        if (GRN_WORKFLOW_STATUS_UNPROCESSING != $petition['col_status']
+            && GRN_WORKFLOW_STATUS_IN_PROCESS != $petition['col_status']
+        ) {
+            $petition['col_status'] = GRN_WORKFLOW_STATUS_IN_PROCESS;
+        }
+        $status = GRN_WORKFLOW_STATUS_UNPROCESSING_CANCEL
+                  + $petition['col_status'];
+        $ptime = time();
+        $agent_id = null;
+        if ($user_id != $petition['col_user']) {
+            $agent_id = $user_id;
+            $user_id = $petition['col_user'];
+        }
+        $logic->modifyStatus($petition_id, $status, $user_id, $comment, $ptime,
+            $agent_id);
+
+        $user_id = $petition['col_user'];
+        if (GRN_WORKFLOW_STATUS_UNPROCESSING == $petition['col_status']) {
+            // 取り戻したは、下書きのみ
+            require_once('workflow/controller_util.csp');
+            $controller_util = new \GRN_Workflow_ControllerUtil($page_name);
+            $controller_util->removeAllPetitions($petition_id, $user_id);
+            if ( ! is_null($petition['col_agent_user'])) {
+                $controller_util->removeAllPetitions($petition_id,
+                    $petition['col_agent_user']);
+            }
+            // 取り戻しの場合、申請者の下書きに申請を送信
+            $uids = [];
+            if ( ! is_null($petition['col_agent_user'])) {
+                $uids = [$petition['col_agent_user']];
+            } else {
+                $uids = [$user_id];
+            }
+            $foreign_keys = ['TEMP_FOLDER_FOREIGN_KEY'];
+            $controller_util->sendPetition($petition_id, $uids, $foreign_keys);
+        } else {
+            require('workflow/auto_schedule_register_logic.csp');
+            $wf_register_logic
+                = \GRN_Workflow_Auto_Schedule_Register_Logic::getInstance();
+            $wf_register_logic->delete($petition_id);
+        }
+
+        //監査する
+        require_once('workflow/inspection.csp');
+        $inspection = \GRN_Workflow_Petition_Inspection::getInstance();
+        if ($inspection->isEnabled()) {
+            $message_type = 'petition_cancel';
+            $message_args['pid'] = $petition_id;
+            $message_args['uid'] = $user_id;
+            $message_args['status'] = $status;
+            $message_args['comment'] = $comment;
+            $message_args['ptime'] = $ptime;
+            //Record Inspection
+            $inspection->record($message_type, $message_args);
+        }
+
+        if ($handle) {
+            // 処理者の申請を削除
+            require_once('workflow/controller_util.csp');
+            $controller_util = new \GRN_Workflow_ControllerUtil($page_name);
+            $controller_util->removePetition($petition_id, $user_id,
+                'UNPROCESSED_FOLDER_FOREIGN_KEY');
+            if ( ! is_null($petition['col_agent_user'])) {
+                $controller_util->removePetition($petition_id,
+                    $petition['col_agent_user'],
+                    'UNPROCESSED_FOLDER_FOREIGN_KEY');
+            }
+        }
+    }
+
+    private function checkOperational()
+    {
+        $petition = $this->getPetition();
+        $user_id = $this->getLoginUserId();
+        $folder_id = $this->getFolderId();
+        $petition_id = $this->getPetitionId();
+        if ($user_id != cb_at($petition, 'creator')
+            && $user_id != $petition['user']
+            && $user_id != $petition['agent_user']
+        ) {
+            // ログインユーザーは申請者でない
+            cb_throw_error(E_GRN_WRKF_DENY_CANCEL_NOT_APPLICANT);
+        }
+        if (GRN_WORKFLOW_STATUS_UNPROCESSING != $petition['status']
+            && GRN_WORKFLOW_STATUS_IN_PROCESS != $petition['status']
+            && GRN_WORKFLOW_STATUS_REMAND != $petition['status']
+        ) {
+            cb_throw_error(E_GRN_WRKF_PETITION_STATUS_DENY_CANCEL);
+        }
+
+        require_once('workflow/folder_logic.csp');
+        $logic = \GRN_Workflow_Folder_Logic::getInstance();
+        $folder = $logic->get($user_id, $folder_id);
+        if ( ! is_array($folder) || 0 == count($folder)) {
+            // ログインユーザーはフォルダの所有者でない
+            cb_throw_error(E_GRN_WRKF_FOLDER_INVALID_FOLDER_ID);
+        }
+
+        //As in mobile view $folder_id get from input is the id of UNPROCESSED FOLDER if user not modify manually.
+        //So here change the $folder_id to the id of OUT FOLDER to check if folder and petition has relationship.
+        $out_folder_id = $folder_id;
+        if (GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID
+            == $folder['col_folder_type']
+        ) {
+            if (GRN_WORKFLOW_STATUS_REMAND != $petition['status']) {
+                $out_folder = $logic->getByForeignKey($user_id,
+                    'OUT_FOLDER_FOREIGN_KEY');
+                $out_folder_id = $out_folder['_id'];
+            }
+        } elseif (GRN_WORKFLOW_FOLDER_TYPE_OUT_ID
+                  != $folder['col_folder_type']
+        ) {
+            // フォルダは送信一覧でない
+            cb_throw_error(E_GRN_WRKF_DENY_CANCEL_FOLDER);
+        }
+        require_once('workflow/folderrelation_logic.csp');
+        $logic = \GRN_Workflow_FolderRelation_Logic::getInstance();
+        $folder_relation = $logic->getSpecific($out_folder_id, $petition_id);
+        if ( ! is_array($folder_relation) || 0 == count($folder_relation)) {
+            // フォルダにフォルダリレーションがない
+            cb_throw_error(E_GRN_WRKF_FOLDER_FOLDERRELATION_NOT_FOUND);
+        }
+        $this->setFolder($folder);
+    }
+
+    private function getPetition()
+    {
+        if (is_null($this->_petition)) {
+            $this->checkArgFromInput([self::ARG_PETITION_ID],
+                $this->getInput());
+            $petition_id = $this->getPetitionId();
+            $petition_util
+                = \GRN_Workflow_Petition_Controller_Utility::getInstance();
+            $columns = [
+                'pid'                 => '_id',
+                'petition_number'     => 'petition_number',
+                'name'                => 'name',
+                'form_name'           => 'form_name',
+                'creator'             => 'creator',
+                'creator_name'        => 'creator_name',
+                'creator_foreign_key' => 'creator_foreign_key',
+                'ctime'               => 'ctime',
+                'icon_type'           => 'icon_type',
+                'icon_id'             => 'icon_id',
+                'icon_url'            => 'icon_url',
+                'status'              => 'status',
+                'user'                => 'user',
+                'agent_user'          => 'agent_user',
+            ];
+            $this->_petition = $petition_util->getView($petition_id, $columns);
+        }
+
+        return $this->_petition;
+    }
+
+    private function setFolder($value)
+    {
+        $this->_folder = $value;
+    }
+
+    protected function getFolder()
+    {
+        return $this->_folder;
+    }
+
+    public function getTitle()
+    {
+        $petition = $this->getPetition();
+        if (GRN_WORKFLOW_STATUS_UNPROCESSING == $petition['status']) {
+            return cb_msg('grn.workflow.mobile', "cancel_navi_0");
+        } else {
+            return cb_msg('grn.workflow.mobile', "cancel_navi_1");
+        }
+    }
+}

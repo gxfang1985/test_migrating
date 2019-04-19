@@ -1,0 +1,1068 @@
+<?php
+
+namespace grn\schedule;
+
+use grn\schedule\bean\FacilityApproval;
+use grn\schedule\bean\FacilityApprovalApplyingInfo;
+use grn\schedule\collection\EventFacilityApprovals;
+
+require_once('grn/application.csp');
+require_once('schedule/error_code.csp');
+require_once('grn/notification.csp');
+require_once('schedule/facility_system_logic.csp');
+require_once('schedule/utility.csp');
+require_once('schedule/application.csp');
+
+class FacilityApprovalLogic
+{
+    const REPEAT_EVENT = 'repeat';
+    const MINIMUM_MEMBER_GROUP_FACILITY = 1;// An event include minimum a member or group or facility
+
+    /**
+     * @param \CB_User $login
+     * @param string   $eventId
+     * @param string   $facilityId
+     * @param bool     $isApproval
+     * @param string   $comment
+     */
+    public function processApprovalApplying(
+        \CB_User $login,
+        $eventId,
+        $facilityId,
+        $isApproval,
+        $comment
+    ) {
+        require_once('schedule/eventfactory.csp');
+        $factory = \GRN_Schedule_EventFactory::getInstance();
+        $event = $factory->getEvent($eventId);
+
+        $facilityLogic = \GRN_Facility_SystemLogic::getInstance();
+        $facility = $facilityLogic->getFacility($facilityId);
+
+        $postCommandParams = ['post' => true, 'reject' => ! $isApproval];
+
+        $this->validateEventSupportFacilityApproval($event, $facility, $login,
+            $postCommandParams);
+        $notLocalFacility = $facilityLogic->getFacilityInfo($facilityId, false);
+
+        $facilityApproval = new FacilityApproval();
+        $facilityApproval->setUser($login->getOID());
+        $facilityApproval->setUserName($login->get('display_name'));
+        $facilityApproval->setEvent($event);
+        $facilityApproval->setFacility($notLocalFacility['_id']);
+        $facilityApproval->setFacilityName($notLocalFacility['col_name']);
+        $facilityApproval->setApprovalTime(time());
+        $facilityApproval->setComment($comment);
+
+        // Saving datetime of event to facility approval because in the case after operational facility approved/rejected, registrant change datetime of event.
+        $facilityApproval->setStartDateTime(cb_datetime_to_timestamp($event->setdatetime));
+        $facilityApproval->setEndDateTime(cb_datetime_to_timestamp($event->enddatetime));
+
+        if ($isApproval) {
+            $facilityApproval->setUsing(FacilityApproval::USING);
+            $facilityApproval->setStatus(FacilityApproval::STATUS_APPROVE);
+        } else {
+            $facilityApproval->setUsing(FacilityApproval::NOT_USING);
+            $facilityApproval->setStatus(FacilityApproval::STATUS_REJECT);
+        }
+
+        $scheduleFacade = new ScheduleFacade();
+        $scheduleFacade->insertFacilityApproval($facilityApproval);
+
+        $this->updateEventModifier($login, $eventId);
+
+        if ( ! $isApproval) {
+            $scheduleFacade->removeFacilityOfEvent($eventId, $facilityId);
+        }
+
+        $timeStampEx = new \CB_TimeStampEx();
+        $today = $timeStampEx->getDate();
+        $beginDate = $event->getFirstDate($today);
+        $isNotify = true;
+        if ($today->compare($beginDate) > 0) {
+            $isNotify = false;
+        }
+        if ($isNotify) {
+            $this->sendNotify(
+                $event, $login,
+                $isApproval ? GRN_NOTIFICATION_ACTION_FACILITY_APPROVED_ID
+                    : GRN_NOTIFICATION_ACTION_FACILITY_REJECTED_ID
+            );
+
+            $app = \GRN_Schedule_Application::getInstance();
+            $app->forwardFacilityResultMail($facilityApproval);
+            $app->sendPushNotificationOfFacilityResponse($facilityApproval,
+                $isApproval);
+        }
+
+        $this->exportLog($facilityApproval);
+    }
+
+    /***
+     * @param \CB_User $login
+     * @param string   $eventId
+     * The method updated modifier include user and date-time
+     *
+     * @return bool|int
+     */
+    private function updateEventModifier(\CB_User $login, $eventId)
+    {
+        $inDb = cb_get_app_db("schedule");
+        $query
+            = "UPDATE tab_grn_schedule_event"
+              . " SET col_modifier='@S', col_modifier_foreign_key='@S', col_modifier_name='@S', col_mtime='@S'"
+              . " WHERE _id='@S';";
+        $query = cb_queryf(
+            $inDb,
+            $query, $login->getOID(), $login->get('foreign_key'),
+            $login->get('display_name'), time(), $eventId
+        );
+        $result = $inDb->query($query);
+
+        if ($result === false) {
+            $inDb->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        return $inDb->affected_rows();
+    }
+
+    /**
+     * @param \GRN_Schedule_EventBase|bool $event
+     * @param \GRN_Facility_Facility|bool  $facility
+     * @param \CB_User                     $login
+     * @param array                        $postCommandParams
+     * @param bool                         $noThrow
+     *
+     */
+    public function validateEventSupportFacilityApproval(
+        $event,
+        $facility,
+        \CB_User $login,
+        $postCommandParams = [],
+        $noThrow = false
+    ) {
+
+        if ( ! $event) {
+            if ($noThrow) {
+                return false;
+            } else {
+                cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+            }
+        }
+
+        if ( ! $event instanceof \GRN_Schedule_NormalEvent) {
+            cb_throw_error(E_GRN_SCHD_NOT_NORMAL_TYPE);
+        }
+
+        if ( ! $facility) {
+            if ($noThrow) {
+                return false;
+            } else {
+                cb_throw_error(E_GRN_FCLT_NOTFOUND_FACILITY);
+            }
+        }
+
+        //Check privilege
+        require_once('schedule/facility_privilege.csp');
+        $privilegeLogic = \GRN_Facility_Privilege_Logic::getInstance();
+        if ( ! $privilegeLogic->hasPrivilegeOfFacility($login, $facility)) {
+            if ($noThrow) {
+                return false;
+            } else {
+                cb_throw_error(E_GRN_SCHD_NOT_OPERATIONAL_ADMINISTRATOR_FACILITY_APPROVAL);
+            }
+        }
+
+        //Check facility approve ON/OFF
+        $scheduleFacilityApprovalSetting
+            = new ScheduleFacilityApprovalSetting();
+        if ( ! $scheduleFacilityApprovalSetting->isRequiredApproval($facility->getOID())) {
+            if ($noThrow) {
+                return false;
+            } else {
+                cb_throw_error(E_GRN_SCHD_SYSTEM_FACILITY_APPROVAL_OFF);
+            }
+
+        }
+
+        $isProcessed = $this->isProcessed($event, $facility->getOID());
+        $isFacilityBelongEvent
+            = $event->isFacilityForEvent($facility->getOID());
+
+        if ( ! is_array($postCommandParams) || count($postCommandParams) == 0) {
+            $postCommandParams = ['post' => false, 'reject' => false];
+        }
+
+        if (isset($postCommandParams) && $postCommandParams['post'] == true) {
+            if ($isProcessed) {
+                if ($noThrow) {
+                    return false;
+                } else {
+                    cb_throw_error(E_GRN_SCHD_FACILITY_WAS_PROCESSED);
+                }
+            } elseif ( ! $isFacilityBelongEvent) {
+                cb_throw_error(E_GRN_SCHD_FACILITY_NOT_BELONG_EVENT);
+            } elseif (isset($postCommandParams)
+                      && $postCommandParams['reject'] == true
+            ) {
+                //Can't reject this only facility of appointment in the case user and goup is empty.
+                if (count($event->groups) + count($event->users)
+                    + count($event->facilities)
+                    <= self::MINIMUM_MEMBER_GROUP_FACILITY
+                ) {
+                    cb_throw_error(E_GRN_SCHD_NOT_REJECT_FACILITY_ONLY_EVENT);
+                }
+            } else {
+                // can process
+            }
+        } else {
+            if ($isProcessed) {
+                // show 'processed screen'
+            } elseif ( ! $isFacilityBelongEvent) {
+                if ($noThrow) {
+                    return false;
+
+                } else {
+                    cb_throw_error(E_GRN_SCHD_FACILITY_NOT_BELONG_EVENT);
+                }
+            } else {
+                // show 'approval screen'
+            }
+        }
+
+        return true;
+    }
+
+    /***
+     * The function writing action approved/rejected when operator process
+     *
+     * @param FacilityApproval $facilityApprovalObj
+     */
+    private function exportLog(FacilityApproval $facilityApprovalObj)
+    {
+        $status = "accept";
+        if ($facilityApprovalObj->getStatus() == 0) {
+            $status = "reject";
+        }
+        require_once("grn/logger.csp");
+        $logManager = \CB_LoggerManager::getInstance();
+        $scheduleLog = $logManager->getLogger(GRN_SCHEDULE_MODULE_ID);
+        $logParams = [
+            "eid"     => $facilityApprovalObj->getEventId(),
+            "faid"    => $facilityApprovalObj->getFacility(),
+            "uid"     => $facilityApprovalObj->getUser(),
+            "status"  => $status,
+            "comment" => $facilityApprovalObj->getComment()
+        ];
+
+        $scheduleLog->noticeEx("modify", "event_facility_approval ",
+            $logParams);
+    }
+
+    public function invalidateFacilitiesOfEvent(
+        \GRN_Schedule_NormalEvent $event,
+        $facilityIds
+    ) {
+        $scheduleFacade = new ScheduleFacade();
+        $scheduleFacade->invalidateFacilitiesOfEvent($event->id, $facilityIds);
+    }
+
+    /**
+     * @param \GRN_Schedule_NormalEvent $event
+     *
+     * @return FacilityApproval[]
+     */
+    public function getListFacilityApprovalByEvent(
+        \GRN_Schedule_NormalEvent $event
+    ) {
+        $scheduleFacade = new ScheduleFacade();
+
+        return $scheduleFacade->getListFacilityApprovalByEventId($event->id);
+    }
+
+    /**
+     * @param \GRN_Schedule_NormalEvent $event
+     *
+     * @return EventFacilityApprovals
+     */
+    public function getEventFacilityApprovalsByEvent(
+        \GRN_Schedule_NormalEvent $event
+    ): EventFacilityApprovals {
+        $scheduleFacade = new ScheduleFacade();
+
+        return new EventFacilityApprovals(
+            $scheduleFacade->getListFacilityApprovalByEventId($event->id)
+        );
+    }
+
+    /**
+     * @param array $event_ids
+     *
+     * @return EventFacilityApprovals[]
+     */
+    public function getListEventFacilityApprovalsByEventIds(array $event_ids
+    ): array {
+        $scheduleFacade = new ScheduleFacade();
+
+        return $scheduleFacade->getListFacilityApprovalByEventIds($event_ids);
+    }
+
+    /**
+     * @param $eventId
+     * @param $facilityId
+     *
+     * @return FacilityApproval|null
+     */
+    public function getLastApproval($eventId, $facilityId)
+    {
+        $scheduleFacade = new ScheduleFacade();
+
+        return $scheduleFacade->getLastApproval($eventId, $facilityId);
+    }
+
+    /*
+     *  Get current status of facilities of event
+     *  @param    GRN_Schedule_NormalEvent
+     *
+     *  @return   list of facilities which have approved or not. The facilities which do not have facility approval setting is not included in return array
+     *            array { facility_id => TRUE/FALSE }
+     *            TRUE    facility is approved
+     *            FALSE   facility is waiting for approval
+     */
+    public function getCurrentStatusOfFacilities(
+        \GRN_Schedule_NormalEvent $event
+    ) {
+        if ( ! is_array($event->facilities) || count($event->facilities) == 0) {
+            return [];
+        }
+
+        $facilityApproval = new FacilityApproval();
+        $facilityApproval->setEvent($event->id);
+        $facilityApproval->setStatus(FacilityApproval::STATUS_APPROVE);
+        $facilityApproval->setUsing(FacilityApproval::USING);
+
+        $scheduleFacade = new ScheduleFacade();
+        $arrFacilityApproval
+            = $scheduleFacade->getListFacilityApprovalByCondition($facilityApproval);
+        $arrConvertedFacilityApproval
+            = $this->convertFacilityIdToKeyOfArray($arrFacilityApproval);
+
+        $facilityIds = array_keys($event->facilities);
+        $scheduleFacilityApprovalSetting
+            = new ScheduleFacilityApprovalSetting();
+        $checkFacilitiesHaveApprovalSetting
+            = $scheduleFacilityApprovalSetting->getSettings($facilityIds);
+
+        $ret = [];
+        foreach ($checkFacilitiesHaveApprovalSetting as $key => $value) {
+            if ($value) {
+                $ret[$key] = false;
+                if (array_key_exists($key, $arrConvertedFacilityApproval)) {
+                    $ret[$key] = true;
+                }
+            }
+        }
+
+        return $ret;
+    }
+
+    private function convertFacilityIdToKeyOfArray($arrFacilities)
+    {
+        $ret = [];
+        foreach ($arrFacilities as $facilityObj) {
+            $ret[$facilityObj->getFacility()] = $facilityObj;
+        }
+
+        return $ret;
+    }
+
+    public function getLastApprovalTime($eventId)
+    {
+        $scheduleFacade = new ScheduleFacade();
+
+        return $scheduleFacade->getLastApprovalTime($eventId);
+    }
+
+    public function hasApprovalHistory($eventId)
+    {
+        $scheduleFacade = new ScheduleFacade();
+
+        return $scheduleFacade->hasApprovalHistory($eventId);
+    }
+
+    public function isProcessed(\GRN_Schedule_NormalEvent $event, $facilityId)
+    {
+        $scheduleFacade = new ScheduleFacade();
+        $getLastConfirmed = $scheduleFacade->getLastApproval($event->id,
+            $facilityId);
+
+        if (is_null($getLastConfirmed)) {
+            return false;
+        }
+
+        if ($getLastConfirmed->isApproved() && $getLastConfirmed->isUsing()) {
+            return true;
+        }
+
+        if ($getLastConfirmed->isRejected() && ! $getLastConfirmed->isUsing()) {
+            $isFacilityBelongEvent = $event->isFacilityForEvent($facilityId);
+
+            if ( ! $isFacilityBelongEvent) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public function setFacilityUsingPurpose($eventId, $usingPurpose)
+    {
+        $scheduleFacade = new ScheduleFacade();
+        $scheduleFacade->setFacilityUsingPurpose($eventId, $usingPurpose);
+    }
+
+    /**
+     * @param string $eventId
+     *
+     * @return string
+     */
+    public function getFacilityUsingPurpose($eventId)
+    {
+        $using_purposes = $this->getFacilityUsingPurposesByEventIds([$eventId]);
+
+        return $using_purposes[$eventId] ?? '';
+    }
+
+
+    /**
+     * @param string[] $event_ids
+     *
+     * @return string[] Key is a event id
+     */
+    public function getFacilityUsingPurposesByEventIds(array $event_ids): array
+    {
+        $scheduleFacade = new ScheduleFacade();
+
+        return $scheduleFacade->getFacilityUsingPurposesByEventIds($event_ids);
+    }
+
+    public function getNamesForFacilitiesNeedApproval($facilityObjs)
+    {
+        $faids = [];
+        $result = [];
+        if ($facilityObjs == null) {
+            return $result;
+        }
+        foreach ($facilityObjs as $facilityObj) {
+            $faid = $facilityObj->getOID();
+            $faids[] = $faid;
+            $fnames[$faid] = $facilityObj->get('name');
+        }
+        $scheduleFacilityApprovalSetting
+            = new ScheduleFacilityApprovalSetting();
+        $checkApprovalFacilities
+            = $scheduleFacilityApprovalSetting->getSettings($faids);
+
+        foreach ($checkApprovalFacilities as $key => $value) {
+            if ($value) {
+                $result[$key] = $fnames[$key];
+            }
+        }
+
+        return $result;
+    }
+
+    public function validateEventFacilitiesForAdd($event)
+    {
+        $facilityObjs = $event->facilities;
+        $approvalFacilities
+            = $this->getNamesForFacilitiesNeedApproval($facilityObjs);
+        if (count($approvalFacilities) == 0) {
+            return;
+        }
+
+        $facilitiesString = implode("; ", $approvalFacilities);
+        if (is_a($event, 'GRN_Schedule_RepeatEvent')) {
+            cb_throw_error(E_GRN_SCHD_FACILITY_CAN_NOT_USE_IN_REPEATING_APPOINTMENT,
+                ['facility' => $facilitiesString]);
+        } elseif (is_a($event, 'GRN_Schedule_TemporaryEvent')) {
+            cb_throw_error(E_GRN_SCHD_APPROVAL_FACILITY_CAN_NOT_USE_IN_TEMPORARY_APPOINTMENT,
+                null, ['facility' => $facilitiesString]);
+        }
+    }
+
+    public static function validateRepeatEventFacilitiesForEdit(
+        $newFacilities,
+        $oldFacilities,
+        $user
+    ) {
+        self::_validateEventFacilitiesForEdit($newFacilities, $oldFacilities,
+            $user, self::REPEAT_EVENT);
+    }
+
+    /**
+     * @param \GRN_Facility_Facility[] $newFacilities
+     * @param \GRN_Facility_Facility[] $oldFacilities
+     * @param \CB_User                 $user
+     * @param                          $typeEvent
+     */
+    private static function _validateEventFacilitiesForEdit(
+        $newFacilities,
+        $oldFacilities,
+        \CB_User $user,
+        $typeEvent
+    ) {
+        $facilityApprovalLogic = new FacilityApprovalLogic();
+        $approvalFacilitiesInfo
+            = $facilityApprovalLogic->getNamesForFacilitiesNeedApproval($newFacilities);
+        if (count($approvalFacilitiesInfo) == 0) {
+            return;
+        }
+
+        if ( ! is_array($oldFacilities)) {
+            $oldFacilities = [];
+        }
+        self::validateAddedApprovalFacility($oldFacilities,
+            $approvalFacilitiesInfo, $typeEvent);
+
+        $arrayFacilities = [];
+        foreach ($newFacilities as $facility) {
+            $arrayFacilities[$facility->getOID()] = $facility;
+        }
+
+        $facilityApprovalSetting = new ScheduleFacilityApprovalSetting();
+        $notApproverFacilitiesInfo = [];
+        foreach ($approvalFacilitiesInfo as $facilityId => $facilityName) {
+            if ( ! $facilityApprovalSetting->isApprover($user,
+                $arrayFacilities[$facilityId])
+            ) {
+                $notApproverFacilitiesInfo[$facilityId] = $facilityName;
+            }
+        }
+
+        // user is not operational administrator of any approval facilities
+        if (count($notApproverFacilitiesInfo)
+            == count($approvalFacilitiesInfo)
+        ) {
+            $facilitiesString = implode("; ", $approvalFacilitiesInfo);
+            if ($typeEvent == self::REPEAT_EVENT) {
+                cb_throw_error(
+                    E_GRN_SCHD_FACILITY_CAN_NOT_USE_IN_REPEATING_APPOINTMENT,
+                    ['facility' => $facilitiesString]
+                );
+            }
+        }
+
+        // user is not operational administrator of all approval facilities
+        if (count($notApproverFacilitiesInfo) > 0) {
+            $facilitiesString = implode("; ", $approvalFacilitiesInfo);
+            if ($typeEvent == self::REPEAT_EVENT) {
+                cb_throw_error(
+                    E_GRN_SCHD_NOT_OPERATIONAL_ADMINISTRATOR_OF_ALL_NEEDED_APPROVAL_FACILITIES,
+                    null,
+                    ['facility' => $facilitiesString]
+                );
+            }
+        }
+    }
+
+    /**
+     * @param \GRN_Facility_Facility[] $oldFacilities
+     * @param array                    $approvalFacilitiesInfoOfNewFacilities
+     * @param string                   $typeEvent
+     */
+    private static function validateAddedApprovalFacility(
+        array $oldFacilities,
+        array $approvalFacilitiesInfoOfNewFacilities,
+        $typeEvent
+    ) {
+        if ($typeEvent != self::REPEAT_EVENT) {
+            return;
+        }
+
+        $mapOldFacilities = [];
+        foreach ($oldFacilities as $facility) {
+            $mapOldFacilities[$facility->getOID()] = $facility;
+        }
+        $addedApprovalFacilitiesInfo
+            = array_diff_key($approvalFacilitiesInfoOfNewFacilities,
+            $mapOldFacilities);
+
+        if (count($addedApprovalFacilitiesInfo) === 0) {
+            return;
+        }
+
+        $facilitiesString = implode("; ", $addedApprovalFacilitiesInfo);
+        cb_throw_error(
+            E_GRN_SCHD_FACILITY_CAN_NOT_USE_IN_REPEATING_APPOINTMENT,
+            ['facility' => $facilitiesString]
+        );
+    }
+
+    public static function validateTemporaryEventFacilities($facilityIds)
+    {
+        $scheduleFacilityApprovalSetting
+            = new ScheduleFacilityApprovalSetting();
+        $checkApprovalFacilities
+            = $scheduleFacilityApprovalSetting->filterNeedApprovalFacilityIds($facilityIds);
+
+        if (count($checkApprovalFacilities) == 0) {
+            return;
+        }
+
+        $facilityLogic = \GRN_Facility_SystemLogic::getInstance();
+        $facilitiesInfo
+            = $facilityLogic->getFacilitiesInfo($checkApprovalFacilities,
+            CB_DATABASE_NO_LOCK);
+
+        $facilitiesName
+            = FacilityApprovalLogic::facilityNamesArrayMap($facilitiesInfo);
+        $facilitiesString = implode("; ", $facilitiesName);
+        cb_throw_error(E_GRN_SCHD_APPROVAL_FACILITY_CAN_NOT_USE_IN_TEMPORARY_APPOINTMENT,
+            null, ['facility' => $facilitiesString]);
+    }
+
+    /**
+     * @param \GRN_Schedule_NormalEvent $oldEvent
+     * @param \GRN_Schedule_NormalEvent $newEvent
+     */
+    public function invalidateFacilitiesForEventUpdate(
+        \GRN_Schedule_NormalEvent $oldEvent,
+        \GRN_Schedule_NormalEvent $newEvent
+    ) {
+        $changeTime = $this->checkTimeScheduleIsChanged($oldEvent, $newEvent);
+
+        if ($changeTime) {
+            // invalidate all record of approval facilities of old event
+            $this->invalidateAllFacilities($oldEvent);
+        } else {
+            $this->invalidateRemovedFacilities($oldEvent, $newEvent);
+        }
+    }
+
+    /**
+     * @param \GRN_Schedule_NormalEvent $oldEvent
+     * @param \GRN_Schedule_NormalEvent $newEvent
+     *
+     * @return bool
+     */
+    public function checkTimeScheduleIsChanged(
+        \GRN_Schedule_NormalEvent $oldEvent,
+        \GRN_Schedule_NormalEvent $newEvent
+    ) {
+        $changeTime = false;
+        if (($oldEvent->isAllDay() && ! $newEvent->isAllDay())
+            || ( ! $oldEvent->isAllDay() && $newEvent->isAllDay())
+        ) {
+            $changeTime = true;
+        } elseif ( ! $oldEvent->isAllDay() && ! $newEvent->isAllDay()) {
+            if (($oldEvent->enddatetime instanceof \CB_DateTime
+                 && ! ($newEvent->enddatetime instanceof \CB_DateTime))
+                || ( ! ($oldEvent->enddatetime instanceof \CB_DateTime)
+                     && $newEvent->enddatetime instanceof \CB_DateTime)
+            ) {
+                $changeTime = true;
+            } else {
+                $oldStartDateTime = $oldEvent->setdatetime;
+                $newStartDateTime = $newEvent->setdatetime;
+                if ($oldStartDateTime->compare($newStartDateTime) != 0) {
+                    $changeTime = true;
+                } elseif ($oldEvent->enddatetime instanceof \CB_DateTime
+                          && $newEvent->enddatetime instanceof \CB_DateTime
+                ) {
+                    $oldEndDateTime = $oldEvent->enddatetime;
+                    $newEndDateTime = $newEvent->enddatetime;
+                    if ($oldEndDateTime->compare($newEndDateTime) != 0) {
+                        $changeTime = true;
+                    }
+                }
+            }
+        }
+
+        return $changeTime;
+    }
+
+    /**
+     * @param \GRN_Schedule_NormalEvent $oldEvent
+     * @param \GRN_Schedule_NormalEvent $newEvent
+     *
+     * @return array
+     */
+    public function getRemovedFacilitiesId(
+        \GRN_Schedule_NormalEvent $oldEvent,
+        \GRN_Schedule_NormalEvent $newEvent
+    ) {
+        $oldFacilities = $oldEvent->facilities ? $oldEvent->facilities : [];
+        $newFacilities = $newEvent->facilities ? $newEvent->facilities : [];
+        $oldFaids = $this->objectArrayToIdArray($oldFacilities);
+        $newFaids = $this->objectArrayToIdArray($newFacilities);
+
+        return array_diff($oldFaids, $newFaids);
+    }
+
+    /**
+     * @param \GRN_Schedule_NormalEvent $oldEvent
+     * @param \GRN_Schedule_NormalEvent $newEvent
+     *
+     * @return array
+     */
+    public function getAddedFacilitiesId(
+        \GRN_Schedule_NormalEvent $oldEvent,
+        \GRN_Schedule_NormalEvent $newEvent
+    ) {
+        $oldFacilities = $oldEvent->facilities ? $oldEvent->facilities : [];
+        $newFacilities = $newEvent->facilities ? $newEvent->facilities : [];
+        $oldFaids = $this->objectArrayToIdArray($oldFacilities);
+        $newFaids = $this->objectArrayToIdArray($newFacilities);
+
+        return array_diff($newFaids, $oldFaids);
+    }
+
+    /**
+     * @param \GRN_Schedule_NormalEvent $oldEvent
+     * @param \GRN_Schedule_NormalEvent $newEvent
+     */
+    public function invalidateRemovedFacilities(
+        \GRN_Schedule_NormalEvent $oldEvent,
+        \GRN_Schedule_NormalEvent $newEvent
+    ) {
+        $removedFaids = $this->getRemovedFacilitiesId($oldEvent, $newEvent);
+        if (count($removedFaids) > 0) {
+            $this->invalidateFacilitiesOfEvent($newEvent, $removedFaids);
+        }
+    }
+
+    public function invalidateAllFacilities(\GRN_Schedule_NormalEvent $oldEvent)
+    {
+        $oldFacilities = $oldEvent->facilities ? $oldEvent->facilities : [];
+        $this->invalidateFacilitiesOfEvent($oldEvent,
+            $this->objectArrayToIdArray($oldFacilities));
+    }
+
+    public function objectArrayToIdArray($objects)
+    {
+        $ids = array_map(function ($object) {
+            return $object->getOID();
+        }, $objects);
+
+        return $ids;
+    }
+
+    public static function validateUsingPurposeByFacilitiesId(
+        $usingPurpose,
+        $facilityIds
+    ) {
+        $scheduleFacilityApprovalSetting
+            = new ScheduleFacilityApprovalSetting();
+        $checkApprovalFacilities
+            = $scheduleFacilityApprovalSetting->filterNeedApprovalFacilityIds($facilityIds);
+
+        if (count($checkApprovalFacilities) > 0
+            && strlen(cb_trim($usingPurpose)) == 0
+        ) {
+            $facilityLogic = \GRN_Facility_SystemLogic::getInstance();
+            $facilitiesInfo
+                = $facilityLogic->getFacilitiesInfo($checkApprovalFacilities,
+                CB_DATABASE_NO_LOCK);
+
+            $facilitiesName
+                = FacilityApprovalLogic::facilityNamesArrayMap($facilitiesInfo);
+            $facilitiesString = implode("; ", $facilitiesName);
+            cb_throw_error(E_GRN_SCHD_APPROVAL_FACILITY_SETTING_CHANGE,
+                ['facility' => $facilitiesString]);
+        }
+    }
+
+    public static function facilityNamesArrayMap($facilitiesInfo)
+    {
+        return array_map(function ($x) {
+            return $x['col_name'];
+        }, $facilitiesInfo);
+    }
+
+    /**
+     * Send approved/rejected notification.
+     *
+     * @param \GRN_Schedule_EventBase $event
+     * @param \CB_User                $sender
+     * @param string                  $action The action id(GRN_NOTIFICATION_ACTION_FACILITY_APPROVED_ID | GRN_NOTIFICATION_ACTION_FACILITY_REJECTED_ID)
+     */
+    public function sendNotify(
+        \GRN_Schedule_EventBase $event,
+        \CB_User $sender,
+        $action
+    ) {
+        if ($action !== GRN_NOTIFICATION_ACTION_FACILITY_APPROVED_ID
+            && $action !== GRN_NOTIFICATION_ACTION_FACILITY_REJECTED_ID
+        ) {
+            /**
+             * Don't send notification if the specified $action is not GRN_NOTIFICATION_ACTION_FACILITY_APPROVED_ID & GRN_NOTIFICATION_ACTION_FACILITY_REJECTED_ID
+             */
+            return;
+        }
+        require_once("schedule/notification.csp");
+        $scheduleNofService = \GRN_Schedule_Notify_Logic::getInstance();
+        $eventCreator
+            = $scheduleNofService->getEventCreatorForNotification($event,
+            $sender);
+        if (empty($eventCreator)) {
+            /**
+             * Don't send notification if event creator is also notification sender.
+             * Or, event creator is deleted.
+             */
+            return;
+        }
+        $scheduleNofData = $scheduleNofService->getNotificationData($event,
+            $action);
+        // Set sender information
+        $senderId = $sender->getOID();
+        $scheduleNofData->setSenderData($sender->get('display_name'),
+            $senderId);
+
+        $notificationService = \GRN_Notification_Service::getInstance();
+        $notificationService->modifyNotifyData($eventCreator, $scheduleNofData,
+            true, true);
+    }
+
+    /**
+     * GTM-1680 Facility approval request notification.
+     *
+     * @param array                  $facilityList The list of facility need to be approved.
+     * @param \GRN_Notification_Data $requestNofData
+     * @param \CB_User               $sender
+     */
+    public function sendFacilityApprovalRequestNotify(
+        array $facilityList,
+        \GRN_Notification_Data &$requestNofData,
+        \CB_User $sender
+    ) {
+        require_once('schedule/view_util.csp');
+        $util = \GRN_Schedule_View_Util::getInstance();
+        $facilityApprovalSetting = new ScheduleFacilityApprovalSetting();
+        /**
+         * Original data
+         */
+        $orgData = $requestNofData->getOrgData();
+        $eventId = $requestNofData->getUniqueId();
+        /**
+         * Fixed data
+         */
+        $requestNofData->setStatusToUnread();
+        $requestNofData->setActionId(GRN_NOTIFICATION_ACTION_FACILITY_REQUESTED_ID);
+        // sender information
+        $senderId = $sender->getOID();
+        $senderName = $sender->get("display_name");
+        $requestNofData->setSenderData($senderName, $senderId);
+
+        $facilityIds = [];
+        foreach ($facilityList as $facility) {
+            if ( ! is_object($facility)) {
+                continue;
+            }
+            $facilityIds[] = $facility->getOID();
+        }
+        $inDataObj = [];
+        $facilityFacade = new \FacilityFacade();
+        $nonLocaleFacilitiesName
+            = $facilityFacade->getFacilityListByIds($inDataObj,
+            $facilityIds);
+        if ( ! is_array($nonLocaleFacilitiesName)) {
+            return;
+        }
+        foreach ($nonLocaleFacilitiesName as $facility) {
+            $facilityId = $facility->getId();
+            $isRequiredApprove
+                = $facilityApprovalSetting->isRequiredApproval($facilityId);
+            if ($isRequiredApprove === false) {
+                continue;
+            }
+            $facilityOperationalAdministrators
+                = $facilityApprovalSetting->getOperationalAdministrators($facilityId);
+            if (count($facilityOperationalAdministrators) == 0) {
+                continue;
+            }
+            // set unique id
+            $uniqueId = "{$eventId}-{$facilityId}";
+            $requestNofData->setUniqueId($uniqueId);
+            // set subjects
+            $subject = $util->getNotifyTitle($facility->getName());
+            $requestNofData->setSubjectData($subject);
+            // set sub module id
+            $requestNofData->setSubModuleId(GRN_FACILITY_APPROVAL_SUB_MODULE_ID);
+            // set org data
+            $orgData["faid"] = $facilityId;
+            $requestNofData->setOrgData($orgData);
+
+            $notificationService = \GRN_Notification_Service::getInstance();
+            $notificationService->modifyNotifyDataListByUser($facilityOperationalAdministrators,
+                $requestNofData, true, true);
+        }
+    }
+
+    /**
+     * @param \GRN_Schedule_NormalEvent $event
+     * @param array                     $facilityIds
+     */
+    public function setFacilitiesApplyingInfo(
+        \GRN_Schedule_NormalEvent $event,
+        $facilityIds
+    ) {
+        if ( ! is_array($facilityIds) || count($facilityIds) == 0) {
+            return;
+        }
+
+        $scheduleFacade = new ScheduleFacade();
+        $facilityApprovalSetting = new ScheduleFacilityApprovalSetting();
+        // cache setting of facilities
+        $facilityApprovalSetting->getSettings($facilityIds);
+        $time = time();
+        foreach ($facilityIds as $facilityId) {
+            $isRequiredApprove
+                = $facilityApprovalSetting->isRequiredApproval($facilityId);
+            if ($isRequiredApprove === false) {
+                continue;
+            }
+
+            $facilityApprovalApplyingInfo = new FacilityApprovalApplyingInfo();
+            $facilityApprovalApplyingInfo->setEvent($event->id);
+            $facilityApprovalApplyingInfo->setFacility($facilityId);
+            $facilityApprovalApplyingInfo->setApplyingTime($time);
+
+            if ($event->creator instanceof \CB_User) {
+                $facilityApprovalApplyingInfo->setApplyingUser($event->creator->getOID());
+                $facilityApprovalApplyingInfo->setApplyingUserName($event->creator->get('display_name'));
+            } else {
+                // case creator was deleted
+                $facilityApprovalApplyingInfo->setApplyingUserName($event->creator);
+
+                $deletedCreatorId = $this->getIdOfDeletedCreator($event->id);
+                if (is_null($deletedCreatorId)) {
+                    // creator was physical deleted
+                    $facilityApprovalApplyingInfo->setApplyingUser(null);
+
+                    $scheduleFacade->setFacilityApplyingInfoForDeletedCreator($facilityApprovalApplyingInfo);
+                    continue;
+                } else {
+                    // creator was logical deleted
+                    $facilityApprovalApplyingInfo->setApplyingUser($deletedCreatorId);
+                }
+            }
+
+            $scheduleFacade->setFacilityApplyingInfo($facilityApprovalApplyingInfo);
+        }
+    }
+
+    /**
+     * @param $eventId
+     * @param $facilityId
+     *
+     * @return mixed
+     */
+    public function getFacilityApplyingInfo($eventId, $facilityId)
+    {
+        $scheduleFacade = new ScheduleFacade();
+
+        return $scheduleFacade->getFacilityApplyingInfo($eventId, $facilityId);
+    }
+
+    /**
+     * @param int   $eventId
+     * @param array $facilityIds
+     *
+     * @return bool|int
+     */
+    public function deleteFacilitiesApplyingInfo($eventId, $facilityIds)
+    {
+        if ( ! is_array($facilityIds) || count($facilityIds) == 0) {
+            return;
+        }
+
+        $scheduleFacade = new ScheduleFacade();
+
+        return $scheduleFacade->deleteFacilitiesApplyingInfo($eventId,
+            $facilityIds);
+    }
+
+    /**
+     * @param \GRN_Schedule_NormalEvent $oldEvent
+     * @param \GRN_Schedule_NormalEvent $newEvent
+     */
+    public function processApplyingInfoFacilitiesForUpdate(
+        \GRN_Schedule_NormalEvent $oldEvent,
+        \GRN_Schedule_NormalEvent $newEvent
+    ) {
+        $newEvent->creator = $oldEvent->creator;
+        // delete applying info of all removed facilities
+        $removedFacilitiesId = $this->getRemovedFacilitiesId($oldEvent,
+            $newEvent);
+        if (count($removedFacilitiesId) > 0) {
+            $this->deleteFacilitiesApplyingInfo($newEvent->id,
+                $removedFacilitiesId);
+        }
+
+        if ($this->checkTimeScheduleIsChanged($oldEvent, $newEvent)) {
+            // set applying info for all facilities
+            $newFacilities = $newEvent->facilities ? $newEvent->facilities : [];
+            $facilityIds = $this->objectArrayToIdArray($newFacilities);
+            $this->setFacilitiesApplyingInfo($newEvent, $facilityIds);
+        } else {
+            // set applying info for added facilities
+            $addedFacilitiesId = $this->getAddedFacilitiesId($oldEvent,
+                $newEvent);
+            $this->setFacilitiesApplyingInfo($newEvent, $addedFacilitiesId);
+        }
+    }
+
+    /**
+     * @param int $eventId
+     *
+     * @return mixed
+     */
+    public function getIdOfDeletedCreator($eventId)
+    {
+        $scheduleFacade = new ScheduleFacade();
+
+        return $scheduleFacade->getIdOfDeletedCreator($eventId);
+    }
+
+    /**
+     * This function return facilities that require approval and user has privilege.
+     *
+     * @param null $user
+     *
+     * @return array
+     */
+    public function getRequireApprovalFacilitiesByUser($user = null)
+    {
+
+        if (is_null($user)) {
+            global $G_container_base;
+            $uum = $G_container_base->getInstance('uum');
+            $user = $uum->getLoginUser();
+        }
+
+        require_once('schedule/facility_privilege.csp');
+        $privilege_logic = \GRN_Facility_Privilege_Logic::getInstance();
+        $schedule_facility_approval_setting
+            = new ScheduleFacilityApprovalSetting();
+
+        $facility_system_logic = \GRN_Facility_SystemLogic::getInstance();
+
+        $privilege_facility_group
+            = $privilege_logic->getFacilityGroupWithAuthorityEx($user);
+        $privilege_approval_facilities = [];
+        foreach ($privilege_facility_group as $fg) {
+            $fg_id = $fg->getOID();
+            $tmp_privilege_facilities
+                = $facility_system_logic->getGroupFacilities($fg_id);
+            foreach ($tmp_privilege_facilities as $facility_row) {
+                $tmp_facility_id = $facility_row->getOID();
+                if ($schedule_facility_approval_setting->isRequiredApproval($tmp_facility_id)) {
+                    $privilege_approval_facilities[] = $tmp_facility_id;
+                }
+            }
+        }
+
+        return $privilege_approval_facilities;
+    }
+}

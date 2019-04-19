@@ -1,0 +1,425 @@
+<?php
+
+use grn\schedule\ScheduleFacilityApprovalSetting;
+use grn\schedule\FacilityApprovalLogic;
+use grn\schedule\ScheduleMemberLogic;
+
+if (strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST') == 0) {
+    include('_prepend_post.csp');
+
+    //uum
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+
+    // イベントの取得
+    require_once('schedule/application.csp');
+    $app = GRN_Schedule_Application::getInstance();
+    require_once('schedule/view_util.csp');
+    $util = GRN_Schedule_View_Util::getInstance();
+    require_once('grn/application.csp');
+    $app_locator = GRN_ApplicationLocator::instance();
+
+    require_once('schedule/facility_system_logic.csp');
+    $facility_logic = GRN_Facility_SystemLogic::getInstance();
+
+    // アクセス権のチェック
+    require_once('schedule/access_logic.csp');
+    $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+    $dynamic_role = $uum->listGrantedRoles();
+
+    // 施設の権限
+    require_once('schedule/facility_privilege.csp');
+    $facility_privilege = GRN_Facility_Privilege_Logic::getInstance();
+
+    // 候補日時が選択されていない
+    if (array_key_exists('datetimes', $G_INPUT) === false
+        || ! is_array($G_INPUT['datetimes'])
+    ) {
+        cb_throw_error(E_GRN_SCHEDULE_CANDIDATE_NOT_SELECTED);
+    }
+
+    $first_eid = null;
+    $first_bdate = null;
+    $first_user_id = null;
+
+    require_once('fw/date.csp');
+    $start_datetime = new CB_DateTime();
+    $end_datetime = new CB_DateTime();
+
+    // 今日を求める
+    $tsex = new CB_TimeStampEx();
+    $today = $tsex->getDate();
+
+    // tuning GRB-15157
+    // param for load and cache setting
+    $param_loadAndCache = ['user', 'locale'];
+
+
+    // 仮予定として登録(登録される予定は一つ)
+    if (array_key_exists('temporary_adjust_search', $G_INPUT) === true) {
+        // GTM-1676
+        $add_datetime_list = cb_at($G_INPUT, 'datetimes');
+        if ($add_datetime_list != null) {
+            if (array_key_exists(GRN_SCHD_ADJUST_NO_FACILITY,
+                $add_datetime_list)
+            ) {
+                $facilityIds = cb_at($G_INPUT, 'sITEM');;
+            } else {
+                $facilityIds = array_keys($add_datetime_list);
+            }
+            FacilityApprovalLogic::validateTemporaryEventFacilities($facilityIds);
+        }
+        // end GTM-1676
+
+        $event = $util->createTemporaryEventForAdjustSearch($G_INPUT);
+        $access = $acc_logic->getEventAccess($login, $event, ['read', 'add'],
+            $dynamic_role, false);
+        if ($access['add'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_ENTRY);
+        }
+
+        // データのチェック
+        $app->checkEventData($event);
+
+        // 公開先のチェック
+        ScheduleMemberLogic::getInstance()->checkAddPublicToUser($event);
+
+        // 施設の予約期間,最大時間をチェック(運用管理者は無制限)
+        if ($obj_facilities
+            = $facility_privilege->getFacilitiesWithoutAuthority($login,
+            $event->facilities)
+        ) {
+            // 施設仮予定のOR検索の場合の予約期間のチェック
+            if ($event->isORSearch()) {
+                foreach ($event->setdates as $setdates) {
+                    foreach ($setdates['dates'] as $temp_date) {
+                        $facility_logic->checkFacilityMaxTime($obj_facilities,
+                            $temp_date['enddatetime'],
+                            $temp_date['setdatetime']);
+                        $facility_logic->checkFacilityLimit($obj_facilities,
+                            $temp_date['enddatetime']);
+                    }
+                }
+            } // 施設の場合の予約期間のチェック
+            else {
+                foreach ($event->setdates as $setdates) {
+                    $facility_logic->checkFacilityMaxTime($obj_facilities,
+                        $setdates['enddatetime'], $setdates['setdatetime']);
+                    $facility_logic->checkFacilityLimit($obj_facilities,
+                        $setdates['enddatetime']);
+                }
+            }
+        }
+
+        if ($event->isORSearch()) {
+            // In case of OR search, create facility members when creating temporaryrelation line
+            $event->facilities = null;
+        }
+
+        // 登録情報
+        $event->creator = $login;
+
+        $eid = $app->entryEvent($event);
+        $first_eid = $eid;
+        $bdatetime = $event->getFirstDate($today);
+        $bdate = $bdatetime->getDate();
+        $first_bdate = $bdate;
+
+        // 施設があれば、カスタマイズ項目を登録する
+        if (is_array($event->facilities) && count($event->facilities) > 0) {
+            // カスタマイズ項目登録
+            $facility_logic->registerData($eid);
+        } // ORの施設仮予定もカスタマイズ項目を登録する
+        elseif ($event->isORSearch()) {
+            $facility_logic->registerData($eid);
+        }
+
+        // 登録の通知
+        if ($today->compare($bdate) <= 0) {
+            if ($event->users && count($event->users) > 0) {
+                $app_locator->loadAndCacheUsersSetting($event->users,
+                    $param_loadAndCache);
+                $title
+                    = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+                $app->setNotify($event->users, $login, $event, $bdate, $title,
+                    '', GRN_SCHEDULE_NOTIFY_ENTRY, $tsex);
+                // メール通知
+                $app->forwardMail($event,
+                    [GRN_SCHEDULE_NOTIFY_ENTRY => $event->users], $login);
+                $app->sendPushNotification(
+                    $event, [GRN_SCHEDULE_NOTIFY_ENTRY => $event->users],
+                    $login, true, $bdate, null);
+            }
+
+            // 通知先の指定がある場合
+            if ($event->private && is_array($event->notify_address)
+                && count($event->notify_address) > 0
+            ) {
+                $title
+                    = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+                $app->sendNotificationsToPublic($login, $event, $bdate, '',
+                    $tsex, $title, true, true, GRN_SCHEDULE_NOTIFY_ENTRY);
+            }
+        }
+        /**
+         * 最近選択した施設を更新
+         */
+        require_once('schedule/facility_system_logic.csp');
+        $f_his = GRN_Facility_HistoryManager::getInstance();
+        $f_his->updateHistory($login, $event);
+    }
+    // 通常予定として登録(選択された日時の数だけ予定が登録される)
+    // not a temporary
+    else {
+        $add_datetime_list = $G_INPUT['datetimes'];
+
+        // GTM-1676
+        if (array_key_exists(GRN_SCHD_ADJUST_NO_FACILITY, $add_datetime_list)) {
+            $facilityIds = cb_at($G_INPUT, 'sITEM');;
+        } else {
+            $facilityIds = array_keys($add_datetime_list);
+        }
+
+        $usingPurpose = cb_trim(cb_at($G_INPUT, 'using_purpose'));
+        FacilityApprovalLogic::validateUsingPurposeByFacilitiesId($usingPurpose,
+            $facilityIds);
+        //end GTM-1676
+
+        foreach ($add_datetime_list as $faid => $add_datetime) {
+            foreach ($add_datetime as $datetime) {
+                $candidate = explode(GRN_SCHD_ADJUST_DELIMITER, $datetime);
+                if ( ! is_array($candidate)) {
+                    cb_throw_error(E_GRN_SCHD_INVALID_DATETIME);
+                }
+                if ( ! $start_datetime->parse($candidate[0])) {
+                    cb_throw_error(E_GRN_SCHD_INVALID_DATETIME);
+                }
+                if ( ! $end_datetime->parse($candidate[1])) {
+                    cb_throw_error(E_GRN_SCHD_INVALID_DATETIME);
+                }
+
+                $params = $G_INPUT;
+
+                // 日時パラメータの設定
+                $params['start_year'] = $start_datetime->year;
+                $params['start_month'] = $start_datetime->month;
+                $params['start_day'] = $start_datetime->day;
+                $params['start_hour'] = $start_datetime->hour;
+                $params['start_minute'] = $start_datetime->minute;
+
+                $params['end_year'] = $end_datetime->year;
+                $params['end_month'] = $end_datetime->month;
+                $params['end_day'] = $end_datetime->day;
+                $params['end_hour'] = $end_datetime->hour;
+                $params['end_minute'] = $end_datetime->minute;
+
+                // OR検索の時には選択した施設のみ含まれるようにする
+                if (GRN_SCHD_ADJUST_NO_FACILITY != $faid) {
+                    $params['sITEM'] = [$faid => $faid];
+                }
+
+                $event = $util->createEvent($params);
+                unset($params);
+
+                $access = $acc_logic->getEventAccess($login, $event,
+                    ['read', 'add'], $dynamic_role, false);
+                if ($access['add'] == GRN_SCHD_ACCESS_DENY) {
+                    cb_throw_error(E_GRN_SCHD_ACCESSDENY_ENTRY);
+                }
+
+                // データのチェック
+                $app->checkEventData($event);
+
+                // 公開先のチェック
+                ScheduleMemberLogic::getInstance()
+                                   ->checkAddPublicToUser($event);
+
+                if (is_a($event->setdatetime, 'CB_DateTime')
+                    && is_a($event->enddatetime, 'CB_Date')
+                ) {
+                    $event->enddatetime = null;
+                }
+
+                // 運用管理権限を持っている施設の予約期間,最大時間は無制限
+                if ( ! $facility_privilege->hasPrivilegeOfFacilities($login,
+                    $event->facilities, 'AND')
+                ) {
+                    // 施設の場合の予約期間のチェック
+                    if (is_array($event->facilities)
+                        && count($event->facilities) > 0
+                    ) {
+                        $facility_logic->checkFacilityMaxTime($event->facilities,
+                            $event->enddatetime, $event->setdatetime);
+                        $facility_logic->checkFacilityLimit($event->facilities,
+                            $event->enddatetime);
+                    }
+                }
+
+                // 登録情報
+                $event->creator = $login;
+
+                // GTM-1676
+                $event->usingPurpose = $usingPurpose;
+                // end GTM-1676
+
+                $eid = $app->entryEvent($event);
+
+                // 施設があれば、カスタマイズ項目を登録する
+                if (is_array($event->facilities)
+                    && count($event->facilities) > 0
+                ) {
+                    // カスタマイズ項目登録
+                    $facility_logic->registerData($eid);
+                    // GTM-1676
+                    if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+                        $facilityApprovalLogic = new FacilityApprovalLogic();
+                        $arrayFacilityIds
+                            = $facilityApprovalLogic->objectArrayToIdArray($event->facilities);
+                        $facilityApprovalLogic->setFacilitiesApplyingInfo($event,
+                            $arrayFacilityIds);
+                    }
+                    // end GTM-1676
+                }
+
+                // 最初の候補日時予定にリダイレクトするため
+                if (is_null($first_eid)) {
+                    $first_eid = $eid;
+                }
+
+                $bdate = &$event->getFirstDate($today);
+                if (is_null($first_bdate)) {
+                    $first_bdate = $bdate;
+                }
+
+                if ($today->compare($bdate) <= 0) {
+                    // 登録の通知
+                    if ($event->users && count($event->users) > 0) {
+                        $app_locator->loadAndCacheUsersSetting($event->users,
+                            $param_loadAndCache);
+                        $title
+                            = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+                        $app->setNotify($event->users, $login, $event, $bdate,
+                            $title, '', GRN_SCHEDULE_NOTIFY_ENTRY, $tsex);
+                        // メール通知
+                        $app->forwardMail($event,
+                            [GRN_SCHEDULE_NOTIFY_ENTRY => $event->users],
+                            $login);
+                        $app->sendPushNotification(
+                            $event,
+                            [GRN_SCHEDULE_NOTIFY_ENTRY => $event->users],
+                            $login, true, $bdate, null);
+                    }
+
+                    // GTM-1676
+                    if (is_array($event->facilities)
+                        && count($event->facilities) > 0
+                    ) {
+                        $app->sendFacilityApprovalRequestNotify($event->facilities,
+                            $event, $login, $tsex);
+                        $app->forwardFacilityRelyMail($event, $login);
+                        $app->sendPushNotificationOfFacilityRequest($event, [],
+                            $login);
+                    }
+                    // end GTM-1676
+
+                    // 通知先の指定がある場合
+                    if ($event->private && is_array($event->notify_address)
+                        && count($event->notify_address) > 0
+                    ) {
+                        $title
+                            = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+                        $app->sendNotificationsToPublic($login, $event, $bdate,
+                            '', $tsex, $title, true, true,
+                            GRN_SCHEDULE_NOTIFY_ENTRY);
+                    }
+                }
+                /**
+                 * 最近選択した施設を更新
+                 */
+                require_once('schedule/facility_system_logic.csp');
+                $f_his = GRN_Facility_HistoryManager::getInstance();
+                $f_his->updateHistory($login, $event);
+
+                unset($event);
+            }
+        }
+    }
+
+    // リダイレクト先の情報の設定
+    $user_id = array_key_exists('uid', $G_INPUT) ? $G_INPUT['uid']
+        : $login->getOID();
+    if ( ! $user_id) {
+        $user_id = $login->getOID();
+    }
+
+    $b_contain = false;
+    $facility_ids = null;
+    $member_ids = null;
+    if (($fid = mb_substr($user_id, 0, 1)) === 'f') {
+        $facility_ids = array_key_exists('sITEM', $G_INPUT) ? $G_INPUT['sITEM']
+            : false;
+        if (is_array($facility_ids) && count($facility_ids) > 0) {
+            foreach ($facility_ids as $key) {
+                if ($key === $fid) {
+                    $b_contain = true;
+                    break;
+                }
+            }
+        }
+    } else {
+        $member_ids = array_key_exists('sUID', $G_INPUT) ? $G_INPUT['sUID']
+            : false;
+        if (is_array($member_ids) && count($member_ids) > 0) {
+            foreach ($member_ids as $key) {
+                if ($key === $user_id) {
+                    $b_contain = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 登録した内容にいない場合
+    if ( ! $b_contain) {
+        $user_id = null;
+
+        if (is_null($member_ids)) {
+            $member_ids = array_key_exists('sUID', $G_INPUT) ? $G_INPUT['sUID']
+                : false;
+        }
+
+        if (is_array($member_ids) && count($member_ids) > 0) {
+            $user_id = reset($member_ids);
+        }
+
+        if (is_null($user_id)) {
+            if (is_null($facility_ids)) {
+                $facility_ids = array_key_exists('sITEM', $G_INPUT)
+                    ? $G_INPUT['sITEM'] : false;
+            }
+
+            if (is_array($facility_ids) && count($facility_ids) > 0) {
+                $user_id = 'f' . reset($facility_ids);
+            }
+        }
+    }
+
+    if (is_null($first_user_id)) {
+        $first_user_id = $user_id;
+    }
+
+    $referer_key = array_key_exists('referer_key', $G_INPUT)
+        ? $G_INPUT['referer_key'] : null;
+    // GRN35-1122
+    $link = cb_get_full_url('schedule/view', [
+        'event'       => $first_eid,
+        'bdate'       => $first_bdate->format(),
+        'uid'         => $first_user_id,
+        'referer_key' => $referer_key
+    ]);
+    echo json_encode(['link' => $link]);
+    cb_safe_exit();
+    // GRN35-1122
+}
+

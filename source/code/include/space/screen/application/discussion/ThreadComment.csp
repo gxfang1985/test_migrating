@@ -1,0 +1,372 @@
+<?php
+
+namespace grn\space\screen\application\discussion;
+
+use grn\grn\mention\MentionController;
+use grn\space\screen\GenericScreenBase;
+use grn\space\service\SpaceService;
+use grn\space\service\TodoService;
+use grn\favour\service\FavourService;
+use grn\space\screen\application\discussion\DiscussionBase;
+use grn\space\service\DiscussionService;
+use grn\space\common\data\bean\Authority;
+use grn\space\common\data\bean\Comment;
+use grn\space\common\data\condition\CommentSearchCondition;
+use grn\space\common\exception\GrnDataNotFoundException;
+use grn\space\common\exception\GrnInvalidPermissionException;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\utility\SpaceDatetimeUtility;
+use grn\space\common\utility\SpaceFileUtility;
+use grn\space\common\utility\ValidateUtility;
+
+/**
+ * Class ThreadComment
+ */
+class ThreadComment extends DiscussionBase
+{
+    private $_last_comment_no;
+
+    /**
+     * @return mixed|string|void
+     * @throws GrnDataNotFoundException
+     * @throws GrnInvalidPermissionException
+     * @throws \grn\space\common\exception\GrnInvalidArgumentException
+     */
+    public function fetch()
+    {
+        $input = $this->getInput();
+        $login_id = $this->getLoginUserId();
+        $limit = $this->getUserConfig()->getFollowMax();
+
+        $parameter = [self::ARG_SPACE_ID];
+        $this->checkArgFromInput($parameter, $input);
+        $this->verifySpaceIsNotExpired();
+        $space_id = $this->getSpaceId();
+        $thread_id = $this->getArrayValue(self::ARG_THREAD_ID, $input);
+        if ( ! ValidateUtility::isNumber($thread_id,
+            ValidateUtility::DISABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            $thread_id = $this->getSystemThreadId();
+        }
+
+        $comment_number = $this->getArrayValue(self::ARG_COMMENT_NUMBER,
+            $input);
+        $comment_id = $this->getArrayValue(self::ARG_COMMENT_ID, $input);
+
+        $offset = $this->getArrayValue(self::ARG_NAVI_TAG, $input);
+        if ( ! ValidateUtility::isNumber($offset,
+            ValidateUtility::DISABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            $offset = 0;
+        }
+
+        $discussion_service = DiscussionService::getInstance();
+        $isAuthority
+            = $discussion_service->hasThreadAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $space_id, $thread_id, $login_id);
+
+        if ($isAuthority) {
+            //confirm discussion notification
+            if ($discussion_service->isNotConfirmedDiscussionNotification($login_id,
+                $thread_id)
+            ) {
+                $thread = $discussion_service->getThread($thread_id, $login_id);
+                $discussion_service->confirmDiscussionNotification($login_id,
+                    $thread);
+            }
+
+            $search_condition = new CommentSearchCondition();
+            $search_condition->setSearchScopeType(CommentSearchCondition::SEARCH_SCOPE_TYPE_THREAD_AND_TODO);
+            $search_condition->setSearchScopeValue($thread_id);
+            $search_condition->setSearchUserId($login_id);
+            $search_condition->setOrderSortArray([CommentSearchCondition::SORT_COMMENT_NO_DESC]);
+            $search_condition->setOffset($offset);
+            $search_condition->setLimit($limit);
+            if ($comment_number) {
+                $search_condition->setHeadCommentNo($comment_number,
+                    ErrorCode::GRN_THREAD_INVALID_COMMENT_ID);
+            } elseif ($comment_id) {
+                $search_condition->setHeadCommentId($comment_id);
+            }
+
+            try {
+                $comment_collection
+                    = $discussion_service->searchCommentBySearchConditionWithAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+                    $search_condition, $login_id,
+                    DiscussionService::MARK_THREAD_COMMENTS_READ);
+                //construction display user name
+                $discussion_service->addInspectionCollectionUserInfo($comment_collection,
+                    $login_id, $this->isSystemUseEnglish(),
+                    $this->isEnglishDisplayAfterName(),
+                    $this->isOrganizationDisplayAfterName(),
+                    $this->getLanguageCode());
+                SpaceDatetimeUtility::constructionInspectionDisplayDatetime($comment_collection,
+                    $this->getDatetimeFormat(),
+                    SpaceDatetimeUtility::DISPLAY_TYPE_LONGDATE_AND_TIME,
+                    $this->getLanguageCode(), $this->getTimezoneName());
+                //add mention info
+                $comment_collection
+                    = $discussion_service->addMentionInfo($comment_collection);
+            } catch (GrnDataNotFoundException $e) {
+                $e->setErrorCode(ErrorCode::GRN_THREAD_INVALID_COMMENT_ID);
+                throw $e;
+            }
+
+            // is favour app active
+            $favour_service = new FavourService();
+            $is_favour_active = $favour_service->isFavourAppActive();
+
+            $favours_info = [];
+            if ($is_favour_active) {
+                $favours_info = $this->_getFavoursCount($login_id,
+                    $favour_service, $comment_collection);
+            }
+
+            $thread_comments = [];
+            $todo_service = TodoService::getInstance();
+            $is_space_admin
+                = $this->isSpaceAdmin(SpaceService::getInstance(),
+                $login_id);
+            $mention_collection = [];
+            $mention_total = [];
+            foreach ($comment_collection as $comment) {
+                /** @var \grn\space\common\data\bean\Comment $comment */
+                $full_url
+                    = cb_get_full_url('space/application/discussion/index',
+                    ['spid' => $space_id]);
+                $full_url .= '#tid=' . $thread_id . '&cmno='
+                             . $comment->getCommentNo();
+
+                $spaceFileCollection = $comment->getSpaceFileCollection();
+                $attachedFiles = [];
+                foreach ($spaceFileCollection as $file) {
+                    /** @var \grn\space\common\data\bean\SpaceFile $file */
+                    $attachedFiles[$file->getId()]
+                        = SpaceFileUtility::getSpaceFileLinkView($file);
+                }
+                $parentTodo = $comment->getParentApplicationObject();
+                $deadline = null;
+                $title = null;
+                $is_cut = false;
+                $content = $comment->getContent();
+                $entire_content = null;
+                $is_rich_text = $comment->isRichText() ? true : false;
+                $is_todo_cmnt = $comment->getParentApplicationType()
+                                == Comment::PARENT_APPLICATION_TYPE_TODO
+                    ? true : false;
+                if ($is_todo_cmnt) {
+                    $title = $parentTodo->getTitle();
+                    $deadline = $this->transferTimestampToDateEx($parentTodo,
+                        $parentTodo->getDeadlineTimestamp());
+                    require_once('grn/controller.csp');
+                    $entire_content = $content;
+                    $content = grn_strip_tags($content);
+                    if (mb_strlen($content) > 140) {
+                        $content = mb_substr($content, 0, 137) . '...';
+                        $is_cut = true;
+                    } else {
+                        $content = $entire_content;
+                    }
+                }
+                if ($is_rich_text) {
+                    $base_url = cb_pageurl('space/application/discussion/index',
+                        ['spid' => $space_id], 'tid=' . $thread_id . '&cmno=');
+                    $content = makeAutoLinkForHtmlEditor($content,
+                        htmlspecialchars('>>'), $base_url, 'space_thread');
+                }
+
+                // for favour
+                $favour_info = ['type_value' => $comment->getId()];
+                if ($is_favour_active) {
+                    if ($is_todo_cmnt) {
+                        if (isset($favours_info['todo'][$comment->getId()])) {
+                            $favour_info
+                                = $favours_info['todo'][$comment->getId()];
+
+                        }
+                        $favour_info['sub_module_id']
+                            = \GrnSpaceApplication::GRN_TODO_SUB_MODULE_ID;
+                        $favour_info['type']
+                            = \GrnSpaceApplication::FAVOUR_TODO_COMMENT;
+                        $favour_info['params'] = [
+                            self::ARG_SPACE_ID  => $space_id,
+                            self::ARG_THREAD_ID => $thread_id,
+                            self::ARG_TODO_ID   => $comment->getParentApplicationId()
+                        ];
+                    } else {
+                        if (isset($favours_info['discussion'][$comment->getId()])) {
+                            $favour_info
+                                = $favours_info['discussion'][$comment->getId()];
+                        }
+                        $favour_info['sub_module_id']
+                            = \GrnSpaceApplication::GRN_DISCUSSION_SUB_MODULE_ID;
+                        $favour_info['type']
+                            = \GrnSpaceApplication::FAVOUR_DISCUSSION_COMMENT;
+                        $favour_info['params'] = [
+                            self::ARG_SPACE_ID  => $space_id,
+                            self::ARG_THREAD_ID => $thread_id
+                        ];
+                    }
+                    $favour_info['module_id']
+                        = \GrnSpaceApplication::GRN_SPACE_MODULE_ID;
+                }
+
+                $cmt_deletable = ($comment->getCreatorId() == $login_id)
+                                 || $is_space_admin;
+                $creator_id = false;
+                if ($this->getUserInfo($comment->getCreatorId())) {
+                    $creator_id = $comment->getCreatorId();
+                }
+                $thread_comments[$comment->getId()] = [
+                    'id'           => $comment->getId(),
+                    'comment_no'   => $comment->getCommentNo(),
+                    'is_todo_cmnt' => $is_todo_cmnt,
+                    'todo_id'      => $comment->getParentApplicationId(),
+                    'parent_date'  => $deadline,
+                    'parent_title' => $title,
+                    'is_cut'       => $is_cut,
+                    'data'         => $content,
+                    'entire_data'  => $entire_content,
+                    'attach_files' => $attachedFiles,
+                    'is_rich_text' => $is_rich_text,
+                    'parent_no'    => $comment->getParentCommentNo(),
+                    'unread'       => ($comment->isUnread() ? true : false),
+                    'ctime'        => $comment->getCreateDisplayDatetime(),
+                    'creator'      => $comment->getCreator(),
+                    'creator_id'   => $creator_id,
+                    'creator_name' => $comment->getCreator()->getDisplayName(),
+                    'deletable'    => $cmt_deletable,
+                    'full_url'     => $full_url,
+                    'favour_info'  => $favour_info
+                ];
+                $mention_collection[$comment->getId()] = $comment->getMention();
+                $mention_total[$comment->getId()] = $comment->getMention()
+                                                            ->count();
+            }
+            $delete_info = [
+                'title'      => grn_get_page_display_name('space/discussion/comment_delete'),
+                'page'       => 'space/application/discussion/thread_comment_delete.tpl',
+                'no_confirm' => 'FALSE',
+                'data'       => ['comment' => $thread_comments],
+                'handler'    => 'lnk_delete',
+            ];
+            $this->setLastCommentNo($discussion_service->getLastCommentNo($thread_id,
+                $login_id));
+        } else {
+            throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_ACCESS_PERMISSION);
+        }
+
+        // Make page navi
+        require_once('grn/controller.csp');
+        $controllerUtil = new \GRN_ControllerUtil();
+        $navi_for_view
+            = $controllerUtil->makeNaviInformation($search_condition->getOffset(),
+            $limit,
+            $comment_collection->getCountNoLimit());
+        $navi_for_view['navi']['fragment'] = 'tid=' . $thread_id;
+        require_once('grn/smarty.csp');
+        $smarty = new \GRN_Smarty();
+        $smarty->assign('thread_id', $thread_id);
+        $smarty->assign('space_id', $space_id);
+        $smarty->assign('thread_comments', $thread_comments);
+        $smarty->assign('navi', $navi_for_view['navi']);
+        $smarty->assign('delete_info', $delete_info);
+        $smarty->assign('from_discussion_index', self::FROM_DISCUSSION_INDEX);
+        $smarty->assign('inline', $this->getUserConfig()->getInlineSetting());
+        $smarty->assign('loginId', $login_id);
+        $smarty->assign('is_favour_active', $is_favour_active);
+        $max_member = GenericScreenBase::MAX_NUM_DISPLAY_MEMBER;
+        $offset_member = GenericScreenBase::DEFAULT_OFFSET_DISPLAY_MEMBER;
+        $mention_list
+            = MentionController::createMemberListsForView($mention_collection,
+            $offset_member, $max_member);
+        $smarty->assign('mention_list', $mention_list);
+        $smarty->assign('mention_total', $mention_total);
+        // user image icon
+        $imageIcon
+            = \GRN_ControllerUtil::getUserIconFormat($this->getLoginUser());
+        $smarty->assign('imageIcon', $imageIcon);
+        if ($imageIcon) {
+            $commentUserIds = [];
+            foreach ($comment_collection as $comment) {
+                $commentUserIds[] = $comment->getCreatorId();
+            }
+            $users_info
+                = \GRN_ControllerUtil::getUserInfoToShowUserName($commentUserIds,
+                $this->getLoginUser());
+            $users_info
+                = \GRN_ControllerUtil::addPhotoUrlForUsersInfo($users_info,
+                \GRN_ControllerUtil::getUserProfilePhotoSmallSize());
+            $smarty->assign('iconSize', \GRN_ControllerUtil::ICON_SIZE_SMALL);
+            $smarty->assign('users_info', $users_info);
+        }
+
+        return $smarty->fetch('space/application/discussion/thread_comment.tpl');
+    }
+
+    /**
+     * @param               $login_id
+     * @param FavourService $favour_service
+     * @param               $comment_collection
+     *
+     * @return array
+     */
+    private function _getFavoursCount(
+        $login_id,
+        $favour_service,
+        $comment_collection
+    ) {
+        $retVlaues = ['todo' => [], 'discussion' => []];
+        $todo_comment_ids = [];
+        $discussion_comment_ids = [];
+        foreach ($comment_collection as $comment) {
+            /** @var \grn\space\common\data\bean\Comment $comment */
+            if ($comment->getParentApplicationType()
+                == Comment::PARENT_APPLICATION_TYPE_TODO
+            ) {
+                $todo_comment_ids[] = $comment->getId();
+            } else {
+                $discussion_comment_ids[] = $comment->getId();
+            }
+        }
+
+        require_once('space/GrnSpaceApplication.csp');
+        if (count($todo_comment_ids)) {
+            $retVlaues['todo'] = $favour_service->getFavourersCount($login_id,
+                \GrnSpaceApplication::GRN_SPACE_MODULE_ID,
+                \GrnSpaceApplication::FAVOUR_TODO_COMMENT,
+                $todo_comment_ids,
+                \GrnSpaceApplication::GRN_TODO_SUB_MODULE_ID
+            );
+        }
+        if (count($discussion_comment_ids)) {
+            $retVlaues['discussion']
+                = $favour_service->getFavourersCount($login_id,
+                \GrnSpaceApplication::GRN_SPACE_MODULE_ID,
+                \GrnSpaceApplication::FAVOUR_DISCUSSION_COMMENT,
+                $discussion_comment_ids,
+                \GrnSpaceApplication::GRN_DISCUSSION_SUB_MODULE_ID
+            );
+        }
+
+        return $retVlaues;
+    }
+
+    /**
+     * @return mixed
+     */
+    public function getLastCommentNo()
+    {
+        return $this->_last_comment_no;
+    }
+
+    /**
+     * @param $last_comment_no
+     */
+    public function setLastCommentNo($last_comment_no)
+    {
+        $this->_last_comment_no = $last_comment_no;
+    }
+}

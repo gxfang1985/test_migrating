@@ -1,0 +1,1 @@
+{capture name='grn_schedule_cellular_GRN_SCH_CE_1'}{cb_msg module='grn.schedule.cellular' key='GRN_SCH_CE-1' replace='true'}{/capture}{grn_cellular_link page='schedule/cellular/day' icon='watch' caption=$params.count|string_format:$smarty.capture.grn_schedule_cellular_GRN_SCH_CE_1}<br>

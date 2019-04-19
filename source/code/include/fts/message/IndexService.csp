@@ -1,0 +1,753 @@
+<?php
+
+namespace grn\fts\message;
+
+use grn\fts\Fields;
+use grn\fts\filter\AndFilter;
+use grn\fts\filter\TermFilter;
+use grn\fts\FtsProduct;
+use grn\fts\SearchConstants;
+use grn\fts\SearchEntry;
+use grn\fts\SearchUtil;
+use grn\fts\UpdateServiceContainer;
+
+class IndexService
+{
+    const ID_PREFIX = 'G.Amessage.';
+    const MESSAGE_PREFIX = 'M'; // message
+    const FOLLOW_PREFIX = 'C'; // comment
+    const FILE_PREFIX = 'F'; // file
+    const USER_PREFIX = 'U'; // user
+    const MESSAGE_TYPE_PREFIX = 'T'; // message type
+
+
+    /** @var UpdateServiceContainer */
+    private $updateServiceContainer = null;
+
+    /**
+     * IndexService constructor.
+     *
+     * @param FtsProduct|NULL $fts_product
+     */
+    public function __construct(FtsProduct $fts_product = null)
+    {
+        $this->updateServiceContainer
+            = new UpdateServiceContainer($fts_product);
+    }
+
+    /**
+     * @return UpdateServiceContainer
+     */
+    protected function getUpdateServiceContainer()
+    {
+        return $this->updateServiceContainer;
+    }
+
+    /**
+     * @param \GRN_Message_Messages $message
+     * @param bool                  $update
+     *
+     * @return void
+     */
+    public function createMessageIndex(
+        \GRN_Message_Messages $message,
+        $update = false
+    ) {
+        $id = self::createMessageDocumentId($message->getOID());
+
+        //Because the modifier is NULL when message is created, the last modifier seems creator.
+        $modifier = ($update && ! is_null($message->get('modifier')))
+            ? $message->get('modifier') : $message->get('creator');
+        $modifierId = $modifier ? $modifier->getOID()
+            : SearchConstants::DELETED_USER_ID;
+        $data = SearchUtil::truncateLongText($message->get('data'));
+        $searchEntry = $this->createMessageSearchEntry($id,
+            $message->get('subject'),
+            $data,
+            (int)$modifierId,
+            (int)$message->get('last_mtime')->unix_ts,
+            (int)$message->getOID());
+
+        $updateServiceContainer = $this->getUpdateServiceContainer();
+        $updateServiceContainer->updateIndex($searchEntry);
+    }
+
+    /**
+     * @param array  $rows Rows gotten by fetch_assoc from tab_grn_message_messages.
+     * @param string $forward
+     */
+    public function bulkCreateMessageIndex(array $rows, $forward)
+    {
+        $entries = [];
+        foreach ($rows as $row) {
+            $id = self::ID_PREFIX . self::MESSAGE_PREFIX . $row['_id'];
+            $creatorId = $row['col_modifier']
+                ?: ($row['col_creator'] ?: SearchConstants::DELETED_USER_ID);
+            $entries[] = $this->createMessageSearchEntry($id,
+                $row['col_subject'], $row['col_data'], (int)$creatorId,
+                (int)$row['col_last_mtime'], (int)$row['_id']);
+        }
+        $updateServiceContainer = $this->getUpdateServiceContainer();
+        $updateServiceContainer->bulkUpdateIndex($entries, $forward);
+    }
+
+    /**
+     * @param string           $messageId
+     * @param string|bool|null $snapshotMessageId
+     * @param string           $userId
+     * @param string           $messageType
+     * @param string           $folderId
+     */
+    public function createFolderMessageRelationIndex(
+        $messageId,
+        $snapshotMessageId,
+        $userId,
+        $messageType,
+        $folderId
+    ) {
+        $id = self::createUserFolderDocumentId($messageId, $userId,
+            $messageType);
+        $entry = $this->createFolderMessageRelationSearchEntry(
+            $id, (int)$messageId, (int)$userId, (int)$messageType,
+            (int)$folderId
+        );
+        $this->getUpdateServiceContainer()
+             ->updateIndex($entry, FtsProduct::solr());
+
+        if (is_string($snapshotMessageId) && strlen($snapshotMessageId) > 0) {
+            $snapshotId = self::createUserFolderDocumentId($snapshotMessageId,
+                $userId, $messageType);
+            $snapshotEntry = $this->createFolderMessageRelationSearchEntry(
+                $snapshotId, (int)$snapshotMessageId, (int)$userId,
+                (int)$messageType, (int)$folderId
+            );
+            $this->getUpdateServiceContainer()
+                 ->updateIndex($snapshotEntry, FtsProduct::solr());
+        }
+    }
+
+    /**
+     * @param       $message_id
+     * @param       $snapshot_message_id
+     * @param array $elasticsearch_params
+     */
+    public function createEsFolderMessageRelationIndex(
+        $message_id,
+        array $user_id_list,
+        array $folder_id_list
+    ) {
+        $id = self::createEsUserFolderId($message_id);
+        $entry = $this->createEsFolderMessageRelationSearchEntry($id,
+            $message_id, $user_id_list, $folder_id_list);
+        $this->getUpdateServiceContainer()
+             ->updateIndex($entry, FtsProduct::elasticsearch());
+    }
+
+    /**
+     * @param       $message_id
+     * @param       $snapshot_message_id
+     * @param array $elasticsearch_params
+     */
+    public function updateEsFolderMessageRelationIndex(
+        $message_id,
+        $snapshot_message_id,
+        array $elasticsearch_params
+    ) {
+        $this->updateIndexEsFolderMessageRelation($message_id,
+            $elasticsearch_params);
+
+        if (is_string($snapshot_message_id)
+            && strlen($snapshot_message_id) > 0
+        ) {
+            $this->updateIndexEsFolderMessageRelation($snapshot_message_id,
+                $elasticsearch_params);
+        }
+    }
+
+    /**
+     * @param       $message_id
+     * @param array $elasticsearch_params
+     */
+    public function updateIndexEsFolderMessageRelation(
+        $message_id,
+        array $elasticsearch_params
+    ) {
+        $id = self::createEsUserFolderId($message_id);
+        $entry = $this->createUpdateEsFolderMessageRelationSearchEntry($id,
+            $message_id, $elasticsearch_params);
+
+        $updateServiceContainer = $this->getUpdateServiceContainer();
+        $updateServiceContainer->updateIndex($entry,
+            FtsProduct::elasticsearch());
+    }
+
+    /**
+     * @param array $rows
+     * @param       $forward
+     */
+    public function bulkCreateFolderMessageRelationIndex(array $rows, $forward)
+    {
+        $entries = [];
+        foreach ($rows as $row) {
+            $messageId = $row['message_id'];
+            $snapshotMessageId = $row['snapshot_message_id'];
+            $userId = $row['user_id'];
+            $folderId = $row['folder_id'];
+            $messageType = $row['message_type'];
+
+            $id = self::createUserFolderDocumentId($messageId, $userId,
+                $messageType);
+            $entries[] = $this->createFolderMessageRelationSearchEntry(
+                $id, (int)$messageId, (int)$userId, (int)$messageType,
+                (int)$folderId
+            );
+
+            if ( ! is_null($snapshotMessageId)) {
+                $snapshotId
+                    = self::createUserFolderDocumentId($snapshotMessageId,
+                    $userId, $messageType);
+                $entries[] = $this->createFolderMessageRelationSearchEntry(
+                    $snapshotId, (int)$snapshotMessageId, (int)$userId,
+                    (int)$messageType, (int)$folderId
+                );
+            }
+        }
+        $updateServiceContainer = $this->getUpdateServiceContainer();
+        $updateServiceContainer->bulkUpdateIndex($entries, $forward,
+            FtsProduct::solr());
+    }
+
+    /**
+     * @param \GRN_Message_Follows $follow
+     *
+     * @return void
+     */
+    public function createFollowIndex(\GRN_Message_Follows $follow)
+    {
+        $id = self::createFollowDocumentId($follow->get('message')
+                                                  ->getOID(),
+            $follow->getOID());
+        $creator = $follow->get('creator');
+        $creatorId = $creator ? $creator->getOID()
+            : SearchConstants::DELETED_USER_ID;
+        $data
+            = SearchUtil::truncateLongText($follow->get('data'));
+        $searchEntry = $this->createFollowSearchEntry($id,
+            $data,
+            (int)$creatorId,
+            (int)$follow->get('ctime')->unix_ts,
+            (int)$follow->get('message')->getOID(),
+            (int)$follow->getOID());
+        $updateServiceContainer = $this->getUpdateServiceContainer();
+        $updateServiceContainer->updateIndex($searchEntry);
+    }
+
+    /**
+     * @param array  $rows Rows gotten by fetch_assoc from tab_grn_message_follows.
+     * @param string $forward
+     */
+    public function bulkCreateFollowIndex(array $rows, $forward)
+    {
+        $entries = [];
+        foreach ($rows as $row) {
+            $id = self::createFollowDocumentId($row['col_message'],
+                $row['_id']);
+            $creatorId = $row['col_creator']
+                ?: SearchConstants::DELETED_USER_ID;
+            $entries[] = $this->createFollowSearchEntry($id, $row['col_data'],
+                (int)$creatorId, (int)$row['col_ctime'],
+                (int)$row['col_message'], (int)$row['_id']);
+        }
+        $updateServiceContainer = $this->getUpdateServiceContainer();
+        $updateServiceContainer->bulkUpdateIndex($entries, $forward);
+    }
+
+    /**
+     * @param \GRN_Message_File     $file
+     * @param \GRN_Message_FileBody $fileBody
+     * @param string                $messageId
+     * @param string|null           $followId
+     *
+     * @return void
+     */
+    public function createFileIndex(
+        \GRN_Message_File $file,
+        \GRN_Message_FileBody $fileBody,
+        $messageId,
+        $followId = null
+    ) {
+        $fileId = $file->getOID();
+        $id = $this->createFileDocumentId($messageId,
+            $followId, $fileId);
+        $followId = (is_null($followId)) ? null : (int)$followId;
+        $modifier = $file->get('modifier');
+        $modifierId = $modifier ? $modifier->getOID()
+            : SearchConstants::DELETED_USER_ID;
+        $fileIdentifier = defined('ON_FOREST') ? $fileBody->get('blob')
+            : $fileBody->getPath();
+        $searchEntry = $this->createFileSearchEntry($id,
+            $fileIdentifier,
+            $fileBody->get('name'),
+            (int)$modifierId,
+            (int)$file->get('mtime')->unix_ts,
+            (int)$messageId,
+            $followId,
+            (int)$fileId);
+        $updateServiceContainer = $this->getUpdateServiceContainer();
+        $updateServiceContainer->updateIndex($searchEntry);
+    }
+
+    /**
+     * @param array  $rows Rows gotten by fetch_assoc from tab_grn_message_attached files as a, tab_grn_message_file as f and tab_grn_message_filebody as b.
+     * @param string $forward
+     */
+    public function bulkCreateFileIndex(array $rows, $forward)
+    {
+        $entries = [];
+        foreach ($rows as $row) {
+            $messageId = $row['col_message'];
+            $followId = is_null($row['col_follow']) ? null
+                : (int)$row['col_follow'];
+            $id = $this->createFileDocumentId($messageId, $followId,
+                $row['_id']);
+            $modifierId = $row['col_modifier']
+                ?: SearchConstants::DELETED_USER_ID;
+            $fileIdentifier = defined('ON_FOREST')
+                ? $row['col_blob']
+                : SearchUtil::getFilePath('message', 'grn_message_filebody',
+                    $row['fileId']);
+            $entries[] = $this->createFileSearchEntry($id, $fileIdentifier,
+                $row['col_name'], (int)$modifierId, (int)$row['col_mtime'],
+                (int)$messageId, $followId, (int)$row['_id']);
+        }
+        $updateServiceContainer = $this->getUpdateServiceContainer();
+        $updateServiceContainer->bulkUpdateIndex($entries, $forward);
+    }
+
+    /**
+     * @param \GRN_Message_Messages $message
+     *
+     * @return void
+     */
+    public function updateMessageIndex(\GRN_Message_Messages $message)
+    {
+        $this->createMessageIndex($message, true);
+    }
+
+    /**
+     * @param string           $messageId
+     * @param string|bool|null $snapshotMessageId
+     * @param string           $userId
+     * @param string           $messageType
+     * @param string           $folderId
+     */
+    public function updateFolderMessageRelationIndex(
+        $messageId,
+        $snapshotMessageId,
+        $userId,
+        $messageType,
+        $folderId
+    ) {
+        $this->createFolderMessageRelationIndex($messageId, $snapshotMessageId,
+            $userId, $messageType, $folderId);
+    }
+
+    /**
+     * @param \GRN_Message_File     $file
+     * @param \GRN_Message_FileBody $fileBody
+     * @param string                $messageId
+     * @param string|null           $followId
+     *
+     * @return void
+     */
+    public function updateFileIndex(
+        \GRN_Message_File $file,
+        \GRN_Message_FileBody $fileBody,
+        $messageId,
+        $followId = null
+    ) {
+        $this->createFileIndex($file, $fileBody, $messageId, $followId);
+    }
+
+    /**
+     * @param string $messageId
+     *
+     * @return void
+     */
+    public function deleteMessageIndex($messageId)
+    {
+        $query = new AndFilter([
+            new TermFilter(Fields::appName(),
+                SearchConstants::APPLICATION_MESSAGE),
+            new TermFilter(Fields::messageId(), $messageId)
+        ]);
+        $updateServiceContainer = $this->getUpdateServiceContainer();
+        $updateServiceContainer->deleteByQuery($query);
+    }
+
+    /**
+     * @param string      $messageId
+     * @param string      $userId
+     * @param string|null $messageType
+     */
+    public function deleteFolderMessageRelationIndex(
+        $messageId,
+        $userId,
+        $messageType = null
+    ) {
+        $query = new AndFilter([
+            new TermFilter(Fields::appName(),
+                SearchConstants::APPLICATION_MESSAGE),
+            new TermFilter(Fields::messageId(), $messageId),
+            new TermFilter(Fields::userId(), $userId),
+        ]);
+        if ( ! is_null($messageType)) {
+            $query->addFilter(new TermFilter(Fields::messageType(),
+                $messageType));
+        }
+        $updateServiceContainer = $this->getUpdateServiceContainer();
+        $updateServiceContainer->deleteByQuery($query, FtsProduct::solr());
+    }
+
+    /**
+     * @param string $followId
+     *
+     * @return void
+     */
+    public function deleteFollowIndex($followId)
+    {
+        $query = new AndFilter([
+            new TermFilter(Fields::appName(),
+                SearchConstants::APPLICATION_MESSAGE),
+            new TermFilter(Fields::followId(), $followId),
+        ]);
+        $updateServiceContainer = $this->getUpdateServiceContainer();
+        $updateServiceContainer->deleteByQuery($query);
+    }
+
+    /**
+     * @param string $fileId
+     *
+     * @return void
+     */
+    public function deleteFileIndex($fileId)
+    {
+        $query = new AndFilter([
+            new TermFilter(Fields::appName(),
+                SearchConstants::APPLICATION_MESSAGE),
+            new TermFilter(Fields::fileId(), $fileId),
+        ]);
+        $updateServiceContainer = $this->getUpdateServiceContainer();
+        $updateServiceContainer->deleteByQuery($query);
+    }
+
+    /**
+     * @param string $id
+     * @param string $title
+     * @param string $data
+     * @param int    $modifierId
+     * @param int    $mtime
+     * @param int    $messageId
+     *
+     * @return \grn\fts\SearchEntryInterface $searchEntry
+     */
+    public function createMessageSearchEntry(
+        $id,
+        $title,
+        $data,
+        $modifierId,
+        $mtime,
+        $messageId
+    ) {
+        $searchEntry = new SearchEntry($id);
+
+        $searchEntry->addValue(Fields::title(), $title);
+        $searchEntry->addValue(Fields::data(), $data);
+        $searchEntry->addValue(Fields::modifierId(), $modifierId);
+        $searchEntry->addValue(Fields::mtime(), $mtime);
+        $searchEntry->addValue(Fields::messageId(), $messageId);
+        $searchEntry->addValue(Fields::appName(),
+            SearchConstants::APPLICATION_MESSAGE);
+        $searchEntry->setType('message.message');
+        $searchEntry->setParentId(self::createEsUserFolderId($messageId));
+
+        return $searchEntry;
+    }
+
+    /**
+     * @param string $id
+     * @param int    $messageId
+     * @param int    $userId
+     * @param int    $messageType
+     * @param int    $folderId
+     *
+     * @return \grn\fts\SearchEntryInterface $searchEntry
+     */
+    private function createFolderMessageRelationSearchEntry(
+        $id,
+        $messageId,
+        $userId,
+        $messageType,
+        $folderId
+    ) {
+        $searchEntry = new SearchEntry($id);
+
+        $searchEntry->addValue(Fields::messageId(), $messageId);
+        $searchEntry->addValue(Fields::userId(), $userId);
+        $searchEntry->addValue(Fields::folderId(), $folderId);
+        $searchEntry->addValue(Fields::messageType(), $messageType);
+        $searchEntry->addValue(Fields::appName(),
+            SearchConstants::APPLICATION_MESSAGE);
+
+        return $searchEntry;
+    }
+
+    /**
+     * @param $id
+     * @param $message_id
+     * @param $user_id_list
+     * @param $folder_id_list
+     *
+     * @return SearchEntry
+     */
+    private function createEsFolderMessageRelationSearchEntry(
+        $id,
+        $message_id,
+        $user_id_list,
+        $folder_id_list
+    ) {
+        $searchEntry = new SearchEntry($id);
+
+        $searchEntry->addValue(Fields::messageId(), (int)$message_id);
+        $searchEntry->addValue(Fields::userIds(),
+            array_map('intval', $user_id_list));
+        $searchEntry->addValue(Fields::userFolderIds(),
+            array_map('intval', $folder_id_list));
+        $searchEntry->addValue(Fields::appName(),
+            SearchConstants::APPLICATION_MESSAGE);
+        $searchEntry->setType('message.folderRelation');
+
+        return $searchEntry;
+    }
+
+    /**
+     * @param       $id
+     * @param       $messageId
+     * @param array $script_params
+     *               $script_params = [
+     *               'addUserIds'       => array ,
+     *               'removeUserIds'    => array ,
+     *               'addFolderIds'     => array ,
+     *               'removeFolderIds'  => array
+     *               ]
+     *
+     * @return SearchEntry
+     */
+    private function createUpdateEsFolderMessageRelationSearchEntry(
+        $id,
+        $message_id,
+        array $script_params
+    ) {
+        $searchEntry = new SearchEntry($id);
+
+        $searchEntry->addValue(Fields::messageId(), (int)$message_id);
+        $searchEntry->addValue(Fields::appName(),
+            SearchConstants::APPLICATION_MESSAGE);
+        $searchEntry->addValue(Fields::userIds(), []);
+        $searchEntry->addValue(Fields::userFolderIds(), []);
+        $searchEntry->setType('message.folderRelation');
+        $script
+            = $this->createScriptForUpdateFolderRelationSearchEntry($script_params);
+        $searchEntry->setScript($script);
+        $searchEntry->setUpsert(true);
+
+        return $searchEntry;
+    }
+
+    /**
+     * @param array $script_params
+     *
+     * @return array
+     */
+    public function createScriptForUpdateFolderRelationSearchEntry(
+        array $script_params
+    ) {
+        $script = [];
+        $inline = '';
+        foreach ($script_params as $key => $param) {
+            $script_params[$key] = array_map('intval', $param);
+        }
+
+        if (isset($script_params['removeUserIds'])) {
+            $inline .= 'for (removeId in params.removeUserIds) { def idx = ctx._source.userIds.indexOf(removeId); ';
+            $inline .= 'if (idx != -1) { ctx._source.userIds.remove(idx); } }';
+        }
+
+        if (isset($script_params['removeFolderIds'])) {
+            $inline .= 'for (removeId in params.removeFolderIds) { def idx = ctx._source.userFolderIds.indexOf(removeId); ';
+            $inline .= 'if (idx != -1) { ctx._source.userFolderIds.remove(idx); } }';
+        }
+
+        if (isset($script_params['addUserIds'])) {
+            $inline .= 'ctx._source.userIds.addAll(params.addUserIds);';
+        }
+
+        if (isset($script_params['addFolderIds'])) {
+            $inline .= 'ctx._source.userFolderIds.addAll(params.addFolderIds);';
+        }
+
+        if (strlen($inline) > 0) {
+            $script['inline'] = $inline;
+        }
+
+        $script['params'] = $script_params;
+
+        return $script;
+    }
+
+    /**
+     * @param string $id
+     * @param string $data
+     * @param int    $modifierId
+     * @param int    $mtime
+     * @param int    $messageId
+     * @param int    $followId
+     *
+     * @return \grn\fts\SearchEntryInterface $searchEntry
+     */
+    private function createFollowSearchEntry(
+        $id,
+        $data,
+        $modifierId,
+        $mtime,
+        $messageId,
+        $followId
+    ) {
+        $searchEntry = new SearchEntry($id);
+
+        $searchEntry->addValue(Fields::data(), $data);
+        $searchEntry->addValue(Fields::modifierId(), $modifierId);
+        $searchEntry->addValue(Fields::mtime(), $mtime);
+        $searchEntry->addValue(Fields::messageId(), $messageId);
+        $searchEntry->addValue(Fields::followId(), $followId);
+        $searchEntry->addValue(Fields::appName(),
+            SearchConstants::APPLICATION_MESSAGE);
+        $searchEntry->setType('message.follow');
+        $searchEntry->setParentId(self::createEsUserFolderId($messageId));
+
+        return $searchEntry;
+    }
+
+    /**
+     * @param string   $id
+     * @param string   $fileIdentifier
+     * @param string   $fileName
+     * @param int      $modifierId
+     * @param int      $mtime
+     * @param int      $messageId
+     * @param int|null $followId
+     * @param int      $fileId
+     *
+     * @return \grn\fts\SearchEntryInterface $searchEntry
+     */
+    private function createFileSearchEntry(
+        $id,
+        $fileIdentifier,
+        $fileName,
+        $modifierId,
+        $mtime,
+        $messageId,
+        $followId,
+        $fileId
+    ) {
+        $searchEntry = SearchUtil::createBaseFileEntry($id, $fileName,
+            $fileIdentifier);
+        $searchEntry->addValue(Fields::modifierId(), $modifierId);
+        $searchEntry->addValue(Fields::mtime(), $mtime);
+        $searchEntry->addValue(Fields::messageId(), $messageId);
+        if ( ! is_null($followId)) {
+            $searchEntry->addValue(Fields::followId(), $followId);
+        }
+        $searchEntry->addValue(Fields::fileId(), $fileId);
+        $searchEntry->addValue(Fields::appName(),
+            SearchConstants::APPLICATION_MESSAGE);
+        $searchEntry->setType('message.file');
+        $searchEntry->setParentId(self::createEsUserFolderId($messageId));
+
+        return $searchEntry;
+    }
+
+    /**
+     * @param $messageId
+     *
+     * @return string "G.Amessage.M{$messageId}"
+     */
+    private static function createMessageDocumentId($messageId)
+    {
+        return sprintf("%s%s%u", self::ID_PREFIX, self::MESSAGE_PREFIX,
+            $messageId);
+    }
+
+    /**
+     * @param string $messageId
+     * @param string $userId
+     * @param string $messageType
+     *
+     * @return string "G.Amessage.M{$messageId}.U{$userId}.T{$messageType}"
+     */
+    private function createUserFolderDocumentId(
+        $messageId,
+        $userId,
+        $messageType
+    ) {
+        return self::createMessageDocumentId($messageId) .
+               sprintf(
+                   "%s%s%u%s%s%u", SearchConstants::DOCUMENT_ID_DELIMITER,
+                   self::USER_PREFIX, $userId,
+                   SearchConstants::DOCUMENT_ID_DELIMITER,
+                   self::MESSAGE_TYPE_PREFIX,
+                   $messageType
+               );
+    }
+
+    /**
+     * @param $messageId
+     * @param $followId
+     *
+     * @return string "G.Amessage.M{$messageId}.C{$followId}"
+     */
+    private static function createFollowDocumentId($messageId, $followId)
+    {
+        return self::createMessageDocumentId($messageId) .
+               sprintf("%s%s%u", SearchConstants::DOCUMENT_ID_DELIMITER,
+                   self::FOLLOW_PREFIX, $followId);
+    }
+
+    /**
+     * @param string      $messageId
+     * @param string|null $followId
+     * @param string      $fileId
+     *
+     * @return string     "G.Amessage.M{$messageId}.F{$fileId}" or "G.Amessage.M{$messageId}.C{followId}.F{$fileId}"
+     */
+    private function createFileDocumentId($messageId, $followId, $fileId)
+    {
+        SearchUtil::validateIds([$fileId, $messageId, $followId]);
+        $id = (is_null($followId)) ? self::createMessageDocumentId($messageId)
+            : self::createFollowDocumentId($messageId, $followId);
+
+        return $id . sprintf("%s%s%u", SearchConstants::DOCUMENT_ID_DELIMITER,
+                self::FILE_PREFIX, $fileId);
+    }
+
+    /**
+     * @param string $messageId
+     *
+     * @return string "G.Amessage.M${messageId}.UF"
+     */
+    private static function createEsUserFolderId($messageId)
+    {
+        return self::createMessageDocumentId($messageId) . "UF";
+    }
+
+}

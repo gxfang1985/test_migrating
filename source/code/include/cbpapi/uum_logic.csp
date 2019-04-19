@@ -1,0 +1,223 @@
+<?php
+
+/**
+ *
+ */
+class GRN_CBPApi_Uum_Logic
+{
+    private $_db = null;
+
+    /**
+     * @return GRN_CBPApi_Uum_Logic
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_CBPApi_Uum_Logic();
+        }
+
+        return $_instance;
+    }
+
+    protected function __construct()
+    {
+        global $G_container_base;
+        $this->_db = $G_container_base->getInstance('dbconn');
+    }
+
+    protected function _getDBConnection()
+    {
+        return $this->_db;
+    }
+
+    public function getUsers($user_list)
+    {
+        $db = $this->_getDBConnection();
+
+        $query = cb_queryf($db,
+            'SELECT u._id,col_display_name,col_foreign_key,col_position,u.col_mtime,col_sort_key,col_url,col_email_address,col_telephone_number,col_birthdate,col_description,col_deleted,col_valid,col_post,r.col_group AS primary_group,col_image FROM tab_cb_user u LEFT JOIN tab_grn_userinfo i ON u._id = i.col_user LEFT JOIN tab_cb_usergrouprelation r ON  r._id = i.col_primary_group WHERE u._id IN (@A) ORDER BY u.col_position,u._id',
+            $user_list);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $builtin_items = $uum->getDefaultDisplayItemProperties();
+
+        $users = [];
+        $user_image_list = [];
+        while ($row = $db->fetch_assoc($result)) {
+            // 基本情報
+
+            $attributes = [
+                'key'         => $row['_id'],
+                'login_name'  => $row['col_foreign_key'],
+                'name'        => $row['col_display_name'],
+                'order'       => $row['col_position'],
+                'version'     => $row['col_mtime'],
+                'reading'     => $row['col_sort_key'],
+                'url'         => $row['col_url'],
+                'email'       => $row['col_email_address'],
+                'phone'       => $row['col_telephone_number'],
+                'birth_date'  => $row['col_birthdate'],
+                'description' => $row['col_description'],
+                'title'       => $row['col_post'],
+            ];
+            if ($row['col_deleted']) {
+                $attributes['status'] = '2';
+            } elseif ( ! is_null($row['col_valid'])) {
+                $attributes['status'] = '1';
+            } else {
+                $attributes['status'] = '0';
+            }
+
+            // イメージ
+            if ( ! $row['col_deleted'] && $row['col_image']) {
+                $user_image_list[$row['_id']] = $row['col_image'];
+            }
+
+            // 優先する組織
+            if ($row['primary_group'] && ! is_null($row['primary_group'])) {
+                $attributes['primary_organization'] = $row['primary_group'];
+            }
+
+            $users[$row['_id']] = [
+                'attributes'    => $attributes,
+                'builtin_items' => $builtin_items,
+                'groups'        => [],
+            ];
+        }
+        $db->free_result($result);
+
+        // 写真
+        if (count($user_image_list)) {
+            $query = cb_queryf($db,
+                'SELECT col_file as id,col_name as name,col_mime as mime_type,col_size as size,col_timestamp as version FROM tab_grn_filebody WHERE col_file IN (@A)',
+                $user_image_list);
+            $result = $db->query($query);
+            if ($result === false) {
+                $db->throwError([
+                    'query' => 'failed query on SELECT: ' . $query
+                ]);
+            }
+            while ($row = $db->fetch_assoc($result)) {
+                $user_id = array_search($row['id'],
+                    $user_image_list);
+                $users[$user_id]['photo'] = $row;
+            }
+            $db->free_result($result);
+        }
+
+        // 所属組織
+        $query = cb_queryf($db,
+            'SELECT col_user, col_group FROM tab_cb_usergrouprelation WHERE col_user IN (@A) ORDER BY col_user, col_group_list, col_group',
+            array_keys($users));
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+
+        // 所属組織
+        while ($row = $db->fetch_assoc($result)) {
+            $users[$row['col_user']]['groups'][$row['col_group']]
+                = $row['col_group'];
+        }
+        $db->free_result($result);
+
+        // 優先する組織（明確に設定されていない場合の処理）
+        foreach ($users as $user_id => $user_info) {
+            if ( ! isset($user_info['attributes']['primary_organization'])) {
+                if (0 < count($user_info['groups'])) {
+                    // 一番最初を優先する組織とする
+                    $users[$user_id]['attributes']['primary_organization']
+                        = reset($user_info['groups']);
+                }
+            }
+        }
+        $users_result = [];
+        foreach ($user_list as $key) {
+            if (($user = cb_at($users, $key, false))) {
+                $users_result[$key] = $user;
+            }
+        }
+
+        return $users_result;
+    }
+
+    public function getGroups($org_list)
+    {
+        $db = $this->_getDBConnection();
+        $i18n = CB_I18N::getInstance();
+
+        $groups = [];
+        $org_list = array_unique($org_list);
+
+        // 組織取得
+        $query = cb_queryf($db,
+            'SELECT c._id, c.col_description,c.col_list_index,c.col_mtime, IFNULL(cl.col_name, c.col_name) as col_name, c.col_parent FROM tab_cb_group c LEFT JOIN (tab_cb_group_local cl INNER JOIN tab_cb_language_status l ON cl.language_id = l._id AND l.col_language = \'@S\') ON c._id = cl.parent_id WHERE c._id IN (@A) ',
+            $i18n->getCurrentLanguage(), $org_list);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+        while ($row = $db->fetch_assoc($result)) {
+            $groups[$row['_id']] = [
+                'key'         => $row['_id'],
+                'name'        => $row['col_name'],
+                'description' => $row['col_description'],
+                'version'     => $row['col_mtime'],
+                'order'       => $row['col_list_index'],
+                'parent'      => $row['col_parent'],
+            ];
+            $groups[$row['_id']]['child_organization'] = [];
+            $groups[$row['_id']]['belong_user'] = [];
+        }
+        $db->free_result($result);
+
+        if (count($org_list) !== count($groups)) {
+            cb_throw_error(E_GRN_GROUP_NOT_FOUND);
+        }
+
+        // 組織の子組織一括取得
+        $query = cb_queryf($db,
+            'SELECT _id,col_parent FROM tab_cb_group WHERE col_parent IN (@A) ',
+            array_keys($groups));
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+        while ($row = $db->fetch_assoc($result)) {
+            if (isset($groups[$row['col_parent']])) {
+                $groups[$row['col_parent']]['child_organization'][]
+                    = $row['_id'];
+            }
+        }
+        $db->free_result($result);
+
+        // 所属ユーザー取得
+        $format = "SELECT " .
+                  "col_user,col_group " .
+                  "FROM " .
+                  "tab_cb_usergrouprelation " .
+                  "INNER JOIN tab_cb_user " .
+                  "ON tab_cb_usergrouprelation.col_user = tab_cb_user._id " .
+                  "WHERE " .
+                  "tab_cb_user.col_deleted IS NULL AND col_group IN (@A)";
+        $query = cb_queryf($db, $format, array_keys($groups));
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+        while ($row = $db->fetch_assoc($result)) {
+            if (isset($groups[$row['col_group']])) {
+                $groups[$row['col_group']]['belong_user'][] = $row['col_user'];
+            }
+        }
+        $db->free_result($result);
+
+        return $groups;
+    }
+}

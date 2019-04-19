@@ -1,0 +1,263 @@
+<?php
+
+namespace grn\space\screen;
+
+use grn\space\common\exception\GrnInvalidPermissionException;
+use grn\space\common\data\bean\Authority;
+use grn\space\common\logic\legacy\SpaceLogLogic;
+use grn\space\data\bean\log\ModifyFolderLog;
+use grn\space\data\collection\FolderCollection;
+use grn\space\data\collection\SpaceCollection;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\exception\GrnDataNotFoundException;
+use grn\space\common\utility\IconUtility;
+use grn\space\data\bean\Folder;
+use grn\space\data\condition\FolderSearchCondition;
+use grn\space\service\SpaceService;
+
+/**
+ * Class FolderSetting
+ *
+ */
+class FolderSetting extends SpaceBase
+{
+    const ID_ADD_NEW_FOLDER = 0;
+    const ARG_FOLDER_LIST = 'folder_list';
+    const ARG_IS_DELETED = 'is_deleted';
+    const EMPTY_VALUE = '';
+
+    /**
+     * @return mixed|string|void
+     * @throws GrnDataNotFoundException
+     */
+    public function fetch()
+    {
+        require_once("grn/smarty.csp");
+        $smarty = new \GRN_Smarty();
+        $spaceId = $this->getSpace()->getId();
+        $loginId = $this->getLoginUserId();
+        $spaceService = SpaceService::getInstance();
+
+        if ( ! $this->isSpaceAdminOrOperator($spaceService, $spaceId,
+            $loginId)
+        ) {
+            throw new GrnDataNotFoundException(ErrorCode::GRN_FOLDER_NO_PERMISSION);
+        }
+
+        if ( ! $spaceService->hasSpaceAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $spaceId, $loginId)
+        ) {
+            throw new GrnDataNotFoundException(ErrorCode::GRN_INVALID_SPACE_ID);
+        }
+
+        $smarty->assign('space', $this->getSpace());
+
+        return $smarty->fetch(cb_get_pagename() . '.tpl');
+    }
+
+    /**
+     * @param $input
+     *
+     * @return bool
+     * @throws GrnDataNotFoundException
+     * @throws GrnInvalidPermissionException
+     * @throws \Exception
+     * @throws \grn\space\common\exception\GrnInvalidArgumentException
+     */
+    public function post($input)
+    {
+        $this->setInput($input);
+        $input = $this->getInput();
+
+        $this->checkArgFromInput([self::ARG_SPACE_ID], $input);
+
+        $spaceId = $this->getSpaceId();
+        $loginId = $this->getLoginUserId();
+        $folderCollection = new FolderCollection();
+
+        $spaceService = SpaceService::getInstance();
+        $isPrivilege = $this->isSpaceAdminOrOperator($spaceService, $spaceId,
+            $loginId);
+
+        if ( ! $isPrivilege) {
+            throw new GrnInvalidPermissionException(ErrorCode::GRN_FOLDER_NO_PERMISSION);
+        }
+
+        $folder_list = json_decode(cb_at($input, self::ARG_FOLDER_LIST,
+            ""), true);
+        $folderIdListDelete = [];
+
+        foreach ($folder_list as $folder) {
+            $isDelete = cb_at($folder, self::ARG_IS_DELETED, false);
+            $folderName = cb_trim(cb_at($folder, 'col_folder_name', ''));
+            if ( ! $isDelete && $folderName === '') {
+                return "REQUIRED_FOLDER_NAME";
+            }
+        }
+
+        foreach ($folder_list as $folder) {
+            $folderDTO = new Folder($folder);
+
+            $folderDTO->setSpaceId($this->getSpaceId());
+            $isDelete = cb_at($folder, self::ARG_IS_DELETED, false);
+
+            if ($isDelete) {
+                $folderIdListDelete[$folderDTO->getId()] = $folderDTO->getId();
+            } else {
+
+                $folderDTO->setFolderName(mb_substr(cb_trim($folderDTO->getFolderName()),
+                    0, self::MAX_LENGTH_NAME));
+
+                if ($folder['_id'] == self::ID_ADD_NEW_FOLDER) {
+                    $folderDTO->setFolderCode(uniqid(self::EMPTY_VALUE, true));
+                    $folderId = $spaceService->addFolder($folderDTO);
+                    $folderDTO->setId($folderId);
+                } else {
+                    $spaceService->modifyFolder($folderDTO);
+                }
+            }
+
+            $folderCollection->appendBean($folderDTO);
+
+        }
+
+        $threadList
+            = $spaceService->getThreadListByFolderIdList($folderIdListDelete);
+
+        /** @var \grn\space\data\bean\Thread $thread */
+        foreach ($threadList as $thread) {
+            if (array_key_exists($thread->getFolderId(), $folderIdListDelete)) {
+                unset($folderIdListDelete[$thread->getFolderId()]);
+            }
+        }
+
+        $spaceService->deleteFolderList($folderIdListDelete);
+
+        $this->_writeFolderSettingLog($folderCollection);
+
+        return true;
+    }
+
+    /**
+     * @param \grn\space\data\collection\FolderCollection $folderCollection
+     */
+    private function _writeFolderSettingLog($folderCollection)
+    {
+        $space = $this->getSpace();
+        $modifyFolderLog = new ModifyFolderLog();
+        $modifyFolderLog->setSpaceId($space->getId());
+        $modifyFolderLog->setSpaceName($space->getSpaceName());
+
+        /** @var \grn\space\data\bean\Folder $folder */
+        foreach ($folderCollection as $folder) {
+            $modifyFolderLog->setFolder(
+                [
+                    $modifyFolderLog::LOG_FOLDER_ID   => $folder->getId(),
+                    $modifyFolderLog::LOG_FOLDER_NAME => $folder->getFolderName()
+                ]
+            );
+        }
+
+        if (count($modifyFolderLog->getFolder()) > 0) {
+            $spaceLogLogic
+                = new SpaceLogLogic(\GrnSpaceApplication::GRN_SPACE_MODULE_ID);
+            $spaceLogLogic->info($modifyFolderLog);
+        }
+    }
+
+    /**
+     * @return array
+     * @throws GrnDataNotFoundException
+     */
+    public function fetchForAjax()
+    {
+        $input = $this->getInput();
+        $spid = cb_at($input, self::ARG_SPACE_ID);
+        $conditions = new FolderSearchCondition();
+        $conditions->setSpaceId($spid);
+
+        $spaceService = SpaceService::getInstance();
+
+        if ( ! $spaceService->hasSpaceAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $this->getSpace()->getId(), $this->getLoginUserId())
+        ) {
+            throw new GrnDataNotFoundException(ErrorCode::GRN_INVALID_SPACE_ID);
+        }
+
+        $folderCollection
+            = $spaceService->getFolderListByCondition($conditions);
+        $folderList = [];
+
+        /** @var \grn\space\data\bean\Folder $folder */
+        foreach ($folderCollection as $folder) {
+            $folderList[] = $folder->toArray();
+        }
+
+        return $folderList;
+    }
+
+    /**
+     * @return string
+     */
+    public function getTitle()
+    {
+        return grn_get_page_display_name(cb_get_pagename());
+    }
+
+    /**
+     * @return array
+     */
+    public function getSitePosition()
+    {
+        $sitePosition = $this->createCategorySitePosition($this->getSpace()
+                                                               ->getCategoryId());
+        $sitePosition[] = [
+            "name"     => $this->getSpace()->getSpaceName(),
+            "page"     => "space/top",
+            "spid"     => $this->getSpace()->getId(),
+            "icon"     => [
+                "image"  => $this->getSpace()->getDisplayIconPath(),
+                "direct" => true,
+                "class"  => "breadcrumb-icon",
+            ],
+            "isHidden" => ! $this->getSpace()->isPublic(),
+        ];
+        $sitePosition[] = [
+            "name" => grn_get_page_display_name(cb_get_pagename()),
+        ];
+
+        return $sitePosition;
+
+
+    }
+
+    /**
+     * @param $input
+     *
+     * @throws GrnDataNotFoundException
+     * @throws \Exception
+     * @throws \grn\space\common\exception\GrnInvalidArgumentException
+     */
+    protected function setInput($input)
+    {
+        parent::setInput($input);
+        $this->checkArgFromInput([self::ARG_SPACE_ID], $input);
+        $this->verifySpaceIsNotExpired();
+        //Set up Space because it is used in $this->getSitePosition which is called before $this->fetch is called.
+        $spaceService = SpaceService::getInstance();
+        try {
+            $space = $spaceService->getSpace($this->getSpaceId(),
+                $this->getLoginUserId(), $this->getLanguageCode());
+            $spaceCollection = new SpaceCollection();
+            $spaceCollection->appendBean($space);
+            $spaceService->addFileUsage($spaceCollection);
+        } catch (GrnDataNotFoundException $e) {
+            $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+            throw $e;
+        }
+        global $G_config_common;
+        IconUtility::constructionSpaceIconPath($space,
+            $G_config_common->get('Global', 'app_path'));
+        $this->setSpace($space);
+    }
+}

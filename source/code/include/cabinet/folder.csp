@@ -1,0 +1,2782 @@
+<?php
+
+/**
+ * ファイル管理、フォルダーAPI
+ *
+ * @author  Tanaka, Yoshiaki        2004/11
+ * @package grn.cabinet
+ */
+
+use grn\fts\Application as FtsApplication;
+use grn\fts\cabinet\IndexService;
+
+require_once('fw/i18n.csp');
+require_once('cabinet/table.csp');
+require_once('cabinet/CabinetFacade.csp');
+require_once('grn/application.csp');
+require_once('inspection.csp');
+define('GRN_CABINET_FOLDER_CSV_PARENT_FOREIGNKEY', 0);
+define('GRN_CABINET_FOLDER_CSV_FOREIGNKEY', 1);
+define('GRN_CABINET_FOLDER_CSV_NAME', 2);
+define('GRN_CABINET_FOLDER_CSV_DESCRIPTION', 3);
+
+
+/**
+ * フォルダーのAPIオブジェクトを生成
+ * アクセス権のチェックはないのでロジック内部でのみの利用とすること
+ *
+ * @package grn.cabinet
+ */
+class GRN_Cabinet_FolderFactory
+{
+    /**
+     * @access private
+     */
+    var $_tab_folder = null;
+    /**
+     * @access private
+     */
+    var $_cache = [];
+
+
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Cabinet_FolderFactory
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    function __construct()
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('cabinet');
+
+        $this->_tab_folder = $tm->getTableInfo('GRN_Cabinet_FolderEntity');
+    }
+
+    /**
+     * @access private
+     *
+     * @param GRN_Cabinet_Folder $folder
+     */
+    function _cache(GRN_Cabinet_Folder $folder)
+    {
+        $this->_cache[$folder->getOID()] = $folder;
+    }
+
+    /**
+     * @access private
+     *
+     * @param $id
+     *
+     * @return GRN_Cabinet_Folder|bool
+     */
+    function _get($id)
+    {
+        if (array_key_exists($id, $this->_cache)) {
+            return $this->_cache[$id];
+        }
+        $ret = false;
+
+        return $ret;
+    }
+
+    /**
+     * テープルオブジェクトからAPIオブジェクトを生成する
+     *
+     * @param \GRN_Cabinet_FolderEntity $row
+     *
+     * @return GRN_Cabinet_Folder
+     */
+    function row2object($row)
+    {
+        if ( ! $row) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        assert('is_a( $row, "GRN_Cabinet_FolderEntity" )');
+
+        if ( ! ($object = $this->_get($row->getOID()))) {
+            $object = new GRN_Cabinet_Folder($row);
+            $this->_cache($object);
+        }
+
+        return $object;
+    }
+
+    /**
+     * IDからAPIオブジェクトを取得する
+     *
+     * @param string $oid オブジェクトID
+     * @param bool   $auto_load
+     *
+     * @return GRN_Cabinet_Folder、見つからない場合はFALSEを返す
+     */
+    function get($oid, $auto_load = true)
+    {
+        $db = $this->_tab_folder->getDBConnection();
+        $oid = $db->escape($oid);
+
+        if ( ! ($object = $this->_get($oid))) {
+            if ( ! $auto_load) {
+                $ret = false;
+
+                return $ret;
+            }
+
+            $i18n = CB_I18N::getInstance();
+            $table_info = $this->_tab_folder;
+
+            $dao = new CabinetFacade();
+            $dataObj = [];
+            $dataObj['lock'] = $table_info->_lock;
+            $dataObj['language'] = $i18n->getCurrentLanguage();
+
+            $folder = $dao->referCabinetFolderById($dataObj, $oid);
+            if ($folder === false) {
+                return false;
+            }
+
+            $row = $table_info->getRow($folder->getId(),
+                $folder->convertArray());
+            $ret = $this->row2object($row);
+
+            return $ret;
+        }
+        if ( ! $object->isValid()) {
+            unset($this->_cache[$oid]);
+            $ret = false;
+
+            return $ret;
+        }
+
+        return $object;
+    }
+}
+
+
+/**
+ * フォルダーAPI
+ *
+ * @package grn.cabinet
+ */
+class GRN_Cabinet_Folder
+{
+    /**
+     * @access private
+     * @var GRN_Cabinet_FolderEntity
+     */
+    var $_folder = null;
+    /**
+     * @access private
+     */
+    var $_subcache = [];
+
+    /**
+     * @access private
+     */
+    var $_triggers = null;
+
+    /**
+     * @access private
+     * @return \CB_TableInfo|object
+     */
+    function _getFolderTable()
+    {
+        static $_tab_folder = null;
+        if (is_null($_tab_folder)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $tm = $app_locator->getTableManager('cabinet');
+            $_tab_folder = $tm->getTableInfo('GRN_Cabinet_FolderEntity');
+        }
+
+        return $_tab_folder;
+    }
+
+    /**
+     * @access private
+     * @return GRN_Cabinet_FolderEntity
+     */
+    function _getRow()
+    {
+        return $this->_folder;
+    }
+
+    /**
+     * invoke hooks on create, update or delete event
+     *
+     * @access public
+     *
+     * @param string $action action
+     */
+    function runHook($action)
+    {
+        if (is_null($this->_triggers)) {
+            $loader = new CB_PluginLoader('grn.cabinet.acl');
+            $this->_triggers = $loader->loadHooks();
+        }
+
+        foreach ($this->_triggers as $hook) {
+            call_user_func($hook, $this->_getRow(), $action);
+        }
+    }
+
+    /**
+     * コンストラクタ
+     *
+     * @param GRN_Cabinet_FolderEntity  フォルダーの実体
+     */
+    function __construct($row)
+    {
+        $this->_folder = $row;
+    }
+
+
+    /**
+     * Check deleted flag of folder
+     *
+     * @param bool $ancestor     Check deleted flag of ancestor folder or not
+     * @param bool $onlyAncestor Check only ancestor folders
+     *
+     * @return bool     Returns TRUE on success or FALSE on failure
+     */
+    function checkDeletedFlag($ancestor = true, $onlyAncestor = false)
+    {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login = $uum->getLoginUser();
+
+        if ($ancestor) {
+            $fm = GRN_Cabinet_FolderManager::getInstance();
+            $ancestors = $fm->getListFolderIdAncestor($this->getOID());
+            if ($onlyAncestor) {
+                unset($ancestors[0]);
+            }
+            foreach ($ancestors as $obj) {
+                $f = $fm->getFolder($login, $obj['id']);
+                if ($f && $f->_folder->get('reserve_int1')) {
+                    return true;
+                }
+            }
+
+            return false;
+        } else {
+            if ($this->_folder->get('reserve_int1')) {
+                return true;
+            }
+
+            return false;
+        }
+    }
+
+    /**
+     * Add deleted flag of folder
+     *
+     * @return bool     Returns TRUE on success or FALSE on failure
+     */
+    function addDeletedFlag()
+    {
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+        $login =& $uum->getLoginUser();
+
+        $this->isDeletable($login, true);
+
+        if ($this->checkDeletedFlag()) {
+            return false;
+        }
+
+        if ( ! $this->_folder->set('reserve_int1', time())) {
+            return false;
+        }
+        if ( ! $this->_folder->updateNow()) {
+            return false;
+        }
+
+        $parent_id = $this->_folder->getId('parent');
+
+        // Log
+        require_once('cabinet/inspection.csp');
+        $inspection = GRN_Cabinet_Inspection::getInstance();
+        $inspection->writeLogFolder('delete', $this->_folder, $parent_id);
+
+        return true;
+    }
+
+    /**
+     * Remove deleted flag of folder
+     *
+     * @return bool     Returns TRUE on success or FALSE on failure
+     */
+    function removeDeletedFlag()
+    {
+        if ( ! $this->checkDeletedFlag(false)) {
+            return false;
+        }
+        if ($this->checkDeletedFlag(true, true)) {
+            return false;
+        }
+        if ( ! $this->_folder->get('reserve_int1')) {
+            return false;
+        }
+
+        if ( ! $this->_folder->set('reserve_int1', null)) {
+            return false;
+        }
+        if ( ! $this->_folder->updateNow()) {
+            return false;
+        }
+
+        $parent_id = $this->_folder->getId('parent');
+
+        // Log
+        require_once('cabinet/inspection.csp');
+        $inspection = GRN_Cabinet_Inspection::getInstance();
+        $inspection->writeLogFolder('restore', $this->_folder, $parent_id);
+
+        return true;
+    }
+
+    /**
+     * @return bool
+     */
+    function isExpired()
+    {
+        $isExpired = false;
+
+        require_once('cabinet/config.csp');
+        $sysconf = GRN_Cabinet_SystemConfig::getInstance();
+        $trash_period = $sysconf->getTrashPeriod();
+
+        assert("$trash_period > 0");
+
+        $ts = new CB_TimeStampEx();
+        $ts->unix_ts = time();
+        $today =& $ts->getDateTime();
+
+        $ts_dtime = new CB_TimeStampEx();
+        $ts_dtime->unix_ts = $this->_folder->get('reserve_int1');
+        $ts_dtimeEx = new CB_TimeStampEx($ts_dtime);
+        $dtime = $ts_dtimeEx->getDateTime($ts_dtimeEx);
+
+        $dtime->hour = 0;
+        $dtime->minute = 0;
+        $dtime->second = 0;
+        $dtime->moveDays(1);
+
+        $tspan = $today->getInterval($dtime);
+
+        if ($tspan->toDays() >= $trash_period) {
+            $isExpired = true;
+        }
+
+        return $isExpired;
+    }
+
+    /**
+     * フォルダーを削除する
+     *
+     * @param CB_User|null $inUser 操作ユーザー
+     *
+     * @return bool  削除できた場合にTRUE、それ以外の場合でFALSE
+     */
+    public function deleteFoldersPermanent($inUser = null)
+    {
+        if ( ! is_null($inUser)) {
+            $this->isDeletable($inUser, true);
+            $subfolders = $this->getFolders($inUser);
+        } else {
+            $subfolders = $this->getFoldersWithoutEvaluate();
+        }
+
+        if ( ! is_array($subfolders)) {
+            return false;
+        }
+
+        //Create an instance
+        $inspection = GRN_Cabinet_Inspection::getInstance();
+
+        foreach (array_keys($subfolders) as $id) {
+            /** @var GRN_Cabinet_Folder $folder */
+            $folder = $subfolders[$id];
+
+            if (is_object($folder)) {
+                $folder->deleteFoldersPermanent($inUser);
+            }
+        }
+
+        $this->deleteFilesInFolder();
+
+        if (FtsApplication::isAvailable()) {
+            $searchService = new IndexService();
+            $searchService->deleteFolderIndex($this->_folder->getOID());
+        }
+
+        $parent_id = $this->_folder->getId('parent');
+        $this->_folder->delete();
+
+        //Write log: delete folder
+        $inspection->writeLogFolder('permanent delete', $this->_folder,
+            $parent_id);
+
+        $this->_folder = null;
+
+        return true;
+    }
+
+    private function deleteFilesInFolder()
+    {
+        $files = $this->getFiles(GRN_CABINET_FILELIST_MODE_ALL);
+
+        require_once('cabinet/notification.csp');
+        $nm = GRN_Cabinet_NotificationManager::getInstance(false);
+
+        foreach (array_keys($files) as $id) {
+            $file = $files[$id];
+
+            // delete notification message
+            $nm->deleteNotification($file);
+
+            // inspection
+            require_once('cabinet/inspection.csp');
+            $inspection = GRN_Cabinet_Inspection::getInstance();
+            $inspection->writeLogFile('delete', $file, $this->getOID());
+
+            // delete
+            $file->delete();
+        }
+    }
+
+    /**
+     * 有効なオブジェクトか調べる
+     *
+     * @return bool  有効な場合にTRUE、既に削除された無効オブジェクトの場合にFALSE
+     */
+    function isValid()
+    {
+        return ! is_null($this->_getRow());
+    }
+
+
+    /**
+     * ユーザーのフォルダに対するアクセス権を判定する
+     *
+     * @param CB_User $user        ユーザー
+     * @param integer $acc_mode    アクセスモード
+     * @param bool    $throw_error アクセス拒否でエラー発生の場合はTRUE
+     *
+     * @return bool
+     */
+    function access($user, $acc_mode, $throw_error = false)
+    {
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        if ( ! $acc->access($user, $this, $acc_mode)) {
+            if ($throw_error) {
+                if ($acc_mode == GRN_CABINET_ACCESS_R) {
+                    cb_throw_error(E_GRN_CABINET_ACCESS_DENY_READ);
+                }
+
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_WRITE);
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * ユーザーのフォルダに対する権限情報を取得する
+     *
+     * @param CB_User $user ユーザー
+     *
+     * @return array  array( 'read'=>[0,1], 'write'=>[0,1] )
+     */
+    function getAuthorities($user)
+    {
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        return $acc->getAuthorities($user, $this);
+    }
+
+    /**
+     * フォルダの削除権限を調べる
+     *
+     * @param CB_User $user
+     * @param bool    $throw_error
+     *
+     * @return bool
+     */
+    function isDeletable($user, $throw_error = false)
+    {
+        if ($this->getOID() == GRN_CABINET_ROOT_FOLDER_ID
+            || ! $this->getId('parent')
+        ) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_DELETE);
+            }
+
+            return false;
+        }
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        // システム管理者はOK
+        if ($acc->isSuperAdmin($user)) {
+            return true;
+        }
+
+        $parent = $this->get('parent');
+
+        // 親フォルダに対して管理権限を持っていればOK
+        if ($acc->isAdmin($user, $parent)) {
+            return true;
+        }
+
+        if ($throw_error) {
+            cb_throw_error(E_GRN_CABINET_ACCESS_DENY_DELETE);
+        }
+
+        return false;
+    }
+
+    /**
+     * フォルダの移動権限を調べる
+     *
+     * @param CB_User $user
+     * @param bool    $throw_error
+     *
+     * @return bool
+     */
+    function isMovable($user, $throw_error = false)
+    {
+        if ($this->getOID() == GRN_CABINET_ROOT_FOLDER_ID
+            || ! $this->getId('parent')
+        ) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_MOVE);
+            }
+
+            return false;
+        }
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        // システム管理者はOK
+        if ($acc->isSuperAdmin($user)) {
+            return true;
+        }
+
+        $parent = $this->get('parent');
+
+        // 親フォルダに対して管理権限を持っていればOK
+        if ($acc->isAdmin($user, $parent)) {
+            return true;
+        }
+
+        if ($throw_error) {
+            cb_throw_error(E_GRN_CABINET_ACCESS_DENY_MOVE);
+        }
+
+        return false;
+    }
+
+    /**
+     * 移動先のフォルダが存在するか調べる
+     *
+     * @param      $user
+     * @param bool $throw_error
+     *
+     * @return bool
+     */
+    function existDestination($user, $throw_error = false)
+    {
+        // ルートは移動できない
+        if ($this->getOID() == GRN_CABINET_ROOT_FOLDER_ID
+            || ! $this->getId('parent')
+        ) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+            }
+
+            return false;
+        }
+
+        /** @var GRN_Cabinet_Folder $parent */
+        $parent = $this->get('parent');
+
+        // 自分以外のサブフォルダの存在を確認
+
+        if ($parent->getNumFolders($user) < 2) {
+            // サブフォルダがなければ更に上の親フォルダの下に移動できるか
+
+            if ( ! ($parent = $parent->get('parent'))) {
+                if ($throw_error) {
+                    cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+                }
+
+                return false;
+            }
+
+            require_once('cabinet/access.csp');
+            $acc = GRN_Cabinet_AccessManager::getInstance();
+
+            if ( ! $acc->isAdmin($user, $parent)) {
+                if ($throw_error) {
+                    cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+                }
+
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 移動先を指定して移動可能か調べる
+     *
+     * @param CB_User            $user
+     * @param GRN_Cabinet_Folder $destination
+     * @param bool               $throw_error
+     *
+     * @return bool
+     */
+    function canMoveTo($user, $destination, $throw_error = false)
+    {
+        // ルートあるいは自分自身には移動できない
+        if ( ! $destination || $this->getOID() == $destination->getOID()) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_MOVE);
+            }
+
+            return false;
+        }
+
+        // ルートは移動できない
+        if ($this->getOID() == GRN_CABINET_ROOT_FOLDER_ID
+            || ! $this->getId('parent')
+        ) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_MOVE);
+            }
+
+            return false;
+        }
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        // 移動先に管理権限が必要
+        if ( ! $acc->isAdmin($user, $destination)) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_MOVE);
+            }
+
+            return false;
+        }
+
+        $parent = $this->get('parent');
+
+        // 親フォルダに管理権限が必要
+        if ( ! $acc->isAdmin($user, $parent)) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_MOVE);
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * このフォルダ以下のファイルを削除する権限があるか調べる
+     *
+     * @param CB_User          $user
+     * @param GRN_Cabinet_File $file
+     * @param bool             $throw_error
+     *
+     * @return int
+     */
+    function isDeletableFile($user, $file, $throw_error = false)
+    {
+        if ( ! $user || ! $file) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_DELETE);
+            }
+
+            return 0;
+        }
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        $lock = $file->getLockObject();
+
+        // 他人がロックしているとNG
+        if ($lock->isLocked() == 1) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_FILE_LOCKED);
+            }
+
+            return -1;
+        }
+
+        // 管理権限をもっているとロックされていても削除できる
+
+        // システム管理者はOK
+        if ($acc->isSuperAdmin($user)) {
+            return 1;
+        }
+
+        // フォルダの管理者はOK
+        if ($acc->isAdmin($user, $this)) {
+            return 1;
+        }
+
+        if ( ! $this->access($user, GRN_CABINET_ACCESS_W, false)) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_DELETE);
+            }
+
+            return 0;
+        }
+
+        return 1;
+    }
+
+    /**
+     * このフォルダ以下のファイルを移動する権限があるか調べる
+     *
+     * @param CB_User          $user
+     * @param GRN_Cabinet_File $file
+     * @param bool             $throw_error
+     *
+     * @return int
+     */
+    function isMovableFile($user, $file, $throw_error = false)
+    {
+        if ( ! $user || ! $file) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_MOVE);
+            }
+
+            return 0;
+        }
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        // 管理権限を持っているとロックされていても移動できる
+
+        // システム管理者はOK
+        if ($acc->isSuperAdmin($user)) {
+            return 1;
+        }
+
+        // フォルダの管理者はOK
+        if ($acc->isAdmin($user, $this)) {
+            return 1;
+        }
+
+        $lock = $file->getLockObject();
+
+        // 他人がロックしているとNG
+        if ($lock->isLocked() == 1) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_FILE_LOCKED);
+            }
+
+            return -1;
+        }
+
+        if ( ! $this->access($user, GRN_CABINET_ACCESS_W, false)) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_MOVE);
+            }
+
+            return 0;
+        }
+
+        return 1;
+    }
+
+    /**
+     * 移動先を指定してこのフォルダ以下のファイルが移動可能か調べる
+     *
+     * @param CB_User            $user
+     * @param GRN_Cabinet_File   $file
+     * @param GRN_Cabinet_Folder $destination
+     * @param bool               $throw_error
+     *
+     * @return bool
+     */
+    function canMoveFileTo($user, $file, $destination, $throw_error = false)
+    {
+        assert('!is_null($user) && $user !== FALSE');
+        assert('!is_null($destination) && $destination !== FALSE');
+
+        if ( ! $user || ! $file || ! $destination) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_MOVE);
+            }
+
+            return false;
+        }
+
+        $lock = $file->getLockObject();
+
+        // 他人がロックしているとNG
+        if ($lock->isLocked() == 1) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_FILE_LOCKED);
+            }
+
+            return false;
+        }
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        // 移動先に対して管理権限もしくは書き込み権限が必要
+        if ( ! $acc->isAdmin($user, $destination)) {
+            if ( ! $destination->access($user, GRN_CABINET_ACCESS_W, false)) {
+                if ($throw_error) {
+                    cb_throw_error(E_GRN_CABINET_ACCESS_DENY_MOVE);
+                }
+
+                return false;
+            }
+        }
+
+        // このフォルダに対して管理権限もしくは書き込み権限が必要
+        if ( ! $acc->isAdmin($user, $this)) {
+            if ( ! $this->access($user, GRN_CABINET_ACCESS_W, false)) {
+                if ($throw_error) {
+                    cb_throw_error(E_GRN_CABINET_ACCESS_DENY_MOVE);
+                }
+
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * ユーザーが特権を与えられているか調べる
+     *
+     * @param object $user       ユーザー
+     * @param array  $privileges 特権リスト
+     * @param bool   $throw_error
+     *
+     * @return boolean
+     */
+    function privileged($user, $privileges, $throw_error = false)
+    {
+        require_once('cabinet/privilege.csp');
+        $pm = GRN_Cabinet_PrivilegeManager::getInstance();
+        if ( ! $pm->privileged($user, $this, $privileges)) {
+            if ($throw_error) {
+                cb_throw_error(E_GRN_CABINET_OPERATION_NOT_GRANTED);
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * ユーザーのフォルダに対する特権を取得
+     *
+     * @param object $user ユーザー
+     *
+     * @return array
+     */
+    function getPrivileges($user)
+    {
+        require_once('cabinet/privilege.csp');
+        $pm = GRN_Cabinet_PrivilegeManager::getInstance();
+
+        return $pm->getPrivileges($user, $this);
+    }
+
+    /**
+     * ルートフォルダーかどうか問い合わせる
+     *
+     * @return bool  ルートフォルダーの場合にTRUE、それ以外でFALSE
+     */
+    function isRoot()
+    {
+        return $this->getId('parent') ? false : true;
+    }
+
+    /**
+     * フォルダーのOIDを取得する
+     *
+     * @return string  フォルダーID
+     */
+    function getOID()
+    {
+        $row = $this->_getRow();
+
+        return $row->getOID();
+    }
+
+    /**
+     * リレーションIDを取得する
+     *
+     * @param string $prop_name プロパティー名
+     *
+     * @return string
+     */
+    function getId($prop_name)
+    {
+        $row = $this->_getRow();
+
+        return $row->getId($prop_name);
+    }
+
+    /**
+     * フォルダーのプロパティーを取得する
+     *
+     * @param string $property_name 取得するプロパティー名
+     *
+     * @return mixed  プロパティー値
+     */
+    function &get($property_name)
+    {
+        $row = $this->_getRow();
+
+        // 親フォルダーはフォルダーオブジェクトとして返す
+        if ($property_name == 'parent') {
+            $parent_id = $row->getId('parent');
+
+            if ( ! $parent_id) {
+                $ret = null;
+
+                return $ret;
+            }
+
+            $factory = GRN_Cabinet_FolderFactory::getInstance();
+            $ret = $factory->get($parent_id);
+
+            return $ret;
+        }
+
+        $ret = $row->get($property_name);
+
+        return $ret;
+    }
+
+
+    /**
+     * プロパティーを設定する
+     *
+     * @param CB_User $user
+     * @param array   $properties
+     *
+     * @return bool  成功の場合にTRUE、それ以外の場合にFALSE
+     */
+    function setProperties($user, $properties)
+    {
+        if ( ! $this->privileged($user, ['operation'])) {
+            $this->access($user, GRN_CABINET_ACCESS_RW, true);
+        }
+
+        $row = $this->_getRow();
+
+        if (array_key_exists('foreign_key', $properties)) {
+            // フォルダコードの重複をチェック
+            // 重複している場合はエラーで終了
+            $fm = GRN_Cabinet_FolderManager::getInstance();
+            $fm->checkForeignKey($properties['foreign_key'], $row->getOID());
+        }
+
+        foreach (array_keys($properties) as $prop_name) {
+            $row->set($prop_name, $properties[$prop_name]);
+        }
+
+        $row->onUpdate($user);
+        $row->updateNow();
+
+        return true;
+    }
+
+    /**
+     * フォルダー内のファイルを取得する
+     *
+     * @param string $id ファイルID
+     *
+     * @return object GRN_File、見つからない場合はFALSE
+     */
+    function getFile($id)
+    {
+        require_once('cabinet/file.csp');
+        $fm = GRN_Cabinet_FileManager::getInstance();
+        $ret = $fm->getFolderFile($this, $id);
+
+        return $ret;
+    }
+
+    /**
+     * フォルダー内のファイルを取得する
+     *
+     * @param int $list_mode
+     *
+     * @return GRN_Cabinet_File[]|bool  フォルダー内のファイルが更新日時降順で格納された配列
+     *                                  array( $fid => GRN_File, ... )
+     */
+    function getFiles($list_mode = GRN_CABINET_FILELIST_MODE_NOT_IN_TRASH
+    )  // Huy added "$list_mode"
+    {
+        require_once('cabinet/file.csp');
+        $fm = GRN_Cabinet_FileManager::getInstance();
+
+        return $fm->getFolderFiles($this, $list_mode);
+    }
+
+    /**
+     * フォルダー内のファイル数を取得する
+     *
+     * @return int  フォルダ内のファイル数
+     */
+    function getNumFiles()
+    {
+        require_once('cabinet/file.csp');
+        $fm = GRN_Cabinet_FileManager::getInstance();
+
+        return $fm->getNumFolderFiles($this);
+    }
+
+    /**
+     * 指定されたフォルダーが親フォルダになっているか調べる
+     * アクセス権は考慮しない
+     *
+     * @param GRN_Cabinet_Folder $folder フォルダー
+     *
+     * @return bool  親フォルダーである場合にはTRUE、それ以外の場合でFALSE
+     */
+    function isParent($folder)
+    {
+        if ($this->getOID() == $folder->getOID()) {
+            return true;
+        }
+
+        $parent = $this->get('parent');
+        $oid = $folder->getOID();
+
+        while ( ! is_null($parent)) {
+            if ($oid == $parent->getOID()) {
+                return true;
+            }
+            $parent = $parent->get('parent');
+        }
+
+        return false;
+    }
+
+    /**
+     * @access private
+     *
+     * @param CB_User            $user
+     * @param GRN_Cabinet_Folder $folder
+     * @param string             $list_index
+     *
+     * @return bool
+     */
+    function _setParent($user, $folder, $list_index = null)
+    {
+        $row = $this->_getRow();
+
+        if ( ! $folder) {
+            $factory = GRN_Cabinet_FolderFactory::getInstance();
+            if (($current = $factory->get($row->getId('parent'), false))) {
+                $current->_subcache = [];
+            }
+            $row->set('parent', null);
+        } else {
+            $row->set('parent', $folder->_getRow());
+            $folder->_subcache = [];
+        }
+
+        if ( ! is_null($list_index)) {
+            $row->set('list_index', $list_index);
+        } else {
+            $row->set('list_index', 0x7FFFFFFF);
+        }
+
+        $row->updateNow();
+
+        return true;
+    }
+
+    /**
+     * 親フォルダーを設定する
+     *
+     * @param CB_User            $user   操作ユーザー
+     * @param GRN_Cabinet_Folder $folder 設定する親フォルダー、nullの場合ルートに移動する
+     * @param string|null        $list_index
+     *
+     * @return bool  設定に成功した場合にTRUE、それ以外の場合にFALSE
+     */
+    function setParent($user, $folder, $list_index = null)
+    {
+        if ($folder && $folder->isParent($this)) {
+            cb_throw_error(E_GRN_CABINET_INVALID_PARENT_FOLDER);
+        }
+
+        $this->canMoveTo($user, $folder, true);
+
+        $this->_setParent($user, $folder, $list_index);
+
+        $this->runHook('update');
+
+        return true;
+    }
+
+    /**
+     * サブフォルダーを設定する
+     *
+     * @param CB_User $inUser      操作ユーザー
+     * @param array   $inFolderIds サブフォルダーIDの配列、格納された順番にサブフォルダーを配置する
+     *
+     * @return bool  成功に場合にTRUE、それ以外の場合にFALSE
+     */
+    function setFolders($inUser, $inFolderIds)
+    {
+        if (count($inFolderIds) < 1) {
+            return false;
+        }
+
+        $current = $this->getFolders($inUser);
+
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+        $table = $this->_getFolderTable();
+
+        $dao = new CabinetFacade();
+        $i18n = CB_I18N::getInstance();
+        $dataObj = [];
+        $dataObj['lock'] = $table->_lock;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+
+        $lidx = 0;
+        foreach ($inFolderIds as $id) {
+            $child = null;
+            if (array_key_exists($id, $current)) {
+                $child = $current[$id];
+                unset($current[$id]);
+            } else {
+                $folder = $dao->referCabinetFolderById($dataObj, $id);
+                if ($folder === false) {
+                    cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+                }
+
+                $row = $table->getRow($folder->getId(),
+                    $folder->convertArray());
+                $child = $factory->row2object($row);
+
+                if ( ! $child) {
+                    cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+                }
+            }
+
+            $child->canMoveTo($inUser, $this, true);
+
+            $lidx = $lidx + 1;
+            $child->_setParent($inUser, $this, $lidx);
+        }
+
+        foreach (array_keys($current) as $id) {
+            $row = $current[$id]->_getRow();
+            $lidx = $lidx + 1;
+            $row->set('list_index', $lidx);
+            $row->updateNow();
+        }
+
+        $this->_subcache = [];
+
+        return true;
+    }
+
+    function setSubFolders($user, $folder_ids)
+    {
+        return $this->setFolders($user, $folder_ids);
+    }
+
+    /**
+     * サブフォルダーを取得する
+     *
+     * @param CB_User $inUser     操作ユーザー
+     * @param int     $inAccMode  要求するアクセス権
+     * @param boolean $isUseLocal ローカライズするか
+     *
+     * @return GRN_Cabinet_Folder[]  array( $fid => &GRN_Cabinet_Folder, ... )
+     */
+    function getFolders(
+        $inUser,
+        $inAccMode = GRN_CABINET_ACCESS_R,
+        $isUseLocal = true
+    ) {
+        if ($inUser) {
+            $uid = $inUser->getOID();
+
+            if (array_key_exists($uid, $this->_subcache)) {
+                if (array_key_exists($inAccMode, $this->_subcache[$uid])) {
+                    return $this->_subcache[$uid][$inAccMode];
+                }
+            }
+        }
+
+        $i18n = CB_I18N::getInstance();
+        $table_info = $this->_getFolderTable();
+
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        $dataObj['offset'] = 0;
+        $dataObj['limit'] = -1;
+        $dataObj['parentId'] = $this->getOID();
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+
+        $folderList = ($isUseLocal) ? $dao->getCabinetFolderList($dataObj)
+            : $dao->getCabinetFolderListWithNonLocal($dataObj);
+
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+        $folders = [];
+        foreach ($folderList as $folder) {
+            $row = $table_info->getRow($folder->getId(),
+                $folder->convertArray());
+            $folderId = $row->getOID();
+            $folders[$folderId] = $factory->row2object($row);
+        }
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+        $folders = $acc->evaluateFolders($inUser, $folders, $inAccMode,
+            $this->getOID());
+
+        if ($inUser) {
+            $uid = $inUser->getOID();
+
+            if ( ! array_key_exists($uid, $this->_subcache)) {
+                $this->_subcache = [];
+                $this->_subcache[$uid] = [];
+            }
+            $this->_subcache[$uid][$inAccMode] = $folders;
+        }
+
+        return $folders;
+    }
+
+    /**
+     * @return GRN_Cabinet_Folder[]
+     */
+    function getFoldersWithoutEvaluate()
+    {
+        $i18n = CB_I18N::getInstance();
+        $table_info = $this->_getFolderTable();
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        $dataObj['offset'] = 0;
+        $dataObj['limit'] = -1;
+        $dataObj['parentId'] = $this->getOID();
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+
+        $folderList = $dao->getCabinetFolderList($dataObj);
+
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+        $folders = [];
+        foreach ($folderList as $folder) {
+            $row = $table_info->getRow($folder->getId(),
+                $folder->convertArray());
+            $folderId = $row->getOID();
+            $folders[$folderId] = $factory->row2object($row);
+        }
+
+        return $folders;
+    }
+
+    function getNumFolders($user, $acc_mode = GRN_CABINET_ACCESS_R)
+    {
+        $folders = $this->getFolders($user, $acc_mode);
+
+        return count($folders);
+    }
+
+    /**
+     * @param $user
+     *
+     * @return CB_Row|int|mixed
+     */
+    function getFolderSize($user)
+    {
+        $size = $this->_folderSize();
+        $this->_recursiveFolderSize($user, $this, $size);
+
+        return $size;
+    }
+
+    /**
+     * @param CB_User            $user
+     * @param GRN_Cabinet_Folder $folder
+     * @param int                $size
+     */
+    function _recursiveFolderSize($user, $folder, &$size)
+    {
+        $children = $folder->getFolders($user);
+        foreach ($children as $child) {
+            $size += $child->_folderSize();
+            if (count($child->getFolders($user))) {
+                $this->_recursiveFolderSize($user, $child, $size);
+            }
+        }
+    }
+
+    /**
+     * @return CB_Row|int|mixed
+     */
+    function _folderSize()
+    {
+        $files = $this->getFiles();
+
+        $size = 0;
+        foreach ($files as $file) {
+            $size += $file->getFileBodySize();
+        }
+
+        return $size;
+    }
+
+
+    // 購読設定
+
+    /**
+     * このフォルダーを購読する
+     *
+     * @param CB_User $user      購読設定するユーザー
+     * @param bool    $onoff     購読する場合にTRUE、解除の場合にFALSE
+     * @param bool    $subfolder サブフォルダーも同時に設定する場合にTRUE
+     *
+     * @return bool  成功の場合にTRUE、それ以外でFALSE
+     */
+    function subscribe($user, $onoff, $subfolder = false)
+    {
+        require_once('cabinet/notification.csp');
+        $nm = GRN_Cabinet_NotificationManager::getInstance();
+
+        return $nm->subscribe($user, $this, $onoff, $subfolder);
+    }
+
+    /**
+     * ユーザーの購読状態を取得する
+     *
+     * @param CB_User $user 対象ユーザー
+     *
+     * @return bool  指定ユーザーが購読している場合にはTRUE、そうでない場合はFALSE
+     */
+    function isSubscribed($user)
+    {
+        require_once('cabinet/notification.csp');
+        $nm = GRN_Cabinet_NotificationManager::getInstance();
+
+        return $nm->isSubscribed($user, $this);
+    }
+
+    // 通知設定
+
+    /**
+     * 通知先を設定する
+     *
+     * @param mixed $target 通知を受信する対象、ユーザー、組織、ロールのいずれか
+     * @param bool  $onoff  通知する場合にはTRUE、解除する場合はFALSE
+     *
+     * @return bool
+     */
+    function setNotificationTarget($target, $onoff)
+    {
+        require_once('cabinet/notification.csp');
+        $nm = GRN_Cabinet_NotificationManager::getInstance();
+
+        return $nm->setNotificationTarget($this, $target, $onoff);
+    }
+
+    /**
+     * 通知先かどうか調べる
+     *
+     * @param mixed $target 通知を受信する対象、ユーザー、組織、ロールのいずれか
+     *
+     * @return bool
+     */
+    function isNotificationTarget($target)
+    {
+        require_once('cabinet/notification.csp');
+        $nm = GRN_Cabinet_NotificationManager::getInstance();
+
+        return $nm->isNotificationTarget($this, $target);
+    }
+
+    /**
+     * 通知先オブジェクトを取得する
+     *
+     * @param string $target "user" or "group" or "role"
+     *
+     * @return array  array( $oid => $object, ... )
+     */
+    function getNotificationTargets($target)
+    {
+        require_once('cabinet/notification.csp');
+        $nm = GRN_Cabinet_NotificationManager::getInstance();
+
+        return $nm->getNotificationTargets($this, $target);
+    }
+
+    /**
+     * 通知対象かどうか調べる、通知設定、購読設定の両方を考慮する
+     *
+     * @param CB_User $user 対象ユーザー
+     *
+     * @return bool
+     */
+    function isNotified($user)
+    {
+        require_once('cabinet/notification.csp');
+        $nm = GRN_Cabinet_NotificationManager::getInstance();
+
+        return $nm->isNotified($user, $this);
+    }
+
+    /**
+     * get folder cabinet display setting data
+     *
+     * @return array
+     */
+    public function getCabinetDisplayOrder()
+    {
+        $fm = GRN_Cabinet_FolderManager::getInstance();
+
+        return $fm->getCabinetDisplayOrder($this);
+    }
+}
+
+class GRN_Cabinet_FolderManager
+{
+    private static $_instance = null;
+
+    /**
+     * @static
+     * @return GRN_Cabinet_FolderManager
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * @access private
+     */
+    var $_tab_folder = null;
+
+
+    function __construct()
+    {
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('cabinet');
+        $this->_tab_folder = $tm->getTableInfo('GRN_Cabinet_FolderEntity');
+    }
+
+    /**
+     * フォルダーを作成する
+     *
+     * @param CB_User $user       操作ユーザー
+     * @param string  $parent_id  親フォルダーID
+     * @param array   $properties フォルダープロパティー
+     *
+     * @return GRN_Cabinet_Folder
+     */
+    function createFolder($user, $parent_id, $properties)
+    {
+        if ( ! $parent_id) {
+            $parent_id = GRN_CABINET_ROOT_FOLDER_ID;
+        }
+
+        if ( ! ($pfolder = $this->getFolder($user, $parent_id,
+            GRN_CABINET_ACCESS_R))
+        ) {
+            cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+        }
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        if ( ! $acc->isSuperAdmin($user)) {
+            $pfolder->privileged($user, ['operation'], true);
+        }
+
+        $parent_row = $pfolder->_getRow();
+
+        /** @var GRN_Cabinet_FolderEntity $row */
+        $row = $this->_tab_folder->newRow();
+
+        // フォルダコードは必須
+        if ( ! array_key_exists('foreign_key', $properties)
+             || strlen($properties['foreign_key']) < 1
+        ) {
+            cb_throw_error(E_COMMON_MISSING_MANDATORY);
+        }
+
+        // フォルダコードの重複は許可しない
+        $this->checkForeignKey($properties['foreign_key'], 0);
+
+        if ( ! $row->initialize($user, $properties)) {
+            $row->delete();
+            $ret = false;
+
+            return $ret;
+        }
+
+        if ($parent_row) {
+            $row->set('parent', $parent_row);
+        }
+
+        $row->onCreate($user);
+        $row->updateNow();
+
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+        $folder = $factory->row2object($row);
+
+        return $folder;
+    }
+
+    public function addFolder(
+        $inUser,
+        $inLocalNameArray,
+        $inForeignKey,
+        $inMemo,
+        $inParentFolderId
+    ) {
+        require_once('cabinet/bean/GrnCabinetFolderLocal.csp');
+        $dao = new CabinetFacade();
+
+
+        //--------------  default folder add -------------
+        $properties = [
+            'name'        => $inLocalNameArray[CB_I18N_DEFUALT_LANGUAGE_CODE],
+            'description' => $inMemo,
+            'foreign_key' => $inForeignKey
+        ];
+
+        //Add New Folder
+        $folder = $this->createFolder($inUser, $inParentFolderId, $properties);
+
+        //Write log: create folder    
+        require_once('cabinet/inspection.csp');
+        $inspection = GRN_Cabinet_Inspection::getInstance();
+        $inspection->writeLogFolder('create', $folder);
+
+
+        //--------------  folder local name add -------------
+        //Add System Portal
+        $folderId = $folder->getOID();
+        $i18n = CB_I18N::getInstance();
+        $availableLanguageArray = $i18n->getAvailableLanguages();
+        foreach ($availableLanguageArray as $languageKey) {
+            if ((array_key_exists($languageKey, $inLocalNameArray))
+                && strlen(cb_trim($inLocalNameArray[$languageKey])) > 0
+            ) {
+                $localName = cb_trim($inLocalNameArray[$languageKey]);
+
+                $dataObj = [];
+                $dataObj['messageTypeAdd'] = 'folder_local_add';
+                $folderLocal = new GrnCabinetFolderLocal();
+                $folderLocal->setParentId($folderId);
+                $folderLocal->setLanguageCode($languageKey);
+                $folderLocal->setName($localName);
+
+                $dao->insertCabinetFolderLocal($dataObj, $folderLocal);
+            }
+        }
+
+        return true;
+    }
+
+    public function modifyFolder(
+        $inUser,
+        $inFolderId,
+        $inLocalNameArray,
+        $inForeignKey,
+        $inMemo
+    ) {
+        require_once('cabinet/bean/GrnCabinetFolderLocal.csp');
+        $dao = new CabinetFacade();
+
+
+        //--------------  default folder modify -------------
+        /** @var GRN_Cabinet $G_cabinet */
+        global $G_cabinet;
+        $folder = $G_cabinet->getFolder($inUser, $inFolderId);
+        if ( ! $folder) {
+            cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+        }
+
+        $properties = [
+            'name'        => $inLocalNameArray[CB_I18N_DEFUALT_LANGUAGE_CODE],
+            'description' => $inMemo,
+            'foreign_key' => $inForeignKey
+        ];
+
+        $folder->setProperties($inUser, $properties);
+
+        // inspection
+        require_once('cabinet/inspection.csp');
+        //Write log: update folder    
+        $inspection = GRN_Cabinet_Inspection::getInstance();
+        $inspection->writeLogFolder('modify', $folder);
+
+
+        //--------------  folder local name modify -------------
+        $i18n = CB_I18N::getInstance();
+        $availableLanguageArray = $i18n->getAvailableLanguages();
+        foreach ($availableLanguageArray as $languageKey) {
+            if ((array_key_exists($languageKey, $inLocalNameArray))
+                && strlen(cb_trim($inLocalNameArray[$languageKey])) > 0
+            ) {
+                $localName = cb_trim($inLocalNameArray[$languageKey]);
+
+                $dataObj = [];
+                $folderLocal = new GrnCabinetFolderLocal();
+                $folderLocal->setParentId($inFolderId);
+                $folderLocal->setLanguageCode($languageKey);
+                $folderLocal->setName($localName);
+
+                $dao->updateCabinetFolderLocal($dataObj, $folderLocal);
+            } else {
+                $dataObj = [];
+                $folderLocal = new GrnCabinetFolderLocal();
+                $folderLocal->setParentId($inFolderId);
+                $folderLocal->setLanguageCode($languageKey);
+
+                $dao->deleteCabinetFolderLocal($dataObj, $folderLocal);
+            }
+        }
+
+        return true;
+    }
+
+    private function _getFolder($inFolderId, $isUseLocal = true)
+    {
+        if (is_null($inFolderId) || $inFolderId <= 0) {
+            return false;
+        }
+
+        $i18n = CB_I18N::getInstance();
+        $table_info = $this->_tab_folder;
+
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        if ($isUseLocal) {
+            $dataObj['language'] = $i18n->getCurrentLanguage();
+        }
+
+        $folder = $dao->referCabinetFolderById($dataObj, $inFolderId);
+        if ($folder === false) {
+            return false;
+        }
+
+        $row = $table_info->getRow($folder->getId(), $folder->convertArray());
+
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+        $resultFolder = $factory->row2object($row);
+
+        return $resultFolder;
+    }
+
+    /**
+     * フォルダーを取得する
+     *
+     * @param CB_User $inUser       操作ユーザー
+     * @param string  $inFolderId   フォルダーID
+     * @param int     $inAccMode    アクセスモード
+     * @param bool    $inIsAccThrow エラー時にスローするか
+     * @param bool    $isUseLocal   ローカライズするか
+     *
+     * @return GRN_Cabinet_Folder
+     */
+    function getFolder(
+        $inUser,
+        $inFolderId,
+        $inAccMode = GRN_CABINET_ACCESS_R,
+        $inIsAccThrow = true,
+        $isUseLocal = true
+    ) {
+        $folder = $this->_getFolder($inFolderId, $isUseLocal);
+
+        if ($folder) {
+            if ($folder->access($inUser, $inAccMode, $inIsAccThrow) === false) {
+                $folder = false;
+            }
+
+        }
+
+        return $folder;
+    }
+
+    /**
+     * Check if folder is deleted permanently
+     *
+     * @param string $inFolderId フォルダーID
+     * @param bool   $isUseLocal ローカライズするか
+     *
+     * @return boolean
+     */
+    function isFolderDeletedPermanent($inFolderId, $isUseLocal = true)
+    {
+        $folder = $this->_getFolder($inFolderId, $isUseLocal);
+        if ($folder) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * GTM-528
+     *
+     * @return GRN_Cabinet_Folder[]
+     */
+    function getDeletedFolders()
+    {
+        $i18n = CB_I18N::getInstance();
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('cabinet');
+        $table_info = $tm->getTableInfo('GRN_Cabinet_FolderEntity');
+
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        $dataObj['offset'] = 0;
+        $dataObj['limit'] = -1;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+
+        $folderList = $dao->getCabinetFolderList($dataObj);
+
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+        $folders = [];
+        foreach ($folderList as $folder) {
+            if ($folder->getReserveInt1() !== null) {
+                $row = $table_info->getRow($folder->getId(),
+                    $folder->convertArray());
+                $folderId = $row->getOID();
+                $folders[$folderId] = $factory->row2object($row);
+            }
+        }
+
+        return $folders;
+    }
+
+    /**
+     * @access private
+     *
+     * @param string $inKey
+     *
+     * @return string|null
+     */
+    function _getFolderIdByForeignKey($inKey)
+    {
+        if ( ! $inKey && strlen($inKey) < 1) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        $i18n = CB_I18N::getInstance();
+        $table_info = $this->_tab_folder;
+
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+
+        $folder = $dao->referCabinetFolderByForeignKey($dataObj, $inKey);
+        if ($folder === false) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        return $folder->getId();
+    }
+
+    private function _getFolderByForeignKey($inKey)
+    {
+        if ( ! $inKey && strlen($inKey) < 1) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        $i18n = CB_I18N::getInstance();
+        $table_info = $this->_tab_folder;
+
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+
+        $folder = $dao->referCabinetFolderByForeignKey($dataObj, $inKey);
+        if ($folder === false) {
+            $ret = null;
+
+            return $ret;
+        }
+        $row = $table_info->getRow($folder->getId(), $folder->convertArray());
+
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+        $folder = $factory->row2object($row);
+
+        return $folder;
+    }
+
+    /**
+     * フォルダコードの重複をチェックする
+     * 指定したフォルダコードのフォルダが存在しないか、指定されたフォルダIDと一致する
+     * 場合に重複なしとする
+     *
+     * @param string $inKey          フォルダコード
+     * @param string $inHid          フォルダID
+     * @param bool   $inIsThrowError 重複を見つけた場合にエラーを発生するならTRUE
+     *
+     * @return bool  重複のある場合にFALSE、それ以外でTRUE
+     */
+    function checkForeignKey($inKey, $inHid, $inIsThrowError = true)
+    {
+        $folder = $this->_getFolderByForeignKey($inKey);
+
+        if (is_null($folder) || $folder === false) {
+            return true;
+        }
+
+        if ($folder->getOID() == $inHid) {
+            return true;
+        }
+
+        if ($inIsThrowError) {
+            cb_throw_error(E_GRN_CABINET_DUPLICATE_FOREIGN_KEY);
+        }
+
+        return false;
+    }
+
+    /**
+     * フォルダコードからフォルダオブジェクトを取得する
+     *
+     * @param CB_User $user     ユーザー
+     * @param string  $key      フォルダコード
+     * @param integer $acc_mode フォルダへのアクセスモード
+     *
+     * @return GRN_Cabinet_Folder
+     */
+    function getFolderByForeignKey(
+        $user,
+        $key,
+        $acc_mode = GRN_CABINET_ACCESS_R
+    ) {
+        $folder = $this->_getFolderByForeignKey($key);
+
+        if ($folder) {
+            $folder->access($user, $acc_mode, true);
+        }
+
+        return $folder;
+    }
+
+
+    /**
+     * 最上位フォルダを取得する
+     *
+     * @param CB_User $inUser     操作ユーザー
+     * @param int     $inAccMode  アクセスモード
+     * @param bool    $isUseLocal ローカライズするか
+     *
+     * @return GRN_Cabinet_Folder
+     */
+    function getRootFolder(
+        $inUser,
+        $inAccMode = GRN_CABINET_ACCESS_R,
+        $isUseLocal = true
+    ) {
+        $ret = $this->getFolder($inUser, GRN_CABINET_ROOT_FOLDER_ID, $inAccMode,
+            true, $isUseLocal);
+
+        return $ret;
+    }
+
+
+    /**
+     * CSVからフォルダインポート
+     *
+     * @param CB_User $user ユーザー
+     * @param array   $line CSVから読み込んだ1行のデータ
+     *
+     * @return GRN_Cabinet_Folder
+     */
+    function importFolder($user, $line)
+    {
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        if ( ! $acc->isSuperAdmin($user)) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        /**
+         * $line[0] : 親フォルダコード
+         * $line[1] : フォルダコード
+         * $line[2] : フォルダ名
+         * $line[3] : メモ
+         **/
+
+        $parent_folder = null;
+
+        $foreign_key = $line[GRN_CABINET_FOLDER_CSV_PARENT_FOREIGNKEY];
+
+        if (strlen($foreign_key) > 0) {
+            if ( ! ($parent_folder
+                    = $this->_getFolderByForeignKey($foreign_key))
+                 || $parent_folder->checkDeletedFlag()
+            ) {
+                cb_throw_error(E_GRN_CABINET_PARENT_FOLDER_NOT_FOUND);
+            }
+        }
+
+        $folder = null;
+
+        $foreign_key = $line[GRN_CABINET_FOLDER_CSV_FOREIGNKEY];
+
+        // フォルダ
+        if (strlen($foreign_key) > 0) {
+            $folder = $this->_getFolderByForeignKey($foreign_key);
+        }
+
+        $properties = [];
+
+        require_once('fw/string_util.csp');
+
+        if (array_key_exists(GRN_CABINET_FOLDER_CSV_FOREIGNKEY, $line)) {
+            $properties['foreign_key']
+                = cb_trim($line[GRN_CABINET_FOLDER_CSV_FOREIGNKEY]);
+        }
+
+        $properties['name'] = cb_trim_check($line[GRN_CABINET_FOLDER_CSV_NAME]);
+
+        if (array_key_exists(GRN_CABINET_FOLDER_CSV_DESCRIPTION, $line)) {
+            $properties['description']
+                = $line[GRN_CABINET_FOLDER_CSV_DESCRIPTION];
+        }
+
+        // inspection
+        require_once('cabinet/inspection.csp');
+        $inspection = GRN_Cabinet_Inspection::getInstance();
+
+        if ( ! $folder) {
+            // 新規にフォルダを追加する場合は親フォルダの指定が必須
+            if ( ! $parent_folder) {
+                cb_throw_error(E_GRN_CABINET_PARENT_FOLDER_NOT_FOUND);
+            }
+
+            $folder = $this->createFolder($user, $parent_folder->getOID(),
+                $properties);
+
+            // Write log: Import folder with operation creation
+            $inspection->writeLogFolder('import_operation_create', $folder);
+        } else {
+            if ($folder->checkDeletedFlag()) {
+                cb_throw_error(E_GRN_CABINET_INVALID_FOLDER_CODE);
+            }
+            if ($parent_folder) {
+                if ($folder->getId('parent') != $parent_folder->getOID()) {
+                    $folder->setParent($user, $parent_folder);
+                }
+            } elseif ($folder->getOID() != GRN_CABINET_ROOT_FOLDER_ID) {
+                // 親フォルダの無指定が許されるのはルートカテゴリを上書きする場合のみ
+                cb_throw_error(E_GRN_CABINET_PARENT_FOLDER_NOT_FOUND);
+            }
+
+            $folder->setProperties($user, $properties);
+
+            // inspection 
+            // Write log: Import folder with operation creation            
+            $inspection->writeLogFolder('import_operation_update', $folder);
+        }
+
+        return $folder;
+    }
+
+    /**
+     * @param CB_CSVWriter       $csv
+     * @param GRN_Cabinet_Folder $folder
+     */
+    function _exportFolder($csv, $folder)
+    {
+        $line = [];
+
+        if (($parent_folder = $folder->get('parent'))) {
+            $line[] = $parent_folder->get('foreign_key');
+        } else {
+            $line[] = '';
+        }
+
+        $line[] = $folder->get('foreign_key');
+        $line[] = $folder->get('name');
+        $line[] = $folder->get('description');
+
+        $csv->writeLine($line);
+    }
+
+    /**
+     * @param CB_User            $user
+     * @param CB_CSVWriter       $csv
+     * @param GRN_Cabinet_Folder $folder
+     */
+    function exportFolder($user, $csv, $folder)
+    {
+        $this->_exportFolder($csv, $folder);
+        $children = $folder->getFolders($user, GRN_CABINET_ACCESS_R, false);
+        foreach (array_keys($children) as $hid) {
+            if ( ! $children[$hid]->checkDeletedFlag(false)) {
+                $child = $children[$hid];
+                $this->exportFolder($user, $csv, $child);
+            }
+        }
+    }
+
+    function createFolderNameCSV(
+        $inCharset,
+        $inIsExportHeader,
+        $inExportLanguageCodeArray = null
+    ) {
+        /// テンポラリのファイルを作成
+        $tempdir = cb_tmpdir();
+        $tempFilename = tempnam($tempdir, 'fl_');
+        require_once('fw/csv.csp');
+        $csv = new CB_CSVWriter($inCharset, $tempFilename);
+
+        // 項目名の書き出し
+        if ($inIsExportHeader) {
+            $header = [];
+            $header[] = cb_msg('grn.cabinet.system', 'folder_csv_code');
+            $header[] = cb_msg('grn.cabinet.system',
+                'folder_csv_language_code');
+            $header[] = cb_msg('grn.cabinet.system', 'folder_csv_name');
+
+            $csv->writeLine($header);
+        }
+
+        // 内容の書き出し
+        require_once('cabinet/inspection.csp');
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $objectList = $dao->getCabinetFolderLocalListByLanguageCodes($dataObj,
+            $inExportLanguageCodeArray);
+
+        $inspection = GRN_Cabinet_Folder_Local_Inspection::getInstance();
+
+        require_once('cabinet/folder.csp');
+        $fm = GRN_Cabinet_FolderManager::getInstance();
+        foreach ($objectList as $folderLocal) {
+            if ($folder =& $fm->getFolder(cb_get_login_user(),
+                    $folderLocal->getParentID())
+                           && $folder->checkDeletedFlag()
+            ) {
+                continue;
+            }
+
+            $line = [];
+            $line[0] = $folderLocal->getParentCode();
+            $line[1] = $folderLocal->getLanguageCode();
+            $line[2] = $folderLocal->getName();
+            $csv->writeLine($line);
+
+            //Check Inspection Message Enabled
+            if ($inspection->isEnabled()) {
+                //Write Inspection Message
+                $message_type = 'folder_local_export';
+                $message_args = [
+                    'hid'          => $folderLocal->getParentId(),
+                    'languageCode' => $folderLocal->getLanguageCode(),
+                    'folder_name'  => $folderLocal->getName()
+                ];
+                $inspection->record($message_type, $message_args);
+            }
+        }
+
+        $csv->close();
+
+        return $tempFilename;
+    }
+
+    /**
+     * CSV read lines
+     *
+     * @access  public
+     *
+     * @param  string   inFilePath      //CSV FilePath
+     * @param  string   inCharset       //read charset
+     * @param  int      inSkipLineCount //read charset
+     *
+     * @return boolean  success:TRUE
+     */
+    public function importFolderNameWithCSV(
+        $inFilePath,
+        $inCharset,
+        $inSkipLineCount = 0
+    ) {
+        global $G_cabinet;
+        global $G_cabinet_login;
+        if ( ! $inCharset) {
+            global $G_config_common;
+            $inCharset = $G_config_common->get('I18N',
+                'default_external_encoding');
+        }
+
+        require_once('fw/csv.csp');
+        $csv = new CB_CSVReader($inCharset, $inFilePath);
+
+        // 先頭行をスキップ
+        for ($i = 0; $i < $inSkipLineCount; ++$i) {
+            $csv->readLine();
+        }
+
+        require_once('cabinet/bean/GrnCabinetFolderLocal.csp');
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['messageTypeAdd'] = 'folder_local_add_import';
+        $dataObj['messageTypeModify'] = 'folder_local_modify_import';
+        $dataObj['messageTypeDelete'] = 'folder_local_delete_import';
+
+        $i18n = CB_I18N::getInstance();
+        $availableLanguageArray = $i18n->getAvailableLanguages();
+
+        while (($line = $csv->readLine()) !== false) {
+            require_once('cabinet/resources.csp');
+            if ( ! is_array($line)
+                 || (count($line) < GRN_CABINET_FOLDER_NAME_CSV_LINE_LENGTH)
+            ) {
+                cb_throw_error(E_GRN_CABINET_CSV_INVALID_FOLDER_COLUMNS);
+            }
+
+            //カテゴリコードからカテゴリIDを求める
+            if (is_null($line[0]) || (strlen($line[0]) <= 0)) {
+                continue;
+            }
+            $folder = $this->_getFolderByForeignKey($line[0]);
+            if ( ! $folder) {
+                continue;
+            }
+
+            if ($folder->checkDeletedFlag()) {
+                cb_throw_error(E_GRN_CABINET_INVALID_FOLDER_CODE);
+            }
+
+            if ( ! in_array($line[1], $availableLanguageArray)) {
+                cb_throw_error(E_COMMON_CSV_LANGUAGE_CODE_INVALID);
+            }
+            //インポートデータの取り込み
+            $folderLocal = new GrnCabinetFolderLocal();
+            $folderLocal->setParentId($folder->getOID());
+            $folderLocal->setLanguageCode($line[1]);
+            $folderLocal->setName(cb_trim($line[2]));
+
+            if (is_null($folderLocal->getName())
+                || (strlen($folderLocal->getName()) <= 0)
+            ) {
+                $dao->deleteCabinetFolderLocal($dataObj, $folderLocal);
+            } else {
+                $dao->updateCabinetFolderLocal($dataObj, $folderLocal);
+            }
+        }
+
+        $csv->close();
+
+        return true;
+    }
+
+    function importFolderAccess($user, $line)
+    {
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        if ( ! $acc->isSuperAdmin($user)) {
+            return false;
+        }
+
+        /**
+         * $line[0] : フォルダコード
+         * $line[1] : 設定項目
+         * $line[2] : 設定値
+         * $line[3] : 設定対象
+         **/
+
+        $folder = null;
+
+        $foreign_key = $line[GRN_CABINET_ACCESS_CSV_FOREINKEY];
+
+        if ( ! is_null($foreign_key) && strlen($foreign_key) > 0) {
+            require_once('fw/string_util.csp');
+            $foreign_key = cb_trim($foreign_key);
+
+            if (strlen($foreign_key) > 0) {
+                $folder = $this->_getFolderByForeignKey($foreign_key);
+            }
+        }
+
+        if ( ! $folder || $folder->checkDeletedFlag()) {
+            cb_throw_error(E_GRN_CABINET_INVALID_FOLDER_CODE);
+        }
+
+        return $acc->importCSV($user, $folder, $line);
+    }
+
+    /**
+     * @param CB_User            $user
+     * @param CB_CSVWriter       $csv
+     * @param GRN_Cabinet_Folder $folder
+     */
+    function exportFolderAccess($user, $csv, $folder)
+    {
+        if ( ! $csv || ! $folder) {
+            assert('FALSE');
+            cb_throw_error();
+        }
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        $acc->exportCSV($folder, $csv);
+
+        $children = $folder->getFolders($user);
+        foreach (array_keys($children) as $cid) {
+            if ( ! $children[$cid]->checkDeletedFlag(false)) {
+                $child = $children[$cid];
+                $this->exportFolderAccess($user, $csv, $child);
+            }
+        }
+    }
+
+    /**
+     * @param CB_User $user
+     * @param         $line
+     *
+     * @return bool|null
+     */
+    function importFolderNotification($user, $line)
+    {
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        if ( ! $acc->isSuperAdmin($user)) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        /*
+          $line[0] : "フォルダコード"
+          $line[1] : "設定項目"
+          $line[2] : "設定値"
+          $line[3] : "設定対象"
+         */
+
+        require_once('cabinet/notification.csp');
+        $noti_folder = GRN_Cabinet_NotifyFolder::getInstance();
+
+        $folder = null;
+
+        $foreign_key = $line[GRN_CABINET_NOTIFICATION_CSV_FOREINKEY];
+
+        if ( ! is_null($foreign_key) && strlen($foreign_key) > 0) {
+            require_once('fw/string_util.csp');
+            $foreign_key = cb_trim($foreign_key);
+
+            if (strlen($foreign_key) > 0) {
+                $folder = $this->_getFolderByForeignKey($foreign_key);
+            }
+        }
+
+        if ( ! $folder || $folder->checkDeletedFlag()) {
+            cb_throw_error(E_GRN_CABINET_INVALID_FOLDER_CODE);
+        }
+
+        $ret = $noti_folder->importCSV($user, $folder, $line);
+
+        return $ret;
+    }
+
+    /**
+     * @param CB_User            $user
+     * @param CB_CSVWriter       $csv
+     * @param GRN_Cabinet_Folder $folder
+     */
+    function exportFolderNotification($user, $csv, $folder)
+    {
+        if ( ! $csv || ! $folder) {
+            assert('FALSE');
+            cb_throw_error();
+        }
+        require_once('cabinet/notification.csp');
+        $noti_folder = GRN_Cabinet_NotifyFolder::getInstance();
+
+        $noti_folder->exportCSV($folder, $csv);
+
+        $children = $folder->getFolders($user);
+        foreach (array_keys($children) as $hid) {
+            if ( ! $children[$hid]->checkDeletedFlag(false)) {
+                $child = $children[$hid];
+                $this->exportFolderNotification($user, $csv, $child);
+            }
+        }
+    }
+
+    /**
+     * @param GRN_Cabinet_Folder $folder
+     * @param string             $hid
+     *
+     * @return bool
+     */
+    function isParent($folder, $hid)
+    {
+        if ($folder->getOID() == $hid) {
+            return false;
+        }
+
+        $p = $folder->get('parent');
+        while ($p) {
+            if ($hid == $p->getOID()) {
+                return true;
+            }
+            $p = $p->get('parent');
+        }
+
+        return false;
+    }
+
+    /**
+     * @param CB_User     $inUser
+     * @param string      $inText
+     * @param int         $inAccMode
+     * @param string|null $inHid
+     * @param string|null $inPrivileges
+     *
+     * @return array
+     */
+    function search(
+        $inUser,
+        $inText,
+        $inAccMode = GRN_CABINET_ACCESS_R,
+        $inHid = null,
+        $inPrivileges = null
+    ) {
+        require_once('fw/string_util.csp');
+        $folderNameArray = cb_parse_search_text($inText);
+
+        if ( ! $inUser || ! $folderNameArray) {
+            return [];
+        }
+
+        $i18n = CB_I18N::getInstance();
+        $table_info = $this->_tab_folder;
+
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+        $dataObj['offset'] = 0;
+        $dataObj['limit'] = -1;
+
+        $folderList = $dao->getCabinetFolderListByNames($dataObj,
+            $folderNameArray);
+
+        $factory = GRN_Cabinet_FolderFactory::getInstance();
+        $folders = [];
+        foreach ($folderList as $folder) {
+            $folderEntityRow = $table_info->getRow($folder->getId(),
+                $folder->convertArray());
+            $folderId = $folderEntityRow->getOID();
+            $folderRow = $factory->row2object($folderEntityRow);
+
+            if (( ! is_null($inHid))
+                && ( ! $this->isParent($folderEntityRow, $inHid))
+            ) {
+                continue;
+            }
+
+            $folders[$folderId] = $folderRow;
+        }
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        if ( ! is_null($inPrivileges)) {
+            $granted = $acc->evaluateFolders($inUser, $folders,
+                GRN_CABINET_ACCESS_R, $inHid);
+
+            require_once('cabinet/privilege.csp');
+            $pm = GRN_Cabinet_PrivilegeManager::getInstance();
+            $privileged = $pm->evaluateFolders($inUser, $folders, $inPrivileges,
+                $inHid);
+
+            foreach (array_keys($folders) as $id) {
+                if ( ! array_key_exists($id, $granted)
+                     || ! array_key_exists($id, $privileged)
+                ) {
+                    unset($folders[$id]);
+                }
+            }
+
+            return $folders;
+        }
+
+        return $acc->evaluateFolders($inUser, $folders, $inAccMode, $inHid);
+    }
+
+
+    /**
+     * オブジェクトを生成せずにフォルダ情報を取得する
+     *
+     * @param CB_User      $inUser      ユーザー
+     * @param array|string $inFolderIds 取得するフォルダのID
+     * @param int          $inAccMode   アクセスモード
+     * @param bool         $inIsNoChildren
+     *
+     * @return array
+     */
+    function getFolderInfo(
+        $inUser,
+        $inFolderIds,
+        $inAccMode = GRN_CABINET_ACCESS_R,
+        $inIsNoChildren = false
+    ) {
+        if ( ! $inUser
+             || ( ! is_array($inFolderIds)
+                  && ! is_string($inFolderIds)
+                  && ! is_numeric($inFolderIds))
+        ) {
+            return [];
+        }
+
+        if ( ! is_array($inFolderIds)) {
+            $inFolderIds = [$inFolderIds => 1];
+        } elseif (count($inFolderIds) < 1) {
+            return [];
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('cabinet');
+
+        $ids = [];
+        foreach (array_keys($inFolderIds) as $id) {
+            $ids[$db->escape($id)] = 1;
+        }
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+
+        $accessible = $acc->evaluateFolders($inUser, $ids, $inAccMode);
+
+        if (count($accessible) < 1) {
+            return [];
+        }
+
+        $i18n = CB_I18N::getInstance();
+        $table_info = $this->_tab_folder;
+
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+        $dataObj['offset'] = 0;
+        $dataObj['limit'] = -1;
+        $folderIdArray = array_keys($accessible);
+
+        $folderList = $dao->getCabinetFolderListByIds($dataObj, $folderIdArray);
+
+        $folders = [];
+        foreach ($folderList as $folder) {
+            $folderId = $folder->getId();
+            $folders[$folderId] = [
+                'hid'         => $folderId,
+                'nid'         => $folderId,
+                'name'        => $folder->getName(),
+                'foreign_key' => $folder->getForeignKey(),
+                'parent'      => $folder->getParent()
+            ];
+        }
+
+        if ( ! $inIsNoChildren) {
+            $folders = $this->addChildCountInfoToFolderInfo($folders, $inUser,
+                $acc, $db);
+        }
+
+        return $folders;
+    }
+
+    private function addChildCountInfoToFolderInfo(
+        $folders,
+        CB_User $inUser,
+        GRN_Cabinet_AccessManager $acc,
+        CB_DatabaseConnection $db
+    ) {
+        $white_list = ['cabinet/system/folder_list'];
+        //Dont check when append child folder tree from 'cabinet/system/folder_list' screen.
+        global $G_INPUT;
+        if (array_key_exists('page', $G_INPUT)
+            && $G_INPUT['page'] == 'cabinet/system/folder_list'
+        ) {
+            $white_list[] = 'cabinet/system/folder_json';
+        }
+        $page_path = strtolower(cb_get_pagename());
+        $condition = "";
+        if ( ! in_array($page_path, $white_list)) {
+            $query
+                = 'SELECT _id, col_parent FROM tab_grn_cabinet_folderentity WHERE col_parent IN (@A) AND ISNULL(col_reserve_int1) ORDER BY col_list_index,_id;';
+        } else {
+            $query
+                = 'SELECT _id, col_parent FROM tab_grn_cabinet_folderentity WHERE col_parent IN (@A) ORDER BY col_list_index,_id;';
+        }
+
+        $result = $db->query($db->format($query, [array_keys($folders)]));
+        $children = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $parentId = $row["col_parent"];
+            $objectId = $row["_id"];
+            $children[$parentId][$objectId] = 1;
+        }
+
+        foreach ($folders as $folderId => $folder) {
+            $accessible = $acc->evaluateFolders($inUser,
+                cb_at($children, $folderId, []), GRN_CABINET_ACCESS_R,
+                $folderId);
+            $folders[$folderId]['child_count'] = count($accessible);
+        }
+
+        return $folders;
+    }
+
+    /**
+     * オブジェクトを生成せずにサブフォルダ情報を取得する
+     *
+     * @param CB_User $inUser    ユーザー
+     * @param string  $inHid     取得するフォルダのID
+     * @param int     $inAccMode アクセスモード
+     * @param bool    $inIsNoChildren
+     *
+     * @return array
+     */
+    function getSubFolderInfo(
+        $inUser,
+        $inHid,
+        $inAccMode = GRN_CABINET_ACCESS_R,
+        $inIsNoChildren = false
+    ) {
+        if ( ! $inUser || ! $inHid) {
+            return [];
+        }
+
+        $i18n = CB_I18N::getInstance();
+        $table_info = $this->_tab_folder;
+
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+        $dataObj['language'] = $i18n->getCurrentLanguage();
+        $dataObj['offset'] = 0;
+        $dataObj['limit'] = -1;
+        $dataObj['parentId'] = $inHid;
+
+        $folderList = $dao->getCabinetFolderList($dataObj);
+
+        $folders = [];
+        foreach ($folderList as $folder) {
+            $folderId = $folder->getId();
+            $folders[$folderId] = [
+                'hid'         => $folderId,
+                'nid'         => $folderId,
+                'name'        => $folder->getName(),
+                'foreign_key' => $folder->getForeignKey(),
+                'parent'      => $inHid,
+                /** Get Deleted Flag */
+                'deleted'     => $folder->getReserveInt1()
+            ];
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('cabinet');
+
+        require_once('cabinet/access.csp');
+        $acc = GRN_Cabinet_AccessManager::getInstance();
+        $folders = $acc->evaluateFolders($inUser, $folders, $inAccMode, $inHid);
+
+        if ( ! $inIsNoChildren) {
+            $folders = $this->addChildCountInfoToFolderInfo($folders, $inUser,
+                $acc, $db);
+        }
+
+        return $folders;
+    }
+
+    public function createMultiLanguageValuesArray($inFolderId)
+    {
+        $resultArray = [];
+
+        $dao = new CabinetFacade();
+
+        $dataObj = [];
+        $folder
+            = $dao->referCabinetFolderById($dataObj,
+            $inFolderId);
+        $resultArray[CB_I18N_DEFUALT_LANGUAGE_CODE] = $folder->getName();
+
+        $dataObj = [];
+        $folderLocalList = $dao->getCabinetFolderLocalListByFolderId($dataObj,
+            $inFolderId);
+        foreach ($folderLocalList as $folderLocal) {
+            $resultArray[$folderLocal->getLanguageCode()]
+                = $folderLocal->getName();
+        }
+
+        return $resultArray;
+    }
+
+
+    /**
+     * get list id folder from folder id to last ancestor
+     *
+     * @param $folderId
+     *
+     * @return array
+     */
+    public function getListFolderIdAncestor($folderId)
+    {
+        $table_info = $this->_tab_folder;
+
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $dataObj['lock'] = $table_info->_lock;
+
+        $result = [];
+        $folder_id = $folderId;
+        while ($folder = $dao->getCabinetFolderOfFolderId($dataObj,
+            $folder_id)) {
+            $result[] = $folder;
+            $folder_id = $folder['parent'];
+        }
+
+        return $result;
+    }
+
+    /**
+     * get folder cabinet display setting data
+     *
+     * @param GRN_Cabinet_Folder $folder フォルダ
+     *
+     * @return array    default: 'inheritance' => FALSE, 'orderby' => '3', 'order' => '2'
+     */
+    public function getCabinetDisplayOrder($folder)
+    {
+        $hid = $folder->getOID();
+
+        if ( ! $hid) {
+            cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+        }
+
+        $dao = new CabinetFacade();
+        $dataObj = [];
+        $display_order = $dao->getCabinetDisplayOrderByFolderId($dataObj, $hid);
+        $order = $display_order->getOrder();
+
+        if ( ! is_array($order) || ! array_key_exists('orderby', $order)
+             || ! array_key_exists('order', $order)
+        ) {
+            $order = ['orderby' => '3', 'order' => '2'];
+        }
+
+        return $order;
+    }
+
+    /**
+     * set folder cabinet display setting data
+     *
+     * @param CB_User $inuser
+     * @param string  $inFolderId     フォルダID
+     * @param string  $cabinetOrderBy order by
+     * @param string  $order          昇順/降順
+     *
+     * @return bool
+     */
+    public function setFolderCabinetOrder(
+        $inuser,
+        $inFolderId,
+        $cabinetOrderBy,
+        $order
+    ) {
+        if ( ! ($folder = $this->getFolder($inuser, $inFolderId,
+            GRN_CABINET_ACCESS_R))
+        ) {
+            cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+        }
+
+        if ($cabinetOrderBy != '1' && $cabinetOrderBy != '2'
+            && $cabinetOrderBy != '3'
+        ) {
+            $cabinetOrderBy = '3';
+        }
+        $setting = [
+            'orderby' => $cabinetOrderBy,
+            'order'   => $order == '1' ? '1' : '2'
+        ];
+
+        require_once('cabinet/bean/GrnCabinetDisplayOrder.csp');
+        $dao = new CabinetFacade();
+
+        $dataObj = [];
+        $cabinetDisplayOrder = $dao->getCabinetDisplayOrderByFolderId($dataObj,
+            $inFolderId);
+        $cabinetDisplayOrder->setFolderId($inFolderId);
+        $cabinetDisplayOrder->setOrder($setting);
+        if ($cabinetDisplayOrder->getId()) {
+            $dao->updateCabinetDisplayOrder($dataObj, $cabinetDisplayOrder);
+        } else {
+            $dao->addCabinetDisplayOrder($dataObj, $cabinetDisplayOrder);
+        }
+
+        return true;
+    }
+}
+

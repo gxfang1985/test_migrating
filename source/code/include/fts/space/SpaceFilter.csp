@@ -1,0 +1,277 @@
+<?php
+
+namespace grn\fts\space;
+
+use grn\fts\api\SearchApi;
+use grn\fts\api\SearchApiParameter;
+use grn\fts\exception\NoResultException;
+use grn\fts\Fields;
+use grn\fts\filter\AndFilter;
+use grn\fts\filter\ExistsFilter;
+use grn\fts\filter\NotExistsFilter;
+use grn\fts\filter\SearchFilterInterface;
+use grn\fts\filter\TermFilter;
+use grn\fts\filter\TermsFilter;
+use grn\fts\FtsProduct;
+use grn\fts\SearchConstants;
+use grn\fts\SearchTarget;
+use grn\space\logic\SpaceLogic;
+use grn\space\data\condition\SpaceSearchCondition;
+
+class SpaceFilter implements SearchFilterInterface
+{
+    const APP_DISCUSSION = 'discussion';
+    const APP_TODO = 'todo';
+    const DEFAULT_SPACE_LIMIT = 1000000;
+
+    /** @var string */
+    private $range;
+    /** @var string */
+    private $spaceCategoryId;
+    /** @var string */
+    private $spaceId;
+    /** @var string[] */
+    private $spaceApps;
+    /** @var string */
+    private $target;
+    /** @var int */
+    private $spaceLimit;
+
+    /**
+     * @param \grn\fts\api\SearchApiParameter $parameter
+     */
+    public function __construct(SearchApiParameter $parameter)
+    {
+        $this->setRange($parameter->getSearchRange());
+        $this->setSpaceCategoryId($parameter->getSpaceCategoryId());
+        $this->setSpaceId($parameter->getSpaceId());
+        $this->setSpaceApps($parameter->getSpaceApps());
+        $this->setTarget($parameter->getTarget());
+
+        global $G_config_common;
+        $limit = ($G_config_common->get('FTS', 'space_max_space'))
+            ?: self::DEFAULT_SPACE_LIMIT;
+        $this->setSpaceLimit($limit);
+    }
+
+    /**
+     * @param string[] $spaceIds
+     *
+     * @return SearchFilterInterface
+     */
+    private function getSpaceQuery(array $spaceIds)
+    {
+        return new TermsFilter(Fields::spaceId(), $spaceIds);
+    }
+
+    /**
+     * @param FtsProduct $fts_product
+     *
+     * @return string
+     * @throws NoResultException  Throws when a range is specified as my space and there is no my space.
+     */
+    public function getQuery(FtsProduct $fts_product)
+    {
+        $range = $this->getRange();
+        $spaceId = $this->getSpaceId();
+        $spaceApps = $this->getSpaceApps();
+
+        $filter = new AndFilter();
+        $filter->addFilter(new TermFilter(Fields::appName(),
+            SearchConstants::APPLICATION_SPACE));
+
+        switch ($range) {
+            case SearchTarget::INNERSPACE:
+                $filter->addFilter($this->getSpaceQuery([$spaceId]));
+                break;
+            case SearchTarget::MYSPACE:
+                $spaceIds
+                    = $this->getMySpaceIdList(SpaceSearchCondition::SEARCH_SPACE_NOT_EXPIRED);
+                if (count($spaceIds) === 0) {
+                    throw new NoResultException();
+                }
+                $spaceIds = $this->filterSpaceLimit($spaceIds);
+                $filter->addFilter($this->getSpaceQuery($spaceIds));
+                break;
+            default:
+                $spaceCategoryId = $this->getSpaceCategoryId();
+                $target = $this->getTarget();
+                if ( ! is_null($spaceCategoryId)
+                     && $target !== SearchTarget::ALL
+                ) {
+                    $spaceIds = $this->getSpaceIdsRecursively($spaceCategoryId,
+                        SpaceSearchCondition::SEARCH_SPACE_NOT_EXPIRED);
+                    if (count($spaceIds) === 0) {
+                        throw new NoResultException();
+                    }
+                    $spaceIds = $this->filterSpaceLimit($spaceIds);
+                    $filter->addFilter($this->getSpaceQuery($spaceIds));
+                }
+                break;
+        }
+
+        if (count($spaceApps) === 0) {
+            $spaceApps = $this->getAllSpaceApps();
+        }
+        if ( ! in_array(self::APP_DISCUSSION, $spaceApps)) {
+            $filter->addFilter(new ExistsFilter(Fields::todoId()));
+        }
+        if ( ! in_array(self::APP_TODO, $spaceApps)) {
+            $filter->addFilter(new ExistsFilter(Fields::discussionId()));
+            $filter->addFilter(new NotExistsFilter(Fields::todoId()));
+        }
+
+        return $filter->getQuery($fts_product);
+    }
+
+    /**
+     * @return string
+     */
+    protected function getLoginUserId()
+    {
+        $loginUser = cb_get_login_user();
+        assert('$loginUser');
+
+        return $loginUser->getOID();
+    }
+
+    /**
+     * @param string[] $spaceIds
+     *
+     * @return string[]
+     */
+    private function filterSpaceLimit(array $spaceIds)
+    {
+        if (count($spaceIds) > $this->getSpaceLimit()) {
+            SearchApi::setLimitFlag(true);
+            $spaceIds = array_slice($spaceIds, 0, $this->getSpaceLimit());
+
+            return $spaceIds;
+        }
+
+        return $spaceIds;
+    }
+
+    /**
+     * @param int $expiration_type
+     *
+     * @return string[]
+     */
+    protected function getMySpaceIdList($expiration_type = null)
+    {
+        $spaceUtil = new SpaceUtil();
+
+        return $spaceUtil->getMySpaceIdList($expiration_type);
+    }
+
+    /**
+     * @param  string $category_id
+     * @param  int    $expiration_type
+     *
+     * @return string[]
+     */
+    protected function getSpaceIdsRecursively(
+        $category_id,
+        $expiration_type = null
+    ) {
+        $spaceLogic = SpaceLogic::getInstance();
+
+        return $spaceLogic->getSpaceIdsRecursively($category_id,
+            $this->getLoginUserId(), $expiration_type);
+    }
+
+    private function getAllSpaceApps()
+    {
+        return [self::APP_DISCUSSION, self::APP_TODO];
+    }
+
+    /**
+     * @param string $range
+     */
+    private function setRange($range)
+    {
+        $this->range = $range;
+    }
+
+    /**
+     * @return string
+     */
+    private function getRange()
+    {
+        return $this->range;
+    }
+
+    /**
+     * @param string $spaceId
+     */
+    private function setSpaceId($spaceId)
+    {
+        $this->spaceId = $spaceId;
+    }
+
+    /**
+     * @return string
+     */
+    private function getSpaceId()
+    {
+        return $this->spaceId;
+    }
+
+    private function setSpaceApps($spaceApps)
+    {
+        $this->spaceApps = $spaceApps;
+    }
+
+    private function getSpaceApps()
+    {
+        return $this->spaceApps;
+    }
+
+    /**
+     * @param string $spaceCategoryId
+     */
+    private function setSpaceCategoryId($spaceCategoryId)
+    {
+        $this->spaceCategoryId = $spaceCategoryId;
+    }
+
+    /**
+     * @return string
+     */
+    private function getSpaceCategoryId()
+    {
+        return $this->spaceCategoryId;
+    }
+
+    /**
+     * @return string
+     */
+    public function getTarget()
+    {
+        return $this->target;
+    }
+
+    /**
+     * @param string $target
+     */
+    public function setTarget($target)
+    {
+        $this->target = $target;
+    }
+
+    /**
+     * @param int $spaceLimit
+     */
+    public function setSpaceLimit($spaceLimit)
+    {
+        $this->spaceLimit = $spaceLimit;
+    }
+
+    /**
+     * @return int
+     */
+    public function getSpaceLimit()
+    {
+        return $this->spaceLimit;
+    }
+}

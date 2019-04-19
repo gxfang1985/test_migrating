@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="{$encoding}"?>
+<methodResponse>
+  <params>
+    <param>
+      <value>
+        <struct>
+          <member>
+            <name>apiver</name>
+            <value><double>{$api_ver}</double></value>
+          </member>
+          <member>
+            <name>islast</name>
+            <value>{$islast}</value>
+          </member>
+          <member>
+            <name>count</name>
+            <value><int>{$count}</int></value>
+          </member>
+{if $users}
+          <member>
+            <name>user_list</name>
+            <value>
+              <array>
+                <data>
+{foreach from=$users key=uid item=user}
+                  <value>
+                    <struct>
+                      <member>
+                        <name>userid</name>
+                        <value><string>{$uid}</string></value>
+                      </member>
+                      <member>
+                        <name>username</name>
+                        <value><string>{$user.name|escape}</string></value>
+                      </member>
+                      <member>
+{if GRN_CBAPI_VERSION_1_02 <= $api_ver }
+                      <member>
+                        <name>username_kana</name>
+                        <value><string>{$user.kana|escape}</string></value>
+                      </member>
+{/if}
+                        <name>loginid</name>
+                        <value><string>{$user.login|escape}</string></value>
+                      </member>
+
+{if GRN_CBAPI_VERSION_1_02 <= $api_ver }
+                      <member>
+                        <name>state</name>
+                        <value><int>{$user.state}</int></value>
+                      </member>
+{/if}
+                      <member>
+                        <name>order</name>
+                        <value><int>{$user.order}</int></value>
+                      </member>
+                    </struct>
+                  </value>
+{/foreach}
+                </data>
+              </array>
+            </value>
+          </member>
+{/if}
+        </struct>
+      </value>
+    </param>
+  </params>
+</methodResponse>

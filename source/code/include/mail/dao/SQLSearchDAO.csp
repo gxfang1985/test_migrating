@@ -1,0 +1,279 @@
+<?php
+
+namespace grn\mail\dao;
+
+use grn\fts\api\SearchApiParameter;
+use \grn\fts\SQLSearchDAOAbstract;
+
+require_once("mail/table.csp");
+
+/**
+ * This class throws query to db and create array of response.
+ */
+class SQLSearchDAO extends SQLSearchDAOAbstract
+{
+
+    const APP = "mail";
+
+    protected $alsoSend_condition = false;
+    protected $sendFrom_condition = false;
+    protected $accountId_condition = false;
+    protected $alsoSend;
+    protected $sendFrom;
+    protected $accountId;
+
+    /**
+     * @param \grn\fts\api\SearchApiParameter $parameter
+     *
+     * @return SQLSearchDAO
+     */
+    static public function create(SearchApiParameter $parameter)
+    {
+        $myself = new self($parameter, new GrnMailFolderDAO());
+
+        return $myself;
+    }
+
+    /**
+     * @param \grn\fts\api\SearchApiParameter $parameter
+     * @param                                 $mailFoldersDao \grn\mail\dao\GrnMailFolderDAO
+     */
+    public function __construct(SearchApiParameter $parameter, $mailFoldersDao)
+    {
+        $this->userId = self::getLoginUserId();
+        $this->setSendFrom($parameter->getSender());
+        $this->setAlsoSend($parameter->getReceiver());
+        $this->setAccountId($parameter->getAccountId());
+        $this->foldersDao = $mailFoldersDao;
+    }
+
+
+    /**
+     * @return \CB_DatabaseConnection
+     */
+    protected function db()
+    {
+        return \GRN_ApplicationLocator::instance()->getConnection(self::APP);
+    }
+
+    /**
+     * @return string of folder column name.
+     */
+    protected function getFolderColumn()
+    {
+        return "folder._id";
+    }
+
+    /**
+     * @return string
+     */
+    public function buildQuery()
+    {
+        $query = "SELECT "
+                 . "messages._id AS mid, "
+                 . "messages.col_subject AS title, "
+                 . "messages.col_from AS sender ,"
+                 . "messages.col_send_ts AS modifiedTime "
+                 . "FROM {$this->getMailMessageTable()} messages "
+                 . "INNER JOIN tab_grn_mail_folder folder ON "
+                 . "folder._id = messages.col_folder "
+                 . "WHERE  messages.col_read_ts > 0 AND messages.col_draft IS NULL "
+                 . "AND " . $this->db()->format("messages.col_user = '@S' ",
+                [$this->userId]);
+
+        if (($nameCondition = $this->buildNameCondition()) !== "") {
+            $query .= "AND {$nameCondition}";
+        }
+
+        $query .= $this->getOptionalFilter();
+
+        if (($accountId = $this->buildAccountIdCondition()) !== "") {
+            $query .= " AND {$accountId} ";
+        }
+
+        $query .= " ORDER BY messages.col_send_ts DESC ";
+        $query = $this->db()->select_format($query, (int)$this->offset,
+            (int)parent::getLimit());
+
+        return $query;
+    }
+
+    /**
+     * @return string
+     */
+    public function buildAccountIdCondition()
+    {
+        if ($this->accountId_condition === false) {
+            return "";
+        }
+
+        return $this->db()
+                    ->format(" folder.col_account = '@S' ", [$this->accountId]);
+    }
+
+    /**
+     * @return string
+     */
+    private function buildSenderNameCondition()
+    {
+        if ($this->sendFrom_condition === true) {
+            $keyword_of_sender = cb_parse_search_text($this->sendFrom);
+            $sender_conditions = [];
+            foreach ($keyword_of_sender as $token) {
+                $sender_conditions[] = $this->db()
+                                            ->format("messages.col_from LIKE '%@L%'",
+                                                [$token]);
+            }
+            $condition = implode($sender_conditions, " AND ");
+
+            return "( {$condition} )";
+        }
+
+        return "";
+    }
+
+    /**
+     * @return string
+     */
+    private function buildAlsoSendNameCondition()
+    {
+        if ($this->alsoSend_condition === true) {
+            $keyword_of_also_sender = cb_parse_search_text($this->alsoSend);
+            $also_send_conditions = [];
+            foreach ($keyword_of_also_sender as $token) {
+                $also_send_conditions[]
+                    = $this->db()->format(
+                    "messages.col_to LIKE '%@L%' "
+                    . " OR messages.col_cc LIKE '%@L%' "
+                    . " OR messages.col_bcc LIKE '%@L%'",
+                    [$token, $token, $token]
+                );
+            }
+
+            $sendAlso = implode($also_send_conditions, " AND ");
+
+            return "( {$sendAlso} )";
+        }
+
+        return "";
+    }
+
+    /**
+     * @return string
+     */
+    public function buildNameCondition()
+    {
+        $sendFrom = $this->buildSenderNameCondition();
+        $sendAlso = $this->buildAlsoSendNameCondition();
+
+        if ($this->sendFrom_condition && $this->alsoSend_condition) {
+            return "( {$sendFrom} AND {$sendAlso} )";
+        }
+
+        if ($this->sendFrom_condition) {
+            return " {$sendFrom} ";
+        }
+
+        if ($this->alsoSend_condition) {
+            return " {$sendAlso} ";
+        }
+
+        return "TRUE";
+
+    }
+
+    /**
+     * @return string
+     */
+    protected function getMailMessageTable()
+    {
+        return "tab_" . grn_mail_get_personal_tablename($this->userId,
+                GRN_MAIL_MESSAGE_TABLE);
+    }
+
+    /**
+     * @return string
+     */
+    protected function getSearchFilterModifiedTime()
+    {
+        return "messages.col_send_ts";
+    }
+
+    /**
+     * @param $name
+     *
+     * @return bool
+     */
+    public function validName($name)
+    {
+        return is_string($name) && $name !== "";
+    }
+
+    /**
+     * @param $sendTo
+     */
+    public function setAlsoSend($sendTo)
+    {
+        if ($this->validName($sendTo) === false) {
+            return;
+        }
+        $this->alsoSend = $sendTo;
+        $this->alsoSend_condition = true;
+    }
+
+    /**
+     * @param $sendFrom
+     */
+    public function setSendFrom($sendFrom)
+    {
+        if ($this->validName($sendFrom) === false) {
+            return;
+        }
+        $this->sendFrom = $sendFrom;
+        $this->sendFrom_condition = true;
+    }
+
+    /**
+     * @param $accountId
+     */
+    public function setAccountId($accountId)
+    {
+        if (is_null($accountId) || (is_numeric($accountId) === false)) {
+            return;
+        }
+        $this->accountId = $accountId;
+        $this->accountId_condition = true;
+    }
+
+    /**
+     * @return string
+     */
+    protected function applicationName()
+    {
+        return self::APP;
+    }
+
+    /**
+     * @return mixed "\grn\message\SQLSearchResultDocument"
+     */
+    protected function getDocument()
+    {
+        return new \grn\mail\SQLSearchResultDocument();
+    }
+
+    /**
+     * @override
+     *
+     * @param \grn\fts\api\SearchApiParameter $parameter
+     */
+    protected function setFolderId(SearchApiParameter $parameter)
+    {
+        $folder_id = $parameter->getMailFolderId();
+        if (is_null($folder_id)) {
+            return;
+        }
+        assert(is_numeric($folder_id));
+        $this->folder_id = $folder_id;
+        $this->search_folder = true;
+    }
+}

@@ -1,0 +1,406 @@
+<?php
+
+use grn\schedule\AttendanceStatusLogic;
+use grn\schedule\ScheduleMemberLogic;
+
+if (isset($cbpapi_service)) {
+    //response SOAP message
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty;
+    // get parameters of SOAP message
+    $node_parameters = $cbpapi_service->getRequestParameters();
+    $startdate = null;
+    $enddate = null;
+    $start_for_daily = null;
+    $end_for_daily = null;
+    $target_type = '';
+    $target_id = '';
+    if (array_key_exists('attributes', $node_parameters)) {
+        if (array_key_exists('start', $node_parameters['attributes'])) {
+            $startdate = $node_parameters['attributes']['start'];
+        }
+        if (array_key_exists('end', $node_parameters['attributes'])) {
+            $enddate = $node_parameters['attributes']['end'];
+        }
+        if (array_key_exists('start_for_daily',
+            $node_parameters['attributes'])
+        ) {
+            $start_for_daily
+                = $node_parameters['attributes']['start_for_daily'];
+        }
+        if (array_key_exists('end_for_daily', $node_parameters['attributes'])) {
+            $end_for_daily = $node_parameters['attributes']['end_for_daily'];
+        }
+    }
+    if (array_key_exists('children', $node_parameters)) {
+        $children = $node_parameters['children'];
+        foreach (array_keys($children) as $key) {
+            $child_tmp = $children[$key];
+            if (0 === strcmp('user', $child_tmp['node_name'])) {
+                $target_type = 'user';
+                $target_id = isset($child_tmp['attributes']['id'])
+                    ? $child_tmp['attributes']['id'] : '';
+                break;
+            }
+            if (0 === strcmp('group', $child_tmp['node_name'])) {
+                $target_type = 'group';
+                $target_id = isset($child_tmp['attributes']['id'])
+                    ? $child_tmp['attributes']['id'] : '';
+                break;
+            }
+            if (0 === strcmp('facility', $child_tmp['node_name'])) {
+                $target_type = 'facility';
+                $target_id = isset($child_tmp['attributes']['id'])
+                    ? $child_tmp['attributes']['id'] : '';
+                break;
+            }
+        }
+    }
+    if (strlen($target_type) <= 0) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'user_id or group_id or facility_id']);
+    }
+    if ( ! $startdate) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'start']);
+    }
+    if ( ! $enddate) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'end']);
+    }
+    $events = getEventsByTarget($startdate, $enddate, $target_type, $target_id,
+        $start_for_daily, $end_for_daily);
+
+    $t->assign('events', $events);
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('schedule')]);
+    $t->assign('action', $cbpapi_service->getAction());
+    grn_cbpapi_response($t, __FILE__);
+}
+
+function getEventsByTarget(
+    $startdate,
+    $enddate,
+    $target_type,
+    $target_id,
+    $start_for_daily = null,
+    $end_for_daily = null
+) {
+    require_once('schedule/facility_system_logic.csp');
+    require_once('schedule/system_logic.csp');
+    $systemlogic = GRN_Schedule_SystemLogic::getInstance();
+    $hiddenprivate = $systemlogic->getHiddenPrivate();
+
+    require_once('cbpapi/schedule_logic.csp');
+    $cbpapi_base_logic = GRN_CBPApi_Schedule_Logic::getInstance();
+    require_once('cbpapi/util.csp');
+    $startdatetime = grn_cbpapi_parse_iso8601($startdate);
+    if ( ! $startdatetime) {
+        cb_throw_error(E_GRN_SCHD_API_INVALID_STARTDATETIME);
+    }
+    $startdatetime = grn_cbpapi_convert_utc_to_local($startdatetime);
+
+    $enddatetime = grn_cbpapi_parse_iso8601($enddate);
+    if ( ! $enddatetime) {
+        cb_throw_error(E_GRN_SCHD_API_INVALID_ENDDATETIME);
+    }
+    $enddatetime = grn_cbpapi_convert_utc_to_local($enddatetime);
+    if (cb_date_compare($startdatetime, $enddatetime) > 0) {
+        cb_throw_error(E_GRN_SCHD_INVALID_DATETIME);
+    }
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    $login_id = $login->getOID();
+    require_once('schedule/facility_system_logic.csp');
+    $facility_logic = GRN_Facility_SystemLogic::getInstance();
+    require_once('schedule/access_logic.csp');
+    $acc_logic = GRN_Schedule_Access_logic::getInstance();
+    $dynamic_roles = $uum->listGrantedRoles();
+    //===============================================================================
+
+    $member = null;
+    if ($target_type == 'group') {
+        if ( ! is_numeric($target_id)) {
+            cb_throw_error(E_GRN_GROUP_NOT_FOUND);
+        }
+        $member = $uum->getGroup($target_id);
+        if ( ! $member && ! is_a($member, 'CB_Group')) {
+            cb_throw_error(E_GRN_GROUP_NOT_FOUND);
+        }
+    } elseif ($target_type == 'user') {
+        if ( ! is_numeric($target_id)) {
+            cb_throw_error(E_GRN_USER_NOT_FOUND);
+        }
+        $member = $uum->getUser($target_id);
+        if ( ! $member) {
+            cb_throw_error(E_GRN_USER_NOT_FOUND);
+        }
+        if ($member->getOID() == $login_id) {
+            $member = $login;
+        }
+    } elseif ($target_type == 'facility') {
+        if ( ! is_numeric($target_id)) {
+            cb_throw_error(E_GRN_FCLT_NOTFOUND_FACILITY);
+        }
+        $member = $facility_logic->getFacility($target_id);
+        if ($member === false) {
+            cb_throw_error(E_GRN_FCLT_NOTFOUND_FACILITY);
+        }
+    }
+    if (is_object($member)
+        && ( ! is_a($member, 'CB_User')
+             || ($member->getOID() != $login_id))
+    ) {
+        if (is_a($member, 'GRN_Facility_Facility')) {
+            // 施設グループのアクセス権を優先的に評価
+            $affiliation_group
+                = $facility_logic->getFacilityAffiliationGroup($member->getOID());
+            if ( ! $affiliation_group) {
+                $access = $acc_logic->evaluateAccess($login, $member, ['read'],
+                    $dynamic_roles);
+            } else {
+                $affiliation_groups
+                    = [$affiliation_group->getOID() => $affiliation_group];
+                $have_config = $acc_logic->getHaveAccessSettingList($login,
+                    $affiliation_groups, 'facilitygroup', $dynamic_roles);
+                if (count($have_config) > 0) {
+                    $access = $acc_logic->evaluateAccess($login,
+                        $affiliation_group, ['read'], $dynamic_roles);
+                } else {
+                    $access = $acc_logic->evaluateAccess($login, $member,
+                        ['read'], $dynamic_roles);
+                }
+            }
+        } else {
+            $access = $acc_logic->evaluateAccess($login, $member, ['read'],
+                $dynamic_roles);
+        }
+        if ( ! $access) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_VIEW);
+        }
+    }
+
+    require_once('cbpapi/schedule_logic.csp');
+    $cbpapi_base_logic = GRN_CBPApi_Schedule_Logic::getInstance();
+
+    require_once('schedule/view_util.csp');
+    $util = GRN_Schedule_View_Util::getInstance();
+
+    $tsex = new CB_TimeStampEx();
+    $tsex->setDateTime($startdatetime);
+    $timestamp = $tsex->unix_ts;
+    $dateex = new CB_DateEx($startdatetime);
+    $setdate = [
+        'format'    => $dateex->format(),
+        'type'      => $util->getDayType($dateex),
+        'date'      => $dateex,
+        'timestamp' => $timestamp
+    ];
+
+    $tsex = new CB_TimeStampEx();
+    $tsex->setDateTime($enddatetime);
+    $timestamp = $tsex->unix_ts;
+    $dateex = new CB_DateEx($enddatetime);
+    $enddate = [
+        'format'    => $dateex->format(),
+        'type'      => $util->getDayType($dateex),
+        'date'      => $dateex,
+        'timestamp' => $timestamp
+    ];
+
+    if ( ! is_null($start_for_daily) || 0 < strlen($start_for_daily)) {
+        $date = new CB_Date();
+        if ( ! $date->parse($start_for_daily)) {
+            cb_throw_error(E_GRN_SCHD_INVALID_SETDATE);
+        }
+        $dateex = new CB_DateEx($date);
+        $setdate['format'] = $dateex->format();
+        $setdate['type'] = $util->getDayType($dateex);
+        $setdate['date'] = $dateex;
+
+        if ( ! is_null($end_for_daily) || 0 < strlen($end_for_daily)) {
+            $date = new CB_Date();
+            if ( ! $date->parse($end_for_daily)) {
+                cb_throw_error(E_GRN_SCHD_INVALID_ENDDATE);
+            }
+            $dateex = new CB_DateEx($date);
+            $enddate['format'] = $dateex->format();
+            $enddate['type'] = $util->getDayType($dateex);
+            $enddate['date'] = $dateex;
+            if ($setdate['date']->compare($enddate['date']) > 0) {
+                cb_throw_error(E_GRN_SCHD_INVALID_DATE);
+            }
+        } else {
+            cb_throw_error(E_GRN_SCHD_INVALID_ENDDATE);
+        }
+    }
+    require_once('schedule/eventfactory.csp');
+    $event_factory = GRN_Schedule_EventFactory::getInstance();
+
+    $sc_type = GRN_SCHEDULE_EVENT_TYPE_NORMAL
+               + GRN_SCHEDULE_EVENT_TYPE_DAILYEVENT;
+    $attendanceStatusLogic = new AttendanceStatusLogic();
+    $isEnableAttendanceStatus
+        = $attendanceStatusLogic->isEnableAttendanceCheck();
+    $events = $event_factory->getEvents(
+        $member->getOID(), $target_type, $setdate, $enddate, $login_id,
+        $sc_type, false, true, false,
+        $isEnableAttendanceStatus
+    );
+
+    if ($isEnableAttendanceStatus) {
+        foreach (['normal', 'daily'] as $type) {
+            $events[$type] = $util->filterAbsentEvents($events[$type]);
+        }
+    }
+
+    $events_for_view = [];
+    $normal_events = $events['normal'];
+    foreach ($normal_events as $event) {
+        $deny = false;
+        $tmp_event = $cbpapi_base_logic->getEventsForViewByIds($login,
+            [$event['id']], false, $deny, true);
+        if ($deny !== true) {
+            if ($event['private']) {
+                $_event = $event_factory->getEvent($event['id'],
+                    null, CB_DATABASE_NO_LOCK, GRN_SCHEDULE_GET_MEMBER_ID);
+                $is_event_available = ScheduleMemberLogic::getInstance()
+                                                         ->isEventAvailableForUser($login,
+                                                             $_event,
+                                                             GRN_SCHEDULE_GET_MEMBER_ID);
+                if ( ! $is_event_available) {
+                    if ($hiddenprivate && $target_type !== 'facility') {
+                        continue;
+                    }
+                    $tmp_event[$event['id']]
+                        = _getPrivateEventForView($tmp_event[$event['id']],
+                        $target_type, $target_id, $event, $facility_logic);
+                }
+            }
+        } else {
+            $tmp_event[$event['id']]
+                = _getPrivateEventForView($tmp_event[$event['id']],
+                $target_type, $target_id, $event, $facility_logic);
+        }
+
+        if (isset($event['repeat']) && $event['repeat'] == 1) {
+            $tmp_event[$event['id']]['start_date_time']
+                = grn_cbpapi_iso8601($event['setdatetime']);
+            $tmp_event[$event['id']]['end_date_time']
+                = grn_cbpapi_iso8601($event['enddatetime']);
+        }
+        $events_for_view[] = $tmp_event;
+    }
+    $daily_events = $events['daily'];
+    foreach ($daily_events as $event) {
+        $deny = false;
+        $tmp_event = $cbpapi_base_logic->getEventsForViewByIds($login,
+            [$event['id']], false, $deny, true);
+        if ($deny !== true) {
+            if ($event['private']) {
+                $_event = $event_factory->getEvent($event['id'],
+                    null, CB_DATABASE_NO_LOCK, GRN_SCHEDULE_GET_MEMBER_ID);
+                $is_event_available = ScheduleMemberLogic::getInstance()
+                                                         ->isEventAvailableForUser($login,
+                                                             $_event,
+                                                             GRN_SCHEDULE_GET_MEMBER_ID);
+                if ( ! $is_event_available) {
+                    if ($hiddenprivate && $target_type !== 'facility') {
+                        continue;
+                    }
+                    $tmp_event[$event['id']]
+                        = _getPrivateEventForView($tmp_event[$event['id']],
+                        $target_type, $target_id, $event, $facility_logic);
+                }
+            }
+        } else {
+            $tmp_event[$event['id']]
+                = _getPrivateEventForView($tmp_event[$event['id']],
+                $target_type, $target_id, $event, $facility_logic);
+        }
+
+        if (isset($event['repeat']) && $event['repeat'] == 1) {
+            $tmp_event[$event['id']]['start_date_time']
+                = $event['setdate']->getDate()->format();
+            $tmp_event[$event['id']]['end_date_time']
+                = $event['enddate']->getDate()->format();
+        }
+        $events_for_view[] = $tmp_event;
+    }
+
+    return $events_for_view;
+}
+
+/**
+ * Get private event for view
+ *
+ * @param array  $event_for_view
+ * @param string $target_type
+ * @param int    $target_id
+ * @param array  $event
+ *
+ * @return array
+ */
+function _getPrivateEventForView(
+    $event_for_view,
+    $target_type,
+    $target_id,
+    $event,
+    $facility_logic
+) {
+    $event_for_view['id'] = 0;
+    $event_for_view['detail'] = $event['title'];
+    switch ($event['private']) {
+        case GRN_EVENT_PRIVATE_PRIVATE:
+            $event_for_view['public_type'] = 'private';
+            break;
+        case GRN_EVENT_PRIVATE_HIDDEN:
+            $event_for_view['public_type'] = 'private';
+            if ($target_type === 'facility') {
+                $event_for_view['detail']
+                    = $facility_logic->getEventTitle($event['title'],
+                    $event['creator_name'], GRN_EVENT_PRIVATE_HIDDEN);
+            } else {
+                $event_for_view['detail'] = cb_msg('grn.schedule',
+                    'event_hidden');
+            }
+            $event_for_view['hidden_private'] = 'true';
+            break;
+    }
+    unset($event_for_view['observers'], $event_for_view['customer'], $event_for_view['repeat_info'], $event_for_view['follows'], $event_for_view['plan'], $event_for_view['memo']);
+    switch ($target_type) {
+        case 'user':
+            unset($event_for_view['groups'], $event_for_view['facilities']);
+            foreach ($event_for_view['users'] as $key => $user) {
+                if ($user['id'] != $target_id) {
+                    unset($event_for_view['users'][$key]);
+                }
+            }
+            break;
+        case 'group':
+            unset($event_for_view['users'], $event_for_view['facilities']);
+            foreach ($event_for_view['groups'] as $key => $group) {
+                if ($group['id'] != $target_id) {
+                    unset($event_for_view['groups'][$key]);
+                }
+            }
+            break;
+        case 'facility':
+            $facility_logic = GRN_Facility_SystemLogic::getInstance();
+            $event_for_view['detail']
+                = $facility_logic->getEventTitle($event['title'],
+                $event['creator_name'], GRN_EVENT_PRIVATE_HIDDEN);
+            unset($event_for_view['users'], $event_for_view['groups']);
+            foreach ($event_for_view['facilities'] as $key => $facility) {
+                if ($facility['id'] != $target_id) {
+                    unset($event_for_view['facilities'][$key]);
+                }
+            }
+            break;
+    }
+
+    return $event_for_view;
+}

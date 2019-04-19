@@ -1,0 +1,210 @@
+<?php
+
+namespace grn\space\screen\application\discussion;
+
+use grn\space\service\DiscussionService;
+use grn\space\service\TodoService;
+use grn\space\screen\application\discussion\DiscussionBase;
+use grn\space\common\data\bean\Application;
+use grn\space\common\data\bean\Authority;
+use grn\space\common\exception\GrnDataNotFoundException;
+use grn\space\common\exception\GrnInvalidPermissionException;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\utility\SpaceFileUtility;
+use grn\space\data\condition\TodoSearchCondition;
+use grn\space\common\utility\SpaceDatetimeUtility;
+use grn\space\common\utility\ValidateUtility;
+
+/**
+ * Class ThreadRight
+ */
+class ThreadRight extends DiscussionBase
+{
+    const ARG_KEY = 'key';
+    const MY_TODO = 'my_todo';
+    const ALL_TODO = 'all_todo';
+    const ALL_FILE = 'all_file';
+    const ARG_COMMENT_ID = 'cmid';
+    const ARG_RIGHT = 'slidebar';
+
+    const SHOW_FILE_LIST = 'file';
+
+    /**
+     * @return mixed|string|void
+     * @throws GrnInvalidPermissionException
+     * @throws \grn\space\common\exception\GrnArgumentOutOfRangeException
+     * @throws \grn\space\common\exception\GrnInvalidArgumentException
+     */
+    public function fetch()
+    {
+        $input = $this->getInput();
+        $login_id = $this->getLoginUserId();
+
+        $parameter = [self::ARG_SPACE_ID];
+        $this->checkArgFromInput($parameter, $input);
+        $this->verifySpaceIsNotExpired();
+        $space_id = $this->getSpaceId();
+        $thread_id = $this->getArrayValue(self::ARG_THREAD_ID, $input);
+        if ( ! ValidateUtility::isNumber($thread_id,
+            ValidateUtility::DISABLE_EMPTY,
+            ValidateUtility::EXCEPTION_NOT_THROW)
+        ) {
+            $thread_id = $this->getSystemThreadId();
+        }
+
+        $key = $this->getArrayValue(self::ARG_KEY, $input);
+
+        $show_file_list = $this->getArrayValue(self::ARG_RIGHT, $input);
+        if ($show_file_list != self::SHOW_FILE_LIST) {
+            $show_file_list = false;
+        }
+
+        $discussion_service = DiscussionService::getInstance();
+        $write_auth
+            = $discussion_service->hasThreadAccessControl(Authority::AUTHORITY_CODE_WRITE,
+            $space_id, $thread_id, $login_id);
+        $read_auth
+            = $discussion_service->hasThreadAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $space_id, $thread_id, $login_id);
+        if ( ! $read_auth) {
+            throw new GrnInvalidPermissionException(ErrorCode::GRN_THREAD_NO_ACCESS_PERMISSION);
+        }
+
+        $todo_service = TodoService::getInstance();
+        $todo_root_category
+            = $todo_service->getApplicationRootCategory($space_id,
+            Application::APPLICATION_CODE_TODO, $this->getLanguageCode());
+        $search_condition = new TodoSearchCondition();
+        $search_condition->setSearchCategoryId($todo_root_category->getId());
+        $search_condition->setSearchThreadId($thread_id);
+        $search_condition->setSearchStatus(TodoSearchCondition::STATUS_INCOMPLETE);
+        $search_condition->setOrderSortArray([
+            TodoSearchCondition::SORT_DEADLINE_TIMESTAMP_ASC,
+            TodoSearchCondition::SORT_CREATE_TIME_DESC
+        ]);
+
+        require_once('grn/smarty.csp');
+        $smarty = new \GRN_Smarty();
+        $smarty->assign('write_auth', $write_auth);
+        $smarty->assign('space_id', $space_id);
+        $smarty->assign('thread_id', $thread_id);
+        $smarty->assign('show_file_list', $show_file_list);
+
+        switch ($key) {
+            case self::MY_TODO :
+                if ($write_auth) {
+                    $my_todo = $this->_getTodo($login_id, $search_condition,
+                        true);
+                    $smarty->assign('todo_list', $my_todo);
+                }
+
+                return $smarty->fetch('space/application/discussion/thread_right_todo_list.tpl');
+                break;
+            case self::ALL_TODO :
+                $all_todo = $this->_getTodo($login_id, $search_condition);
+                $smarty->assign('todo_list', $all_todo);
+
+                return $smarty->fetch('space/application/discussion/thread_right_todo_list.tpl');
+                break;
+            case self::ALL_FILE :
+                $all_file = $this->_getFile($thread_id, $login_id);
+                $smarty->assign('file_list', $all_file);
+
+                return $smarty->fetch('space/application/discussion/thread_right_file_list.tpl');
+                break;
+            default:
+                if ($show_file_list) {
+                    $all_file = $this->_getFile($thread_id, $login_id);
+                    $smarty->assign('all_file_list', $all_file);
+                } else {
+                    $all_todo = $this->_getTodo($login_id, $search_condition);
+                    $smarty->assign('all_todo_list', $all_todo);
+                }
+
+                return $smarty->fetch('space/application/discussion/thread_right.tpl');
+                break;
+        }
+    }
+
+    /**
+     * @param                     $login_id
+     * @param TodoSearchCondition $search_condition
+     * @param bool                $is_my_todo
+     *
+     * @return array
+     */
+    private function _getTodo(
+        $login_id,
+        TodoSearchCondition $search_condition,
+        $is_my_todo = false
+    ) {
+        if ($is_my_todo) {
+            $search_condition->setSearchParticipantUserId($login_id);
+            $search_condition->setSearchStatus(TodoSearchCondition::STATUS_INCOMPLETE_PARTICIPANT_USER);
+        }
+        $todo_service = TodoService::getInstance();
+        $todo_collection
+            = $todo_service->searchTodoBySearchConditionWithAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+            $search_condition, $login_id, false, false);
+
+        $todo_list = [];
+        foreach ($todo_collection as $todo) {
+            /** @var \grn\space\data\bean\Todo $todo */
+            $today_date = $this->transferTimestampToDateEx($todo, time());
+            $start_date = $this->transferTimestampToDateEx($todo,
+                $todo->getStartTimestamp());
+            $deadline_date = $this->transferTimestampToDateEx($todo,
+                $todo->getDeadlineTimestamp());
+            if ($deadline_date != null
+                && ($start_date == null
+                    || $today_date->compare($start_date) >= 0)
+            ) {
+                $todo_list[$todo->getId()] = [
+                    'id'            => $todo->getId(),
+                    'title'         => $todo->getTitle(),
+                    'deadline_date' => $deadline_date,
+                    'status'        => $this->getTodoStatus($todo)
+                ];
+            }
+        }
+
+        return $todo_list;
+    }
+
+    /**
+     * @param $thread_id
+     * @param $login_id
+     *
+     * @return array
+     */
+    private function _getFile($thread_id, $login_id)
+    {
+        $discussion_service = DiscussionService::getInstance();
+        $file_collection
+            = $discussion_service->getAllThreadFileWithReadAuthority($thread_id,
+            $login_id);
+        SpaceDatetimeUtility::constructionInspectionDisplayDatetime($file_collection,
+            $this->getDatetimeFormat(),
+            SpaceDatetimeUtility::DISPLAY_TYPE_LONGDATE_AND_TIME,
+            $this->getLanguageCode(),
+            $this->getTimezoneName());
+
+        $all_file = [];
+        foreach ($file_collection as $file) {
+            /** @var \grn\space\common\data\bean\SpaceFile $file */
+            $fileType = $file->getParentApplicationType();
+            $parentId = $file->getParentApplicationId();
+            $mtime = $file->getModifyDisplayDatetime();
+            $all_file[$file->getId()]
+                = array_merge(SpaceFileUtility::getSpaceFileLinkView($file),
+                [
+                    'type'      => $fileType,
+                    'parent_id' => $parentId,
+                    'mtime'     => $mtime
+                ]
+            );
+        }
+
+        return $all_file;
+    }
+}

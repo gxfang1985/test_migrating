@@ -1,0 +1,637 @@
+<?php
+
+require_once('fw/transaction.csp');
+require_once('fw/server_file.csp');
+require_once('fw/cydec.csp');
+
+use grn\cydec\common\ShardLogic;
+use grn\cydec\mq\BlobRemoveJobMessage;
+use grn\cydec\mq\MessageQueue;
+use grn\cydec\mq\QueueRecord;
+use grn\cydec\mq\QueueRecordBuilder;
+
+/**
+ * Transactional file manager class to save/remove files to/from a blob server.
+ */
+class CB_BlobFileManager implements CB_Transactional, CB_FileManager
+{
+    const APPLICATION_NAME = 'garoon';
+
+    public function boot()
+    {
+        $tm = CB_TransactionManager::getInstance();
+        $tm->register(CB_TRANSACTION_LEVEL_FILE, $this);
+        $this->mq = new MessageQueue();
+        $this->setBlobRemoveRecordBuilder();
+
+    }
+
+    /* @var CB_BlobDataToCopy[] $toCopy */
+    private $toCopy = [];
+    /** @var CB_BlobDataToPut[] $toPut */
+    private $toPut = [];
+    /** @var QueueRecordBuilder */
+    private $deleteRecordBuilder;
+
+    /** @var MessageQueue */
+    private $mq;
+
+    private $temporaryFileList = [];
+    /** @var  \Closure */
+    private $onBuildFunction;
+
+    /**
+     * @param string $path
+     */
+    public function markAsTemporaryFile($path)
+    {
+        $this->temporaryFileList[] = $path;
+    }
+
+    private function setBlobRemoveRecordBuilder()
+    {
+        $this->deleteRecordBuilder = $this->getDeleteRecordBuilder();
+    }
+
+    /**
+     * Delete Temporary files and clean the list.
+     *
+     * @return boolean
+     */
+    private function deleteTemporaryFile()
+    {
+        foreach ($this->temporaryFileList as $path) {
+            @unlink($path);
+        }
+        $this->temporaryFileList = [];
+
+        return true;
+    }
+
+    /**
+     * @param CB_ServerFile $server_file
+     */
+    public function addToCopy(CB_ServerFile $server_file)
+    {
+        $server_file->set('blob', $this->generateBlobId());
+        $this->toCopy[] = new CB_BlobDataToCopy($server_file->get('blob'),
+            $server_file->get('name'), $server_file->getTmpName(),
+            $server_file->get("size"));
+    }
+
+    /**
+     * @param $fileName
+     * @param $contents
+     *
+     * @return string
+     */
+    public function addToPut($fileName, $contents)
+    {
+        $temp = tmpfile();
+        $blobId = $this->generateBlobId();
+        fwrite($temp, $contents);
+        $this->toPut[] = new CB_BlobDataToPut($blobId, $fileName, $temp,
+            strlen($contents));
+
+        return $blobId;
+    }
+
+    /**
+     * @param CB_ServerFile $server_file
+     */
+    public function addToRemove(CB_ServerFile $server_file)
+    {
+        $blob_id = $server_file->get('blob');
+        $this->addToRemoveByBlobId($blob_id);
+    }
+
+    /**
+     * @param $blob_id
+     */
+    public function addToRemoveByBlobId($blob_id)
+    {
+        if ($this->isValidBlobId($blob_id)) {
+            $this->deleteRecordBuilder->addArgument($blob_id);
+        }
+    }
+
+    /**
+     * @param $blob_id
+     *
+     * @return string|null
+     */
+    public function getURL($blob_id)
+    {
+        if ( ! $this->isValidBlobId($blob_id)) {
+            return null;
+        }
+
+        $shard_key = $this->generateShardKeyFromBlobId($blob_id);
+        $location = $this->getShardLocation($shard_key);
+        $host = $location->getHost();
+        $port = $location->getPort();
+        $domain = CB_CyDECUtil::getInstance()->getDomainID();
+        $app = self::APPLICATION_NAME;
+        // @see http://wiki.dev.cybozu.co.jp/display/gaia2/MS+Blob+Server
+        // http://HOST:PORT/DOMAIN/GAIA_APPLICATION_NAME/BLOB_ID
+        return "http://{$host}:{$port}/{$domain}/{$app}/{$blob_id}";
+    }
+
+    /**
+     * @param CB_ServerFile $server_file
+     * @param bool          $create
+     *
+     * @return string
+     */
+    public function formatPath(CB_ServerFile $server_file, $create = false)
+    {
+        $blob_id = $server_file->get('blob');
+        $url = $this->getURL($blob_id);
+        if (is_null($url)) {
+            require_once('fw/error_code.csp');
+            cb_throw_error(E_COMMON_NOT_FOUND_DOWNLOAD_FILE);
+        }
+
+        return $url;
+    }
+
+    public function commit()
+    {
+        foreach ($this->toCopy as $file) {
+            $this->filePut($file);
+            if (is_uploaded_file($file->getTmpName())) {
+                @unlink($file->getTmpName());
+            }
+        }
+
+        foreach ($this->toPut as $data) {
+            $this->filePut($data);
+        }
+
+        $this->deleteRecordBuilder->build();
+
+        $this->toCopy = [];
+        $this->toPut = [];
+        $this->setBlobRemoveRecordBuilder();
+
+        $this->deleteTemporaryFile();
+
+        return true;
+    }
+
+    /**
+     * transfer file to Blob server
+     *
+     * @param CB_BlobDataToCopy|CB_BlobDataToPut $file
+     */
+    private function filePut($file)
+    {
+        $uri = $this->getURL($file->getBlobId());
+
+        $blob_http_client = $this->getBlobHttpClient();
+        $blob_http_client->put($uri, $file);
+    }
+
+    /**
+     * @param QueueRecord[] $records
+     */
+    private function delete(array $records)
+    {
+
+        foreach ($records as $record) {
+            $this->mq->enqueue($record);
+        }
+    }
+
+    public function abort()
+    {
+        $this->toCopy = [];
+        $this->toPut = [];
+        $this->setBlobRemoveRecordBuilder();
+
+        $this->deleteTemporaryFile();
+    }
+
+    public function exists(CB_ServerFile $server_file)
+    {
+        $blob_id = $server_file->get('blob');
+        $url = $this->getURL($blob_id);
+
+        if (is_null($url)) {
+            return false;
+        }
+
+        $blob_http_client = $this->getBlobHttpClient();
+        $status = $blob_http_client->head($url)->getStatusLine();
+
+        if ($status['status-code'] === 200) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param CB_ServerFile $server_file
+     *
+     * @return bool
+     */
+    public function download(CB_ServerFile $server_file)
+    {
+        $path = $server_file->getPath();
+        header('X-Reproxy-URL: ' . $path);
+
+        return true;
+    }
+
+    /**
+     * Generate BLOB ID.
+     *
+     * @return string
+     */
+    private function generateBlobId()
+    {
+        $now_ts = new CB_TimeStampEx(null, 'UTC');
+        $date = $now_ts->format("YmdHis");
+        $uuid = strtoupper(str_replace('-', '', cb_create_uuid()));
+        $shard_key = $this->generateShardKeyFromHex(substr($uuid, 0, 15));
+
+        return sprintf("%s%s%03d", $date, $uuid, $shard_key);
+    }
+
+    /**
+     * Generate a shard key from blob id.
+     *
+     * @param string $blob_id
+     *
+     * @return string
+     */
+    private function generateShardKeyFromBlobId($blob_id)
+    {
+        return $this->generateShardKeyFromHex(substr($blob_id, 14, 15));
+    }
+
+    /**
+     * Generate a shard key.
+     *
+     * @param string $hex
+     *
+     * @return int
+     */
+    private function generateShardKeyFromHex($hex)
+    {
+        assert('strlen($hex) === 15');
+
+        return intval($hex, 16) % 360;
+    }
+
+    /**
+     * Get a target blob server's host from shard key.
+     *
+     * @param int $key
+     *
+     * @return \grn\cydec\common\ShardLocationInterface
+     */
+    protected function getShardLocation($key)
+    {
+        assert('0 <= $key');
+        assert('$key < 360');
+
+        $logic = new ShardLogic();
+        $path = CB_CyDECUtil::getInstance()->getConfig('blob.json');
+
+        return $logic->getShardLocation($path, $key);
+    }
+
+    /**
+     * @return QueueRecordBuilder
+     */
+    protected function getDeleteRecordBuilder()
+    {
+        $this->onBuildFunction = function (array $records) {
+            $this->delete($records);
+        };
+
+        return new QueueRecordBuilder(new BlobRemoveJobMessage(),
+            $this->onBuildFunction);
+    }
+
+    /**
+     * @param string $blob_id
+     *
+     * @return bool
+     */
+    public function isValidBlobId($blob_id)
+    {
+        return preg_match('/^[a-fA-F0-9]{49}$/', $blob_id) === 1;
+    }
+
+    /**
+     * @return CB_BlobHttpClient
+     */
+    public function getBlobHttpClient()
+    {
+        return new CB_BlobHttpClient();
+    }
+
+    /**
+     * @param string $uri
+     *
+     * @return bool|string
+     */
+    public function getContents($uri)
+    {
+        $blob_http_client = new CB_BlobHttpClient();
+
+        return $blob_http_client->get($uri)->getBody();
+    }
+
+    /**
+     * @param string $uri
+     * @param string $mode
+     *
+     * @return resource|bool
+     */
+    public function openFile($uri, $mode)
+    {
+        return CB_ServerFileUtil::tryFopen($uri, $mode);
+    }
+}
+
+abstract class CB_AbstractBlobData
+{
+    private $blobId;
+    private $fileName;
+    private $fileSize;
+
+    /**
+     * CB_AbstractBlobData constructor.
+     *
+     * @param string $blobId
+     * @param string $fileName
+     * @param string $fileSize
+     */
+    public function __construct($blobId, $fileName, $fileSize)
+    {
+        $this->setBlobId($blobId);
+        $this->setFileName($fileName);
+        $this->setFileSize($fileSize);
+    }
+
+    /**
+     * @return string
+     */
+    public function getBlobId()
+    {
+        return $this->blobId;
+    }
+
+    /**
+     * @param string $blobId
+     */
+    private function setBlobId($blobId)
+    {
+        $this->blobId = $blobId;
+    }
+
+    /**
+     * @param string $fileName
+     */
+    private function setFileName($fileName)
+    {
+        $this->fileName = $fileName;
+    }
+
+    /**
+     * @return string
+     */
+    public function getFileName()
+    {
+        return $this->fileName;
+    }
+
+    /**
+     * @param string $fileSize
+     */
+    private function setFileSize($fileSize)
+    {
+        $this->fileSize = $fileSize;
+    }
+
+    /**
+     * @return string
+     */
+    public function getFileSize()
+    {
+        return $this->fileSize;
+    }
+
+    /**
+     * @return resource
+     */
+    abstract function openFileHandler();
+}
+
+class CB_BlobDataToCopy extends CB_AbstractBlobData
+{
+    private $tmpName;
+
+    /**
+     * CB_BlobDataToCopy constructor.
+     *
+     * @param string $blobId
+     * @param string $name
+     * @param string $tmpName
+     * @param string $fileSize
+     */
+    public function __construct($blobId, $name, $tmpName, $fileSize)
+    {
+        parent::__construct($blobId, $name, $fileSize);
+        $this->tmpName = $tmpName;
+    }
+
+    /**
+     * @return string
+     */
+    public function getTmpName()
+    {
+        return $this->tmpName;
+    }
+
+    /**
+     * @return resource
+     */
+    public function openFileHandler()
+    {
+        return CB_ServerFileUtil::tryFopen($this->tmpName, "r");
+    }
+}
+
+class CB_BlobDataToPut extends CB_AbstractBlobData
+{
+    private $fileHandler;
+
+    /**
+     * CB_BlobDataToPut constructor.
+     *
+     * @param string   $blobId
+     * @param string   $fileName
+     * @param resource $fileHandler
+     * @param string   $fileSize
+     */
+    public function __construct($blobId, $fileName, $fileHandler, $fileSize)
+    {
+        parent::__construct($blobId, $fileName, $fileSize);
+        $this->fileHandler = $fileHandler;
+    }
+
+    /**
+     * @return resource
+     */
+    public function openFileHandler()
+    {
+        rewind($this->fileHandler);
+
+        return $this->fileHandler;
+    }
+
+}
+
+class CB_BlobHttpClient
+{
+
+    /**
+     * @param string              $uri
+     * @param CB_AbstractBlobData $blobData
+     */
+    public function put($uri, CB_AbstractBlobData $blobData)
+    {
+        $http_client = $this->getHttpClient();
+
+        $http_client->setCurlOption(CURLOPT_PUT, true);
+        $http_client->setCurlOption(CURLOPT_HTTPHEADER, $this->getHeaders());
+        // @see http://jp2.php.net/curl_setopt
+        // The file to PUT must be set with CURLOPT_INFILE
+        // CURLOPUT_INFILE must be a file handler.
+        $file_handler = $blobData->openFileHandler();
+        $http_client->setCurlOption(CURLOPT_INFILE, $file_handler);
+        $http_client->setCurlOption(CURLOPT_INFILESIZE,
+            $blobData->getFileSize());
+
+        $is_succeeds = $http_client->execute($uri);
+        $status = $http_client->getStatusLine();
+
+        fclose($file_handler);
+
+        $status_code = $status['status-code'];
+        $allow_statuses = [201];
+        if ($is_succeeds === false
+            || ! in_array($status_code, $allow_statuses)
+        ) {
+            $this->handleError($http_client, $uri, E_COMMON_BLOB_PUT_FAILED);
+        }
+    }
+
+    /**
+     * @param string $uri
+     *
+     * @return CB_HttpClient
+     */
+    public function get($uri)
+    {
+        $http_client = $this->getHttpClient();
+
+        $http_client->setCurlOption(CURLOPT_HTTPHEADER, $this->getHeaders());
+
+        $is_succeeds = $http_client->execute($uri);
+        $status = $http_client->getStatusLine();
+
+        if ($is_succeeds === false) {
+            $this->handleError($http_client, $uri, E_COMMON_BLOB_GET_FAILED);
+        }
+
+        $status_code = $status['status-code'];
+        if ($status_code === 404) {
+            cb_throw_error();
+        }
+
+        $allow_statuses = [200];
+        if ( ! in_array($status_code, $allow_statuses)) {
+            $this->handleError($http_client, $uri, E_COMMON_BLOB_GET_FAILED);
+        }
+
+        return $http_client;
+    }
+
+    /**
+     * @param string $uri
+     *
+     * @return CB_HttpClient
+     */
+    public function head($uri)
+    {
+        // send HEAD and check status code
+        $http_client = $this->getHttpClient();
+
+        $http_client->setCurlOption(CURLOPT_NOBODY, true);
+        $http_client->setCurlOption(CURLOPT_HTTPHEADER, $this->getHeaders());
+
+        $is_succeeds = $http_client->execute($uri);
+        $status = $http_client->getStatusLine();
+
+        $status_code = $status['status-code'];
+        $allow_statuses = [200, 404];
+        if ($is_succeeds === false
+            || ! in_array($status_code, $allow_statuses)
+        ) {
+            $this->handleError($http_client, $uri, E_COMMON_BLOB_HEAD_FAILED);
+        }
+
+        return $http_client;
+    }
+
+    /**
+     * @return CB_HttpClient
+     */
+    protected function getHttpClient()
+    {
+        return cb_lwc_http_client();
+    }
+
+    /**
+     * @return array
+     */
+    private function getHeaders()
+    {
+        return [cb_get_request_id_header()];
+    }
+
+    /**
+     * @param CB_HttpClient $http_client
+     * @param string        $uri
+     * @param string        $error_code
+     */
+    private function handleError(CB_HttpClient $http_client, $uri, $error_code)
+    {
+        $this->writeLog($http_client, $uri);
+        cb_throw_error($error_code);
+    }
+
+    /**
+     * @param CB_HttpClient $http_client
+     * @param string        $uri
+     */
+    private function writeLog(CB_HttpClient $http_client, $uri)
+    {
+        $status = $http_client->getStatusLine();
+        $status_code = $status['status-code'];
+
+        $error_info = $http_client->getError();
+        $error_code = cb_at($error_info, "errno", "");
+        $error_message = cb_at($error_info, "message", "");
+
+        cb_http_error_to_log_file($status_code, $uri, $error_code,
+            $error_message);
+    }
+
+}

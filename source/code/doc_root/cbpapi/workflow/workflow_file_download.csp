@@ -1,0 +1,330 @@
+<?php
+if (isset($cbpapi_service)) {
+    $node_parameter = $cbpapi_service->getRequestParameters();
+    if ( ! isset($node_parameter['attributes']['file_id'])) {
+        require_once('grn/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'file_id']);
+    }
+    $file_id = $node_parameter['attributes']['file_id'];
+    if ( ! is_numeric($file_id)) {
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_ITEMDATAFILE_NOT_FOUND);
+    }
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    $user_id = $login->getOID();
+
+    //-- check access right
+
+    // examine 'petition id' from 'file id'
+    $petition_id = null;
+    $app_locator = GRN_ApplicationLocator::instance();
+    $database = $app_locator->getConnection('workflow');
+    $query
+        = 'SELECT col_petition
+              FROM tab_grn_workflow_itemdatafile idf INNER JOIN tab_grn_workflow_itemdata idt
+              ON idf.col_item_data = idt._id
+              WHERE idf._id = "@S"';
+    $query = cb_queryf($database, $query, $file_id);
+    $result = $database->query($query);
+    if ($result === false) {
+        $db->throwError(['query' => 'query failed: ' . $query]);
+    }
+    $ret = $database->fetch_assoc($result);
+    if ( ! $ret) {
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_ITEMDATAFILE_NOT_FOUND);
+    }
+    $petition_id = $ret['col_petition'];
+    $database->free_result($result);
+
+    // examine owner of folder from 'petition id'
+    $query
+        = 'SELECT col_user, f._id, col_folder_type
+              FROM tab_grn_workflow_folderrelation fr INNER JOIN  tab_grn_workflow_folder f
+              ON fr.col_folder = f._id
+              WHERE col_petition = "@S"';
+    $query = cb_queryf($database, $query, $petition_id);
+    $result = $database->query($query);
+    if ($result === false) {
+        $db->throwError(['query' => 'query failed: ' . $query]);
+    }
+
+    $user_folder_relation = [];
+    $count = $database->num_rows($result);
+    for ($i = 0; $i < $count; $i++) {
+        $ret = $database->fetch_assoc($result);
+        $uid = $ret['col_user'];
+        $folder_id = $ret['_id'];
+        $folder_info = [
+            'id'   => $folder_id,
+            'type' => $ret['col_folder_type']
+        ];
+
+        $user_folder_relation[$uid][$folder_id] = $folder_info;
+    }
+    $database->free_result($result);
+
+    //--
+
+    $is_accessible = array_key_exists($user_id, $user_folder_relation);
+    if ( ! $is_accessible) {
+        // 承認予定の判断
+        require_once('workflow/controller_util.csp');
+        $c = GRN_Workflow_Petition_Controller_Utility::getInstance();
+        $is_accessible = $c->checkApprovalPlanByPetitionId($user_id,
+            $petition_id);
+        if ( ! $is_accessible) {
+            //代理承認の検証
+            require_once('workflow/config.csp');
+            $configs = GRN_Workflow_Configs::getInstance();
+            $config =& $configs->getSystemConfig();
+            foreach ($user_folder_relation as $mandator_id => $folders) {
+                if ($config->isProxyApproval($user_id, $mandator_id)) {
+                    foreach ($folders as $folder) {
+                        $type = $folder['type'];
+                        if ($type == GRN_WORKFLOW_FOLDER_TYPE_UNPROCESSED_ID) {
+                            $user_id = $mandator_id;
+                            $is_accessible = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if ( ! $is_accessible) {
+                //公開申請データの閲覧権限のチェック
+                $c = GRN_Workflow_Category_Controller_Utility::getInstance();
+                $is_accessible = $c->checkPublicByPetitionId($petition_id,
+                    false);
+            }
+        }
+    }
+
+    if ( ! $is_accessible) {
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_PETITION_DENY_ACCESS);
+    }
+
+    //-- Check Access Right to the file.
+    $right_to_view_file = false;
+
+    require_once('workflow/controller_util.csp');
+    $petition_util = GRN_Workflow_Petition_Controller_Utility::getInstance();
+    $item_data_util
+        = GRN_Workflow_ItemData_Controller_Utility::getInstance();
+    $item_data_file_util
+        = GRN_Workflow_ItemDataFile_Controller_Utility::getInstance();
+
+    //Create Parameter Translation Map
+    $translation_map_petition = [
+        'pid'        => '_id',
+        'user'       => 'user',
+        'agent_user' => 'agent_user',
+    ];
+
+    //Create Parameter Translation Map
+    $translation_map_item_data = [
+        'idid'             => '_id',                  //Item Data ID
+        'settings'         => 'settings',             //ITem Data Settings
+        'attach_file'      => 'attach_file',
+        'attach_file_view' => 'attach_file_view'
+    ];
+
+    //Create Parameter Translation Map
+    $translation_map_item_data_file = [
+        'ifid'      => '_id',                  //Item Data File ID
+        'item_data' => 'item_data',            //Item Data ID
+        'file'      => 'file',                 //GRN_File ID
+    ];
+
+    //Get Item Data File
+    $item_data_file_for_access = $item_data_file_util->getView($file_id,
+        $translation_map_item_data_file);
+
+    //Get Item Data 
+    $item_data
+        = $item_data_util->getView($item_data_file_for_access['item_data'],
+        $translation_map_item_data, $petition_id);
+
+    // Get Path Step Data
+    require_once('workflow/path_data.csp');
+    $path_step_data_logic = GRN_Workflow_PathStepDatas::getInstance();
+    $path_step_columns = ['_id', GRN_WORKFLOW_COLUMN_TYPE];
+    $path_step_list
+        = $path_step_data_logic->getListByPetitionId($petition_id,
+        $path_step_columns, 0, -1, CB_DATABASE_NO_LOCK);
+
+    if (count($path_step_list)) {
+
+        // Get Path Step Data User
+        $path_step_data_user_logic
+            = GRN_Workflow_PathStepDataUsers::getInstance();
+        $path_step_user_columns = [
+            'tab_grn_workflow_pathstepdatauser' => [
+                '_id'                => 'pid',
+                'col_path_step_data' => 'col_path_step_data',
+                'col_user'           => 'col_user',
+                'col_agent_user'     => 'col_agent_user',
+            ],
+            'tab_cb_user'                       => [
+                '_id'              => '_id',
+                'col_display_name' => 'col_current_display_name'
+            ]
+        ];
+        $users
+            = $path_step_data_user_logic->getListByPathStepDataIds(array_keys($path_step_list),
+            $path_step_user_columns);
+
+        $path_step_user_list = [];
+        foreach ($users as $user) {
+            if ( ! in_array($user['col_path_step_data'],
+                array_keys($path_step_list))
+            ) {
+                require_once('workflow/error_code.csp');
+                cb_throw_error(E_GRN_WRKF_ITEM_DENY_ACCESS);
+            }
+
+            if ($path_step_list[$user['col_path_step_data']]['col_type'] == 1) {
+                $path_step_type = 'circular';
+            } else {
+                $path_step_type = 'acceptance';
+            }
+
+            if ($user['col_agent_user'] > 0) {
+                $path_step_user_list[] = [
+                    'path_step_data_id' => $user['col_path_step_data'],
+                    'type'              => $path_step_type,
+                    'user_id'           => $user['col_agent_user']
+                ];
+            }
+            if ($user['col_user'] > 0) {
+                $path_step_user_list[] = [
+                    'path_step_data_id' => $user['col_path_step_data'],
+                    'type'              => $path_step_type,
+                    'user_id'           => $user['col_user']
+                ];
+            }
+        }
+
+        // Check in 'circular' path step.
+        $in_circular = false;
+        for ($i = 0; $i < count($path_step_user_list); $i++) {
+            if ($path_step_user_list[$i]['type'] == 'circular'
+                && $path_step_user_list[$i]['user_id'] == $user_id
+            ) {
+                $in_circular = true;
+                $right_to_view_file = true;
+                break;
+            }
+        }
+
+        // Check in 'acceptance' path step.
+        $in_acceptance = false;
+        if ( ! $in_circular) {
+            require_once('workflow/change_access_data.csp');
+            $change_access_data_logic
+                = GRN_Workflow_ChangeAccessData::getInstance();
+
+            for ($i = 0; $i < count($path_step_user_list); $i++) {
+                if ($path_step_user_list[$i]['type'] == 'acceptance'
+                    && $path_step_user_list[$i]['user_id'] == $user_id
+                ) {
+                    $change_access_data = $change_access_data_logic->evaluateEx(
+                        $item_data_file_for_access['item_data'],
+                        $path_step_user_list[$i]['path_step_data_id']
+                    );
+                    if ($change_access_data['col_view'] == 1) {
+                        $in_acceptance = true;
+                        $right_to_view_file = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Check in 'circular' path step.
+        $in_circular = false;
+        for ($i = 0; $i < count($path_step_user_list); $i++) {
+            if ($path_step_user_list[$i]['type'] == 'circular'
+                && $path_step_user_list[$i]['user_id'] == $user_id
+            ) {
+                $in_circular = true;
+                $right_to_view_file = true;
+                break;
+            }
+        }
+
+        // Check in 'acceptance' path step.
+        $in_acceptance = false;
+        if ( ! $in_circular) {
+            require_once('workflow/change_access_data.csp');
+            $change_access_data_logic
+                = GRN_Workflow_ChangeAccessData::getInstance();
+
+            for ($i = 0; $i < count($path_step_user_list); $i++) {
+                if ($path_step_user_list[$i]['type'] == 'acceptance'
+                    && $path_step_user_list[$i]['user_id'] == $user_id
+                ) {
+                    $change_access_data = $change_access_data_logic->evaluateEx(
+                        $item_data_file_for_access['item_data'],
+                        $path_step_user_list[$i]['path_step_data_id']
+                    );
+                    if ($change_access_data['col_view'] == 1) {
+                        $in_acceptance = true;
+                        $right_to_view_file = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Check if login user is the creator of this petition.
+        $petition = $petition_util->getView($petition_id,
+            $translation_map_petition);
+        if ($petition['user'] > 0 && $petition['user'] == $user_id
+            || $petition['agent_user'] > 0
+               && $petition['agent_user'] == $user_id
+        ) {
+            if ($item_data['attach_file_view'] == '1') {
+                $right_to_view_file = true;
+            }
+        }
+
+        if ( ! $right_to_view_file) {
+            //公開申請データの閲覧権限のチェック
+            $c = GRN_Workflow_Category_Controller_Utility::getInstance();
+            if ( ! $c->checkPublicByPetitionId($petition_id, false)) {
+                require_once('workflow/error_code.csp');
+                cb_throw_error(E_GRN_WRKF_ITEM_DENY_ACCESS);
+            }
+        }
+    }
+    //-- end: check access right
+
+    //Get GRN_File Object
+    require_once('workflow/file.csp');
+    $file_manager = new GRN_Workflow_FileManager_Core();
+    $file_table = $file_manager->getFileTable();
+    $file_id = $item_data_file_for_access['file'];
+    $file = $file_table->getRow($file_id);
+    if ( ! is_object($file) || ! is_a($file, 'GRN_File')) {
+        require_once('workflow/error_code.csp');
+        cb_throw_error(E_GRN_WRKF_ITEMDATAFILE_NOT_FOUND);
+    }
+    /** @var GRN_Workflow_FileBody $body */
+    $body = $file->getCurrentBody();
+    $file_content = base64_encode($body->getContents());
+    // SOAP response
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty();
+
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('workflow')]);
+    $t->assign('action', $cbpapi_service->getAction());
+    $t->assign('file_content', $file_content);
+
+    grn_cbpapi_response($t, __FILE__);
+}

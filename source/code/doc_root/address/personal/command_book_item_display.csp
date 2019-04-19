@@ -1,0 +1,155 @@
+<?php
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    // GET/POSTされたパラメータを取得する
+    $bid = null;
+    if (array_key_exists('bid', $G_INPUT)) {
+        $bid = $G_INPUT['bid'];
+    }
+    if (0 == strlen($bid)) {
+        cb_throw_error(E_GRN_ADDRESS_INVALID_BOOK_ID);
+    }
+    $display_flags = @ $G_INPUT['display_flags'];
+
+    // アドレス帳を取得する
+    require_once('address/application.csp');
+    $app_locator = GRN_ApplicationLocator::instance();
+    /** @var GRN_Address_Application $app */
+    $app =& $app_locator->getInstance(GRN_ADDRESS_APPLICATION_ID);
+    if ( ! is_object($app) || ! is_a($app, 'GRN_Address_Application')) {
+        cb_throw_error(E_GRN_APPLICATION_NOT_AVAILABLE);
+    }
+    $book_manager =& $app->getBookManager();
+
+    // ログインユーザーを取得する
+    global $G_container_base;
+    $uum =& $G_container_base->getInstance('uum');
+    $login =& $uum->getLoginUser();
+    if ( ! is_object($login) || ! is_a($login, 'CB_User')) {
+        cb_throw_error(E_GRN_USER_NOT_FOUND);
+    }
+    $login_id = $login->getOID();
+
+    // アドレス帳の設定を取得する
+    require_once('address/config.csp');
+    $config_manager = GRN_Address_ConfigManager::getInstance();
+    $config =& $config_manager->getPersonalConfig($login);
+
+    // 使用権限を取得する
+    require_once('address/access.csp');
+    $access_manager = GRN_Address_AccessManager::getInstance();
+    if ( ! ($row =& $access_manager->getAbstractData(GRN_ADDRESS_AVAILABLE))) {
+        assert('FALSE');
+    }
+
+    // ダイナミックロールを取得する
+    $dynamic_roles = $uum->listGrantedRoles();
+
+    // 使用権限を評価する
+    $authorities = ['private_address', 'shared_address'];
+    $security_model = $access_manager->getSecurityModel($row);
+    $access = $access_manager->evaluateAccess($row, $login,
+        $dynamic_roles, $authorities, $security_model);
+
+    // アドレスブックを取得する
+    if (0 > $bid) {
+        // 個人アドレス帳の使用権限を評価する
+        $authorities = ['private_address'];
+        if ( ! $access_manager->isAllowedAccess($access, $authorities,
+            $security_model)
+        ) {
+            cb_throw_error(E_GRN_ADDRESS_ACCESS_DENY_PRIVATE_ADDRESS);
+        }
+
+        if ( ! ($book
+            =& $book_manager->getPrivateAddressBookByUserId($login_id))
+        ) {
+            if ( ! ($book =& $book_manager->addPrivateAddressBook('cyde',
+                $login_id, []))
+            ) {
+                cb_throw_error(E_GRN_ADDRESS_PRIVATE_ADDRESS_BOOK_NOT_FOUND);
+            }
+        }
+    } else {
+        // 共有アドレス帳の使用権限を評価する
+        $authorities = ['shared_address'];
+        if ( ! $access_manager->isAllowedAccess($access, $authorities,
+            $security_model)
+        ) {
+            cb_throw_error(E_GRN_ADDRESS_ACCESS_DENY_SHARED_ADDRESS);
+        }
+
+        // 共有アドレスブックを取得する
+        if ( ! ($book =& $book_manager->getSharedAddressBook($bid))) {
+            cb_throw_error(E_GRN_ADDRESS_SHARED_ADDRESS_BOOK_NOT_FOUND);
+        }
+
+        // 共有アドレス帳の閲覧、編集権限を評価する
+        $row =& $book->getRow();
+        $authorities = ['browse'];
+        $access = $access_manager->evaluateAccess($row, $login,
+            $dynamic_roles, $authorities);
+        $security_model = $access_manager->getSecurityModel($row);
+        if ( ! $access_manager->isAllowedAccess($access, $authorities,
+            $security_model)
+        ) {
+            cb_throw_error(E_GRN_ADDRESS_ACCESS_DENY_EDITING);
+        }
+    }
+
+    // 組み込み項目情報一覧を取得する
+    require_once('address/view_util.csp');
+    $view_util = GRN_Address_ViewUtil::getInstance();
+    $builtin_items = $view_util->listBuiltinItems($book);
+    unset($builtin_items['map']); // remove the "map" item before save
+    // 拡張項目情報一覧を取得する
+    $extended_items = $view_util->listExtendedItems($book);
+
+    // 一覧表示フラグを変更する
+    $config->setDisplayFlag($book, $display_flags, $builtin_items,
+        $extended_items);
+
+    // set modification timestamp
+    $mtime = new CB_TimeStamp();
+    $mtime->unix_ts = time();
+
+    // 監査する
+    require_once('address/inspection.csp');
+    $inspection = GRN_Address_Inspection::getInstance();
+    if ($inspection->isEnabled()) {
+        $section = GRN_ADDRESS_INSPECTION_CONFIG;
+        $params = [];
+        if (0 > $bid) {
+            $message = GRN_ADDRESS_INSPECTION_PRIVATE_ADDRESS_CARD_ITEM;
+        } else {
+            $message = GRN_ADDRESS_INSPECTION_SHARED_ADDRESS_CARD_ITEM;
+            $params['bid'] = $bid;
+        }
+
+        $informations = $display_flags;
+        unset($informations['subject']);
+        unset($informations['route_detail']);
+        foreach ($builtin_items as $item_id => $item) {
+            if (1 != $item['use']) {
+                unset($informations[$item_id]);
+            }
+        }
+        foreach ($extended_items as $item_id => $item) {
+            if (1 == $item['use']) {
+                $informations[$item['id']] = $informations[$item_id];
+                unset($informations[$item_id]);
+            } else {
+                unset($informations[$item_id]);
+            }
+        }
+
+        // ログ出力のプロパティをアルファベット順で表示するようにする。
+        ksort($informations);
+
+        $inspection->record($section, $message, $params, $informations);
+    }
+
+    cb_redirect('address/personal/item_display');
+}
+
+

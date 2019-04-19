@@ -1,0 +1,261 @@
+<?php
+
+namespace grn\kunai\screen;
+
+use grn\kunai\data\bean\KunaiAvailabilityDynamicRole;
+use grn\kunai\data\bean\KunaiAvailabilityGroup;
+use grn\kunai\data\bean\KunaiAvailabilityStaticRole;
+use grn\kunai\data\bean\KunaiAvailabilityUser;
+use grn\kunai\data\bean\log\KunaiAvailabilityImportLog;
+use grn\kunai\service\KunaiService;
+use grn\kunai\exception\KunaiException;
+use grn\kunai\exception\KunaiErrorCode;
+
+class SystemAvailabilityUserImport2 extends KunaiScreenBase
+{
+    const SESSION_KEY = 'kunai/system/availability_user_import1';
+
+    const PATH_INFO = 'kunai/system/availability_user_import2';
+
+    const IMPORT_FILES_KEY = 'import_files';
+
+    const KUNAI_CSV_SETTING_ITEM = 0;
+    const KUNAI_CSV_SETTING_TARGET = 1;
+
+    const SAMPLE_LINE_NUM = 5;
+
+    /**
+     * @var KunaiAvailabilityImportLog
+     */
+    private $_availability_import_log;
+    static private $_index = 1;
+
+    public function __construct($input)
+    {
+        parent::__construct($input);
+
+        require_once('grn/smarty.csp');
+        $this->setSmarty(new \GRN_Smarty());
+    }
+
+    public function fetch()
+    {
+        $input = $this->getInput();
+
+        require_once('grn/error_code.csp');
+        $fileId = $this->getArrayValue('file_id', $input);
+        if (0 == strlen($fileId)) {
+            cb_throw_error(E_GRN_CSV_FILE_NOT_FOUND);
+        }
+
+        $session = $this->getSession(self::SESSION_KEY);
+        $files = $session->getFiles(self::IMPORT_FILES_KEY);
+
+        if ( ! is_array($files) || ! array_key_exists($fileId, $files)
+             || ! $files[$fileId]->exists()
+        ) {
+            cb_throw_error(E_GRN_CSV_FILE_NOT_FOUND);
+        }
+
+        require_once('fw/csv.csp');
+        $csv = new \CB_CSVReader($this->getCharset(),
+            $files[$fileId]->getPath());
+
+        $lines = [];
+        for ($readLines = 0; $readLines < self::SAMPLE_LINE_NUM; $readLines++) {
+            if (($line = $csv->readLine()) == false) {
+                break;
+            }
+
+            if ($readLines == 0 && $this->isSkip()) {
+                continue;
+            }
+
+            $lines[] = $line;
+        }
+
+        $smarty = $this->getSmarty();
+        $smarty->assign('charset', $this->getCharset());
+        $smarty->assign('skip', $this->isSkip());
+        $smarty->assign('file_id', $fileId);
+        $smarty->assign('csv_datas', $lines);
+        $smarty->assign('available_apps',
+            KunaiService::getActiveControlledApps());
+        $smarty->assign('page_title', $this->getTitle());
+        $smarty->assign('site_position', $this->getSitePosition());
+
+        return $smarty->fetch(self::PATH_INFO . '.tpl');
+    }
+
+    public function getSitePosition()
+    {
+        $page_infos = ['availability_user_import2' => null];
+
+        return $this->makeSitePosition(self::PATH_SYSTEM, $page_infos);
+    }
+
+    public function post($input)
+    {
+        $this->setInput($input);
+        require_once('grn/error_code.csp');
+        $fileId = $this->getArrayValue('file_id', $input);
+        if (0 == strlen($fileId)) {
+            cb_throw_error(E_GRN_CSV_FILE_NOT_FOUND);
+        }
+
+        $session = $this->getSession(self::SESSION_KEY);
+        $files = $session->getFiles(self::IMPORT_FILES_KEY);
+
+        if ( ! is_array($files) || ! array_key_exists($fileId, $files)
+             || ! $files[$fileId]->exists()
+        ) {
+            cb_throw_error(E_GRN_CSV_FILE_NOT_FOUND);
+        }
+
+        $kunaiService = new KunaiService;
+        $kunaiService->deleteAllAvailability();
+
+        require_once('fw/csv.csp');
+        $csv = new \CB_CSVReader($this->getCharset(),
+            $files[$fileId]->getPath());
+
+        // 先頭行をスキップ
+        if ($this->isSkip()) {
+            $csv->readLine();
+        }
+
+        $this->_availability_import_log = new KunaiAvailabilityImportLog();
+        while (($line = $csv->readLine()) !== false) {
+            $this->processEachLine($line);
+        }
+        $csv->close();
+
+        foreach (array_keys($files) as $id) {
+            $session->unsetFile(self::IMPORT_FILES_KEY, $id);
+        }
+
+        //Log
+        $kunaiService->getKunaiLogLogic()
+                     ->notice($this->_availability_import_log);
+
+        return ['system/application_list', ['app_id' => 'kunai']];
+    }
+
+    private function processEachLine($line)
+    {
+        $AppValue = [];
+        $availableApps = KunaiService::getActiveControlledApps();
+        $availableAppsNum = count($availableApps);
+        $importAppsNum = count($line) - 2;
+        if ($availableAppsNum == $importAppsNum) {
+            foreach ($availableApps as $key => $value) {
+                $flag = $line[$key + 2] ? cb_trim($line[$key + 2]) : null;
+                if ($flag == null || intval($flag) == 1) {
+                    $AppValue[$value] = $flag ? true : false;
+                } else {
+                    throw new KunaiException(KunaiErrorCode::GRN_KUNAI_CSV_FILE_INVALID);
+                }
+            }
+        } else {
+            throw new KunaiException(KunaiErrorCode::GRN_KUNAI_CSV_INVALID_FORMAT);
+        }
+
+        //Data setting
+        $item = cb_trim($line[self::KUNAI_CSV_SETTING_ITEM]);
+        $target = cb_trim($line[self::KUNAI_CSV_SETTING_TARGET]);
+        $object = $this->setAvailabilityTarget($item, $target);
+        $object->setAppStatus($AppValue);
+
+        $kunaiService = new KunaiService;
+        $result = $kunaiService->addOrModifyAvailability($item, $object);
+
+        //log
+        if ($result) {
+            $this->_availability_import_log->setItem(self::$_index, $item);
+            $this->_availability_import_log->setForeignKey(self::$_index,
+                $target);
+            $this->_availability_import_log->setAvailability(self::$_index,
+                $object);
+            self::$_index++;
+        }
+    }
+
+    /**
+     * Set availability target
+     *
+     * @param  string $availability_type 'dynamic_role', 'group', 'static_role', 'user'
+     * @param  string $availability_target
+     *
+     * @return object    KunaiAvailabilityDynamicRole
+     *                   KunaiAvailabilityGroup
+     *                   KunaiAvailabilityStaticRole
+     *                   KunaiAvailabilityUser
+     */
+    public function setAvailabilityTarget(
+        $availability_type,
+        $availability_target
+    ) {
+        if ($availability_type === KunaiService::DYNAMIC_ROLE) {
+            $object = new KunaiAvailabilityDynamicRole();
+
+            require_once('grn/uum_util.csp');
+            $uum_util = \GRN_UumUtil::getInstance();
+            $dynamic_roles = $uum_util->listDynamicRoles();
+            if ( ! array_key_exists($availability_target, $dynamic_roles)) {
+                $e = new KunaiException();
+                $e->setErrorCode(KunaiErrorCode::GRN_KUNAI_CSV_INVALID_AVAILABILITY_TARGET);
+                $e->setCause(['item' => $availability_target]);
+                throw $e;
+            }
+            $object->setDynamicRole($availability_target);
+        } else {
+            global $G_container_base;
+            $uum =& $G_container_base->getInstance('uum');
+
+            if ($availability_type == KunaiService::USER) {
+                $object = new KunaiAvailabilityUser();
+                $target =& $uum->getUserByForeignKey($availability_target);
+                if ($target) {
+                    $object->setUserId($target->getOID());
+                }
+            } elseif ($availability_type == KunaiService::GROUP) {
+                $object = new KunaiAvailabilityGroup();
+                $target =& $uum->getGroupByForeignKey($availability_target);
+                if ($target) {
+                    $object->setGroupId($target->getOID());
+                }
+            } elseif ($availability_type == KunaiService::STATIC_ROLE) {
+                $object = new KunaiAvailabilityStaticRole();
+                $target
+                    =& $uum->getStaticRoleByForeignKey($availability_target);
+                if ($target) {
+                    $object->setStaticRoleId($target->getOID());
+                }
+            } else {
+                $e = new KunaiException();
+                $e->setErrorCode(KunaiErrorCode::GRN_KUNAI_CSV_INVALID_AVAILABILITY_TYPE);
+                $e->setCause(['item' => $availability_type]);
+                throw $e;
+            }
+
+            if ( ! $target) {
+                $e = new KunaiException();
+                $e->setErrorCode(KunaiErrorCode::GRN_KUNAI_CSV_INVALID_AVAILABILITY_TARGET);
+                $e->setCause(['item' => $availability_target]);
+                throw $e;
+            }
+        }
+
+        return $object;
+    }
+
+    public function needHeader()
+    {
+        return false;
+    }
+
+    public function needFooter()
+    {
+        return false;
+    }
+}

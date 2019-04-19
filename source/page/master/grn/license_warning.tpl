@@ -1,0 +1,1 @@
+<div style="color: red; font-weight: bold;">{cb_msg module='grn.grn' key='GRN_GRN-440' replace='true'}{cb_msg module='grn.grn' key='GRN_GRN-441' replace='true'}{cb_msg module='grn.grn' key='GRN_GRN-442' replace='true'}{cb_msg module='grn.grn' key='GRN_GRN-443' replace='true'}</div>

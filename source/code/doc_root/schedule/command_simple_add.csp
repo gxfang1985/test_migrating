@@ -1,0 +1,223 @@
+<?php
+
+use grn\schedule\AttendanceStatusLogic;
+use grn\schedule\FacilityApprovalLogic;
+use grn\schedule\ScheduleMemberLogic;
+
+if (strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST') == 0) {
+    global $G_state_set;
+    $G_state_set->set('copyright_should_be_written', false);
+    $G_state_set->set('html_should_be_closed', false);
+    $G_state_set->set("error_page_type", "json");
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+
+    $private = cb_at($G_INPUT, "private");
+    if ($private == GRN_PRIVATE_SETTING_MANAGED) {
+        $notify_address_candidate = ScheduleMemberLogic::getInstance()
+                                                       ->getDefaultPublicByUserId($login->getOID(),
+                                                           ScheduleMemberLogic::PLUG_IN_TYPE_VIEW,
+                                                           true, true);
+        if (count($notify_address_candidate) > 0) {
+            $G_INPUT["p_sUID"] = array_keys($notify_address_candidate);
+        }
+    }
+
+    //update history
+    require_once('grn/uum_util.csp');
+    $uum_util = GRN_UumUtil::getInstance();
+    if (array_key_exists('sUID', $G_INPUT)) {
+        $input_values = $G_INPUT['sUID'];
+        if (is_array($input_values) && count($input_values) > 0) {
+            if (mb_substr($input_values[0], 0, 1) != 'g') {
+                $uum_util->selectUsers($login, $input_values);
+            } else {
+                $group_id = mb_substr($input_values[0], 1);
+                $group_ids = [$group_id];
+                $uum_util->selectGroups($login, $group_ids);
+            }
+        }
+    }
+
+    //create event
+    require_once('schedule/application.csp');
+    $app = GRN_Schedule_Application::getInstance();
+    require_once('schedule/view_util.csp');
+    $util = GRN_Schedule_View_Util::getInstance();
+    require_once('schedule/facility_system_logic.csp');
+    $facility_logic = GRN_Facility_SystemLogic::getInstance();
+    $event = $util->createSimpleEvent($G_INPUT);
+
+    // GTM-1676
+    if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+        $event->setUsingPurpose(cb_at($G_INPUT, 'using_purpose'));
+    }
+    // end GTM-1676
+
+    // GTM-1622
+    // In case of OFF Attendance check function
+    $attendanceStatusLogic = new AttendanceStatusLogic();
+    if ( ! $attendanceStatusLogic->isEnableAttendanceCheck()) {
+        $event->attendanceCheck = null;
+    }
+
+    //update the facility was most recently selected
+    require_once('schedule/facility_system_logic.csp');
+    $f_his = GRN_Facility_HistoryManager::getInstance();
+    $f_his->updateHistory($login, $event);
+
+    //check access right
+    require_once('schedule/access_logic.csp');
+    $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+    $dynamic_role = $uum->listGrantedRoles();
+    $access = $acc_logic->getEventAccess($login, $event, ['read', 'add'],
+        $dynamic_role, false);
+    if ($access['add'] == GRN_SCHD_ACCESS_DENY) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_ENTRY);
+    }
+
+    //check data
+    $app->checkEventData($event);
+
+    // 公開先のチェック
+    ScheduleMemberLogic::getInstance()->checkAddPublicToUser($event);
+
+    if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+        if (is_a($event->setdatetime, 'CB_DateTime')
+            && is_a($event->enddatetime, 'CB_Date')
+        ) {
+            $event->enddatetime = null;
+        }
+    }
+
+    //
+    require_once('schedule/facility_privilege.csp');
+    $facility_privilege = GRN_Facility_Privilege_Logic::getInstance();
+    require_once('schedule/netmeeting_event_logic.csp');
+    $vcb_event_logic = GRN_Netmeeting_EventLogic::getInstance();
+    if ( ! $facility_privilege->hasPrivilegeOfFacilities($login,
+        $event->facilities, 'AND')
+    ) {
+        //
+        if (is_array($event->facilities) && count($event->facilities) > 0) {
+            if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+                $facility_logic->checkFacilityMaxTime($event->facilities,
+                    $event->enddatetime, $event->setdatetime);
+                $facility_logic->checkFacilityLimit($event->facilities,
+                    $event->enddatetime);
+
+                $vcb_input_data = null;
+                if ($vcb_event_logic->isNetmeetingAvailable($event)) {
+                    if (($vcb_input_data
+                        = $vcb_event_logic->getNetmeetingEventParam($event,
+                        $login))
+                    ) {
+                        $vcb_event_logic->getNetmeetingInputParam($G_INPUT,
+                            $vcb_input_data);
+
+                        if ($vcb_event_logic->checkNetmeetingInput($vcb_input_data)
+                            === false
+                        ) {
+                            $vcb_event_logic->throwError();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    //register event
+    $event->creator = $login;
+    $eid = $app->entryEvent($event);
+
+    //Send request to reserve a V-CUBE meeting
+    if (isset($vcb_input_data)
+        && is_a($vcb_input_data, 'GRN_Schedule_Netmeeting_InputData')
+    ) {
+        $vcb_event_logic->cmmandNetmeetingReservationAdd($event->id,
+            $vcb_input_data);
+    }
+
+    //if there is a facility to register a customization item
+    if (is_array($event->facilities) && count($event->facilities) > 0) {
+        $facility_logic->registerData($eid);
+        // GTM-1676
+        if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+            $facilityApprovalLogic = new FacilityApprovalLogic();
+            $facilityIds
+                = $facilityApprovalLogic->objectArrayToIdArray($event->facilities);
+            $facilityApprovalLogic->setFacilitiesApplyingInfo($event,
+                $facilityIds);
+        }
+        // end GTM-1676
+    }
+
+    //compare event date with today for notify
+    $tsex = new CB_TimeStampEx();
+    $today = $tsex->getDate();
+
+    $bdate = &$event->getFirstDate($today);
+
+    $b_notify = true;
+    if ($today->compare($bdate) > 0) {
+        $b_notify = false;
+    }
+
+    //notify
+    if ($b_notify) {
+        if ($event->users && count($event->users) > 0) {
+            $title = _schedule_command_add_getNotifyTitle($event);
+            $app->setNotify($event->users, $login, $event, $bdate, $title, '',
+                GRN_SCHEDULE_NOTIFY_ENTRY, $tsex);
+            $app->forwardMail($event,
+                [GRN_SCHEDULE_NOTIFY_ENTRY => $event->users], $login);
+            $app->sendPushNotification(
+                $event, [GRN_SCHEDULE_NOTIFY_ENTRY => $event->users], $login,
+                true, $bdate, null);
+        }
+
+        // GTM-1676
+        if (is_array($event->facilities) && count($event->facilities) > 0) {
+            $app->sendFacilityApprovalRequestNotify($event->facilities, $event,
+                $login, $tsex);
+            $app->forwardFacilityRelyMail($event, $login);
+            $app->sendPushNotificationOfFacilityRequest($event, [], $login);
+        }
+        // end GTM-1676
+
+        if ($event->private && is_array($event->notify_address)
+            && count($event->notify_address) > 0
+        ) {
+            $title = _schedule_command_add_getNotifyTitle($event);
+            $app->sendNotificationsToPublic($login, $event, $bdate, '', $tsex,
+                $title, false, true, GRN_SCHEDULE_NOTIFY_ENTRY);
+        }
+    }
+
+    echo "{\"event_id\":\"" . $eid . "\"}";
+}
+
+/**
+ *
+ * Get the title of the notification.
+ *
+ * @param GRN_Schedule_EventBase $event
+ */
+function _schedule_command_add_getNotifyTitle(GRN_Schedule_EventBase $event)
+{
+    require_once('schedule/view_util.csp');
+    $util = GRN_Schedule_View_Util::getInstance();
+
+    $tsex = new CB_TimeStampEx();
+    $today = $tsex->getDate();
+    $bdate = &$event->getFirstDate($today);
+
+    $title = '';
+    if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+        $title = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+    }
+
+    return $title;
+}

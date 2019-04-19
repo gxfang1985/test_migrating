@@ -1,0 +1,1 @@
+{grn_load_css file="grn/html/portal.css"}

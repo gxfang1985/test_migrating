@@ -1,0 +1,253 @@
+<?php
+
+require_once('fw/persistent.csp');
+require_once('fw/database.csp');
+
+class GRN_TableInfo extends CB_TableInfo
+{
+    /**
+     * @param string $class_name
+     */
+    function _setClassName($class_name)
+    {
+        $this->_class_name = $class_name;
+    }
+
+    function setForeignkeySuffix($suffix, $keywords)
+    {
+        if (is_null($suffix) || strlen($suffix) < 1 || ! is_array($keywords)
+            || count($keywords) < 1
+        ) {
+            return;
+        }
+
+        foreach ($this->_column_info as $key => $column) {
+            if (($column['type'] === 'relation')
+                || ($column['type'] === 'weak_relation')
+            ) {
+                if ( ! array_key_exists('to', $column)) {
+                    continue;
+                }
+                $to = strtolower($column['to']);
+                if (in_array($to, $keywords)) {
+                    $this->_column_info[$key]['suffix']
+                        = CB_PERSISTENT_NAMESEPARATOR . $suffix;
+                }
+            }
+        }
+    }
+
+    function deleteMatchedRows($column, $uid)
+    {
+        $db = $this->getDBConnection();
+        $table_name = CB_DATABASE_TABLE_PREFIX . $this->getTableName();
+        $column_name = CB_DATABASE_COLUMN_PREFIX . $column;
+
+        $uid = cb_queryf($db, "'@S'", $uid);
+        $query = "DELETE FROM $table_name WHERE $column_name = $uid";
+
+        $db->query($query);
+    }
+
+    function setNullMatchedColumns($column, $uid)
+    {
+        $db = $this->getDBConnection();
+        $table_name = CB_DATABASE_TABLE_PREFIX . $this->getTableName();
+        $column_name = CB_DATABASE_COLUMN_PREFIX . $column;
+
+        $uid = cb_queryf($db, "'@S'", $uid);
+        $query
+            = "UPDATE $table_name SET $column_name = NULL WHERE $column_name = $uid";
+
+        $db->query($query);
+    }
+}
+
+class GRN_TableManager extends CB_TableManager
+{
+    /**
+     * @param $table_name
+     *
+     * @return GRN_TableInfo
+     */
+    protected function _createTableInfo($table_name)
+    {
+        return new GRN_TableInfo($this, $table_name, $this->_cache_limit);
+    }
+
+    /**
+     * @param CB_TableInfo $table_info
+     * @param bool         $ifnotexists
+     *
+     * @return bool
+     */
+    function _createTable($table_info, $ifnotexists)
+    {
+        $ret = true;
+        $db = $this->_dbconn;
+        $columns = $table_info->getColumnInfo();
+        $indices = $table_info->getIndexInfo();
+        global $G_container_base;
+        $master_db = $G_container_base->getInstance('dbconn');
+        $table_name = $master_db->escape($table_info->getTableName());
+        $table_original_name
+            = $master_db->escape($table_info->_table_original_name);
+        $class_name = $table_info->getClassName();
+        $readonly = $table_info->_isReadOnly();
+        if ( ! is_null($class_name)) {
+            $class_name = $master_db->escape($class_name);
+        }
+        $query
+            = sprintf("CREATE TABLE %s %s${table_name} (%s %s NOT NULL AUTO_INCREMENT PRIMARY KEY",
+            ($ifnotexists ? 'IF NOT EXISTS' : ''),
+            CB_DATABASE_TABLE_PREFIX,
+            CB_DATABASE_OID_NAME,
+            CB_DATABASE_OID_TYPE);
+        foreach ($columns as $col_name => $col_info) {
+            $query .= ', ';
+            $col_name = $master_db->escape($col_name);
+            $query .= $this->_generateColumnSQL($table_name, $col_name,
+                $col_info);
+        }
+        foreach ($indices as $idx_name => $idx_info) {
+            $query .= ', ';
+            $idx_name = $master_db->escape($idx_name);
+            $query .= $this->_generateIndexSQL($idx_name, $idx_info);
+        }
+        $query .= ') ENGINE=InnoDB;';
+        $db->query($query);
+
+        //サフィックスがない場合のみスキーマ情報を作成
+        if ( ! $table_info->_suffix) {
+            if ( ! ($ifnotexists && $this->tableExists($table_name))) {
+                $cquery
+                    = sprintf("INSERT INTO %s (col_name, col_class, col_readonly, col_columns, col_indices) VALUES ('${table_original_name}', %s, %d, '%s', '%s');",
+                    CB_DATABASE_METATABLE,
+                    (is_null($class_name) ? 'NULL' : "'${class_name}'"),
+                    ($readonly ? 1 : 0),
+                    $master_db->escape($this->_encodeColumnInfo($columns)),
+                    $master_db->escape($this->_encodeIndexInfo($indices)));
+                $master_db->query($cquery);
+            }
+        }
+        $this->execAfterCreateTable($table_info);
+
+        return $ret;
+    }
+
+    private function execAfterCreateTable(GRN_TableInfo $table_info)
+    {
+        $class_methods = get_class_methods($table_info->getClassName());
+        if (is_array($class_methods)
+            && in_array("execAfterCreateTable", $class_methods)
+        ) {
+            $class_name = $table_info->getClassName();
+            $class_name::execAfterCreateTable($table_info);
+        }
+    }
+
+    /**
+     * @param CB_TableInfo $table_info
+     *
+     * @return bool
+     */
+    function _dropTable($table_info)
+    {
+        $db = $this->_dbconn;
+        global $G_container_base;
+        $master_db = $G_container_base->getInstance('dbconn');
+        $table_name = $master_db->escape($table_info->getTableName());
+        $table_original_name
+            = $master_db->escape($table_info->_table_original_name);
+        $query = sprintf("DROP TABLE IF EXISTS %s${table_name};",
+            CB_DATABASE_TABLE_PREFIX);
+        $db->query($query);
+
+        //サフィックスがない場合のみスキーマ情報およびキャッシュをクリア
+        if ( ! $table_info->_suffix) {
+            $cquery
+                = sprintf("DELETE FROM %s WHERE col_name='${table_original_name}';",
+                CB_DATABASE_METATABLE);
+            $master_db->query($cquery);
+        }
+
+        return true;
+    }
+
+    /**
+     * @param CB_TableInfo $table_info
+     *
+     * @return bool
+     */
+    function _alterTable($table_info)
+    {
+        //サフィックスがない場合のみ更新可能
+        if ( ! $table_info->_suffix) {
+            return parent::_alterTable($table_info);
+        }
+
+        return false;
+    }
+
+    /**
+     * @param string $table_name
+     *
+     * @return bool
+     */
+    function tableExists($table_name)
+    {
+        global $G_container_base;
+        $db = $this->_dbconn;
+        $table_name = $db->escape($table_name);
+        $query = sprintf("SHOW TABLES LIKE '%s${table_name}';",
+            CB_DATABASE_TABLE_PREFIX);
+        $result = $db->query($query);
+        $ret = false;
+        if ($db->num_rows($result) != 0) {
+            $ret = true;
+        }
+        $db->free_result($result);
+
+        return $ret;
+    }
+
+    /**
+     * This method exists for mobile api only.
+     * Mobile API returns the result of registration by the same transaction.
+     * However, when the persistent layer is used, Query has not been executed yet.
+     * It is necessary to execute registerNow() and updateNow() to execute it.
+     * However, it is difficult to execute it by all the codes.
+     * Therefore, the method that can be collectively executed is offered.
+     */
+    function registerNowAndUpdateNowAll()
+    {
+        foreach (array_keys($this->_tablemap) as $key) {
+            $table_info = $this->_tablemap[$key];
+            if ( ! $table_info->_commit()) {
+                $this->abort();
+
+                return false;
+            }
+        }
+
+        require_once('schedule/access_logic.csp');
+        $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+        $acc_logic->reset_cache(); // Reset cache data because we have made change to the database
+
+        return true;
+    }
+}
+
+class GRN_Class2TableParser extends CB_Class2TableParser
+{
+    /**
+     * @param string $class_name
+     * @param string $suffix
+     *
+     * @return array
+     */
+    function parse($class_name, $suffix = '')
+    {
+        return parent::parse($class_name, $suffix);
+    }
+}

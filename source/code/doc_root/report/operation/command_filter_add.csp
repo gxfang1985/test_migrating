@@ -1,0 +1,189 @@
+<?php
+require_once('report/filter_logic.csp');
+require_once('report/controller_util.csp');
+require_once('report/inspection.csp');
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    global $G_INPUT;
+
+    require_once('grn/multi_select_utility.csp');
+    $G_INPUT = grn_deploy_selected_users('selected_users_sUID', 'sUID',
+        $G_INPUT);
+
+    //頻度更新
+    require_once('grn/uum_util.csp');
+    $uum_util = GRN_UumUtil::getInstance();
+    $input_keys = array_keys($G_INPUT);
+    foreach ($input_keys as $input_key) {
+        if (preg_match('#^selected_users_.*$#', $input_key)) {
+            $input_value = $G_INPUT[$input_key];
+            $input_values = explode(':', $input_value[0]);
+            if ($input_value[0] && is_array($input_values)) {
+                $uum_util->selectUsers($G_report_login_user, $input_values);
+            }
+        }
+    }
+
+    //Instantiate Smarty Object
+    require_once("grn/smarty.csp");
+    $t = new GRN_Smarty;
+
+    //Validation Check
+    require_once('SmartyValidate.class.php');
+    SmartyValidate::connect($t);
+    $target_name = 'report/operation/filter_add';
+    SmartyValidate::register_form($target_name);
+
+    $util = GRN_Report_Filter_Controller_Utility::getInstance();
+
+    $input = [];
+
+    //Validate After POST
+    if (SmartyValidate::is_valid($G_INPUT, $target_name)
+        & $util->validate($input)
+    ) {
+        $logic = GRN_Report_Filter_Logic::getInstance();
+
+        $name = $G_INPUT['name'];
+        $cid = $G_INPUT['cid'];
+        $and_or = $G_INPUT['and_or'];
+        $formtype = @$G_INPUT['select_form'] ? @$G_INPUT['select_form_type']
+            : GRN_REPORT_FILTER_FORM_TYPE_ALL;
+        //Get Category and validate manage permission before submit
+        require_once('report/controller_util.csp');
+        $category_util = GRN_Report_Category_Controller_Utility::getInstance();
+        $category_util->checkManage($cid, true, CB_DATABASE_NO_LOCK);
+        $category_util->checkAccess($cid, true, CB_DATABASE_NO_LOCK);
+        $filter_id = $logic->createFilter($cid, $name, $name, $and_or,
+            $formtype);
+        if (array_key_exists('sUID', $G_INPUT)) {
+            $sUID = $G_INPUT['sUID'];
+            $logic->registerDisplayUsers($filter_id, $sUID);
+        }
+
+        //対象フォームを入力
+        if ($formtype == GRN_REPORT_FILTER_FORM_TYPE_NAME) {
+            $logic->createFormCondition($filter_id,
+                @$G_INPUT['select_form_name_input']);
+        } elseif ($formtype == GRN_REPORT_FILTER_FORM_TYPE_SELECT) {
+            $logic->addFilterFormRelation($filter_id,
+                @$G_INPUT['selected_form_id']);
+        }
+
+        //監査する
+        $filter_inspection = GRN_Report_Filter_Inspection::getInstance();
+        if ($filter_inspection->isEnabled()) {
+            $inspection_and_or = $filter_inspection->setAndOr($and_or);
+
+            $message_type = 'filter_add';
+
+            $message_args['fid'] = $filter_id;
+            $message_args['name'] = $name;
+            $message_args['and_or'] = $inspection_and_or;
+
+            //Record Inspection
+            $filter_inspection->record($message_type, $message_args);
+        }
+
+        require_once('report/controller_util.csp');
+        $filter_util = GRN_Report_Filter_Controller_Utility::getInstance();
+
+        for ($i = 0; $i < count($G_INPUT['type']); $i++) {
+            $type = $G_INPUT['type'][$i];
+            $condition = $G_INPUT['condition'][$i];
+            $is_date = false;
+            $item_type = @$G_INPUT['item_type'][$i];
+            $item_id = @$G_INPUT['item_id'][$i];
+            $dt_index = @$G_INPUT['item_index'][$i]
+                ? $G_INPUT['item_index'][$i] : 0;
+            $value = $filter_util->getConditionValue($G_INPUT, $i, $type,
+                $item_type, $formtype, $dt_index);
+
+            if ($type == GRN_REPORT_FILTER_TYPE_CREATE_DATE
+                || ($formtype == GRN_REPORT_FILTER_FORM_TYPE_SELECT
+                    && strcmp($item_type, GRN_REPORT_CONDITION_ITEM_DATE) == 0)
+            ) {
+                $is_date = true;
+            }
+
+            //特定のフォームを選択し、かつ項目選択で項目を選択した場合のみ条件のタイプが ITEM_DETAIL になる。
+            if ($formtype == GRN_REPORT_FILTER_FORM_TYPE_SELECT
+                && $item_id > 0
+            ) {
+                $type = GRN_REPORT_FILTER_TYPE_ITEMDATA_DETAIL;
+            }
+
+            $condition_id = $logic->createCondition($filter_id, $condition,
+                $type, $value, $item_id, $item_type);
+
+            //条件の監査
+            $condition_inspection
+                = GRN_Report_FilterCondition_Inspection::getInstance();
+
+            if ($condition_inspection->isEnabled()) {
+                $message_type = [];
+                $message_type = 'filtercondition_add';
+                $message_args['fid'] = $filter_id;
+                $message_args['cid'] = $condition_id;
+                $message_args['type']
+                    = $condition_inspection->setFilterType($type);
+                $message_args['condition']
+                    = $condition_inspection->setCondition($condition,
+                    $is_date);
+
+                $column = $logic->getSaveColumn($type, $condition, $item_type);
+                if ($column == GRN_REPORT_COLUMN_NUMBER) {
+                    $message_args['number'] = $value;
+                    $message_args['text'] = null;
+                } else {
+                    $message_args['number'] = null;
+                    $message_args['text'] = $value;
+                }
+
+                $condition_inspection->record($message_type, $message_args);
+            }
+        }
+
+        $params = [];
+        $params['fid'] = $filter_id;
+        $params['cid'] = $cid;
+        cb_redirect('report/operation/filter_view', $params);
+    } else {
+        // 動的に追加したバリデーションを解除
+        SmartyValidate::unregister_form($target_name);
+        SmartyValidate::register_form($target_name);
+
+        //Include Sharing Code Get Category for view
+        $user_type = GRN_REPORT_ACCESS_TYPE_MANAGE;
+        include('_category.csp');
+
+        include('_filter_add.csp');
+
+        //Assign Post Parameters
+        $t->assign('inputs', $input);
+
+        //selected user
+        if (array_key_exists('sUID', $G_INPUT)) {
+            $userIds = $G_INPUT['sUID'];
+            global $G_container_base;
+            $uum =& $G_container_base->getInstance('uum');
+
+            $initialize_users_for_view = [];
+
+            foreach ($userIds as $user_id) {
+                $user_name = '';
+                $user =& $uum->getUser($user_id);
+                if ($user !== false) {
+                    $user_name = $user->get('display_name');
+                }
+                $initialize_users_for_view[$user_id] = $user_name;
+            }
+            $t->assign('selected_users', $initialize_users_for_view);
+        }
+
+        //Assign Template Name
+        $t->setPageInfo($target_name);
+
+        //Display Previous Page
+        $t->display($target_name . '.tpl');
+    }
+}

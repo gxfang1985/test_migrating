@@ -1,0 +1,1 @@
+{grn_report_include_item category_id=$category_id form_id=$form_id item=$item display="detail-system"}

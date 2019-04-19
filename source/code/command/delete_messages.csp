@@ -1,0 +1,251 @@
+<?php
+
+use grn\fts\message\IndexService;
+use grn\fts\Application as FtsApplication;
+
+
+cb_require_role('CommandLine');
+
+define('GRN_CLI_DELETE_MESSAGES_COMMIT_NUM', 1000);
+
+require_once('grn/cli.csp');
+
+$summary = "";
+
+$opts = cb_cli_start(
+// Mandatory command-line options
+    [],
+
+    // Optional command-line options
+    [
+        new CB_CLI_BEFORE_OPTION(),
+        new CB_CLI_EXEC_OPTION(),
+        new CB_CLI_MAX_COUNT_OPTION(),
+        new CB_CLI_MAX_DURATION_OPTION()
+    ]
+);
+
+require_once('grn/application.csp');
+require_once('message/application.csp');
+$app_locator = GRN_ApplicationLocator::instance();
+$dbconn = $app_locator->getConnection(GRN_MESSAGE_APPID);
+
+if (count($opts) == 0) {
+    $query = "SELECT COUNT(_id) FROM tab_grn_message_messages ";
+
+    $ret = $dbconn->query($query);
+
+    if ($ret === false) {
+        $dbconn->throwError(['query' => 'failed query: ' . $query]);
+    }
+
+    $row = $dbconn->fetch_row($ret);
+    $count = 0;
+    if ($row !== false) {
+        $count = $row[0];
+    }
+    $dbconn->free_result($ret);
+
+    $summary = "Hit $count record";
+    $summary .= ($count > 1) ? "s." : ".";
+}
+if (array_key_exists(CB_CLI_BEFORE_OPTION, $opts)) {
+    $before = cb_date_convert2timestamp($opts[CB_CLI_BEFORE_OPTION]);
+    if (array_key_exists(CB_CLI_EXEC_OPTION, $opts) === false) {
+        // count only
+
+        $query
+            = "SELECT COUNT(col_last_mtime) FROM tab_grn_message_messages WHERE col_last_mtime < $before;";
+
+        $ret = $dbconn->query($query);
+
+        if ($ret === false) {
+            $dbconn->throwError(['query' => 'failed query: ' . $query]);
+        }
+
+        $row = $dbconn->fetch_row($ret);
+        $count = 0;
+        if ($row !== false) {
+            $count = $row[0];
+        }
+        $dbconn->free_result($ret);
+
+        $summary = "Hit $count record";
+        $summary .= ($count > 1) ? "s." : ".";
+    } else {
+        // execute
+
+        $max_duration = array_key_exists(CB_CLI_MAX_DURATION_OPTION, $opts)
+            ? intval($opts[CB_CLI_MAX_DURATION_OPTION]) * 60 : null;
+
+        $query
+            = "SELECT _id, col_creator, col_creator_name, col_subject, col_data FROM tab_grn_message_messages WHERE col_last_mtime < $before ORDER BY col_last_mtime, _id DESC";
+
+        if (array_key_exists(CB_CLI_MAX_COUNT_OPTION, $opts) === true) {
+            $query .= " LIMIT 0, " . strval($opts[CB_CLI_MAX_COUNT_OPTION]);
+        }
+
+        $ret = $dbconn->query($query);
+
+        if ($ret === false) {
+            $dbconn->throwError(['query' => 'failed query: ' . $query]);
+        }
+
+        require_once('message/message_logic.csp');
+        require_once('message/file.csp');
+        require_once('message/notification.csp');
+        require_once('message/inspection.csp');
+        global $G_container_base;
+        /** @var GRN_Uum $uum */
+        $uum = $G_container_base->getInstance('uum');
+        $message_logic = new GRN_Message_Logic();
+        $fm = new GRN_Message_FileManager();
+        $notification = new GRN_Message_NotificationListener();
+        $logger = GRN_Message_Logger_25::getInstance();
+        $indexService = null;
+        if (FtsApplication::isAvailable()) {
+            $indexService = new IndexService();
+        }
+
+
+        global $_cb_cli_starting_timestamp;
+        $start_ts = cb_date_convert2timestamp($_cb_cli_starting_timestamp);
+
+        $count = 0;
+        $deleted_record_num = 0;
+        $commit_flag = true;
+
+        while (($row = $dbconn->fetch_assoc($ret)) !== false) {
+            if (is_null($max_duration) !== true
+                && (time() - $start_ts) > $max_duration
+            ) {
+                cb_cli_log("Stopped processing by passing the max_duration.");
+                break;
+            }
+
+            $commit_flag = false;
+
+            // recipient list
+            $addressee_list
+                = $message_logic->getAddresseesSkipUserCheck($row['_id'], true);
+            if ( ! is_array($addressee_list)) {
+                continue;
+            }
+
+            $addressee_uid_list = [];
+            $addressee_name_list = [];
+            foreach ($addressee_list as $addressee) {
+                $addressee_uid_list[] = $addressee['id'];
+                $addressee_name_list[] = $addressee['name'];
+            }
+
+            // attached file list
+            $file_list = $message_logic->getMessageFiles($row['_id']);
+            $file_name_list = [];
+            foreach ($file_list as $file) {
+                if (array_key_exists('name', $file)) {
+                    $file_name_list[] = $file['name'];
+                }
+            }
+
+            // creator name
+            if (is_null($row['col_creator'])) {
+                $creator_name = $row['col_creator_name'];
+            } else {
+                $creator = $uum->getUser($row['col_creator']);
+                if ( ! $creator) {
+                    $creator_name = $row['col_creator_name'];
+                } else {
+                    $creator_name = $creator->get('display_name');
+                }
+            }
+
+            // logging
+            $params = [
+                'mid'            => $row['_id'],
+                'creator_name'   => $creator_name,
+                'subject'        => $row['col_subject'],
+                'data'           => $row['col_data'],
+                'file_name_'     => $file_name_list,
+                'receiver_name_' => $addressee_name_list
+            ];
+
+            $logger->notice('delete', 'message', $params);
+
+            // delete attached files
+            $fm->deleteClosedFiles($row['_id']);
+            if ($indexService instanceof IndexService) {
+                $indexService->deleteMessageIndex($row['_id']);
+            }
+
+            // delete a message
+            $del_query
+                = sprintf("DELETE FROM tab_grn_message_messages WHERE _id=%s;",
+                $row['_id']);
+            $del_ret = $dbconn->query($del_query);
+            if ($del_ret === false) {
+                $dbconn->throwError(['query' => 'failed query: ' . $query]);
+            }
+
+            // delete notification data
+            foreach ($addressee_uid_list as $uid) {
+                $user_tmp = $uum->getUser($uid);
+                $notification->deleteNotification($user_tmp, $row['_id']);
+            }
+
+            cb_cli_log(sprintf("Deleted mid=%s.", $row['_id']));
+
+            // check commit num
+            $count++;
+            if ($count == GRN_CLI_DELETE_MESSAGES_COMMIT_NUM) {
+                $tm = CB_TransactionManager::getInstance();
+                $tm->commit();
+
+                $commit_flag = true;
+                cb_cli_log("Committed.");
+
+                $count = 0;
+            }
+
+            $deleted_record_num++;
+        }
+
+        _deleteFolderRelation($dbconn);
+
+        if ($commit_flag === false) {
+            $tm = CB_TransactionManager::getInstance();
+            $tm->commit();
+
+            cb_cli_log("Committed.");
+        }
+
+        $dbconn->free_result($ret);
+
+        $summary = "Deleted $deleted_record_num record";
+        $summary .= ($deleted_record_num > 1) ? "s." : ".";
+    }
+} else {
+    if (array_key_exists(CB_CLI_EXEC_OPTION, $opts)) {
+        cb_cli_log('Can not be processing because missing the before parameter.');
+        cb_cli_log('Please enter the before parameter.');
+        die();
+    }
+}
+cb_cli_end($summary);
+
+/**
+ * @param CB_DatabaseConnection $dbconn
+ */
+function _deleteFolderRelation(CB_DatabaseConnection $dbconn)
+{
+    for ($i = 0; $i < 50; ++$i) {
+        $dbconn->query(
+            'DELETE mf FROM tab_grn_message_foldermessagerelations___p' . $i
+            . ' mf ' .
+            'INNER JOIN tab_grn_message_addressees ma ' .
+            'ON ma.col_message=mf.col_message AND ma.col_addressee=mf.col_user '
+            .
+            'WHERE ma.col_dtime > 0 AND mf.col_snapshot_message IS NULL'
+        );
+    }
+}

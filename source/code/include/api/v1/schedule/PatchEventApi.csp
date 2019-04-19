@@ -1,0 +1,150 @@
+<?php
+declare(strict_types=1);
+
+namespace grn\api\v1\schedule;
+
+use grn\api\RestApi;
+use grn\api\ResponseEntity;
+use grn\api\http\response\Record;
+use grn\api\http\HttpStatus;
+use grn\api\validator\ArrayChecker;
+use grn\api\validator\BooleanChecker;
+use grn\api\validator\DatetimeRFC3339Checker;
+use grn\api\validator\NotNullChecker;
+use grn\api\validator\ApiValidator;
+use grn\api\validator\schedule\EventsCorrelationChecker;
+use grn\api\validator\StringLengthChecker;
+use grn\api\validator\TimeZoneChecker;
+use grn\api\validator\MultipleNotNullChecker;
+use grn\api\validator\schedule\ScheduleMemberChecker;
+use grn\api\validator\TypeFieldAndKeyExistsChecker;
+use grn\schedule\api\adapter\events\GetEventAdapter;
+use grn\schedule\api\model\DateTime;
+use grn\schedule\api\model\Event;
+use grn\schedule\api\model\Member;
+use grn\schedule\api\model\Facility;
+use grn\schedule\api\service\EventsService;
+use grn\schedule\rest_api\EventParamsBuilder;
+use grn\schedule\rest_api\PatchInputWithEventMerger;
+
+class PatchEventApi extends RestApi
+{
+    /**
+     * @param array $params
+     *
+     * @return ResponseEntity
+     * @throws \grn\api\exception\validation\ValidationFailedException
+     */
+    public function execute(array $params): ResponseEntity
+    {
+        $login = cb_get_login_user();
+        $event_id = $params['id'];
+
+        require_once('schedule/application.csp');
+        $app = \GRN_Schedule_Application::getInstance();
+        $event = $app->getEvent($login, $event_id);
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        if (is_a($event, 'GRN_Schedule_TemporaryEvent')) {
+            cb_throw_error(E_GRN_SCHD_CAN_NOT_DELETE_TEMPORARY_EVENT);
+        }
+
+        $get_event_adapter = new GetEventAdapter();
+        $event_params_array = $get_event_adapter->getResponse($event, $get_event_adapter->getFiles($event_id));
+
+        $validator = $this->createValidator($event);
+        $merged_input = PatchInputWithEventMerger::merge($this->getInput(), $event_params_array);
+        $validator->validate($merged_input);
+
+        $events_service = new EventsService();
+        $event_params_builder = new EventParamsBuilder($merged_input);
+        $event_params = $event_params_builder->buildPatch();
+        $events_service->patchEvent(cb_get_login_user(), $event, $event_params);
+        $events_service->saveNow();
+
+        $event_id = $params['id'];
+        $body = $events_service->getEvent($event_id);
+        $http_status = new HttpStatus(HttpStatus::OK);
+        $response_entity = new ResponseEntity(new Record($body), $http_status);
+
+        return $response_entity;
+    }
+
+    /**
+     * @param \GRN_Schedule_EventBase $event
+     *
+     * @return ApiValidator
+     */
+    private function createValidator(\GRN_Schedule_EventBase $event): ApiValidator
+    {
+        $is_banner_event = $event instanceof \GRN_Schedule_BannerEvent;
+
+        $validator = new ApiValidator();
+        if ( ! $event instanceof \GRN_Schedule_RepeatEvent) {
+            $validator->addParamValidator(Event::START, new NotNullChecker());
+            $validator->addParamValidator(Event::START, new DatetimeRFC3339Checker(DateTime::DATETIME));
+            $validator->addParamValidator(Event::START, new TimeZoneChecker(DateTime::TIMEZONE));
+
+            if ($is_banner_event) {
+                $validator->addParamValidator(Event::END, new NotNullChecker());
+            }
+            $validator->addParamValidator(Event::END, new DatetimeRFC3339Checker(DateTime::DATETIME));
+            if ( ! $is_banner_event) {
+                $validator->addParamValidator(Event::END, new TimeZoneChecker(DateTime::TIMEZONE));
+            }
+
+            $validator->addParamValidator(Event::START_ONLY, new BooleanChecker());
+            $validator->addParamValidator(Event::ALL_DAY, new BooleanChecker());
+            if ( ! $is_banner_event) {
+                $validator->addApplicationValidator(new EventsCorrelationChecker(EventsCorrelationChecker::CHECK_PATCH_PARAMS));
+            }
+        }
+
+        $validator->addParamValidator(Event::EVENT_MENU, new StringLengthChecker(0, 100));
+        $validator->addParamValidator(Event::SUBJECT, new StringLengthChecker(0, 100));
+        $validator->addParamValidator(Event::NOTES, new StringLengthChecker(0, 65535));
+        $validator->addParamValidator([
+            Event::ADDITIONAL_ITEM,
+            Event::ADDITIONAL_ITEM_NAME,
+            Event::ADDITIONAL_ITEM_VALUE
+        ], new StringLengthChecker(0, null));
+
+        if ( ! $is_banner_event) {
+            $validator->addParamValidator([Event::ATTENDEES, Event::FACILITIES], new MultipleNotNullChecker());
+        } else {
+            $validator->addParamValidator(Event::ATTENDEES, new NotNullChecker());
+        }
+
+        $validator->addParamValidator(Event::ATTENDEES,
+            new ScheduleMemberChecker(
+                [
+                    Member::MEMBER_TYPE_USER,
+                    Member::MEMBER_TYPE_ORGANIZATION
+                ],
+                cb_lwc_uum()->isForeignKeyPublic()
+            )
+        );
+
+        if ( ! $is_banner_event) {
+            $validator->addParamValidator(Event::FACILITIES,
+                new TypeFieldAndKeyExistsChecker([], [Facility::ID, Facility::CODE]));
+            $validator->addParamValidator(Event::FACILITY_USING_PURPOSE, new StringLengthChecker(0, 65535));
+        }
+
+        $validator->addParamValidator(Event::ADDITIONAL_ITEM, new ArrayChecker());
+        $validator->addParamValidator([Event::ADDITIONAL_ITEM, Event::ADDITIONAL_ITEM_NAME], new ArrayChecker());
+
+
+        $validator->addParamValidator(
+            [
+                Event::ADDITIONAL_ITEM,
+                Event::ADDITIONAL_ITEM_NAME,
+                Event::ADDITIONAL_ITEM_VALUE
+            ],
+            new StringLengthChecker(0, null));
+
+        return $validator;
+    }
+
+}

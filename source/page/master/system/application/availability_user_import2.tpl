@@ -1,0 +1,3 @@
+{include file='system/application/_availability_user_csv_columns.tpl'}
+{capture assign='cancel_button'}{grn_button_cancel page='system/common_list' id='application'}{/capture}
+{include file='grn/std_import2.tpl' config_id='system' app_id='application' prev_page='system/application/availability_user_import1' post_page='system/application/command_availability_user_import2' column_explanation=$smarty.capture.explanation}

@@ -1,0 +1,321 @@
+<?php
+if (isset($cbpapi_service)) {
+    // get parameters of SOAP message
+    $node_parameters = $cbpapi_service->getRequestParameters();
+
+    $node_parameters_attribute = [];
+    if (array_key_exists('attributes', $node_parameters)) {
+        $node_parameters_attribute = $node_parameters['attributes'];
+    }
+
+    $required_fields = ['search_time', 'search_condition'];
+    foreach ($required_fields as $field) {
+        if ( ! array_key_exists($field, $node_parameters_attribute)) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => $field]);
+        }
+    }
+
+    $parameter = [
+        'search_time'      => $node_parameters_attribute['search_time'],
+        'search_condition' => $node_parameters_attribute['search_condition']
+    ];
+
+    $node_candidates = $cbpapi_service->selectNodes($node_parameters,
+        'candidate');
+    if ( ! $node_candidates) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'candidate']);
+    }
+    $candidates = [];
+
+    foreach (array_keys($node_candidates) as $key) {
+        $attr_candidate = $node_candidates[$key]['attributes'];
+        $required = ['start', 'end'];
+        foreach ($required as $field) {
+            if ( ! array_key_exists($field, $attr_candidate)) {
+                require_once('cbpapi/error_code.csp');
+                cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                    ['param' => $field]);
+            }
+        }
+        require_once('cbpapi/schedule_logic.csp');
+        $start_date = grn_cbpapi_parse_iso8601($attr_candidate['start']);
+        $start_date_to_local = schedule_parse_datetime($start_date);
+        $end_date = grn_cbpapi_parse_iso8601($attr_candidate['end']);
+        $end_date_to_local = schedule_parse_datetime($end_date);
+        $candidate = [
+            'setdatetime' => $start_date_to_local,
+            'enddatetime' => $end_date_to_local
+        ];
+        $candidates[] = $candidate;
+    }
+    $members = $cbpapi_service->selectNodes($node_parameters, 'member');
+    if ( ! $members) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'member']);
+    }
+    $users = [];
+    $facilities = [];
+    foreach ($members as $key => $member) {
+        $current_member = $member['children'][0];
+        $node_name = $current_member['node_name'];
+        if ( ! array_key_exists('id', $current_member['attributes'])) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => 'id']);
+        }
+        if ($node_name == 'user') {
+            $users[$current_member['attributes']['id']]
+                = $current_member['attributes']['id'];
+        } elseif ($node_name == 'organization') {
+            $users['g' . $current_member['attributes']['id']] = 'g'
+                                                                . $current_member['attributes']['id'];
+        } elseif ($node_name == 'facility') {
+            $facilities[$current_member['attributes']['id']]
+                = $current_member['attributes']['id'];
+        }
+    }
+
+    //begin process search free times
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+
+    $search_time = new CB_Time();
+    if ( ! $search_time->parse($parameter['search_time'])) {
+        cb_throw_error(E_COMMON_INVALID_TIME);
+    }
+    $search_time = new CB_TimeEx($search_time);
+
+    $sUID = $users;
+    $sITEM = $facilities;
+
+    // 検索対象が一つも選ばれていない
+    if (( ! is_array($sUID) || count($sUID) <= 0)
+        && ( ! is_array($sITEM)
+             || count($sITEM) <= 0)
+    ) {
+        cb_throw_error(E_GRN_SCHD_NOT_MEMBER);
+    }
+
+    require_once('schedule/application.csp');
+    $application = GRN_Schedule_Application::getInstance();
+
+    require_once('schedule/facility_system_logic.csp');
+    $facility_logic = GRN_Facility_SystemLogic::getInstance();
+
+    // メンバーIDのリストを生成
+    $members_count = 0;
+    $user_id_list = [];
+    $group_id_list = [];
+    $member_id_list_for_view = [];
+
+    foreach ($sUID as $uid) {
+        if (mb_substr($uid, 0, 1) == 'g') {
+            $gid = mb_substr($uid, 1);
+            $group_id_list[$gid] = $gid;
+        } else {
+            $user_id_list[$uid] = $uid;
+        }
+    }
+
+    $facility_id_list = [];
+    $facility_id_list_for_view = [];
+    foreach ($sITEM as $selected_fid) {
+        $facility_id_list[$selected_fid] = $selected_fid;
+    }
+
+    // アクセス権のチェック
+    require_once('schedule/access_logic.csp');
+    $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+    $dynamic_role = $uum->listGrantedRoles();
+
+    $add_permitted = true;
+
+    // ユーザーへのアクセス権をチェック
+    if (is_array($user_id_list) && count($user_id_list) > 0) {
+        $user_access_list = $acc_logic->getEvaluateAccessesListById($login,
+            $user_id_list, 'user', ['read', 'add'], $dynamic_role);
+        foreach ($user_access_list as $access) {
+            if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+                cb_throw_error(E_GRN_SCHD_ACCESSDENY_VIEW);
+            }
+            if ($access['add'] == GRN_SCHD_ACCESS_DENY) {
+                $add_permitted = false;
+            }
+        }
+
+        $users_info = $uum->getUsersInfo($user_id_list,
+            ['col_display_name', 'col_valid']);
+
+        $members_count += count($users_info);
+        // ユーザー情報が取得できなかったIDをメンバーから外す
+        foreach ($user_id_list as $key => $val) {
+            if (array_key_exists($val, $users_info)) {
+                $member_id_list_for_view[$key] = $val;
+            }
+        }
+
+        unset($user_id_list);
+    }
+
+    // グループへのアクセス権をチェック
+    if (is_array($group_id_list) && count($group_id_list) > 0) {
+        $group_access_list = $acc_logic->getEvaluateAccessesListById($login,
+            $group_id_list, 'group', ['read', 'add'], $dynamic_role);
+        foreach ($group_access_list as $access) {
+            if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+                cb_throw_error(E_GRN_SCHD_ACCESSDENY_VIEW);
+            }
+            if ($access['add'] == GRN_SCHD_ACCESS_DENY) {
+                $add_permitted = false;
+            }
+        }
+
+        // テンプレート側では組織はgXX形式でアクセス権配列にアクセスするので付与する
+        $group_access_list_for_view = [];
+        foreach ($group_access_list as $key => $group_access) {
+            $group_access_list_for_view['g' . $key] = $group_access;
+        }
+
+        $groups_info = $uum->getGroupInfoList($group_id_list);
+
+        $members_count += count($groups_info);
+        // 組織情報が取得できなかったIDをメンバーから外す
+        foreach ($group_id_list as $key => $val) {
+            if (array_key_exists($val, $groups_info)) {
+                $member_id_list_for_view['g' . $key] = 'g' . $val;
+            }
+        }
+
+        unset($group_id_list);
+    }
+
+    // AND検索の登録権限チェックに使うために定義
+    $facility_access_list = [];
+
+    // 施設へのアクセス権をチェック
+    if (is_array($facility_id_list) && count($facility_id_list) > 0) {
+        $target_facility_id_list = $facility_id_list;
+        $facility_access_list
+            = $acc_logic->getFacilityGroupAccessList($login,
+            $target_facility_id_list,
+            ['read', 'add'],
+            $dynamic_role);
+        $facility_access_list += $acc_logic->getEvaluateAccessesListById($login,
+            $target_facility_id_list,
+            'facility', ['read', 'add'], $dynamic_role);
+        foreach ($facility_access_list as $access) {
+            if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+                cb_throw_error(E_GRN_SCHD_ACCESSDENY_VIEW);
+            }
+        }
+
+        $facilities_info = $facility_logic->getFacilitiesInfo($facility_id_list,
+            CB_DATABASE_NO_LOCK);
+
+        // 組織情報が取得できなかったIDを施設から外す
+        foreach ($facility_id_list as $key => $val) {
+            if (array_key_exists($val, $facilities_info)) {
+                $facility_id_list_for_view[$key] = $val;
+            }
+        }
+    }
+
+    // ユーザー情報が取れないユーザー指定があった場合のために再度チェック
+    if (( ! is_array($member_id_list_for_view)
+          || count($member_id_list_for_view) <= 0)
+        && ( ! is_array($facility_id_list_for_view)
+             || count($facility_id_list_for_view) <= 0)
+    ) {
+        cb_throw_error(E_GRN_SCHD_NOT_MEMBER);
+    }
+
+    require_once('cbpapi/schedule_logic.csp');
+    $search_logic = GRN_Schedule_CBPAPI_FreeTimeSearchLogic::getInstance();
+
+    // 検索する空き時間の範囲
+    $term_hour = $search_time->hour;
+    $term_minute = $search_time->minute;
+    // 施設検索条件
+    $search_method = $parameter['search_condition'];
+    // 空き時間の検索
+    $search_result = $search_logic->searchFreeTimes($candidates, $term_hour,
+        $term_minute,
+        $member_id_list_for_view,
+        $facility_id_list_for_view,
+        $search_method);
+    require_once('cbpapi/util.csp');
+    $candidates_return = [];
+    foreach ($search_result as $facility_key => $candidate) {
+        $candidates_return[$facility_key] = [];
+        $list_start_datetime = [];
+        foreach ($candidate as $date_key => $date) {
+            $setdate = $date['date']->format();
+            $settime = $date['set_time']->format();
+            $set_date_time = new CB_DateTime();
+            $set_date_time->parse($setdate . ' ' . $settime);
+            $set_date_timeex = new CB_DateTimeEx($set_date_time);
+            $list_start_datetime[$date_key] = $set_date_timeex;
+        }
+
+        $moveday = false;
+        foreach ($candidate as $date_key => $date) {
+            require_once('schedule/utility.csp');
+
+            if ($date_key > 0) {
+                $current_date = $list_start_datetime[$date_key]->getDate();
+                $previous_date = $list_start_datetime[$date_key - 1]->getDate();
+                if ((cb_date_compare($current_date, $previous_date) == 0)
+                    && (cb_date_compare($list_start_datetime[$date_key],
+                            $list_start_datetime[$date_key - 1]) <= 0)
+                ) {
+                    $moveday = true;
+                } else {
+                    if (cb_date_compare($current_date, $previous_date) !== 0) {
+                        $moveday = false;
+                    }
+                }
+            }
+            if (cb_date_compare($date['set_time'], $date['end_time']) > 0) {
+                $nextday = new CB_DateEx($date['date']);
+                $nextday->moveDays(1);
+                $end_date = $nextday->format();
+            } else {
+                $end_date = $date['date']->format();
+            }
+            $start_date = $date['date']->format();
+            if ($moveday) {
+                $next_day = new CB_DateEx($date['date']);
+                $next_day->moveDays(1);
+                $start_date = $next_day->format();
+                $end_date = $next_day->format();
+            }
+            $set_time = $date['set_time']->format();
+            $set_date_time = new CB_DateTime();
+            $set_date_time->parse($start_date . ' ' . $set_time);
+            $candidates_return[$facility_key][$date_key]['start']
+                = grn_cbpapi_iso8601($set_date_time);
+
+            $end_time = $date['end_time']->format();
+            $end_date_time = new CB_DateTime();
+            $end_date_time->parse($end_date . ' ' . $end_time);
+            $candidates_return[$facility_key][$date_key]['end']
+                = grn_cbpapi_iso8601($end_date_time);
+        }
+    }
+    //begin process search free times
+    //response SOAP message
+    require_once("grn/smarty.csp");
+    $t = new GRN_Smarty;
+    $t->assign('candidates', $candidates_return);
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('schedule')]);
+    grn_cbpapi_response($t, __FILE__);
+}
+
+

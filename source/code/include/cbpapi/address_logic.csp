@@ -1,0 +1,373 @@
+<?php
+
+class GRN_CBPApi_Address_Logic
+{
+    /**
+     * @return GRN_CBPApi_Address_Logic
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_CBPApi_Address_Logic();
+        }
+
+        return $_instance;
+    }
+
+    var $_dbconn = null;
+
+    function _getDBConnection()
+    {
+        if (is_null($this->_dbconn)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->_dbconn = $app_locator->getConnection('address');
+        }
+
+        return $this->_dbconn;
+    }
+
+    function getCardsForViewByIds(& $book, $card_id_list)
+    {
+        if ( ! is_array($card_id_list) || count($card_id_list) <= 0) {
+            return [];
+        }
+        $cards_for_view = [];
+        require_once('cbpapi/util.csp');
+        foreach ($card_id_list as $key => $card_id) {
+            $data_for_view = [];
+            if ( ! ($data = $book->getData($card_id))) {
+                cb_throw_error(E_GRN_ADDRESS_CARD_NOT_FOUND);
+            }
+            $bid = $book->getOID();
+            require_once('address/view_util.csp');
+            $view_util = GRN_Address_ViewUtil::getInstance();
+            $data_for_view = $view_util->getData($data, $bid);
+            $data_for_view['book_id'] = $bid;
+            $data_for_view['cid'] = $card_id;
+
+            $creator =& $data_for_view['creator'];
+            unset($data_for_view['creator']);
+            if (is_object($creator) && is_a($creator, 'CB_User')) {
+                $data_for_view['creator'] = $creator->getOID();
+            }
+
+            $modifier =& $data_for_view['modifier'];
+            unset($data_for_view['modifier']);
+            if (is_object($modifier) && is_a($modifier, 'CB_User')) {
+                $data_for_view['modifier'] = $modifier->getOID();
+            }
+
+            $create_time = &$data_for_view['ctime'];
+            unset($data_for_view['ctime']);
+            if (is_object($create_time) && is_a($create_time, 'cb_timestamp')) {
+                $data_for_view['ctime'] = grn_cbpapi_iso8601($create_time);
+            }
+
+            $modify_time = &$data_for_view['mtime'];
+            unset($data_for_view['mtime']);
+            if (is_object($modify_time) && is_a($modify_time, 'CB_Timestamp')) {
+                $data_for_view['mtime'] = grn_cbpapi_iso8601($modify_time);
+                $data_for_view['version'] = $modify_time->unix_ts;
+            }
+            // 組み込み項目情報一覧を取得する
+            $builtin_items = $view_util->listBuiltinItems($book);
+            $data_for_view['builtin_items'] = $builtin_items;
+            // 拡張項目情報一覧を取得する
+            $extended_items = $view_util->listExtendedItems($book);
+            $data_for_view['extended_items'] = $extended_items;
+
+            $cards_for_view[$card_id] = $data_for_view;
+        }
+
+        return $cards_for_view;
+    }
+
+    function getCardsIdList(& $book)
+    {
+        $dbconn = &$this->_getDBConnection();
+        $book_type = $book->getDataType();
+        $table_name = strtolower('tab_grn_address_' . $book_type . 'data');
+        $add_condition = '';
+        $book_id = $book->getOID();
+        $add_condition .= ' WHERE col_book = ' . $book_id;
+
+        $query_format = 'SELECT _id, col_mtime FROM %s %s ORDER BY _id ';
+        $query = sprintf($query_format, $table_name, $add_condition);
+
+        $query = $dbconn->select_format($query, 0, -1, CB_DATABASE_NO_LOCK);
+        $result = $dbconn->query($query);
+        if ($result === false) {
+            $dbconn->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+        $cards = [];
+        while ($row = $dbconn->fetch_assoc($result)) {
+            $card = [];
+            $card['id'] = $row['_id'];
+            $card['version'] = $row['col_mtime'];
+            $cards[$row['_id']] = $card;
+        }
+
+        // 結果の開放
+        $dbconn->free_result($result);
+
+        return $cards;
+    }
+
+    function getInputParamerters($raw_params)
+    {
+        $param = [];
+        $card = array_key_exists('children', $raw_params)
+            ? $raw_params['children'] : null;
+        if (0 >= count($card)) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => 'card']);
+        }
+        $file_contents = [];
+        foreach (array_keys($card) as $card_key) {
+            $node = $card[$card_key]['node_name'];
+            if ($node == 'card') {
+                $required_fields = ['book_id', 'id', 'version'];
+                if (array_key_exists('attributes', $card[$card_key])) {
+                    $attributes = $card[$card_key]['attributes'];
+                    foreach ($required_fields as $field) {
+                        if ( ! array_key_exists($field, $attributes)) {
+                            require_once('cbpapi/error_code.csp');
+                            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                                ['param' => $field]);
+                        }
+                    }
+                    $param['bid'] = $attributes['book_id'];
+                    $param['cid'] = $attributes['id'];
+                    $param['version'] = $attributes['version'];
+                }
+
+                $elements_children = array_key_exists('children',
+                    $card[$card_key]) ? $card[$card_key]['children'] : [];
+                foreach (array_keys($elements_children) as $children_key) {
+                    $element = $elements_children[$children_key];
+                    $node_name = $element['node_name'];
+                    if ($node_name == 'creator' || $node_name == 'modifier') {
+                        continue;
+                    }
+                    $node_value = array_key_exists('text', $element)
+                        ? $element['text'] : null;
+                    if ($node_name == 'personal_name') {
+                        $personal_names = $element['children'];
+                        foreach (array_keys($personal_names) as $personal_key) {
+                            $personal_name = array_key_exists('text',
+                                $personal_names[$personal_key])
+                                ? $personal_names[$personal_key]['text'] : null;
+                            if ($personal_key > 0) {
+                                $param['given_name'] = $personal_name;
+                            } else {
+                                $param['family_name'] = $personal_name;
+                            }
+                        }
+                    } elseif ($node_name == 'personal_reading') {
+                        $personal_readings = $element['children'];
+                        foreach (
+                            array_keys($personal_readings) as $personal_key
+                        ) {
+                            $personal_reading = array_key_exists('text',
+                                $personal_readings[$personal_key])
+                                ? $personal_readings[$personal_key]['text']
+                                : null;
+                            if ($personal_key > 0) {
+                                $param['given_sort_key'] = $personal_reading;
+                            } else {
+                                $param['family_sort_key'] = $personal_reading;
+                            }
+                        }
+                    } elseif ($node_name == 'route') {
+                        $route = $element['children'];
+                        if (count($route) > 0) {
+                            foreach (array_keys($route) as $route_key) {
+                                $node = $route[$route_key]['node_name'];
+                                $route_value = array_key_exists('text',
+                                    $route[$route_key])
+                                    ? $route[$route_key]['text'] : null;
+                                if ($node == 'path') {
+                                    $param['route'] = $route_value;
+                                } elseif ($node == 'time') {
+                                    $param['route_time'] = $route_value;
+                                } elseif ($node == 'fare') {
+                                    $param['route_fare'] = $route_value;
+                                }
+                            }
+                        }
+                    } elseif ($node_name == 'section') {
+                        $param['section_name'] = $node_value;
+                    } elseif ($node_name == 'company_reading') {
+                        $param['company_sort_key'] = $node_value;
+                    } elseif ($node_name == 'company_tel') {
+                        $param['company_telephone_number'] = $node_value;
+                    } elseif ($node_name == 'company_fax') {
+                        $param['facsimile_number'] = $node_value;
+                    } elseif ($node_name == 'post') {
+                        $param['post_name'] = $node_value;
+                    } elseif ($node_name == 'personal_tel') {
+                        $param['personal_telephone_number'] = $node_value;
+                    } elseif ($node_name == 'email') {
+                        $param['email_address'] = $node_value;
+                    } elseif ($node_name == 'image') {
+                        $image_attrs = $element['attributes'];
+                        $size = array_key_exists('size', $image_attrs)
+                            ? $image_attrs['size'] : null;
+                        $mime_type = array_key_exists('mime_type',
+                            $image_attrs) ? $image_attrs['mime_type'] : null;
+                        if ( ! array_key_exists('file_id', $image_attrs)) {
+                            require_once('cbpapi/error_code.csp');
+                            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                                ['param' => 'file_id']);
+                        }
+                        if ( ! array_key_exists('name', $image_attrs)) {
+                            require_once('cbpapi/error_code.csp');
+                            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                                ['param' => 'name']);
+                        }
+                        $param['image'] = [
+                            'file_id'   => $image_attrs['file_id'],
+                            'name'      => $image_attrs['name'],
+                            'size'      => $size,
+                            'mime_type' => $mime_type
+                        ];
+                    } elseif ($node_name == 'custom') {
+                        $customs = array_key_exists('children', $element)
+                            ? $element['children'] : null;
+                        $files = [];
+                        $extensions = [];
+                        foreach (array_keys($customs) as $custom_key) {
+                            $custom_type = $customs[$custom_key]['node_name'];
+                            $attrs = $customs[$custom_key]['attributes'];
+                            //GRN2-534
+                            if ( ! array_key_exists('field_code', $attrs)) {
+                                require_once('address/error_code.csp');
+                                cb_throw_error(E_GRN_ADDRESS_INVALID_EXTENDED_ITEM_ID);
+                            }
+                            //GRN2-534
+                            $field_code = $attrs['field_code'];
+                            if ($custom_type == 'file') {
+                                $size = array_key_exists('size', $attrs)
+                                    ? $attrs['size'] : null;
+                                $mime_type = array_key_exists('mime_type',
+                                    $attrs) ? $attrs['mime_type'] : null;
+                                if ( ! array_key_exists('file_id', $attrs)) {
+                                    require_once('cbpapi/error_code.csp');
+                                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                        null, ['param' => 'file_id']);
+                                }
+                                if ( ! array_key_exists('name', $attrs)) {
+                                    require_once('cbpapi/error_code.csp');
+                                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                        null, ['param' => 'name']);
+                                }
+                                $files[$field_code] = [
+                                    'file_id'   => $attrs['file_id'],
+                                    'name'      => $attrs['name'],
+                                    'size'      => $size,
+                                    'mime_type' => $mime_type
+                                ];
+                            } else {
+                                $extension_value = array_key_exists('text',
+                                    $customs[$custom_key])
+                                    ? $customs[$custom_key]['text'] : null;
+                                $extensions[$field_code] = $extension_value;
+                            }
+                        }
+                        $param['files'] = $files;
+                        $param['extensions'] = $extensions;
+                    } else {
+                        $param[$node_name] = $node_value;
+                    }
+                }
+            }
+
+            if ($node == 'file') {
+                $file_attrs = $card[$card_key]['attributes'];
+                if ( ! array_key_exists('id', $file_attrs)) {
+                    require_once('cbpapi/error_code.csp');
+                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                        ['param' => 'id']);
+                }
+                $file_id = $file_attrs['id'];
+                $file_child = $card[$card_key]['children'][0];
+                $content_value = array_key_exists('text', $file_child)
+                    ? $file_child['text'] : null;
+                $content = $content_value;
+                $file_contents[$file_id] = $content;
+            }
+            $this->_getFilesContentInput($param, $file_contents);
+        }
+
+        return $param;
+    }
+
+    function getExtensionIdByCode($code, $table)
+    {
+        $db = &$this->_getDBConnection();
+        $query = cb_queryf($db,
+            "SELECT _id FROM @S WHERE col_id = '@S' ORDER BY _id DESC", $table,
+            $code);
+        $query = $db->select_format($query, 0, 1, CB_DATABASE_NO_LOCK);
+        $result = $db->query($query);
+        if ($result === false) {
+            $db->throwError(['query' => 'failed query on SELECT: ' . $query]);
+        }
+        $field_id = null;
+        while ($row = $db->fetch_assoc($result)) {
+            $field_id = $row['_id'];
+        }
+        $db->free_result($result);
+
+        return $field_id;
+    }
+
+    function _getFilesContentInput(&$param, $file_content)
+    {
+        $contents = [];
+        if (count($file_content) <= 0) {
+            return $param;
+        }
+        foreach ($param as $key => $file_info) {
+            if ((strcasecmp($key, 'image') == 0)
+                || (strcasecmp($key, 'files') == 0)
+            ) {
+                foreach (array_keys($file_content) as $file_id) {
+                    if (strcasecmp($key, 'image') == 0) {
+                        if ($file_info['file_id'] == $file_id) {
+                            $param[$key]['content'] = $file_content[$file_id];
+                        }
+                    } else {
+                        if (count($file_info) > 0) {
+
+                            foreach (array_keys($file_info) as $field_code) {
+                                if ($file_info[$field_code]['file_id']
+                                    == $file_id
+                                ) {
+                                    $param['files'][$field_code]['content']
+                                        = $file_content[$file_id];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return $param;
+    }
+
+    /**
+     *  commit
+     */
+    function saveNow()
+    {
+        $locator = GRN_ApplicationLocator::instance();
+        $manager =& $locator->getTableManager('address');
+        $manager->registerNowAndUpdateNowAll();
+    }
+}

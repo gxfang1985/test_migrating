@@ -1,0 +1,1 @@
+<div class="attention">{cb_msg module="grn.space" key="space_has_expired" replace="true"}</div>

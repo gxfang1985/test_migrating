@@ -1,0 +1,570 @@
+<?php
+/**
+ * Report Application Report Class
+ *
+ * @author  Shou Aoki 2009/09
+ * @version 1.0
+ * @package grn.report
+ */
+
+require_once('report/resources.csp');
+require_once('report/table_manager.csp');
+require_once('fw/string_util.csp');
+require_once('report/error_code.csp');
+
+/**
+ * Report Schedule Relation Logic Class
+ *
+ * @package grn.report
+ */
+class GRN_Report_Report_Schedule_Logic
+{
+    /** @var GRN_Report_Report_Schedule_Logic */
+    private static $_instance = null;
+
+    /** @var \grn\report\dao\ReportScheduleRelationDAO */
+    private $dao;
+
+    private function __construct()
+    {
+        $this->dao = new \grn\report\dao\ReportScheduleRelationDAO();
+    }
+
+    /**
+     * Get Instance
+     *
+     * @return GRN_Report_Report_Schedule_Logic
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * スケジュールと報告書の関連を追加
+     *
+     * @param         $reportId
+     * @param         $eventId
+     * @param CB_Date $date
+     * @param bool    $noneCreateCopy
+     *
+     * @return array
+     */
+    function addRelation(
+        $reportId,
+        $eventId,
+        $date = null,
+        $noneCreateCopy = false
+    ) {
+        //Check Argument
+        cb_trim_check($reportId, E_GRN_RPRT_REPORT_INVALID_ID);    //Report ID
+        cb_trim_check($eventId, E_GRN_RPRT_SCHEDULE_INVALID_ID);  //Schedule ID
+        if ( ! is_numeric($reportId)) {
+            cb_throw_error(E_GRN_RPRT_REPORT_INVALID_ID);
+        }
+        if ( ! is_numeric($eventId)) {
+            cb_throw_error(E_GRN_RPRT_SCHEDULE_INVALID_ID);
+        }
+
+        if ($date && ! is_a($date, 'CB_Date')) {
+            cb_throw_error(E_GRN_RPRT_SCHEDULE_INVALID_DATE);
+        }
+
+        require_once('grn/uum.csp');
+        global $G_container_base;
+        $grn_uum = $G_container_base->getInstance('uum');
+        $login_user = $grn_uum->getLoginUser();
+        $user_id = $login_user->getOID();
+
+        require_once('schedule/application.csp');
+        $app = GRN_Schedule_Application::getInstance();
+        $event = $app->getEvent($login_user, $eventId, $date,
+            CB_DATABASE_NO_LOCK, true, GRN_SCHEDULE_GET_MEMBER_ID);
+        if ( ! $event) {
+            cb_throw_error(E_GRN_RPRT_CANNOT_ACCESS_SCHEDULE);
+        }
+        require_once('report/controller_util.csp');
+        $sched_util
+            = GRN_Report_Report_Schedule_Controller_Utility::getInstance();
+        $sched_util->checkRelatable($user_id, $event, true, $reportId);
+
+        //レポートの作成者でないときはエラー
+        require_once('report/controller_util.csp');
+        $report_util = GRN_Report_Report_Controller_Utility::getInstance();
+        $report = $report_util->getSimpleView($reportId);
+        if ( ! isset($report['creator']) || $user_id != $report['creator']) {
+            cb_throw_error(E_GRN_RPRT_REPORT_INVALID_ID);
+        }
+
+        // 繰り返し予定と関連付ける場合、分離する。
+        require_once('schedule/eventfactory.csp');
+        require_once('schedule/resources.csp');
+        $factory = GRN_Schedule_EventFactory::getInstance();
+        $event_type = $factory->getEventType($eventId);
+        if (($event_type & GRN_SCHEDULE_EVENT_TYPE_REPEAT)
+            == GRN_SCHEDULE_EVENT_TYPE_REPEAT
+            && ! $noneCreateCopy
+        ) {
+            if (is_null($date)) {
+                cb_throw_error(E_GRN_SCHD_NOT_SPECIFIED_DATE);
+            }
+
+            //Get UUM Instance
+            global $G_container_base;
+            $grn_uum =& $G_container_base->getInstance('uum');
+
+            //Get Login User
+            $user =& $grn_uum->getLoginUser();
+
+            // 分離するためにイベントの取得
+            $event = $factory->getEvent($eventId, $date);
+            if ( ! $event) {
+                cb_throw_error(E_GRN_RPRT_CANNOT_ACCESS_SCHEDULE);
+            }
+
+            $old_eid = $eventId;
+            $event->setdate = $date;
+            $event->enddate = $date;
+            $event->modifier = $user;
+            require_once('schedule/repeat_event_logic.csp');
+            $logic = GRN_Schedule_RepeatEventLogic::getInstance();
+            $eventId = $logic->modifyEvent($event, $date,
+                GRN_REPEAT_MODIFY_THIS);
+        }
+
+        $database = GRN_Report_Table_Manager::getDataBase();
+        $tablename
+            = GRN_Report_Table_Manager::getTableName(GRN_REPORT_TABLE_REPORTSCHEDULERELATIONS);
+
+        $values = [];
+        $values['col_report'] = $reportId;
+        $values['col_schedule'] = $eventId;
+        if ($date) {
+            $values['col_date'] = "'" . $date->format() . "'";
+        }
+
+        $query = "INSERT INTO %s(%s) VALUES(%s)";
+        $query = sprintf($query, $tablename, implode(',', array_keys($values)),
+            implode(',', $values));
+
+        $result = $database->query($query);
+        if ($result === false) {
+            //Throw Query Error
+            $database->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        // update report modifier and modified time
+        require_once('report/report_logic.csp');
+        $report_logic = GRN_Report_Report_Logic::getInstance();
+        $property_list = [];
+        $report_logic->modify($reportId, $property_list);
+
+        return ['reportId' => $reportId, 'eventId' => $eventId];
+    }
+
+    /**
+     * @param $reportId
+     * @param $eventId
+     *
+     * @return bool
+     */
+    function removeRelation($reportId, $eventId)
+    {
+        //Check Argument
+        cb_trim_check($reportId, E_GRN_RPRT_REPORT_INVALID_ID);    //Report ID
+        cb_trim_check($eventId, E_GRN_RPRT_SCHEDULE_INVALID_ID);  //Schedule ID
+        if ( ! is_numeric($reportId)) {
+            cb_throw_error(E_GRN_RPRT_REPORT_INVALID_ID);
+        }
+        if ( ! is_numeric($eventId)) {
+            cb_throw_error(E_GRN_RPRT_SCHEDULE_INVALID_ID);
+        }
+
+        $database = GRN_Report_Table_Manager::getDataBase();
+        $tablename
+            = GRN_Report_Table_Manager::getTableName(GRN_REPORT_TABLE_REPORTSCHEDULERELATIONS);
+
+        $query
+            = "DELETE FROM @S WHERE col_report = '@S' AND col_schedule = '@S'";
+        $query = cb_queryf($database, $query, $tablename, $reportId, $eventId);
+
+        $result = $database->query($query);
+        if ($result === false) {
+            //Throw Query Error
+            $database->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        // update report modifier and modified time
+        require_once('report/report_logic.csp');
+        $report_logic = GRN_Report_Report_Logic::getInstance();
+        $property_list = [];
+        $report_logic->modify($reportId, $property_list);
+
+        return true;
+    }
+
+    /**
+     * @param $eventId
+     *
+     * @return bool
+     */
+    function removeByEventId($eventId)
+    {
+        $this->dao->deleteReportRelationByScheduleId($eventId);
+
+        return true;
+    }
+
+    /**
+     * @param $eventId
+     * @param $user
+     * @param $option
+     *
+     * @return mixed
+     */
+    function getListByEventId($eventId, $user, $option = null)
+    {
+        //Check Argument
+        cb_trim_check($eventId, E_GRN_RPRT_SCHEDULE_INVALID_ID);  //Schedule ID
+        if ( ! is_numeric($eventId)) {
+            cb_throw_error(E_GRN_RPRT_SCHEDULE_INVALID_ID);
+        }
+
+        $database = GRN_Report_Table_Manager::getDataBase();
+        $tablename
+            = GRN_Report_Table_Manager::getTableName(GRN_REPORT_TABLE_REPORTSCHEDULERELATIONS);
+
+        $query = "SELECT "
+                 . " s.col_report "
+                 . " FROM "
+                 . " tab_grn_report_reportschedulerelations AS s "
+                 . " left join tab_grn_report_report AS report ON (report._id = s.col_report)"
+                 . " WHERE "
+                 . " s.col_schedule = '@S'"
+                 . " AND report.col_draft = 0"
+                 . " AND report.col_deleted = 0"
+                 . " ORDER BY"
+                 . " report.col_mtime DESC";
+
+        $query = cb_queryf($database, $query, $eventId);
+
+        $result = $database->query($query);
+        if ($result === false) {
+            //Throw Query Error
+            $database->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        $report_id_list = [];
+        //Update Report List
+        $count = $database->num_rows($result);
+        for ($i = 0; $i < $count; $i++) {
+            $row = $database->fetch_assoc($result);
+            $report_id_list[] = $row['col_report'];
+        }
+        $database->free_result($result);
+
+        require_once('report/report_manager.csp');
+        $manager = GRN_Report_Report_Manager::getInstance();
+        if (is_null($option)) {
+            $reports = $manager->getAccessibleReportList($report_id_list,
+                $user);
+        } else {
+            //ケータイからのアクセスは、ページ分割する
+            $reports = $manager->getAccessibleReportList($report_id_list, $user,
+                $option);
+        }
+
+        return $reports;
+    }
+
+    /**
+     * @param $event_id_list
+     * @param $user
+     *
+     * @return array
+     */
+    function getRelatedReportEventIdsByEventIds($event_id_list, $user)
+    {
+        if ( ! $event_id_list || ! is_array($event_id_list)) {
+            return [];
+        }
+
+        //event_id_listの値に非数値が入っていないか調べる
+        foreach ($event_id_list as $key => $id) {
+            if ( ! is_numeric($id)) {
+                unset($event_id_list[$key]);
+            }
+        }
+
+        if (count($event_id_list) == 0) {
+            return [];
+        }
+
+        $database = GRN_Report_Table_Manager::getDataBase();
+        $query = " SELECT"
+                 . " relat.col_schedule"
+                 . " FROM"
+                 . " tab_grn_report_reportschedulerelations AS relat"
+                 . " LEFT JOIN tab_grn_report_report AS report ON (report._id = relat.col_report)"
+                 . " WHERE"
+                 . " report.col_draft = 0"
+                 . " AND report.col_deleted = 0"
+                 . " AND relat.col_schedule IN (@S)";
+
+        $query = cb_queryf($database, $query, implode(',', $event_id_list));
+        $result = $database->query($query);
+        if ($result === false) {
+            $database->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        $events = [];
+        $count = $database->num_rows($result);
+        for ($i = 0; $i < $count; $i++) {
+            $row = $database->fetch_assoc($result);
+            $events[$row['col_schedule']] = 1;
+        }
+        $database->free_result($result);
+
+        if ( ! $events || count($events) == 0) {
+            return [];
+        }
+
+        //アクセス権に関するチェック
+        require_once('category_manager_base.csp');
+        $manager = GRN_Report_Category_Manager_Base::getInstance();
+
+        $category_ids = $manager->getAccessibleCategoryIdList($user->getOID());
+        $query = " SELECT "
+                 . " r.col_schedule"
+                 . " FROM"
+                 . " tab_grn_report_report AS report"
+                 . " LEFT JOIN tab_grn_report_reportschedulerelations AS r ON (report._id = r.col_report)"
+                 . " WHERE"
+                 . cb_queryf($database, " r.col_schedule IN (@S)",
+                implode(',', array_keys($events)))
+                 . " AND"
+                 . " CASE"
+                 . " WHEN"
+                 . " report.col_category IS NULL";
+        if ($category_ids && count($category_ids) > 0) {
+            $query .= " OR report.col_category in ("
+                      . cb_queryf($database, "@S", implode(',', $category_ids))
+                      . ") ";
+        }
+        $query .= " AND report.col_private = 0 "
+                  . " THEN"
+                  . " TRUE"
+                  . " ELSE"
+                  . " report.col_creator = " . $user->getOID()
+                  . " OR EXISTS ("
+                  . " SELECT"
+                  . " notify._id"
+                  . " FROM"
+                  . " tab_grn_report_notification AS notify"
+                  . " WHERE"
+                  . " notify.col_user = " . $user->getOID()
+                  . " AND report._id = notify.col_report"
+                  . " )"
+                  . " OR EXISTS ("
+                  . " SELECT"
+                  . " member._id"
+                  . " FROM"
+                  . " tab_grn_report_member AS member"
+                  . " WHERE"
+                  . " member.col_user = " . $user->getOID()
+                  . " AND report._id = member.col_report"
+                  . " )"
+                  . " END";
+
+        $result = $database->query($query);
+        if ($result === false) {
+            $database->throwError(['query' => 'query failed: ' . $query]);
+        }
+        $events = [];
+        $count = $database->num_rows($result);
+        for ($i = 0; $i < $count; $i++) {
+            $row = $database->fetch_assoc($result);
+            $events[$row['col_schedule']] = 1;
+        }
+        $database->free_result($result);
+
+        return $events;
+
+    }
+
+    /**
+     * @param $reportId
+     *
+     * @return array|bool
+     */
+    function getRelatedEventId($reportId)
+    {
+        cb_trim_check($reportId, E_GRN_RPRT_REPORT_INVALID_ID);  //Report ID
+        if ( ! is_numeric($reportId)) {
+            cb_throw_error(E_GRN_RPRT_REPORT_INVALID_ID);
+        }
+
+        $database = GRN_Report_Table_Manager::getDataBase();
+        $tablename
+            = GRN_Report_Table_Manager::getTableName(GRN_REPORT_TABLE_REPORTSCHEDULERELATIONS);
+
+        $query
+            = "SELECT s.col_schedule,s.col_date FROM @S AS s WHERE s.col_report = '@S'";
+        $query = cb_queryf($database, $query, $tablename, $reportId);
+
+        $result = $database->query($query);
+        if ($result === false) {
+            //Throw Query Error
+            $database->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        $count = $database->num_rows($result);
+        if ($count == 0) {
+            return false;
+        }
+
+        $row = $database->fetch_assoc($result);
+        $database->free_result($result);
+
+        $ret = [];
+        $ret['event_id'] = $row['col_schedule'];
+        $ret['date'] = $row['col_date'];
+
+        return $ret;
+    }
+
+    /**
+     * ユーザーが、指定された予定に関連する報告書を書いたかどうかを調べる。
+     * 下書きであっても関連していたならTRUEが返される。
+     *
+     * @param $eventId
+     * @param $userId
+     *
+     * @return unknown_type
+     */
+    function isWrited($eventId, $userId)
+    {
+        //Check Argument
+        cb_trim_check($eventId, E_GRN_RPRT_SCHEDULE_INVALID_ID);  //Schedule ID
+        if ( ! is_numeric($eventId)) {
+            cb_throw_error(E_GRN_RPRT_SCHEDULE_INVALID_ID);
+        }
+
+        $database = GRN_Report_Table_Manager::getDataBase();
+        $tablename
+            = GRN_Report_Table_Manager::getTableName(GRN_REPORT_TABLE_REPORTSCHEDULERELATIONS);
+
+        $query = "SELECT "
+                 . " s.col_report "
+                 . " FROM "
+                 . " tab_grn_report_reportschedulerelations AS s "
+                 . " left join tab_grn_report_report AS report ON (report._id = s.col_report)"
+                 . " WHERE "
+                 . " s.col_schedule = '@S'"
+                 . " AND report.col_creator = '" . $userId . "'"
+                 . " AND report.col_deleted = 0";
+
+        $query = cb_queryf($database, $query, $eventId);
+
+        $result = $database->query($query);
+        if ($result === false) {
+            //Throw Query Error
+            $database->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        $report_id_list = [];
+        //Update Report List
+        $count = $database->num_rows($result);
+        $database->free_result($result);
+
+        if ($count > 0) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * 指定されたレポートが予定と関連付けられているかを調べる。
+     * 下書きであっても関連していたならTRUEが返される。
+     *
+     * @param $report_id
+     *
+     * @return bool
+     */
+    function isRelated($report_id)
+    {
+        //Check Argument
+        cb_trim_check($report_id, E_GRN_RPRT_REPORT_INVALID_ID);
+        if ( ! is_numeric($report_id)) {
+            cb_throw_error(E_GRN_RPRT_REPORT_INVALID_ID);
+        }
+
+        $database = GRN_Report_Table_Manager::getDataBase();
+        $tablename
+            = GRN_Report_Table_Manager::getTableName(GRN_REPORT_TABLE_REPORTSCHEDULERELATIONS);
+
+        $query = "SELECT "
+                 . " col_report "
+                 . " FROM "
+                 . " tab_grn_report_reportschedulerelations "
+                 . " WHERE "
+                 . " col_report = '@S'";
+
+        $query = cb_queryf($database, $query, $report_id);
+
+        $result = $database->query($query);
+        if ($result === false) {
+            //Throw Query Error
+            $database->throwError(['query' => 'query failed: ' . $query]);
+        }
+
+        //Update Report List
+        $count = $database->num_rows($result);
+        $database->free_result($result);
+
+        if ($count > 0) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * @param      $user
+     * @param      $event_id
+     * @param      $date
+     * @param int  $get_mode
+     * @param bool $is_report_draft
+     *
+     * @return mixed
+     */
+    function &getEventDataByEventId(
+        &$user,
+        $event_id,
+        $date,
+        $get_mode = GRN_SCHEDULE_GET_MEMBER_OBJECT,
+        $is_report_draft = false
+    ) {
+        require_once('schedule/application.csp');
+        $app = GRN_Schedule_Application::getInstance();
+
+        $event = null;
+        if ($is_report_draft) {
+            $event = $app->getEvent($user, $event_id, $date,
+                CB_DATABASE_NO_LOCK, false, $get_mode);
+        } else {
+            $event = $app->getEvent($user, $event_id, null, CB_DATABASE_NO_LOCK,
+                false, $get_mode);
+        }
+
+        return $event;
+    }
+}
+
+

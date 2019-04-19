@@ -1,0 +1,211 @@
+<?php
+
+namespace grn\space\screen;
+
+use grn\grn\Validate;
+
+
+use grn\space\common\data\bean\Authority;
+use grn\space\common\exception\ErrorCode;
+use grn\space\common\exception\GrnDataNotFoundException;
+use grn\space\common\exception\GrnInvalidPermissionException;
+use grn\space\common\exception\GrnRequiredDataIsNotException;
+use grn\space\common\exception\GrnInvalidArgumentException;
+use grn\space\data\bean\Thread;
+use grn\space\data\condition\FolderSearchCondition;
+use grn\space\data\condition\ThreadSearchCondition;
+use grn\space\service\SpaceService;
+use grn\space\service\DiscussionService;
+
+use grn\space\common\data\bean\Application;
+
+/**
+ * Class FolderList
+ *
+ */
+class FolderList extends SpaceBase
+{
+
+    const ID_ADD_NEW_FOLDER = 0;
+    const ARG_FOLDER_LIST = 'folder_list';
+    const ARG_FOLDER_ID = 'folder_id';
+    const ARG_FOLDER_IS_EXPANDED = 'is_expanded';
+    const IS_EXPANDED = 'true';
+    const FOLDER = 'folder';
+    const DISCUSSION_LIST = 'discussion_list';
+
+    private $_mobileView = false;
+    private $_sessionKey = self::FOLDER_EXPANDED_SESSION_KEY;
+
+    public function setMobileView()
+    {
+        $this->_mobileView = true;
+    }
+
+    /**
+     * @return array
+     * @throws GrnArgumentOutOfRangeException
+     * @throws GrnDataNotFoundException
+     * @throws GrnInvalidArgumentException
+     * @throws GrnInvalidPermissionException
+     * @throws GrnRequiredDataIsNotException
+     * @throws \Exception
+     * @throws \grn\space\common\exception\GrnArgumentOutOfRangeException
+     * @throws \grn\space\common\exception\GrnInvalidArgumentException
+     */
+    public function fetchForAjax()
+    {
+        if ($this->_mobileView) {
+            $this->_sessionKey = self::MOBILE_FOLDER_EXPANDED_SESSION_KEY;
+        }
+
+        $folderResult = [
+            self::FOLDER          => [
+                'id'          => '',
+                'folder_name' => '',
+                'space'       => '',
+                'is_unread'   => '',
+                'is_expanded' => ''
+            ],
+            self::DISCUSSION_LIST => []
+        ];
+
+        $discussionService = DiscussionService::getInstance();
+        $spaceService = SpaceService::getInstance();
+        $input = $this->getInput();
+        $parameter = [self::ARG_SPACE_ID];
+        $this->checkArgFromInput($parameter, $input);
+        $this->verifySpaceIsNotExpired();
+
+        $spaceId = $this->getSpaceId();
+        $folderId = cb_at($input, self::ARG_FOLDER_ID, 0);
+        $threadId = cb_at($input, self::ARG_THREAD_ID, 0);
+        $loginId = $this->getLoginUserId();
+        $isExpanded = cb_at($input, self::ARG_FOLDER_IS_EXPANDED);
+
+        if ($threadId > 0) {
+            $discussion = $discussionService->getThread($threadId, $loginId);
+            if ($discussion->getFolderId() > 0) {
+                $folderId = $discussion->getFolderId();
+                $isExpanded = self::IS_EXPANDED;
+            } else {
+                return $folderResult;
+            }
+        }
+
+        if ($threadId < 1
+            && ( ! Validate::isNumber($folderId)
+                 || $folderId < 1)
+        ) {
+            throw new GrnDataNotFoundException(ErrorCode::GRN_FOLDER_INVALID_ID);
+        }
+
+        $currentLanguage = $this->getLanguageCode();
+        $searchCondition = new ThreadSearchCondition();
+
+        try {
+            $rootCategory
+                = $discussionService->getApplicationRootCategory($spaceId,
+                Application::APPLICATION_CODE_DISCUSSION, $currentLanguage);
+
+            if ( ! $discussionService->hasThreadCategoryAccessControl(Authority::AUTHORITY_CODE_READ_DETAIL,
+                $spaceId, $rootCategory->getId(), $loginId)
+            ) {
+                throw new GrnInvalidPermissionException(ErrorCode::GRN_NO_READ_PERMISSION);
+            }
+        } catch (GrnDataNotFoundException $e) {
+            $e->setErrorCode(ErrorCode::GRN_INVALID_SPACE_ID);
+            throw $e;
+        } catch (GrnArgumentOutOfRangeException $e) {
+            throw $e;
+        } catch (GrnInvalidArgumentException $e) {
+            throw $e;
+        }
+
+        try {
+            $searchCondition->setSearchFolderId($folderId);
+            $searchCondition->setSearchCategoryId($rootCategory->getId());
+            $searchCondition->setSearchScopeType(ThreadSearchCondition::SEARCH_SCOPE_CATEGORY_TARGET_ONLY);
+            $searchCondition->setOrderSortArray(
+                [
+                    ThreadSearchCondition::SORT_COMPONENT_MODIFY_TIME_DESC,
+                    ThreadSearchCondition::SORT_TITLE_ASC
+                ]
+            );
+            $threadCollection
+                = $discussionService->searchThreadBySearchConditionWithAccessControl(
+                Authority::AUTHORITY_CODE_READ_DETAIL, $searchCondition,
+                $loginId
+            );
+        } catch (GrnRequiredDataIsNotException $e) {
+            throw $e;
+        } catch (GrnInvalidArgumentException $e) {
+            throw $e;
+        }
+
+        $session = $this->getSession($this->_sessionKey);
+        $folderIdListExpanded = $session->get(self::FOLDER_ID_LIST_EXPANDED);
+
+        if ( ! isset($folderIdListExpanded)) {
+            $folderIdListExpanded = [];
+        }
+
+        $isExisted = array_key_exists($folderId, $folderIdListExpanded);
+        if ($isExisted === false && $isExpanded === self::IS_EXPANDED) {
+            $folderIdListExpanded[$folderId] = $folderId;
+        } elseif ($isExpanded != self::IS_EXPANDED) {
+            unset($folderIdListExpanded[$folderId]);
+        }
+
+        $session->set(self::FOLDER_ID_LIST_EXPANDED, $folderIdListExpanded);
+
+        $folder = $spaceService->getFolder($folderId);
+
+        if ($folder->getSpaceId() != $spaceId) {
+            throw new GrnDataNotFoundException(ErrorCode::GRN_FOLDER_INVALID_ID);
+        }
+
+        $discussionList = [];
+        /** @var \grn\space\data\bean\Thread $thread */
+        foreach ($threadCollection as $thread) {
+            if ($thread->isSystemUse()) {
+                continue;
+            }
+
+            if ($thread->isUnreadUnder()) {
+                $folder->setIsUnread(true);
+            }
+
+            $page = "detail";
+            if ($thread->isUnreadUnder() && $thread->isUnread()
+                && $thread->getComponentModifyDatetime()
+                   == $thread->getModifyDatetime()
+            ) {
+                $page = "body";
+            }
+
+            $discussionList[] = [
+                'id'              => $thread->getId(),
+                'folder'          => $thread->getFolderId(),
+                'is_system_use'   => $thread->isSystemUse(),
+                'is_unread'       => $thread->isUnread(),
+                'is_unread_under' => $thread->isUnreadUnder(),
+                'title'           => $thread->getTitle(),
+                'page'            => $page
+            ];
+        }
+
+        $folderResponse = [
+            'id'          => $folder->getId(),
+            'folder_name' => $folder->getFolderName(),
+            'space'       => $folder->getSpaceId(),
+            'is_unread'   => $folder->isUnread()
+        ];
+
+        $folderResult[self::FOLDER] = $folderResponse;
+        $folderResult[self::DISCUSSION_LIST] = $discussionList;
+
+        return $folderResult;
+    }
+
+}

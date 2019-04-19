@@ -1,0 +1,351 @@
+<?php
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    global $G_INPUT;
+
+    //Instantiate Smarty Object
+    require_once("grn/smarty.csp");
+    $t = new GRN_Smarty;
+
+    //Get Parameter
+    $category_id = @ $G_INPUT['cid'];    //Category ID
+    $form_id = @ $G_INPUT['fid'];    //Form ID
+    $event_id = @ $G_INPUT['eid'];    //Event ID for schedule relation
+    $str_date = @ $G_INPUT['date'];   //Date for schedule relation
+    $command = @ $G_INPUT['cmd'];    //Command
+
+    $date = new CB_Date();
+    if ( ! $date->parse($str_date)) {
+        $date = false;
+    }
+
+    //Get Session Key
+    require_once('report/controller_util.csp');
+    require_once('grn/controller.csp');
+    $tmp_key = grn_get_temporary_key();
+
+    // 未分類でないカテゴリのアクセス権をチェック
+    if (GRN_REPORT_CATEGORY_NONPARTY_ID != $category_id) {
+        require_once('report/controller_util.csp');
+        $category_util = GRN_Report_Category_Controller_Utility::getInstance();
+        $category_util->checkAccess($category_id, true, CB_DATABASE_NO_LOCK);
+    }
+
+    //Check Command Parameter
+    switch ($command) {
+        case 'back':
+            //Redirect Back Page
+            if (is_numeric($event_id) && $event_id > 0) {
+                cb_redirect('report/send_form', [
+                    'cid'     => $category_id,
+                    'fid'     => $form_id,
+                    'eid'     => $event_id,
+                    'date'    => $str_date,
+                    'sf'      => 1,
+                    'tmp_key' => $tmp_key
+                ]);
+            } else {
+                cb_redirect('report/send_form', [
+                    'cid'     => $category_id,
+                    'fid'     => $form_id,
+                    'sf'      => 1,
+                    'tmp_key' => $tmp_key
+                ]);
+            }
+            break;
+        case 'cancel':
+            //Redirect Cancel Page
+            if (is_numeric($event_id) && $event_id > 0) {
+                cb_redirect('report/send', [
+                    'cid'  => $category_id,
+                    'eid'  => $event_id,
+                    'date' => $str_date
+                ]);
+            } else {
+                cb_redirect('report/send', ['cid' => $category_id]);
+            }
+            break;
+        default:
+            break;
+    }
+
+    //Get Session
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session_send_form = $session_manager->getSession('report/send_form'
+                                                      . $tmp_key);
+
+    //Load Send Form Session (for Design)
+    $form_for_view = $session_send_form->get('form');
+    $item_list_for_view = $session_send_form->get('item_list');
+    $properties_for_view = $session_send_form->get('properties');
+    $members = $session_send_form->get('members');
+    $notification = $session_send_form->get('notification');
+    $operators = $session_send_form->get('operators');
+    $operator_set = $session_send_form->get('operator_set');
+    $partner_values = $session_send_form->get('partner_values');
+    $private = $session_send_form->get('private');
+
+    //Load Send Form Session (for Data)
+    $send_form_data_list = $session_send_form->get('send_form_data_list');
+
+    //Create Report Property List
+    $property_list = [];
+    $property_list[GRN_REPORT_COLUMN_PRIVATE] = $private;
+    $property_list[GRN_REPORT_COLUMN_DRAFT] = GRN_REPORT_SENT;
+
+    //もしevent_idが存在するならば、アクセス可能かチェックする
+    $event = null;
+    if (is_numeric($event_id) && $event_id > 0) {
+        require_once('schedule/application.csp');
+        $app = GRN_Schedule_Application::getInstance();
+        $event = $app->getEvent($G_report_login_user, $event_id, null,
+            CB_DATABASE_NO_LOCK, false, GRN_SCHEDULE_GET_MEMBER_OBJECT);
+        if ( ! $event) {
+            cb_throw_error(E_GRN_RPRT_CANNOT_ACCESS_SCHEDULE);
+        }
+    }
+
+    //Check Form Existance
+    $translation_map_form = ['_id' => '_id'];
+    $form_util = GRN_Report_Form_Controller_Utility::getInstance();
+    $form = $form_util->getView($form_for_view['fid'],
+        $translation_map_form);
+
+    //Create Report
+    require_once('report/report_logic.csp');
+    $report_logic = GRN_Report_Report_Logic::getInstance();
+    $report_id = $report_logic->add($form_for_view,
+        $form_for_view['subject'], $property_list);
+    $form_for_view['report'] = $report_id;
+
+    //Inspection
+    require_once('report/inspection.csp');
+    $inspection = GRN_Report_Report_Inspection::getInstance();
+    if ($inspection->isEnabled()) {
+        $inspection_private = $inspection->setPrivate($private);
+
+        $message_type = 'report_add';
+        $message_args = [];
+        $message_args['rid'] = $report_id;
+        $message_args['fid'] = $form_for_view['fid'];
+        $message_args['name'] = $form_for_view['name'];
+        $message_args['subject'] = $form_for_view['subject'];
+        $message_args['private'] = $inspection_private;
+        $message_args['maintainer'] = $operators;
+
+        //Record Inspection
+        $inspection->record($message_type, $message_args);
+    }
+
+    //Create Item Data
+    require_once('report/itemdata_logic.csp');
+    $itemdata_logic = GRN_Report_ItemData_Logic::getInstance();
+    $itemdata_logic->addMulti($report_id, $item_list_for_view);
+
+    //Member Setting
+    require_once('report/member_logic.csp');
+    $member_logic = GRN_Report_Member_Logic::getInstance();
+    $member_logic->addMulti($report_id, $members, $operators);
+    $member_logic->changeOrder($report_id, $members);
+
+    //Notification Setting
+    foreach ($notification as $nkey => $nid) {
+        if ($nid == $G_report_login_user->getOID()) {
+            unset($notification[$nkey]);
+        }
+        foreach ($members as $mkey => $mid) {
+            if ($nid == $mid) {
+                unset($notification[$nkey]);
+            }
+        }
+    }
+
+    require_once('report/notification_logic.csp');
+    $notification_logic = GRN_Report_Notification_Logic::getInstance();
+    $notification_logic->addMulti($report_id, $notification, $operators);
+    $notification_logic->changeOrder($report_id, $notification);
+
+    //Create Notification List
+    $notification_list = array_merge($members, $notification);
+    $notification_list[] = $G_report_login_user->getOID();
+
+    //Partners Setting
+    require_once('report/partner.csp');
+    $partners = GRN_ReportPartnerData::createByValues($partner_values);
+    require_once('report/partner_logic.csp');
+    $partner_logic = GRN_Report_Partner_Logic::getInstance();
+    $partner_logic->addMulti($report_id, $partners);
+
+    //Send Notification
+    require_once('report/notification.csp');
+    $notification = GRN_Report_Notification_Listener::getInstance();
+    $tsex = new CB_TimeStampEx();
+    $notification->sendList(GRN_REPORT_NOTIFY_ENTRY, $notification_list,
+        $G_report_login_user, $report_id, $tsex);
+
+    //event_idが存在するなら関連を張る
+    if (is_numeric($event_id) && $event_id > 0) {
+        require_once('report/report_schedule_logic.csp');
+        $report_schedule_logic
+            = GRN_Report_Report_Schedule_Logic::getInstance();
+        $ret = $report_schedule_logic->addRelation($report_id, $event_id,
+            $date);
+        if (isset($ret['eventId'])) {
+            $event_id = $ret['eventId'];
+        }
+
+        /**
+         *  以下の条件を全て満たすユーザーに対して通知を送る
+         *  ・予定の通知を受け取るユーザー
+         *  ・この報告書の通知先でないユーザー
+         *  ・この報告書にアクセス権があるユーザー
+         */
+        //報告書の通知先を取得
+        $report_notification_list = [];
+        foreach ($notification_list as $value) {
+            $report_notification_list[$value] = $value;
+        }
+
+        //予定の通知先を取得
+        $event_notification_list = [];
+        foreach ($event->users as $uid => $user) {
+            $event_notification_list[$uid] = $uid;
+        }
+        require_once('schedule/system_logic.csp');
+        $logic = GRN_Schedule_SystemLogic::getInstance();
+        if ($logic->getManagedNotify() != '1'
+            && isset($event->notify_address)
+        ) {
+            foreach ($event->notify_address as $uid => $user) {
+                $event_notification_list[$uid] = $uid;
+            }
+        }
+
+        //報告書が非公開の場合,報告書の参加者または通知先以外のユーザーを予定の通知先から削除
+        if ($private) {
+            foreach ($event_notification_list as $euser) {
+                if ( ! isset($report_notification_list[$euser])) {
+                    unset($event_notification_list[$euser]);
+                }
+            }
+        }
+
+        //報告書の通知先と予定の通知先に同じユーザーがいる場合は、予定の通知先から削除する
+        foreach ($report_notification_list as $ruser) {
+            foreach ($event_notification_list as $euser) {
+                if ($ruser == $euser) {
+                    unset($event_notification_list[$euser]);
+                }
+            }
+        }
+
+        //予定の通知先から、報告書の閲覧権限がないユーザーを削除
+        require_once('report/controller_util.csp');
+        $report_util = GRN_Report_Report_Controller_Utility::getInstance();
+        $event_notification_list
+            = $report_util->getViewableUserList($event_notification_list,
+            $report_id);
+
+        //ユーザーオブジェクトを取得
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        foreach ($event_notification_list as $euser) {
+            $event_notification_list[$euser] = $uum->getUser($euser);
+        }
+
+        //予定の最終更新日時、最終更新者を更新する
+        require_once('schedule/application.csp');
+        $app = GRN_Schedule_Application::getInstance();
+        $event->modifier = $G_report_login_user;
+        $app->modifyEventWithoutDateTime($event);
+
+        // GRN2-4583
+        $event->id = $event_id;
+
+        // ----- GRN2-4506 -----
+        // 通知のタイムゾーン対応のために、setdatetimeなどを変換する。
+        if (count($event_notification_list) > 0) {
+            if ($event instanceof GRN_Schedule_NormalEvent) {
+                // 通常予定（終日以外）も、イベントのタイムゾーンに変更する
+                if ($event->setdatetime instanceof CB_DateTimeEx) {
+                    require_once('fw/i18n.csp');
+                    $settimestamp = new CB_TimeStampEx(null, $event->timezone);
+                    $settimestamp->setDateTime($event->setdatetime,
+                        CB_I18N::getInstance()->getCurrentTimezone());
+                    $event->setdatetime = $settimestamp->getDateTime();
+                    if (isset($event->enddatetime)) {
+                        $endtimestamp = new CB_TimeStampEx(null,
+                            $event->timezone);
+                        $endtimestamp->setDateTime($event->enddatetime,
+                            CB_I18N::getInstance()->getCurrentTimezone());
+                        $event->enddatetime = $endtimestamp->getDateTime();
+                    } else {
+                        $event->enddatetime = $event->setdatetime;
+                    }
+                }
+            } elseif ($event instanceof GRN_Schedule_RepeatEvent) {
+                if ( ! isset($event->settime)) {
+                    // $dateをイベントのタイムゾーンに変更する。
+                    // イベントとユーザーのタイムゾーンの時差を見る。終日予定が1日早くなっているかどうか確認する。
+                    require_once('fw/i18n.csp');
+                    $dateTimeZoneEvent = new DateTimeZone($event->timezone);
+                    $dateTimeZoneUser = new DateTimeZone(CB_I18N::getInstance()
+                                                                ->getCurrentTimezone());
+                    $dateTimeEvent = new DateTime("now",
+                        $dateTimeZoneEvent);
+                    $dateTimeUser = new DateTime("now", $dateTimeZoneUser);
+                    $timeOffset
+                        = $dateTimeZoneEvent->getOffset($dateTimeUser);
+                    if ($timeOffset > 0) {
+                        // イベントのタイムゾーンがユーザーのタイムゾーンより早い場合。
+                        // イベントのタイムゾーンでの$dateは1日後となるので、変更する。
+                        $dateEx = new CB_DateEx($date);
+                        $dateEx->moveDays(1);
+                        $date->year = $dateEx->year;
+                        $date->month = $dateEx->month;
+                        $date->day = $dateEx->day;
+                    }
+                }
+                // $dateと$event->settimeやendtimeからsetdatetime, enddatetimeを登録する。
+                require_once('fw/date.csp');
+                $setdatetime = new CB_DateTime();
+                $setdatetime->year = $date->year;
+                $setdatetime->month = $date->month;
+                $setdatetime->day = $date->day;
+                $setdatetime->hour = (isset($event->settime->hour))
+                    ? $event->settime->hour : 0;
+                $setdatetime->minute = (isset($event->settime->minute))
+                    ? $event->settime->minute : 0;
+                $setdatetime->second = (isset($event->settime->second))
+                    ? $event->settime->second : 0;
+                $event->setdatetime = $setdatetime;
+                if (isset($event->endtime)) {
+                    $enddatetime = new CB_DateTime();
+                    $enddatetime->year = $date->year;
+                    $enddatetime->month = $date->month;
+                    $enddatetime->day = $date->day;
+                    $enddatetime->hour = (isset($event->endtime->hour))
+                        ? $event->endtime->hour : 0;
+                    $enddatetime->minute = (isset($event->endtime->minute))
+                        ? $event->endtime->minute : 0;
+                    $enddatetime->second = (isset($event->endtime->second))
+                        ? $event->endtime->second : 0;
+                    $event->enddatetime = $enddatetime;
+                } else {
+                    $event->enddatetime = $event->setdatetime;
+                }
+            }
+        }
+        // ----- GRN2-4506 ----
+
+        //予定の通知ロジック取得
+        $app->setNotify($event_notification_list, $G_report_login_user, $event,
+            $date, $event->getTitle(), '', GRN_SCHEDULE_NOTIFY_MODIFY, $tsex);
+    }
+
+    //Redirect Next Page
+    cb_redirect('report/index');
+}
+
+

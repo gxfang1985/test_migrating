@@ -1,0 +1,398 @@
+<?php
+/*
+* Created on 2007-04-06
+* Updated on 2011-03-28 XML出力部分の改修
+*
+* フォルダの情報XML書出し
+* 
+* ■受信データ仕様 
+* 名前       | 必須 |   値    | 個数 | 備考
+* ----------------------------|------------------------------------------------------------------------
+* fid        |  △  | 数値    |  1   | 出力対象となるファイルID
+* hid        |  △  | 数値    |  1   | 出力対象のフォルダID
+* type       |  ○  | 数値    |  1   | 出力タイプ (0:該当フォルダ情報のみ、
+*            |      |         |      |             1:該当フォルダ情報 + 直下のフォルダ郡の情報,
+*            |      |         |      |             2:該当フォルダ情報 + 派生するサブフォルダ全て)
+* items      |  ×  | 配列    | 複数 | 出力項目 
+* registrant |  ×  | 文字列  |  1   | 更新者 のログインアカウント
+*            |      |         |      | →coopLogin.cspにて、LoginAsを行う
+* app        |  ○  | 固定値  |  1   | "cabinet"
+*            |      |         |      | →coopLogin.cspにて、各アプリケーションオブジェクトの生成時使用*
+* ■機能
+* ・任意のフォルダを指定し、ファイル管理上のフォルダ情報について、後述する書式のXMLで出力することができる    
+*     
+* ・[受信データ]を受取り、対象フォルダ情報を指定条件で指定された項目をXMLにて出力する    
+*   ・[対象フォルダの指定]    
+*     以下のいづれか一つのみ有効とし、複数指定された場合は、フォルダID→フォルダコードの順で有効値を判定する    
+*     単一のフォルダID
+*     単一のフォルダコード
+*     
+*   ・[指定条件 について]    
+*      0    指定フォルダのフォルダ情報のみ
+*      1    直下のフォルダリスト情報一覧(サブフォルダなし)
+*      2    直下のフォルダリスト情報一覧(サブフォルダあり)
+*
+* [XMLの形式]              
+* <?xml version="1.0" encoding="UTF8">
+* <folder_information>
+*   <folders parent_id="" parent_code="">          …※１
+*     <folder id="" code="" list_index="">         …※１        (パラメータitems[] の指定値)
+*         <title />                                フォルダ名         0
+*         <description />                          メモ               1
+*         <creator_id />                           登録者ID           2
+*         <creator_login_name />                   登録者ログイン名   3
+*         <creator_display_name />                 登録者表示名       4
+*         <create_time />                          登録日時           5
+*         <modifier_id />                          更新者ID           6
+*         <modifier_login_name />                  更新者ログイン名   7
+*         <modifier_display_name>                  更新者表示名       8
+*         <modify_time />                          更新日時           9
+*         <folders parent_id="" parent_code="">
+*           <folder id="" code="" list_index="">
+*            …
+*           </folder>
+*         </folders>
+*     </folder>                                    …※１
+*   </folders>                                     …※１
+* </folder_information>
+* 
+* ※１ 指定されたフォルダがROOTの場合は
+* この２要素は  <root id="1" code="ROOT"> </root>に置き換わる
+* 
+* ※ ROOT フォルダの場合に、登録者ID,登録者ログイン名がNULL,登録者表示名はAdministrator なのは、仕様
+* テーブル情報そのまま出しているだけだし。
+*/
+
+require_once('coopUtility.csp');
+
+global $G_INPUT;
+
+// coopLogin.cspのファイル存在 /////////////////////////////////
+if ( ! is_file('coopLogin.csp')) {
+    global $G_state_set;
+    $G_state_set->set('copyright_should_be_written', false);
+    $G_state_set->set('html_should_be_closed', false);
+
+    include_once("error_code.csp");
+
+    header("X-Cybozu-Error:" . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Header Data><CR><LF>");
+    print("1," . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Footer Data><CR><LF>");
+    print("ERROR<CR><LF>");
+    cb_safe_exit();
+}
+////////////////////////////////////////////////////////////////
+
+//ログイン認証
+require('coopLogin.csp');
+unset($uum);
+
+$folder = null;
+
+require_once('cabinet/folder.csp');
+$folderManager = GRN_Cabinet_FolderManager::getInstance();
+
+// 受信データチェック////////////////////////////////////////////////////////////
+if (array_key_exists('hid', $G_INPUT) && is_numeric($G_INPUT['hid'])) {
+    // フォルダの取得
+    if ( ! ($folder = $folderManager->getFolder($G_login, $G_INPUT['hid'],
+        GRN_CABINET_ACCESS_R, true))
+    ) {
+        require_once('cabinet/error_code.csp');
+        cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+    }
+} elseif (array_key_exists('foldercode', $G_INPUT)) {
+    // フォルダの取得
+    if ( ! ($folder = $folderManager->getFolderByForeignKey($G_login,
+        $G_INPUT['foldercode'], GRN_CABINET_ACCESS_R, true))
+    ) {
+        require_once('cabinet/error_code.csp');
+        cb_throw_error(E_GRN_CABINET_FOLDER_NOT_FOUND);
+    }
+}
+unset($folderManager);
+
+
+$type = null;
+// type は、有効値[0-2] のみ
+if (array_key_exists('type', $G_INPUT)
+    && preg_match('/^[0-2]$/', $G_INPUT['type'])
+) {
+    $type = $G_INPUT['type'];
+}
+
+
+// パラメータエラー
+if (is_null($type) || is_null($folder)) {
+    $error_msg = [];
+
+    if ($type == null) {
+        $error_msg[] = '[type]';
+    }
+
+    if (array_key_exists('hid', $G_INPUT) && ! is_numeric($G_INPUT['hid'])) {
+        $error_msg[] = '[hid]';
+    } elseif ( ! array_key_exists('hid', $G_INPUT)
+               && ! array_key_exists($G_INPUT['foldercode'])
+    ) {
+        $error_msg[] = '[hid]';
+        $error_msg[] = '[foldercode]';
+    }
+
+    include_once("error_code.csp");
+    api_response_data(null,
+        E_API_CABINET_PARAM_WRONG . implode(',', $error_msg));
+    cb_safe_exit();
+}
+
+$items = [];
+
+if (array_key_exists('items', $G_INPUT) && is_array($G_INPUT['items'])) {
+    $items = $G_INPUT['items'];
+}
+
+
+//////////////////////////////////////////////////////////////////////////////////
+
+// XML書出用の配列
+//                    element名              => array( itemsパラメータ値, xml値書出タイプ)
+$xml_map = [
+    'title'                 => ['item' => '0', 'writeType' => 'text'],
+    'description'           => ['item' => '1', 'writeType' => 'writeCDATA'],
+    'creator_id'            => ['item' => '2', 'writeType' => 'writeRaw'],
+    'creator_login_name'    => ['item' => '3', 'writeType' => 'text'],
+    'creator_display_name'  => ['item' => '4', 'writeType' => 'text'],
+    'create_time'           => ['item' => '5', 'writeType' => 'text'],
+    'modifier_id'           => ['item' => '6', 'writeType' => 'writeRaw'],
+    'modifier_login_name'   => ['item' => '7', 'writeType' => 'text'],
+    'modifier_display_name' => ['item' => '8', 'writeType' => 'text'],
+    'modify_time'           => ['item' => '9', 'writeType' => 'text'],
+];
+
+// 出力しない項目を取得 
+$delete_array = [];
+foreach ($xml_map as $key => $value) {
+
+    if (array_search($value['item'], $items, true) === false) {
+        $delete_array[] = $key;
+    }
+
+}
+
+// 出力しない項目を削除 
+foreach ($delete_array as $val) {
+    unset($xml_map[$val]);
+}
+
+// Open Temprary File
+$temp_dir = cb_tmpdir();
+$temp_file_name = tempnam($temp_dir, 'api_folderinfo_');
+
+//Open XML Document
+$xml_writer = new XMLWriter();
+$xml_writer->openUri($temp_file_name);
+$xml_writer->setIndentString(' ');
+$xml_writer->setIndent(true);
+$xml_writer->startDocument('1.0', 'UTF-8', 'yes');
+
+// START XML書出し 
+$xml_writer->startElement('folder_information');                                                   // file_information
+
+$is_root = $folder->isRoot();
+if ($is_root) {
+    $xml_writer->startElement('root');                                                         // root start
+    $xml_writer->writeAttribute('id', $folder->getOID());
+    $xml_writer->writeAttribute('code', $folder->get('foreign_key'));
+} else {
+    $parent_folder = &$folder->get('parent');
+    api_write_folders_element_start($xml_writer,
+        $parent_folder);                          // folders start
+
+    // 不具合改修:フォルダ情報でROOT指定時におけるXMLが仕様どおりでない (261)
+    api_write_folder_element_start($xml_writer,
+        $folder);                                // folder start
+}
+
+api_write_folder($xml_writer, $G_login, $folder, $xml_map,
+    $type);             // folder data
+
+// 不具合改修:フォルダ情報でROOT指定時におけるXMLが仕様どおりでない (261)
+if ( ! $is_root) {
+    api_write_folder_element_end($xml_writer);                                            // folder end
+}
+
+$xml_writer->endElement();                                                                     // root or folders end 
+
+$xml_writer->endElement();                                                                         // file_information
+
+//End XML Document
+$xml_writer->endDocument();
+$xml_writer->flush();
+
+// Download and Unlink Temporary File
+cb_prepare_download('folderinformation.xml', 'application/xml', false);
+$fp = fopen($temp_file_name, 'rb');
+
+while ( ! feof($fp)) {
+    echo fread($fp, 8192);
+}
+
+fclose($fp);
+
+unlink($temp_file_name);
+//処理おわり//////////////////////////////////////////////////////////////////////////////////////////////
+
+
+/**
+ * フォルダ情報のXML書出し
+ *
+ * @param $type  0 : 該当フォルダ情報のみ
+ *               1 : 該当フォルダ情報 + 直下のフォルダリスト
+ *               2 : 該当フォルダ情報 + 派生するサブフォルダ全部
+ */
+function api_write_folder(
+    & $xml_writer,
+    & $user,
+    & $folder,
+    & $xml_map,
+    $type = "2"
+) {
+
+    // folder Data部の書出し
+    api_write_folder_data($xml_writer, $folder, $xml_map);
+
+    if ($type != "0") {
+        $children = $folder->getFolders($user, GRN_CABINET_ACCESS_R);
+
+        if ($children) {
+            api_write_folders_element_start($xml_writer,
+                $folder);                 // folders start
+            if ($type != "2") {
+                $type = "0";
+            }
+
+            foreach (array_keys($children) as $hid) {
+                $child =& $children[$hid];
+                api_write_folder_element_start($xml_writer,
+                    $child);          // folder start
+                // Data部 書出し (自身を呼び出す)
+                api_write_folder($xml_writer, $user, $child, $xml_map, $type);
+
+                api_write_folder_element_end($xml_writer);                      // folder end
+            }
+
+            api_write_folders_element_end($xml_writer);                             // folders end
+
+        }
+    }
+
+}
+
+/**
+ * フォルダ情報の<folder>Element START
+ * api_write_folder_element_end とペアでつかう
+ *
+ */
+function api_write_folder_element_start(& $xml_writer, & $folder)
+{
+    $xml_writer->startElement('folder');                                    // folder
+    $xml_writer->writeAttribute('id', $folder->getOID());
+    $xml_writer->writeAttribute('code', $folder->get('foreign_key'));
+    $xml_writer->writeAttribute('list_index', $folder->get('list_index'));
+}
+
+/**
+ * フォルダ情報の<folder>Element 内の データ部分の書出し
+ *
+ */
+function api_write_folder_data(& $xml_writer, & $folder, $xml_map)
+{
+    // 指定項目整形
+    $xml_folderinfo_map = api_get_folder_info_array($folder, $xml_map);
+    // 項目書込
+    api_xml_write_map_data($xml_writer, $xml_folderinfo_map);
+
+}
+
+/**
+ * フォルダ情報の<folder>Element END
+ * api_write_folder_element_end とペアでつかう
+ *
+ */
+function api_write_folder_element_end(& $xml_writer)
+{
+    $xml_writer->endElement();                                              // folder
+}
+
+///////////////////////////////////
+
+
+// folders /////////////////////////
+function api_write_folders_element_start(& $xml_writer, & $folder)
+{
+    if ($folder) {
+        $xml_writer->startElement('folders');                                // sub folders
+        $xml_writer->writeAttribute('parent_id', $folder->getOID());
+        $xml_writer->writeAttribute('parent_code', $folder->get('foreign_key'));
+    }
+}
+
+function api_write_folders_element_end(& $xml_writer)
+{
+    $xml_writer->endElement();                                              // sub folders
+}
+
+//////////////////////////////////////
+
+
+function api_get_folder_info_array(& $folder, $xml_map)
+{
+
+    if ($folder) {
+
+        $xml_map['title']['value'] = $folder->get("name");
+        $xml_map['description']['value'] = $folder->get("description");
+
+
+        $xml_map['create_time']['value']
+            = api_format_datetime($folder->get("ctime"));
+        $xml_map['modify_time']['value']
+            = api_format_datetime($folder->get("mtime"));
+
+        $c_user = $folder->get('creator');
+        if ($c_user) {
+            $xml_map['creator_id']['value'] = $c_user->getOID();
+            $xml_map['creator_login_name']['value']
+                = $c_user->get("foreign_key");
+            $xml_map['creator_display_name']['value']
+                = $c_user->get("display_name");
+        } else {
+            if ( ! $folder->isRoot()) {
+                $xml_map['creator_id']['value'] = 0;
+            }
+            $xml_map['creator_login_name']['value']
+                = $folder->get("creator_foreign_key");
+            $xml_map['creator_display_name']['value']
+                = $folder->get("creator_name");
+        }
+
+        $m_user = $folder->get('modifier');
+        if ($m_user) {
+            $xml_map['modifier_id']['value'] = $m_user->getOID();
+            $xml_map['modifier_login_name']['value']
+                = $m_user->get("foreign_key");
+            $xml_map['modifier_display_name']['value']
+                = $m_user->get("display_name");
+        } else {
+            $xml_map['modifier_id']['value'] = 0;
+            $xml_map['modifier_login_name']['value']
+                = $folder->get("modifier_foreign_key");
+            $xml_map['modifier_display_name']['value']
+                = $folder->get("modifier_name");
+        }
+    }
+
+    return $xml_map;
+
+}

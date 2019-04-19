@@ -1,0 +1,310 @@
+<?php
+
+namespace grn\schedule\screen;
+
+use grn\grn\GrnGenericScreenBase;
+use grn\schedule\bean\FacilityApproval;
+use grn\schedule\ScheduleFacilityApprovalSetting;
+use grn\schedule\FacilityApprovalLogic;
+use grn\grn\Validate;
+
+require_once("schedule/facility_system_logic.csp");
+require_once("schedule/resources.csp");
+require_once("schedule/error_code.csp");
+require_once("schedule/view_util.csp");
+require_once("schedule/access_logic.csp");
+require_once("schedule/application.csp");
+require_once("fw/session_manager.csp");
+require_once("fw/i18n.csp");
+require_once("schedule/facility_privilege.csp");
+
+class FacilityApproveDetailUtil
+{
+    //NOTE: KEY WORD, NEVER EDIT UNLESS YOU KNOW WHAT YOU ARE DOING!
+    const ARG_EVENT_ID = "event";
+    const ARG_FACILITY_ID = "faid";
+    const ARG_B_DATE = "bdate";
+    const ARG_REFERER = "referer_key";
+    const ARG_STATUS = "status";
+    const ARG_MESSAGE = "message";
+    const ARG_APPROVAL_ACTION = "approve";
+    const ARG_DATA = "data";
+    const ARG_CREATOR_UID = "creator_uid";
+    const ARG_CREATOR_NAME = "creator_name";
+    const ARG_CSRF_TICKET = "csrf_ticket";
+    const ARG_SITE_POSITION = "site_position";
+    const ARG_NAME = "name";
+    const ARG_PAGE = "page";
+    const ARG_EMPTY = "";
+    const ARG_DISPLAY_NAME = "display_name";
+    const ARG_APPROVAL_LIST_PATH = "schedule/operation/approval_facility_list";
+    const ARG_SCH_INDEX_PATH = "schedule/index";
+    const ARG_PATH = "schedule/operation/facility_approve";
+    const ARG_CB_USER = "CB_User";
+    const ARG_NOTIFICATION_ID = "nid";
+    const ARG_NOTIFICATION_NHID = "nhid";
+    const ARG_UPDATE_READ_NOTIFICATION = "updateReadNotification";
+
+    private function _validateIds($eventId, $facilityId)
+    {
+        if ( ! Validate::isNumber($eventId)
+             || $eventId < 1
+        ) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        if ( ! Validate::isNumber($facilityId)
+             || $facilityId < 1
+        ) {
+            cb_throw_error(E_GRN_FCLT_NOTFOUND_FACILITY);
+        }
+    }
+
+    /***
+     * The function prepare data for view
+     *
+     * @param $smarty
+     * @param $input
+     */
+    public function prepareForView($smarty, $input, $isMobileView = false)
+    {
+        $login = cb_get_login_user();
+        if ( ! $login) {
+            cb_throw_error(E_GRN_USER_NOT_FOUND);
+        }
+
+        $scheduleApp = \GRN_Schedule_Application::getInstance();
+        $facilityApprovalLogic = new FacilityApprovalLogic();
+
+        $eventId = cb_at($input, self::ARG_EVENT_ID);
+        $facilityId = cb_at($input, self::ARG_FACILITY_ID);
+        $strDate = cb_at($input, self::ARG_B_DATE);
+        $refererKey = cb_at($input, self::ARG_REFERER, null);
+        $pageTitle = $this->getTitle();
+        $notificationId = cb_at($input, self::ARG_NOTIFICATION_ID);
+        $notificationReadId = cb_at($input, self::ARG_NOTIFICATION_NHID);
+        $noThrow = false;
+
+        $this->_validateIds($eventId, $facilityId);
+        if (isset($notificationId) && Validate::isNumber($notificationId)) {
+            $noThrow = true;
+        } elseif (isset($notificationReadId)
+                  && Validate::isNumber($notificationReadId)
+        ) {
+            $noThrow = true;
+        }
+
+        if ($isMobileView) {
+            $noThrow = false;//No applying on mobile view
+        }
+        //Update read notification
+        require_once('grn/notification.csp');
+        $notificationService = \GRN_Notification_Service::getInstance();
+        $timeStamp = new \CB_TimeStamp();
+        $timeStamp->unix_ts = time();
+        $uniqueId = $eventId . "-" . $facilityId;
+        $notify_data
+            = $notificationService->getNotifyDataProperties($login,
+            GRN_SCHEDULE_MODULE_ID, $uniqueId,
+            GRN_FACILITY_APPROVAL_SUB_MODULE_ID);
+        if (is_a($notify_data, 'GRN_Notification_Data')
+            && ! $notify_data->isStatusConfirmed()
+        ) {
+            $notificationService->confirmNotifyData(
+                $login, GRN_SCHEDULE_MODULE_ID, $uniqueId, $timeStamp, false,
+                GRN_FACILITY_APPROVAL_SUB_MODULE_ID
+            );
+        }
+        $facilityLogic = \GRN_Facility_SystemLogic::getInstance();
+        $facility = $facilityLogic->getFacility($facilityId);
+
+        require_once('schedule/eventfactory.csp');
+        $factory = \GRN_Schedule_EventFactory::getInstance();
+        $event = $factory->getEvent($eventId);
+
+        $validateResult
+            = $facilityApprovalLogic->validateEventSupportFacilityApproval(
+            $event, $facility, $login, ['post' => false, 'reject' => false],
+            $noThrow
+        );
+
+        if (isset($validateResult) && $validateResult === false) {
+            $smarty->assign('exceptionMessage',
+                cb_msg('grn.schedule.operation', 'facility_approval_invalid'));
+            $smarty->assign('page_title', $pageTitle);
+
+            return;
+        }
+        $startDate = $event->setdatetime->format();
+
+        $endDate = self::ARG_EMPTY;
+        if ($event->enddatetime) {
+            $endDate = $event->enddatetime->format();
+        }
+        $isSameDay = $scheduleApp->compareDate($event->setdatetime,
+                $event->enddatetime) === 0;
+
+        //Facility apply time
+        $facilityApply
+            = $facilityApprovalLogic->getFacilityApplyingInfo($eventId,
+            $facilityId);
+        $facilityApplyTime = "";
+        if (isset($facilityApply)) {
+            $timeStamp = new \CB_TimeStamp();
+            $timeStamp->unix_ts = $facilityApply->getApplyingTime();
+            $createTimeStamp = new \CB_TimeStampEx($timeStamp);
+            $tmpDateTime = $createTimeStamp->getDateTime();
+            $facilityApplyTime = $tmpDateTime->format();
+        }
+
+        $usingPurpose
+            = cb_trim($facilityApprovalLogic->getFacilityUsingPurpose($eventId));
+        if (strlen($usingPurpose) == 0) {
+            $usingPurpose = cb_msg('grn.schedule.operation',
+                'facility_approve_purpose_empty');
+        }
+        $scheduleEvent = [
+            "eventId"           => $eventId,
+            "startDate"         => $startDate,
+            "endDate"           => $endDate,
+            "purpose"           => $usingPurpose,
+            "facilityApplyTime" => $facilityApplyTime
+        ];
+        if (isset($facilityApply)) {
+            $scheduleEvent[self::ARG_CREATOR_UID]
+                = $facilityApply->getApplyingUser();
+            $scheduleEvent[self::ARG_CREATOR_NAME]
+                = $facilityApply->getApplyingUserName();
+            $uum = cb_lwc_uum();
+            $userApplicant
+                = $uum->getUser($facilityApply->getApplyingUser());
+            if ( ! $userApplicant) {
+                $scheduleEvent[self::ARG_CREATOR_UID] = null;
+            }
+        } else {
+            if (is_a($event->creator, self::ARG_CB_USER)) {
+                $scheduleEvent[self::ARG_CREATOR_UID]
+                    = $event->creator->getOID();
+                $scheduleEvent[self::ARG_CREATOR_NAME]
+                    = $event->creator->get(self::ARG_DISPLAY_NAME);
+            } else {
+                $scheduleEvent[self::ARG_CREATOR_UID] = null;
+                $scheduleEvent[self::ARG_CREATOR_NAME] = $event->creator;
+            }
+        }
+        $approveForView = new FacilityApproval();
+
+        $isProcessed = $facilityApprovalLogic->isProcessed($event, $facilityId);
+        if ($isProcessed) {
+            $facilityApproval
+                = $facilityApprovalLogic->getLastApproval($eventId,
+                $facilityId);
+            if ( ! is_null($facilityApproval)) {
+                $approveForView = $facilityApproval;
+
+                //Date time of event is time saving facility approval
+                if ($approveForView->getStatus() == 0) {
+                    $startCB_TimeStampExRejected = new \CB_TimeStampEx();
+                    $startCB_TimeStampExRejected->unix_ts
+                        = intval($approveForView->getStartDateTime());
+                    $scheduleEvent['startDate']
+                        = $startCB_TimeStampExRejected->getDateTime()
+                                                      ->format();
+
+                    $endCB_TimeStampExRejected = new \CB_TimeStampEx();
+                    $endCB_TimeStampExRejected->unix_ts
+                        = intval($approveForView->getEndDateTime());
+                    $scheduleEvent['endDate']
+                        = $endCB_TimeStampExRejected->getDateTime()
+                                                    ->format();
+
+                    $isSameDay = $scheduleApp->compareDate(
+                            $startCB_TimeStampExRejected->getDateTime(),
+                            $endCB_TimeStampExRejected->getDateTime()
+                        ) === 0;
+                }
+                $timeStampApproved = new \CB_TimeStampEx();
+                $timeStampApproved->unix_ts
+                    = intval($approveForView->getApprovalTime());
+                $approveForView->setApprovalTime($timeStampApproved->getDateTime()
+                                                                   ->format());
+
+            }
+        }
+        $smarty->assign("approveForView", $approveForView);
+        $facilityForView = [
+            "title"               => $facility->get(self::ARG_NAME),
+            self::ARG_FACILITY_ID => $facilityId
+        ];
+        $smarty->assign("isSameDay", $isSameDay);
+        $smarty->assign("scheduleEvent", $scheduleEvent);
+        $smarty->assign("facility", $facilityForView);
+        $smarty->assign("isProcessed", $isProcessed);
+        $smarty->assign("page_name", cb_get_pagename());
+        $smarty->assign("loginId", $login->getOID());
+        $smarty->assign("refererKey", $refererKey);
+        $smarty->assign("beginDate", $strDate);
+        $smarty->assign('page_title', $pageTitle);
+
+    }
+
+    /***
+     * The function process data for POST function, it's shared using on mobile view and pc view
+     *
+     * @param $input
+     */
+    public function processForPost($input)
+    {
+        $login = cb_get_login_user();
+        if ( ! $login) {
+            cb_throw_error(E_GRN_USER_NOT_FOUND);
+        }
+
+        $eventId = cb_at($input, self::ARG_EVENT_ID);
+        $facilityId = cb_at($input, self::ARG_FACILITY_ID);
+        $comment = cb_at($input, self::ARG_DATA);
+        $approval = cb_at($input, self::ARG_APPROVAL_ACTION);
+
+        $this->_validateIds($eventId, $facilityId);
+
+        $updateReadNotification = cb_at($input,
+            self::ARG_UPDATE_READ_NOTIFICATION);
+        if ($updateReadNotification === true) {
+            //Update read notification
+            require_once('grn/notification.csp');
+            $notificationService = \GRN_Notification_Service::getInstance();
+            $timeStamp = new \CB_TimeStamp();
+            $timeStamp->unix_ts = time();
+            $uniqueId = $eventId . "-" . $facilityId;
+            $notificationService->confirmNotifyData(
+                $login, GRN_SCHEDULE_MODULE_ID, $uniqueId, $timeStamp, false,
+                GRN_FACILITY_APPROVAL_SUB_MODULE_ID
+            );
+        }
+
+        $facilityApprovalLogic = new FacilityApprovalLogic();
+        if (preg_match('/^' . FacilityApproval::STATUS_APPROVE . '$/',
+            $approval)
+        ) {
+            $facilityApprovalLogic->processApprovalApplying($login, $eventId,
+                $facilityId, true, $comment);
+        } elseif (preg_match('/^' . FacilityApproval::STATUS_REJECT . '$/',
+            $approval)
+        ) {
+            $facilityApprovalLogic->processApprovalApplying($login, $eventId,
+                $facilityId, false, $comment);
+        } else {
+            cb_throw_error(E_GRN_SCHD_FACILITY_APPROVAL_INVALID_COMMAND);
+        }
+    }
+
+    /***
+     * The function get title of page
+     *
+     * @return string|void
+     */
+    public function getTitle()
+    {
+        return grn_get_current_page_display_name();
+    }
+}

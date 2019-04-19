@@ -1,0 +1,393 @@
+<?php
+
+namespace grn\message\dao;
+
+require_once('grn/application.csp');
+require_once('grn/table_util.csp');
+require_once('message/table_utility.csp');
+require_once('message/resources.csp');
+
+use grn\fts\Application as FtsApplication;
+use grn\fts\message\IndexService;
+
+class GrnMessageFolderMessageRelationsDAO
+{
+    /**
+     * Get all message ids in specified folders.
+     * If the message has a snapshot, it return original message id and snapshot message id.
+     *
+     * @param string[] $inFolderIds
+     * @param string   $inUserId
+     *
+     * @return string[] $messageIds
+     */
+    public function getMessageIdsInFolders($inFolderIds, $inUserId)
+    {
+        if (count($inFolderIds) === 0) {
+            return [];
+        }
+
+        $db = $this->getDatabaseConnection();
+        $tableName = $this->getTableName($inUserId);
+        $query = cb_queryf($db,
+            "SELECT r.col_message AS id, r.col_snapshot_message AS snapshot_id FROM {$tableName} AS r, tab_grn_message_messages AS m WHERE m._id=r.col_message AND col_folder IN (@A) AND col_user = '@S' ORDER BY m.col_last_mtime DESC",
+            $inFolderIds, $inUserId);
+        $result = $db->query($query);
+        $messageIds = [];
+        $unsortedMessageIds = [];
+        while ($row = $db->fetch_assoc($result)) {
+            if (is_null($row['snapshot_id'])) {
+                $messageIds[$row['id']] = $row['id'];
+            } else {
+                $unsortedMessageIds[$row['id']] = $row['id'];
+                $unsortedMessageIds[$row['snapshot_id']] = $row['snapshot_id'];
+            }
+        }
+        $db->free_result($result);
+
+        return $unsortedMessageIds + $messageIds;
+    }
+
+    /**
+     * Get user's all message ids except in draft and garbage folders.
+     * If the message has a snapshot, it return original message id and snapshot message id.
+     *
+     * @param string $inUserId
+     *
+     * @return string[] $messageIds
+     */
+    public function getAllMessageIds($inUserId)
+    {
+        $db = $this->getDatabaseConnection();
+        $tableName = $this->getTableName($inUserId);
+        $escapedUserId = $db->escape($inUserId);
+        $query = "SELECT " .
+                 "r.col_message AS messageId " .
+                 ", r.col_snapshot_message AS snapshotMessageId " .
+                 "FROM " .
+                 "{$tableName} AS r, " .
+                 "tab_grn_message_folders AS f, " .
+                 "tab_grn_message_messages AS m " .
+                 "WHERE " .
+                 "r.col_user = '{$escapedUserId}' AND " .
+                 "r.col_folder = f._id AND " .
+                 "r.col_message = m._id AND " .
+                 "f.col_folder_type != " . GRN_MESSAGE_DRAFTFOLDER
+                 . " AND " .
+                 "f.col_folder_type != "
+                 . GRN_MESSAGE_GARBAGEFOLDER . " AND " .
+                 "f.col_user = '{$escapedUserId}' " .
+                 "ORDER BY m.col_last_mtime DESC";
+        $result = $db->query($query);
+        $messageIds = [];
+        $unsortedMessageIds = [];
+        while ($row = $db->fetch_assoc($result)) {
+            if (is_null($row['snapshotMessageId'])) {
+                $messageIds[$row['messageId']] = $row['messageId'];
+            } else {
+                $unsortedMessageIds[$row['messageId']] = $row['messageId'];
+                $unsortedMessageIds[$row['snapshotMessageId']]
+                    = $row['snapshotMessageId'];
+            }
+        }
+        $db->free_result($result);
+
+        return $unsortedMessageIds + $messageIds;
+    }
+
+    /**
+     * @param string $userId
+     * @param string $messageId
+     *
+     * @return bool
+     */
+    public function hasMessageFolder($userId, $messageId)
+    {
+        $db = $this->getDatabaseConnection();
+        $tableName = $this->getTableName($userId);
+        $query = $db->format(
+            "SELECT 1 FROM {$tableName} WHERE col_user='@S' AND col_message='@S'",
+            [$userId, $messageId]
+        );
+        $result = $db->query($query);
+        $row = $db->fetch_assoc($result);
+        $db->free_result($result);
+
+        return $row !== false;
+    }
+
+    /**
+     * @param string $userId
+     * @param string $snapshotMessageId
+     *
+     * @return bool
+     */
+    public function hasSnapshotMessageFolder($userId, $snapshotMessageId)
+    {
+        $db = $this->getDatabaseConnection();
+        $tableName = $this->getTableName($userId);
+        $query = $db->format(
+            "SELECT 1 FROM {$tableName} WHERE col_user='@S' AND col_snapshot_message='@S'",
+            [$userId, $snapshotMessageId]
+        );
+        $result = $db->query($query);
+        $row = $db->fetch_assoc($result);
+        $db->free_result($result);
+
+        return $row !== false;
+    }
+
+    /**
+     * @return \CB_DatabaseConnection
+     */
+    protected function getDatabaseConnection()
+    {
+        $app_locator = \GRN_ApplicationLocator::instance();
+
+        return $app_locator->getConnection('message');
+    }
+
+    /**
+     * @param string $userId
+     *
+     * @return string
+     */
+    protected function getTableName($userId)
+    {
+        return grn_get_personal_tablename_message($userId,
+            'tab_grn_message_foldermessagerelations');
+    }
+
+    /**
+     * @param \GRN_Message_Messages $message
+     * @param array                 $users
+     * @param array                 $folders
+     * @param                       $message_type
+     */
+    public function insertRelations(
+        \GRN_Message_Messages $message,
+        array $users,
+        array $folders,
+        $message_type
+    ) {
+        $db = cb_get_app_db("message");
+        $indexService = new IndexService();
+
+        $columns = [
+            "col_folder",
+            "col_last_vtime",
+            "col_message",
+            "col_mtime",
+            "col_sent_message_flag",
+            "col_subscription_flag",
+            "col_user",
+            "col_snapshot_message"
+        ];
+        $original_message = $message->get('original_message');
+        $values = [];
+        /** @var $user \CB_User */
+        foreach ($users as $userId => $user) {
+            $folder = $folders[$userId];
+            $subscriptionFlag = $folder["subscriptionFlag"];
+            $folderType = $folder["folderType"];
+            $messageId = ! $original_message ? $message->getOID()
+                : $original_message->getOID();
+
+            $values[grn_get_personal_suffix($user->getOID())][]
+                = $db->format("('@S',@S,'@S',@S,'@S','@S','@S',@S)",
+                [
+                    $folder["folderId"],
+                    //col_folder
+                    $message_type == 0 ? "0" : "UNIX_TIMESTAMP()",
+                    // col_lastvtime
+                    $messageId,
+                    //col_message
+                    $folderType == GRN_MESSAGE_GARBAGEFOLDER
+                        ? "UNIX_TIMESTAMP()" : "NULL",
+                    $message_type,
+                    //col_sent_message
+                    $subscriptionFlag,
+                    //col_subscription_flag
+                    $userId,
+                    // col_user
+                    ! $original_message
+                        ? "NULL" : cb_queryf($db, "'@S'", $message->getOID())
+                    // col_snapshot_message
+                ]
+            );
+
+            if (FtsApplication::isAvailable()) {
+                $indexService->createFolderMessageRelationIndex(
+                    $messageId, ! $original_message ? null : $message->getOID(),
+                    $userId, $message_type, $folder['folderId']
+                );
+            }
+        }
+        $columnsStatement = implode($columns, ",");
+        foreach ($values as $userHash => $valueStatement) {
+            $query
+                = "INSERT INTO tab_grn_message_foldermessagerelations___%s (%s) VALUES %s";
+            $db->query(sprintf(
+                $query, $userHash, $columnsStatement,
+                implode($valueStatement, ",")
+            ));
+        }
+
+    }
+
+    /**
+     * @param array $users
+     *
+     * @return array
+     */
+    private function getMappedUserHashTable(array $users)
+    {
+        $userIdsHashTable = [];
+        foreach ($users as $user) {
+            if ( ! $user instanceof \CB_User) {
+                continue;
+            }
+            $userIdsHashTable[grn_get_personal_suffix($user->getOID())][]
+                = $user->getOId();
+        }
+
+        return $userIdsHashTable;
+    }
+
+    /**
+     * 通知を受け取るように設定しているユーザーのId一覧を返します。
+     * 通知の設定は、メッセージ本体と、フォルダー毎に設定が可能で、
+     * メッセージの本体とフォルダの通知設定がともに1のユーザーidを取得します
+     *
+     * @param $messageId
+     * @param $addressees \GRN_Message_Addressees[]
+     *
+     * @return array userIds
+     */
+    public function getSubscribedUserIds($messageId, array $addressees)
+    {
+        $db = $this->getDatabaseConnection();
+        $queries = [];
+
+        $userIdsHashTable = $this->getMappedUserHashTable($addressees);
+
+        foreach ($userIdsHashTable as $personalTableKey => $mappedUserIds) {
+            $queries[]
+                = "SELECT relation.col_user AS userId FROM tab_grn_message_foldermessagerelations___{$personalTableKey} AS relation "
+                  . "INNER JOIN tab_grn_message_folders AS folders ON folders._id = relation.col_folder "
+                  . "WHERE relation.col_subscription_flag = '1' AND folders.col_subscription_flag = '1' "
+                  . $db->format("AND relation.col_message='@S'", [$messageId])
+                  . $db->format("AND relation.col_user IN (@A)",
+                    [$mappedUserIds])
+                  . "/** GrnMessageFolderMessageRelationsDAO::getSubscribedUserIds */";
+        }
+        $userIds = [];
+        foreach ($queries as $query) {
+            $result = $db->query($query);
+            while ($row = $db->fetch_assoc($result)) {
+                $userIds[] = $row["userId"];
+            }
+        }
+
+        return $userIds;
+    }
+
+    /**
+     * Get users that the message is still be in normal folder (not in trash or "in trash and still in other folder")
+     *
+     * @param int   $message_id
+     * @param array $addressees
+     *
+     * @return array
+     */
+    public function getUserIdsCanReceiveMentionNotification(
+        int $message_id,
+        array $addressees
+    ): array {
+        $db = $this->getDatabaseConnection();
+        $queries = [];
+
+        $user_ids_hash_table = $this->getMappedUserHashTable($addressees);
+
+        foreach (
+            $user_ids_hash_table as $personal_table_key => $mapped_user_ids
+        ) {
+            $queries[]
+                = "SELECT relation.col_user AS user_id FROM tab_grn_message_foldermessagerelations___{$personal_table_key} AS relation "
+                  . "INNER JOIN tab_grn_message_folders AS folders ON folders._id = relation.col_folder WHERE"
+                  . $db->format(" relation.col_message='@S'", [$message_id])
+                  . $db->format(" AND relation.col_user IN (@A)",
+                    [$mapped_user_ids])
+                  . $db->format(" AND (folders.col_folder_type IS NULL OR folders.col_folder_type NOT IN (@A))",
+                    [[GRN_MESSAGE_GARBAGEFOLDER]]);
+        }
+
+        $user_ids = [];
+        foreach ($queries as $query) {
+            $result = $db->query($query);
+            while ($row = $db->fetch_assoc($result)) {
+                $user_ids[] = $row['user_id'];
+            }
+        }
+
+        return $user_ids;
+    }
+
+    /**
+     * @param \GRN_Message_Messages $message
+     * @param array                 $users
+     *
+     * @return array
+     */
+    public function getMessageViewableHashUserIds(
+        \GRN_Message_Messages $message,
+        array $users
+    ) {
+        $db = $this->getDatabaseConnection();
+        $messageViewable = [];
+        $userIdHashTable = $this->getMappedUserHashTable($users);
+
+        $queries = [];
+        foreach ($userIdHashTable as $hashKey => $mappedUserIds) {
+            $queries[]
+                = "SELECT r.col_user AS userId FROM tab_grn_message_foldermessagerelations___{$hashKey} AS r "
+                  . "INNER JOIN tab_cb_user AS u ON u._id=r.col_user "
+                  . $db->format("WHERE r.col_message='@S' AND r.col_user IN (@A) AND u.col_deleted IS NULL GROUP BY col_user HAVING COUNT(*) > 0",
+                    [
+                        $message->getOID(),
+                        $mappedUserIds
+                    ]);
+        }
+        foreach ($queries as $query) {
+            $result = $db->query($query);
+            while ($row = $db->fetch_assoc($result)) {
+                $messageViewable[$row["userId"]] = true;
+            }
+        }
+
+        return $messageViewable;
+    }
+
+    /**
+     * update last view time to now(UNIX_TIMESTAMP)
+     * There are cases which user has two relation sending folder and other folder.
+     * In this case, Update two relation.
+     *
+     * @param \CB_User $user
+     * @param          $messageId
+     *
+     * @return bool
+     */
+    public function updateLastViewTimeToNow(\CB_User $user, $messageId)
+    {
+        $userTable = $this->getTableName($user->getOID());
+        $db = $this->getDatabaseConnection();
+        $query = sprintf("UPDATE %s SET col_last_vtime=UNIX_TIMESTAMP() ",
+                $userTable)
+                 . $db->format("WHERE col_user='@S' AND col_message='@S'",
+                [$user->getOID(), $messageId])
+                 . "/*GrnMessageFolderMessageRelationsDAO::updateLastViewToToNow*/";
+
+        return $db->query($query);
+    }
+}

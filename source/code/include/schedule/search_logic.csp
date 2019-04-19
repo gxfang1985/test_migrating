@@ -1,0 +1,2382 @@
+<?php
+/**
+ *
+ * @author      A.Shima
+ * @package     grn.schedule
+ */
+
+require_once('schedule/table.csp');
+require_once('schedule/resources.csp');
+require_once('schedule/error_code.csp');
+require_once('grn/application.csp');
+require_once('schedule/utility.csp');
+require_once('schedule/view_util.csp');
+
+use grn\grn\MemberLogic;
+
+/**
+ * データのソート
+ *
+ * @access private
+ */
+function _grn_schedule_date_sort($var1, $var2)
+{
+    if ( ! is_array($var1) || ! is_array($var2)) {
+        assert(' ! is_array( $var1 ) || ! is_array( $var2 )');
+
+        return 0;
+    }
+
+    // 日付との比較
+    if (array_key_exists('col_setdate', $var1)) {
+        $dateex = new CB_DateEx($var1['col_setdate']);
+
+        // 日付と日付
+        if (array_key_exists('col_setdate', $var2)) {
+            $result = $dateex->compare($var2['col_setdate']);
+            if ($result !== 0) {
+                return $result > 0 ? 1 : -1;
+            }
+
+            // 開始日が同じ場合は、終了日付を見る
+            $dateex = new CB_DateEx($var1['col_enddate']);
+            $result = $dateex->compare($var2['col_enddate']);
+            if ($result !== 0) {
+                return $result > 0 ? 1 : -1;
+            }
+
+            // まったく同じ場合は、ID
+            if ($var1['id'] !== $var2['id']) {
+                return (intval($var1['id']) > intval($var2['id'])) ? 1 : -1;
+            }
+
+            // フォローのIDで判断
+            if ( ! array_key_exists('fid', $var1)) {
+                return -1;
+            }
+
+            if ( ! array_key_exists('fid', $var2)) {
+                return 1;
+            }
+
+            return (intval($var1['fid']) > intval($var2['fid'])) ? 1 : -1;
+        }
+
+        // 日付と日時
+        $dateex2 = $var2['col_setdatetime']->getDate();
+        $result = $dateex->compare($dateex2);
+        if ($result !== 0) {
+            return $result > 0 ? 1 : -1;
+        }
+
+        return -1;
+    } // 日時との比較
+    else {
+        // 日時と日時の比較
+        if (array_key_exists('col_setdatetime', $var2)) {
+            if ($var1['col_setdatetime']->unix_ts
+                != $var2['col_setdatetime']->unix_ts
+            ) {
+                return ($var1['col_setdatetime']->unix_ts
+                        > $var2['col_setdatetime']->unix_ts) ? 1 : -1;
+            }
+
+            // 開始時間が同じ場合は、終了時間を見る
+            if ($var1['col_enddatetime']->unix_ts
+                != $var2['col_enddatetime']->unix_ts
+            ) {
+                return ($var1['col_enddatetime']->unix_ts
+                        > $var2['col_enddatetime']->unix_ts) ? 1 : -1;
+            }
+
+            // 時刻が同じ場合はIDで並び替え
+            if ($var1['id'] !== $var2['id']) {
+                return (intval($var1['id']) > intval($var2['id'])) ? 1 : -1;
+            }
+
+            // フォローのIDで判断
+            if ( ! array_key_exists('fid', $var1)) {
+                return -1;
+            }
+
+            if ( ! array_key_exists('fid', $var2)) {
+                return 1;
+            }
+
+            return (intval($var1['fid']) > intval($var2['fid'])) ? 1 : -1;
+        }
+
+        // 日時と日付
+        $dateex = $var1['col_setdatetime']->getDate();
+
+        $result = $dateex->compare($var2['col_setdate']);
+
+        // 日付部分が同じ場合は 終日、バナーが前
+        if ($result == 0) {
+            return 1;
+        }
+
+        // 日付の前後
+        return $result > 0 ? 1 : -1;
+    }
+
+    return 0;
+}
+
+/**
+ * @param $var1 array
+ * @param $var2 array
+ *
+ * @return int
+ */
+function _grn_schedule_updated_date_sort($var1, $var2)
+{
+    return _grn_schedule_updated_or_created_date_sort($var1, $var2, 'updated');
+}
+
+/**
+ * @param $var1 array
+ * @param $var2 array
+ *
+ * @return int
+ */
+function _grn_schedule_created_date_sort($var1, $var2)
+{
+    return _grn_schedule_updated_or_created_date_sort($var1, $var2, 'created');
+}
+
+/**
+ * @param $var1 array
+ * @param $var2 array
+ * @param $type string
+ *
+ * @return int
+ */
+function _grn_schedule_updated_or_created_date_sort(
+    array $var1,
+    array $var2,
+    string $type
+): int {
+    if ($type == 'created') {
+        $col = 'col_ctime';
+    } else {
+        $col = 'col_mtime';
+    }
+
+    if ($var1[$col] != $var2[$col]) {
+        return $var1[$col] <=> $var2[$col];
+    } else {
+        return _grn_schedule_date_sort($var1, $var2);
+    }
+
+}
+
+
+class GRN_Schedule_SearchLogic extends CB_ModuleBase
+{
+    const OPTION_ALLOW_EMPTY_KEYWORD = 'allow_empty_keyword';
+
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        parent::__construct(GRN_SCHEDULE_MODULE_ID . '.search');
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('schedule');
+        $this->_eventtable = $tm->getTableInfo(GRN_SCHEDULEEVENT);
+        $this->_datetimetable = $tm->getTableInfo(GRN_EVENTDATETIME);
+        $this->_datetable = $tm->getTableInfo(GRN_EVENTDATE);
+        $this->_membertable = $tm->getTableInfo(GRN_EVENTMEMBER);
+        $this->_addresstable = $tm->getTableInfo(GRN_SCHEDULE_ADDRESSDATA);
+        $this->_followtable = $tm->getTableInfo(GRN_EVENTFOLLOW);
+    }
+
+    private $_eventtable = null;
+    private $_datetimetable = null;
+    private $_datetable = null;
+    private $_membertable = null;
+    private $_addresstable = null;
+    private $_followtable = null;
+
+    private static $_instance = null;
+
+    /**
+     * @return GRN_Schedule_SearchLogic
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * @param   CB_User     $user
+     * @param   array       $options
+     * @param   string      $keyword
+     * @param   int         $offset
+     * @param   int         $limit
+     * @param   CB_Date|int $setdate
+     * @param   CB_Date|int $enddate
+     * @param   string[]    $order_by
+     * @param   boolean     $getTotal
+     *
+     * @return  array
+     */
+    public function search(
+        CB_User $user,
+        array $options,
+        $keyword,
+        $offset,
+        $limit,
+        $setdate,
+        $enddate,
+        $order_by = null,
+        $getTotal = true
+    ) {
+        $retval = [];
+        if ($getTotal) {
+            $retval['total'] = 0;
+        }
+
+        if (strlen($keyword) === 0 && ! $this->allowEmptyKeyword($options)) {
+            return $retval;
+        }
+
+        $member_ids = null;
+        if (array_key_exists('member_ids', $options)) {
+            $member_ids = $options['member_ids'];
+        }
+
+        if ( ! is_array($member_ids) || count($member_ids) == 0) {
+            return $retval;
+        }
+
+        // 検索者のリストを作成する
+        $str_member = $this->_makeMembersCondition($member_ids);
+        if ($str_member === false) {
+            return $retval;
+        }
+
+        $keyword_conditions = $this->_makeKeywordConditions($options, $keyword);
+        if ( ! $keyword_conditions) {
+            return $retval;
+        }
+
+        $expand_repeat_and_temporary = false;
+        if (array_key_exists('expand_repeat_and_temporary', $options)) {
+            $expand_repeat_and_temporary = true;
+        }
+        $exclude_private = array_key_exists('exclude_private', $options);
+
+        $events = [];
+        if (array_key_exists('event', $keyword_conditions)) {
+            $datetimeevents = &$this->_getDateTimeEventRowSet(
+                $user, $setdate, $enddate, $str_member,
+                $keyword_conditions['event'], $keyword,
+                $expand_repeat_and_temporary, $exclude_private
+            );
+
+            $dateevents = &$this->_getDateEventRowSet(
+                $user, $setdate, $enddate, $str_member,
+                $keyword_conditions['event'], $keyword,
+                $expand_repeat_and_temporary, $exclude_private
+            );
+
+            // 合成
+            $events = array_merge_recursive((array)$datetimeevents,
+                (array)$dateevents);
+        }
+
+        if (array_key_exists('follow', $keyword_conditions)) {
+            $datetimeevents = &$this->_getDateTimeEventRowSet($user, $setdate,
+                $enddate, $str_member, $keyword_conditions['follow'],
+                $keyword, $expand_repeat_and_temporary, $exclude_private, true);
+            $dateevents = &$this->_getDateEventRowSet($user, $setdate,
+                $enddate, $str_member, $keyword_conditions['follow'],
+                $keyword, $expand_repeat_and_temporary, $exclude_private, true);
+
+            // 合成
+            $events = array_merge_recursive((array)$events,
+                (array)$datetimeevents, (array)$dateevents);
+        }
+
+        // 並び替え
+        if (isset($order_by[0]) && $order_by[0] == 'updatedAt') {
+            usort($events, '_grn_schedule_updated_date_sort');
+        } elseif (isset($order_by[0]) && $order_by[0] == 'createdAt') {
+            usort($events, '_grn_schedule_created_date_sort');
+        } else {
+            usort($events, '_grn_schedule_date_sort');
+        }
+        if (isset($order_by[1]) && $order_by[1] == 'desc') {
+            krsort($events);
+        }
+
+        $counter = 0;
+        $i = 0;
+        $retvals = [];
+
+        foreach (array_keys($events) as $key) {
+            $i++;
+            // offset
+            if ($offset >= $i) {
+                continue;
+            }
+
+            $event = $events[$key];
+            $temp = [];
+            $temp['event_id'] = $event['id'];
+            $temp['title']
+                = grn_schedule_get_event_title($event['col_eventmenu'],
+                $event['col_detail']);
+            $temp['event_menu'] = $event['col_eventmenu'];
+            $temp['event_menu_color'] = $event['col_reserve_int2'];
+            $temp['event_detail'] = $event['col_detail'];
+            $temp['memo'] = $event['col_memo'];
+            $temp['creator_id'] = $event['col_creator'];
+            $temp['creator_name'] = $event['col_creator_name'];
+            // フォローの場合はフォローを使う
+            if (array_key_exists('col_follow', $event)) {
+                if ( ! is_null($event['col_follow'])) {
+                    $temp['memo'] = '';
+                    $temp['follow_id'] = $event['fid'];
+                    $temp['follow'] = $event['col_follow'];
+                    $temp['creator_id'] = $event['f_creator'];
+                    $temp['creator_name'] = $event['f_creator_name'];
+                }
+            }
+            $event_type = intval($event['col_event_type']);
+
+            if (($event_type & GRN_SCHEDULE_EVENT_TYPE_ALLDAY)
+                == GRN_SCHEDULE_EVENT_TYPE_ALLDAY
+                || ($event_type & GRN_SCHEDULE_EVENT_TYPE_BANNER)
+                   == GRN_SCHEDULE_EVENT_TYPE_BANNER
+            ) {
+                $temp['setdate'] = $event['col_setdate'];
+                $temp['enddate'] = $event['col_enddate'];
+            } elseif (($event_type & GRN_SCHEDULE_EVENT_TYPE_START)
+                      == GRN_SCHEDULE_EVENT_TYPE_START
+            ) {
+                $temp['setdatetime'] = $event['col_setdatetime']->getDateTime();
+            } else {
+                $temp['setdatetime'] = $event['col_setdatetime']->getDateTime();
+                $temp['enddatetime'] = $event['col_enddatetime']->getDateTime();
+            }
+
+            $temp['event_type'] = $event_type;
+            if (($event_type & GRN_SCHEDULE_EVENT_TYPE_REPEAT)
+                == GRN_SCHEDULE_EVENT_TYPE_REPEAT
+            ) {
+                $temp['repeat'] = true;
+            } elseif (($event_type & GRN_SCHEDULE_EVENT_TYPE_TEMPORARY)
+                      == GRN_SCHEDULE_EVENT_TYPE_TEMPORARY
+            ) {
+                $temp['temporary'] = true;
+                if ($expand_repeat_and_temporary) {
+                    $temp['candidate_id'] = $event['_id'];
+                }
+            } elseif (($event_type & GRN_SCHEDULE_EVENT_TYPE_BANNER)
+                      == GRN_SCHEDULE_EVENT_TYPE_BANNER
+            ) {
+                $temp['banner'] = true;
+            }
+
+            $retvals[] = $temp;
+
+            // 取得数に達した場合
+            $counter++;
+            if ($counter >= $limit) {
+                break;
+            }
+        }
+
+        if ($getTotal) {
+            $retvals['total'] = count($events);
+        }
+
+        return $retvals;
+    }
+
+    /**
+     * @param array $member_ids
+     *
+     * @return bool|string
+     */
+    private function _makeMembersCondition($member_ids)
+    {
+        if ( ! is_array($member_ids) || count($member_ids) == 0) {
+            return false;
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('schedule');
+
+        $user_id_list = [];
+        $group_id_list = [];
+        $facility_id_list = [];
+
+        foreach (array_keys($member_ids) as $key) {
+            $prefix = mb_substr($key, 0, 1);
+            $id = mb_substr($key, 1);
+            switch ($prefix) {
+                case MemberLogic::PREFIX_ORGANIZATION:
+                    $group_id_list[] = $id;
+                    break;
+                case MemberLogic::PREFIX_FACILITY:
+                    $facility_id_list[] = $id;
+                    break;
+                default:
+                    // no prefix
+                    $user_id_list[] = $key;
+                    break;
+            }
+        }
+
+        $conditions = [];
+        if ( ! empty($user_id_list)) {
+            $conditions[] = $db->format("m.col_user IN (@A)", [$user_id_list]);
+        }
+        if ( ! empty($group_id_list)) {
+            $conditions[] = $db->format("m.col_group IN (@A)",
+                [$group_id_list]);
+        }
+        if ( ! empty($facility_id_list)) {
+            $conditions[] = $db->format("m.col_facility IN (@A)",
+                [$facility_id_list]);
+        }
+
+        return implode(' OR ', $conditions);
+    }
+
+    /**
+     * @param array  $options
+     * @param string $keyword
+     *
+     * @return array|bool
+     */
+    private function _makeKeywordConditions(array $options, $keyword)
+    {
+        if (strlen($keyword) === 0) {
+            if ($this->allowEmptyKeyword($options)) {
+                return ['event' => ''];
+            } else {
+
+                return false;
+            }
+        }
+
+        require_once('fw/string_util.csp');
+        $text = cb_parse_search_text($keyword);
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $db = $app_locator->getConnection('schedule');
+
+        $conditions = ['event' => [], 'follow' => []];
+
+        foreach ($text as $key) {
+            $query_event = [];
+            $query_follow = [];
+            if (array_key_exists('title', $options)) {
+                $query_event[] = cb_queryf($db,
+                    'e.col_dummytitle LIKE \'%@L%\'', $key);
+            }
+
+            if (array_key_exists('companyinfo', $options)) {
+                $query_event[] = cb_queryf($db,
+                    'c.col_company_name LIKE \'%@L%\'', $key);
+            }
+
+            if (array_key_exists('memo', $options)) {
+                $query_event[] = cb_queryf($db, 'e.col_memo LIKE \'%@L%\'',
+                    $key);
+            }
+            if (array_key_exists('follow', $options)) {
+                $query_follow[] = cb_queryf($db,
+                    ' exists ( select * FROM tab_grn_schedule_eventfollow fa where col_follow like \'%@L%\' AND e._id = fa.col_event) ',
+                    $key);
+            }
+
+            // フォローが設定されている場合、フォローを含めて検索する。
+            if (count($query_follow) > 0) {
+                $a = implode(' OR ', $query_follow);
+                if (count($query_event) > 0) {
+                    $conditions['follow'][] = '( ' . implode(' OR ',
+                            $query_event) . ' OR ' . $a . ' )';
+                } else {
+                    $conditions['follow'][] = '( ' . $a . ' )';
+                }
+            } // フォローが設定されていない場合、フォローを含めずに検索する。
+            elseif (count($query_event) > 0) {
+                $conditions['event'][] = '( ' . implode(' OR ', $query_event)
+                                         . ' )';
+            }
+        }
+
+        if (count($conditions['event']) > 0) {
+            $conditions['event'] = '(' . implode(' AND ', $conditions['event'])
+                                   . ')';
+        } else {
+            unset($conditions['event']);
+        }
+
+        if (count($conditions['follow']) > 0) {
+            $conditions['follow'] = '(' . implode(' AND ',
+                    $conditions['follow']) . ')';
+        } else {
+            unset($conditions['follow']);
+        }
+
+        if (count($conditions) === 0) {
+            return false;
+        }
+
+        return $conditions;
+    }
+
+    private function &_getDateTimeEventRowSet(
+        CB_User $user,
+        $setdate,
+        $enddate,
+        $str_member,
+        $keyword_condition,
+        $keyword,
+        $expand_repeat_and_temporary,
+        $exclude_private,
+        $b_follow = false
+    ): array {
+        $rowset = new CB_MultiRowSet($this->_membertable, 'm');
+        $rowset->addJoin($this->_datetimetable,
+            "m.col_event_type_simple = '1' AND ( " . $str_member
+            . " ) AND d.col_event = m.col_event", CB_DATABASE_LEFT_JOIN, 'd');
+        $rowset->addJoin($this->_addresstable, 'm.col_event = c.col_event',
+            CB_DATABASE_LEFT_JOIN, 'c');
+
+        if ($b_follow) {
+            $on = 'm.col_event = f.col_event';
+            // フォローを検索
+            $on_follow = null;
+            require_once('fw/string_util.csp');
+            $text = cb_parse_search_text($keyword);
+            foreach ($text as $key) {
+                if ( ! is_null($on_follow)) {
+                    $on_follow .= ' OR ';
+                }
+                $key = $rowset->queryf('@S', $key);
+                $on_follow .= " ( f.col_follow LIKE '%$key%' )";
+            }
+            $on .= ' AND ( ' . $on_follow . ' ) ';
+            $rowset->addJoin($this->_followtable, $on, CB_DATABASE_LEFT_JOIN,
+                'f');
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('schedule');
+        $rowset->addJoin($this->_eventtable, 'm.col_event = e._id',
+            CB_DATABASE_LEFT_JOIN, 'e');
+        $user_table = $tm->getTableInfo('CB_User');
+        $on = 'm.col_user = u._id';
+        $rowset->addJoin($user_table, $on, CB_DATABASE_LEFT_JOIN, 'u');
+
+        // schedule_eventのcol_creatorはSET NULL
+        $on = 'e.col_creator = eu._id';
+        $rowset->addJoin($user_table, $on, CB_DATABASE_LEFT_JOIN, 'eu');
+
+        if ($b_follow) {
+            // schedule_eventfollowのcol_creatorはSET NULL
+            $on = 'f.col_creator = fu._id';
+            $rowset->addJoin($user_table, $on, CB_DATABASE_LEFT_JOIN, 'fu');
+        }
+
+        $ts1 = null;
+        $ts2 = null;
+        $setdatetime_inequality = null;
+        $enddatetime_inequality = null;
+
+        // 取得する日付の計算
+        if (is_a($setdate, 'CB_Date')) {
+            $datetime = new CB_DateTime();
+            $datetime->year = intval($setdate->year);
+            $datetime->month = intval($setdate->month);
+            $datetime->day = intval($setdate->day);
+            $datetime->hour = 0;
+            $datetime->minute = 0;
+            $datetime->second = 0;
+            $ts1 = new CB_TimeStampEx();
+            $ts1->setDateTime($datetime);
+
+            $datetime->year = intval($enddate->year);
+            $datetime->month = intval($enddate->month);
+            $datetime->day = intval($enddate->day);
+            $ts2 = new CB_TimeStampEx();
+            $ts2->setDateTime($datetime);
+            $ts2->add(new CB_DateTimeSpan(86400));
+
+            $setdatetime_inequality = '<';
+            $enddatetime_inequality = '>';
+        } elseif (is_int($setdate)) {
+            $ts1 = CB_TimeStampEx::valueOf($setdate);
+            $ts2 = CB_TimeStampEx::valueOf($enddate);
+
+            $setdatetime_inequality = '<=';
+            $enddatetime_inequality = '>=';
+        }
+
+        $format
+            = $rowset->queryf("(( d.col_setdatetime >= '@S' AND d.col_setdatetime "
+                              . $setdatetime_inequality
+                              . " '@S' ) OR ( d.col_setdatetime <> d.col_enddatetime AND d.col_enddatetime "
+                              . $enddatetime_inequality
+                              . " '@S' AND d.col_enddatetime <= '@S' ) OR ( d.col_setdatetime < '@S' AND d.col_enddatetime > '@S' ) )",
+            $ts1->unix_ts, $ts2->unix_ts, $ts1->unix_ts, $ts2->unix_ts,
+            $ts1->unix_ts, $ts2->unix_ts);
+
+        // 繰り返し予定をすべて取得するかどうか
+        $rowset->addCondition($format);
+        if (strlen($keyword_condition) > 0) {
+            $rowset->addCondition($keyword_condition);
+        }
+        $func = null;
+        $group_by = null;
+        if ($expand_repeat_and_temporary) {
+            $func = [
+                'col_setdatetime'     => 'd.col_setdatetime',
+                'col_enddatetime'     => 'd.col_enddatetime',
+                'id'                  => 'e._id',
+                'col_eventmenu'       => 'e.col_eventmenu',
+                'col_reserve_int2'    => 'e.col_reserve_int2',
+                'col_detail'          => 'e.col_detail',
+                'col_memo'            => 'e.col_memo',
+                'col_private'         => 'e.col_private',
+                'col_event_type'      => 'e.col_event_type',
+                'col_creator'         => 'e.col_creator',
+                'col_creator_name'    => 'e.col_creator_name',
+                'col_deleted'         => 'u.col_deleted',
+                'col_creator_deleted' => 'eu.col_deleted',
+                'col_ctime'           => 'e.col_ctime',
+                'col_mtime'           => 'e.col_mtime',
+            ];
+
+            $group_by = ['_id' => 'd._id'];
+
+            if ($b_follow) {
+                $func['fid'] = 'f._id';
+                $func['col_follow'] = 'f.col_follow';
+                $func['f_creator'] = 'f.col_creator';
+                $func['f_creator_name'] = 'f.col_creator_name';
+                $func['f_creator_deleted'] = 'fu.col_deleted';
+            }
+        } else {
+            $func = [
+                'col_setdatetime' => 'MIN(d.col_setdatetime)',
+                'col_enddatetime' => 'MIN(d.col_enddatetime)',
+                'col_deleted'     => 'u.col_deleted',
+                'col_ctime'       => 'e.col_ctime',
+                'col_mtime'       => 'e.col_mtime',
+            ];
+
+            $group_by = [
+                'id'                  => 'e._id',
+                'col_detail'          => 'e.col_detail',
+                'col_eventmenu'       => 'e.col_eventmenu',
+                'col_reserve_int2'    => 'e.col_reserve_int2',
+                'col_memo'            => 'e.col_memo',
+                'col_private'         => 'e.col_private',
+                'col_event_type'      => 'e.col_event_type',
+                'col_creator'         => 'e.col_creator',
+                'col_creator_name'    => 'e.col_creator_name',
+                'col_creator_deleted' => 'eu.col_deleted',
+            ];
+            if ($b_follow) {
+                $group_by['col_follow'] = 'f.col_follow';
+                $group_by['fid'] = 'f._id';
+                $group_by['f_creator'] = 'f.col_creator';
+                $group_by['f_creator_name'] = 'f.col_creator_name';
+                $group_by['f_creator_deleted'] = 'fu.col_deleted';
+            }
+
+        }
+
+        $rowset->applyGroupFunctions($func, $group_by);
+
+        $rowset->addOrderColumn('d.col_setdatetime, d.col_enddatetime, d.col_event');
+
+        $events = [];
+
+        while ( ! is_null($row = $rowset->iterate())) {
+            // ユーザー削除フラグが立っていたら無視
+            if ( ! is_null($row['col_deleted'])) {
+                continue;
+            }
+
+            // ログインユーザー以外は、非公開のチェックを行う
+            if ($exclude_private
+                && $this->_isHidden($row, $user) == GRN_EVENT_PRIVATE_HIDDEN
+            ) {
+                continue;
+            }
+
+            $ts_setdatetime = new CB_TimeStampEx();
+            $ts_setdatetime->unix_ts = intval($row['col_setdatetime']);
+            $row['col_setdatetime'] = $ts_setdatetime;
+            $ts_enddatetime = new CB_TimeStampEx();
+            $ts_enddatetime->unix_ts = intval($row['col_enddatetime']);
+            $row['col_enddatetime'] = $ts_enddatetime;
+
+            if ( ! is_null($row['col_creator_deleted'])) {
+                $row['col_creator'] = null;
+            }
+
+            if (array_key_exists('f_creator_deleted', $row)
+                &&
+                ! is_null($row['f_creator_deleted'])
+            ) {
+                $row['f_creator'] = null;
+            }
+            $events[] = $row;
+        }
+
+        return $events;
+    }
+
+    private function &_getDateEventRowSet(
+        CB_User $user,
+        $setdate,
+        $enddate,
+        $str_member,
+        $keyword_condition,
+        $keyword,
+        $expand_repeat_and_temporary,
+        $exclude_private,
+        $b_follow = false
+    ): array {
+        if (is_int($setdate)) {
+            $original_setdate = $setdate;
+            $original_enddate = $enddate;
+
+            $setdatetime = new CB_DateTimeEx(cb_timestamp_to_datetime($setdate,
+                'UTC'));
+            $setdate = $setdatetime->getDate();
+
+            $enddatetime = new CB_DateTimeEx(cb_timestamp_to_datetime($enddate,
+                'UTC'));
+            $enddate = $enddatetime->getDate();
+
+            $setdate->moveDays(-1);
+            $enddate->moveDays(+1);
+        }
+
+        // テーブルのJoin
+        $rowset = new CB_MultiRowSet($this->_membertable, 'm');
+        $rowset->addJoin($this->_datetable,
+            "m.col_event_type BETWEEN '32' AND '64' AND ( " . $str_member
+            . " ) AND d.col_event = m.col_event", CB_DATABASE_LEFT_JOIN, 'd');
+        $rowset->addJoin($this->_addresstable, 'm.col_event = c.col_event',
+            CB_DATABASE_LEFT_JOIN, 'c');
+
+        if ($b_follow) {
+            $on = 'm.col_event = f.col_event';
+            // フォローを検索
+            $on_follow = null;
+            require_once('fw/string_util.csp');
+            $text = cb_parse_search_text($keyword);
+            foreach ($text as $key) {
+                if ( ! is_null($on_follow)) {
+                    $on_follow .= ' OR ';
+                }
+                $key = $rowset->queryf('@S', $key);
+                $on_follow .= " ( f.col_follow LIKE '%$key%' )";
+            }
+            $on .= ' AND ( ' . $on_follow . ' ) ';
+            $rowset->addJoin($this->_followtable, $on, CB_DATABASE_LEFT_JOIN,
+                'f');
+        }
+        $rowset->addJoin($this->_eventtable, 'm.col_event = e._id',
+            CB_DATABASE_LEFT_JOIN, 'e');
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $tm = $app_locator->getTableManager('schedule');
+        $user_table = $tm->getTableInfo('CB_User');
+        $on = 'm.col_user = u._id';
+        $rowset->addJoin($user_table, $on, CB_DATABASE_LEFT_JOIN, 'u');
+
+        // schedule_eventのcol_creatorはSET NULL
+        $on = 'e.col_creator = eu._id';
+        $rowset->addJoin($user_table, $on, CB_DATABASE_LEFT_JOIN, 'eu');
+
+        if ($b_follow) {
+            // schedule_eventfollowのcol_creatorはSET NULL
+            $on = 'f.col_creator = fu._id';
+            $rowset->addJoin($user_table, $on, CB_DATABASE_LEFT_JOIN, 'fu');
+        }
+
+        // クエリーの作成
+        $format
+            = $rowset->queryf("(( d.col_setdate >= '@S' AND d.col_setdate <= '@S' ) OR ( d.col_enddate >= '@S' AND d.col_enddate <= '@S' ) OR ( d.col_setdate < '@S' AND d.col_enddate > '@S' ) )",
+            $setdate->format(), $enddate->format(), $setdate->format(),
+            $enddate->format(), $setdate->format(), $enddate->format());
+
+        $rowset->addCondition($format);
+        if (strlen($keyword_condition) > 0) {
+            $rowset->addCondition($keyword_condition);
+        }
+
+        $func = null;
+        $group_by = null;
+        if ($expand_repeat_and_temporary) {
+            $func = [
+                'col_setdate'         => 'd.col_setdate',
+                'col_enddate'         => 'd.col_enddate',
+                'col_timezone'        => 'd.col_timezone',
+                'col_end_timezone'    => 'd.col_end_timezone',
+                'id'                  => 'e._id',
+                'col_eventmenu'       => 'e.col_eventmenu',
+                'col_reserve_int2'    => 'e.col_reserve_int2',
+                'col_detail'          => 'e.col_detail',
+                'col_memo'            => 'e.col_memo',
+                'col_private'         => 'e.col_private',
+                'col_event_type'      => 'e.col_event_type',
+                'col_creator'         => 'e.col_creator',
+                'col_creator_name'    => 'e.col_creator_name',
+                'col_deleted'         => 'u.col_deleted',
+                'col_creator_deleted' => 'eu.col_deleted',
+                'col_ctime'           => 'e.col_ctime',
+                'col_mtime'           => 'e.col_mtime',
+            ];
+
+            $group_by = ['_id' => 'd._id'];
+
+            if ($b_follow) {
+                $func['col_follow'] = 'f.col_follow';
+                $func['fid'] = 'f._id';
+                $func['f_creator'] = 'f.col_creator';
+                $func['f_creator_name'] = 'f.col_creator_name';
+                $func['f_creator_deleted'] = 'fu.col_deleted';
+            }
+        } else {
+            $func = [
+                'col_setdate'      => 'MIN(d.col_setdate)',
+                'col_enddate'      => 'MIN(d.col_enddate)',
+                'col_timezone'     => 'd.col_timezone',
+                'col_end_timezone' => 'd.col_end_timezone',
+                'col_deleted'      => 'u.col_deleted',
+                'col_ctime'        => 'e.col_ctime',
+                'col_mtime'        => 'e.col_mtime',
+            ];
+
+            $group_by = [
+                'id'                  => 'e._id',
+                'col_detail'          => 'e.col_detail',
+                'col_eventmenu'       => 'e.col_eventmenu',
+                'col_reserve_int2'    => 'e.col_reserve_int2',
+                'col_memo'            => 'e.col_memo',
+                'col_private'         => 'e.col_private',
+                'col_creator'         => 'e.col_creator',
+                'col_creator_name'    => 'e.col_creator_name',
+                'col_event_type'      => 'e.col_event_type',
+                'col_creator_deleted' => 'eu.col_deleted',
+            ];
+
+            if ($b_follow) {
+                $group_by['col_follow'] = 'f.col_follow';
+                $group_by['fid'] = 'f._id';
+                $group_by['f_creator'] = 'f.col_creator';
+                $group_by['f_creator_name'] = 'f.col_creator_name';
+                $group_by['f_creator_deleted'] = 'fu.col_deleted';
+            }
+        }
+
+        $rowset->applyGroupFunctions($func, $group_by);
+        $rowset->addOrderColumn('d.col_setdate, d.col_enddate, d.col_event');
+
+        $events = [];
+        while ( ! is_null($row = &$rowset->iterate())) {
+            // ユーザー削除フラグが立っていたら無視
+            if ( ! is_null($row['col_deleted'])) {
+                continue;
+            }
+
+            // ログインユーザー以外は、非公開のチェックを行う
+            if ($exclude_private
+                && $this->_isHidden($row, $user) == GRN_EVENT_PRIVATE_HIDDEN
+            ) {
+                continue;
+            }
+
+            $row['col_setdate'] = CB_Date::valueOf($row['col_setdate']);
+            $row['col_enddate'] = CB_Date::valueOf($row['col_enddate']);
+
+            if ( ! is_null($row['col_creator_deleted'])) {
+                $row['col_creator'] = null;
+            }
+
+            if (array_key_exists('f_creator_deleted', $row)
+                &&
+                ! is_null($row['f_creator_deleted'])
+            ) {
+                $row['f_creator'] = null;
+            }
+
+            $events[] = &$row;
+        }
+
+        if (isset($original_setdate)) {
+            $events = $this->_filterEventsByUtcDateTime($events,
+                $original_setdate, $original_enddate);
+        }
+
+        return $events;
+    }
+
+    /**
+     * @param array $events
+     * @param int   $start_ts
+     * @param int   $end_ts
+     *
+     * @return array
+     */
+    function _filterEventsByUtcDateTime(
+        array $events,
+        int $start_ts,
+        int $end_ts
+    ) {
+        $filtered_events = [];
+        foreach ($events as $event) {
+            $event_start_datetime = CB_DateTime::valueOf(
+                intval($event['col_setdate']->year),
+                intval($event['col_setdate']->month),
+                intval($event['col_setdate']->day),
+                0, 0, 0
+            );
+            $event_start_ts
+                = cb_datetime_to_timestamp($event_start_datetime,
+                $event['col_timezone']);
+
+            $event_end_datetime = CB_DateTime::valueOf(
+                intval($event['col_enddate']->year),
+                intval($event['col_enddate']->month),
+                intval($event['col_enddate']->day),
+                23, 59, 59
+            );
+            $event_end_ts = cb_datetime_to_timestamp($event_end_datetime,
+                $event['col_end_timezone']);
+
+            if (($start_ts > $event_end_ts) || ($end_ts < $event_start_ts)) {
+                continue;
+            } else {
+                $filtered_events[] = $event;
+            }
+        }
+
+        return $filtered_events;
+    }
+
+    /**
+     * 非公開のパターンをチェック
+     *
+     * @access private
+     */
+    function _isHidden($row, $login)
+    {
+        $private = intval($row['col_private']);
+
+        // そもそも公開予定は関係ない
+        if ($private == 0) {
+            return GRN_EVENT_PRIVATE_NONE;
+        }
+
+        // 比較ユーザーがいない場合はすべて隠す
+        if ( ! $login) {
+            return GRN_EVENT_PRIVATE_HIDDEN;
+        }
+
+        // 自分が登録したかどうか
+        $creator_id = $row['col_creator'];
+        if (is_string($creator_id) && mb_strlen($creator_id) > 0
+            && $creator_id == $login->getOID()
+        ) {
+            return GRN_EVENT_PRIVATE_PRIVATE;
+        }
+
+        // 参加者に自分がいる場合は見える
+        $rowset = new CB_RowSet($this->_membertable);
+        // 削除フラグたってたらオブジェクト取れないし対処すると普段のパフォーマンスが怖いのでこれは対処しない
+        $rowset->addCondition($rowset->queryf("col_event = '@S' AND col_user ='@S'",
+            $row['id'], $login->getOID()));
+        $rowset->applyGroupFunctions(['count' => 'COUNT(*)']);
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        // 隠す必要がある
+        if ($row['count'] == 0) {
+            return GRN_EVENT_PRIVATE_HIDDEN;
+        }
+
+        return GRN_EVENT_PRIVATE_PRIVATE;
+    }
+
+    private function allowEmptyKeyword(array $options): bool
+    {
+        return array_key_exists(self::OPTION_ALLOW_EMPTY_KEYWORD, $options);
+    }
+}
+
+class GRN_Schedule_AdjustSearchLogic extends CB_ModuleBase
+{
+    /**
+     * @access private
+     */
+    function __construct()
+    {
+        parent::__construct(GRN_SCHEDULE_MODULE_ID . '.adjustsearch');
+    }
+
+    /**
+     * @access private
+     */
+    private $_candidates_count = 0;
+    /**
+     * @access private
+     */
+    private $_candidate_list = [];
+
+    private static $_instance = null;
+
+    /**
+     * @return GRN_Schedule_AdjustSearchLogic
+     */
+    public static function getInstance()
+    {
+        if ( ! isset(self::$_instance)) {
+            $c = __CLASS__;
+            self::$_instance = new $c;
+        }
+
+        return self::$_instance;
+    }
+
+
+    /**
+     * @author yonekawa
+     *
+     * @param  array  $date_list
+     * @param  int    $start_hour
+     * @param  int    $end_hour
+     * @param  int    $term_hour
+     * @param  int    $term_minute
+     * @param  array  $member_id_list
+     * @param  array  $facility_id_list
+     * @param  string $facility_search_method
+     *
+     * @return array    Free time candidate list.
+     *    $facility_id is facility's _id or GRN_SCHD_ADJUST_NO_FACILITY
+     *
+     *    array( $facility_id1 => array( 'date' => $date_object,
+     *                                   'set_time' => $time_object,
+     *                                   'end_time' => $time_object),
+     *           $facility_id2 => array( 'date' => $date_object,
+     *                                   'set_time' => $time_object,
+     *                                   'end_time' => $time_object),
+     *           ...
+     *           $facility_idN => array( 'date' => $date_object,
+     *                                   'set_time' => $time_object,
+     *                                   'end_time' => $time_object)
+     *    )
+     */
+    function searchFreeTimes(
+        $date_list,
+        $start_hour,
+        $end_hour,
+        $term_hour = 0,
+        $term_minute = 0,
+        $member_id_list = [],
+        $facility_id_list = [],
+        $facility_search_method = 'OR',
+        $around_time = 0,
+        $except_hours = [],
+        $workday_condition = GRN_SCHEDULE_ALL_DAYS
+    ) {
+        $candidate_list = [];
+
+        $this->_candidates_count = 0;
+        $this->_candidate_list = [];
+
+        // create term's TimeSpan
+        // 検索する時間帯のTimeSpanを作成
+        $term_span = $this->_createTermSpan($term_hour, $term_minute);
+        if ($term_span <= 0) {
+            return [];
+        }
+
+        // create datetime candidate list
+        // 候補日時のリストを作成
+        $target_datetime_list = $this->_createTargetDatetimeList($date_list,
+            $start_hour, $end_hour, $except_hours);
+        $target_datetime_list
+            = $this->_filterDatetimeList($target_datetime_list,
+            $member_id_list, $workday_condition);
+        $target_datetime_count = count($target_datetime_list);
+        if ($target_datetime_count <= 0) {
+            return [];
+        }
+
+        // No facility search
+        // 施設を一つも選んでいない時はユーザーだけで検索する
+        if (count($facility_id_list) <= 0) {
+            foreach ($target_datetime_list as $datetime) {
+                $user_freetimes
+                    = $this->_createUsersFreeTimeList($member_id_list,
+                    $datetime['setdatetime'],
+                    $datetime['enddatetime'],
+                    $around_time);
+
+                $candidate_list = $this->_createCandidateList($user_freetimes,
+                    GRN_SCHD_ADJUST_NO_FACILITY,
+                    $datetime,
+                    $term_span);
+
+                if ($this->_candidates_count
+                    >= GRN_SCHD_ADJUST_MAX_CANDIDATES
+                ) {
+                    return $this->_candidate_list;
+                }
+            }
+
+            return $candidate_list;
+        }
+
+        if (strcasecmp($facility_search_method, 'OR') === 0) {
+            // OR Search for facilities
+            // OR検索(一つの施設を使用する)
+
+            // user freetime caching
+            $user_freetime_cache = [];
+
+            foreach ($facility_id_list as $faid) {
+                for ($i = 0; $i < $target_datetime_count; $i++) {
+                    $set_datetime = $target_datetime_list[$i]['setdatetime'];
+                    $end_datetime
+                        = $target_datetime_list[$i]['enddatetime'];
+                    $facility_freetimes
+                        = $this->_createFacilityFreeTimeList($faid,
+                        $set_datetime,
+                        $end_datetime);
+                    if (count($facility_freetimes) <= 0) {
+                        continue;
+                    }
+
+                    for ($j = 0; $j < $target_datetime_count; $j++) {
+                        if (array_key_exists($j, $user_freetime_cache)
+                            === false
+                        ) {
+                            // user freetime caching
+                            // 施設 * 候補日で繰り返すことになるのでユーザーの空き時間をキャッシュ
+                            $set_datetime
+                                = $target_datetime_list[$j]['setdatetime'];
+                            $end_datetime
+                                = $target_datetime_list[$j]['enddatetime'];
+                            $user_freetimes
+                                = $this->_createUsersFreeTimeList($member_id_list,
+                                $set_datetime,
+                                $end_datetime,
+                                $around_time);
+                            $user_freetime_cache[$j] = $user_freetimes;
+                        } else {
+                            $user_freetimes = $user_freetime_cache[$j];
+                        }
+
+                        if (count($user_freetimes) <= 0) {
+                            continue;
+                        }
+
+                        $merge_freetimes
+                            = $this->_mergeFreetimes($user_freetimes,
+                            $facility_freetimes);
+                        $candidate_list
+                            = $this->_createCandidateList($merge_freetimes,
+                            $faid,
+                            $target_datetime_list[$j],
+                            $term_span);
+
+                        if ($this->_candidates_count
+                            >= GRN_SCHD_ADJUST_MAX_CANDIDATES
+                        ) {
+                            return $candidate_list;
+                        }
+                    }
+                }
+            }
+            unset($user_freetime_cache);
+        } else {
+            // AND Search for facilities
+            // AND検索(全ての施設を使用する)
+            foreach ($target_datetime_list as $datetime) {
+                $facilities_freetimes
+                    = $this->_createFacilitiesFreeTimeList($facility_id_list,
+                    $datetime['setdatetime'],
+                    $datetime['enddatetime']);
+
+                if (count($facilities_freetimes) <= 0) {
+                    continue;
+                }
+
+                $user_freetimes
+                    = $this->_createUsersFreeTimeList($member_id_list,
+                    $datetime['setdatetime'],
+                    $datetime['enddatetime'],
+                    $around_time);
+
+                if (count($user_freetimes) <= 0) {
+                    continue;
+                }
+
+                $merge_freetimes = $this->_mergeFreetimes($user_freetimes,
+                    $facilities_freetimes);
+                $candidate_list = $this->_createCandidateList($merge_freetimes,
+                    GRN_SCHD_ADJUST_NO_FACILITY,
+                    $datetime,
+                    $term_span);
+
+                if ($this->_candidates_count
+                    >= GRN_SCHD_ADJUST_MAX_CANDIDATES
+                ) {
+                    return $candidate_list;
+                }
+            }
+        }
+
+        return $candidate_list;
+    }
+
+    /**
+     * Get the candidates count
+     *
+     * @return int candidates count
+     */
+    function getCandidatesCount()
+    {
+        return $this->_candidates_count;
+    }
+
+    /**
+     * Create candidate datetime from freetime list
+     * 空き時間から候補日時を作成
+     *
+     * @access private
+     */
+    function _createCandidateList($freetimes, $faid, $datetime, $term_span)
+    {
+        // validate check
+        if ($term_span <= 0) {
+            return $this->_candidate_list;
+        }
+        if (array_key_exists('setdatetime', $datetime) === false) {
+            return $this->_candidate_list;
+        }
+
+        if (array_key_exists($faid, $this->_candidate_list) !== true) {
+            $this->_candidate_list[$faid] = [];
+        }
+
+        $candidate_set_time = new CB_Time();
+        $candidate_end_time = new CB_Time();
+        $set_tsex = new CB_TimeStampEx();
+        $end_tsex = new CB_TimeStampEx();
+
+        foreach ($freetimes as $start => $end) {
+            $freetime_span = $end - $start;
+            if ($freetime_span < $term_span) {
+                continue;
+            }
+
+            $candidate_date = $datetime['setdatetime']->getDate();
+            while ($freetime_span >= $term_span) {
+                $set_tsex->unix_ts = $start;
+                $end_tsex->unix_ts = $start + $term_span;
+
+                $candidate_set_time = $set_tsex->getTime();
+                $candidate_end_time = $end_tsex->getTime();
+
+                $this->_candidate_list[$faid][] = [
+                    'date'     => $candidate_date,
+                    'set_time' => $candidate_set_time,
+                    'end_time' => $candidate_end_time
+                ];
+
+                $this->_candidates_count++;
+                if ($this->_candidates_count
+                    >= GRN_SCHD_ADJUST_MAX_CANDIDATES
+                ) {
+                    return $this->_candidate_list;
+                }
+
+                $start = $end_tsex->unix_ts;
+                $freetime_span = $end - $start;
+            }
+        }
+
+        return $this->_candidate_list;
+    }
+
+    /**
+     * create datetime candidate list
+     * 候補日時のリストを作成
+     *
+     * @access private
+     */
+    function _createTargetDatetimeList(
+        $date_list,
+        $start_hour,
+        $end_hour,
+        $except_hours = []
+    ) {
+        $target_datetime_list = [];
+
+        // Remove conflict from $date_list
+        // 重複した候補日を削除
+        $dates = [];
+        foreach ($date_list as $d) {
+            $date_string = $d->format();
+            if (array_key_exists($date_string, $dates)) {
+                continue;
+            }
+            $dates[$date_string] = $d;
+        }
+
+        $span_list = [['start_hour' => $start_hour, 'end_hour' => $end_hour]];
+        foreach ($except_hours as $except_hour) {
+            $start_time = $except_hour['start_time'];
+            $end_time = $except_hour['end_time'];
+            if ($start_time->hour < $end_time->hour) {
+                $next_span_list = [];
+                foreach ($span_list as $span) {
+                    if (($start_time->hour < $span['start_hour']
+                         && $end_time->hour < $span['start_hour'])
+                        || ($start_time->hour > $span['end_hour']
+                            && $end_time->hour > $span['end_hour'])
+                    ) {
+                        $next_span_list[] = $span;
+                    } else {
+                        if ($span['start_hour'] < $start_time->hour
+                            && $start_time->hour < $span['end_hour']
+                        ) {
+                            $next_span_list[]
+                                = [
+                                'start_hour' => $span['start_hour'],
+                                'end_hour'   => $start_time->hour
+                            ];
+                        }
+                        if ($span['start_hour'] < $end_time->hour
+                            && $end_time->hour < $span['end_hour']
+                        ) {
+                            $next_span_list[]
+                                = [
+                                'start_hour' => $end_time->hour,
+                                'end_hour'   => $span['end_hour']
+                            ];
+                        }
+                    }
+                }
+                $span_list = $next_span_list;
+            }
+        }
+
+        foreach ($dates as $date) {
+            foreach ($span_list as $span) {
+                $set_datetime = new CB_DateTime();
+                $end_datetime = new CB_DateTime();
+                $end_datetime->year = $set_datetime->year = $date->year;
+                $end_datetime->month = $set_datetime->month = $date->month;
+                $end_datetime->day = $set_datetime->day = $date->day;
+                $set_datetime->hour = $span['start_hour'];
+                $end_datetime->hour = $span['end_hour'];
+
+                $target_datetime_list[] = [
+                    'setdatetime' => new CB_DateTimeEx($set_datetime),
+                    'enddatetime' => new CB_DateTimeEx($end_datetime)
+                ];
+            }
+        }
+
+        return $target_datetime_list;
+    }
+
+    /**
+     * create term's timespan
+     * 検索する空き時間のTimeStampを生成する
+     *
+     * @access private
+     */
+    function _createTermSpan($term_hour = 0, $term_minute = 0)
+    {
+        $t = new CB_Time();
+        $t->hour = $term_hour;
+        $t->minute = $term_minute;
+        $term = new CB_TimeEx($t);
+
+        $term_span = $term->getInterval(new CB_Time());
+
+        return $term_span->toSeconds();
+    }
+
+    /**
+     * Filter datetime list by workday condition
+     *
+     * @param array  $datetime_list
+     * @param array  $user_id_list
+     * @param string $workdays_condition
+     *
+     * @return array $filtered_datetime_list
+     */
+    private function _filterDatetimeList(
+        $datetime_list,
+        $user_id_list,
+        $workdays_condition = GRN_SCHEDULE_ALL_DAYS
+    ) {
+        $filtered_datetime_list = [];
+
+        // 稼働日条件を検索条件に追加
+        switch ($workdays_condition) {
+            case GRN_SCHEDULE_MEMBER_WORKDAYS:
+                foreach ($user_id_list as $user_id) {
+                    if (substr($user_id, 0, 1) === 'g') {
+                        continue;
+                    }
+
+                    $filtered_datetime_list = [];
+                    foreach ($datetime_list as $datetime) {
+                        $set_datetime = $datetime['setdatetime'];
+                        $end_datetime = $datetime['enddatetime'];
+
+                        $user_datetime_list
+                            = $this->_getWorkdayDateTimeList($user_id,
+                            $set_datetime, $end_datetime);
+                        foreach ($user_datetime_list as $user_datetime) {
+                            $filtered_datetime_list[] = $user_datetime;
+                        }
+                    }
+                    $datetime_list = $filtered_datetime_list;
+                }
+                $filtered_datetime_list = $datetime_list;
+                break;
+            case GRN_SCHEDULE_MEMBER_HOLIDAYS:
+                foreach ($user_id_list as $user_id) {
+                    if (substr($user_id, 0, 1) === 'g') {
+                        continue;
+                    }
+
+                    $filtered_datetime_list = [];
+                    foreach ($datetime_list as $datetime) {
+                        $set_datetime = $datetime['setdatetime'];
+                        $end_datetime = $datetime['enddatetime'];
+
+                        $user_datetime_list
+                            = $this->_getHolidayDateTimeList($user_id,
+                            $set_datetime, $end_datetime);
+                        foreach ($user_datetime_list as $user_datetime) {
+                            $filtered_datetime_list[] = $user_datetime;
+                        }
+                    }
+                    $datetime_list = $filtered_datetime_list;
+                }
+                $filtered_datetime_list = $datetime_list;
+                break;
+            case GRN_SCHEDULE_LOGIN_WORKDAYS:
+                global $G_container_base;
+                $login_id = $G_container_base->getInstance('uum')
+                                             ->getLoginUser()->getOID();
+                foreach ($datetime_list as $datetime) {
+                    $set_datetime = $datetime['setdatetime'];
+                    $end_datetime = $datetime['enddatetime'];
+
+                    $user_datetime_list
+                        = $this->_getWorkdayDateTimeList($login_id,
+                        $set_datetime, $end_datetime);
+                    foreach ($user_datetime_list as $user_datetime) {
+                        $filtered_datetime_list[] = $user_datetime;
+                    }
+                }
+                break;
+            case GRN_SCHEDULE_LOGIN_HOLIDAYS:
+                global $G_container_base;
+                $login_id = $G_container_base->getInstance('uum')
+                                             ->getLoginUser()->getOID();
+                foreach ($datetime_list as $datetime) {
+                    $set_datetime = $datetime['setdatetime'];
+                    $end_datetime = $datetime['enddatetime'];
+
+                    $user_datetime_list
+                        = $this->_getHolidayDateTimeList($login_id,
+                        $set_datetime, $end_datetime);
+                    foreach ($user_datetime_list as $user_datetime) {
+                        $filtered_datetime_list[] = $user_datetime;
+                    }
+                }
+                break;
+            case GRN_SCHEDULE_ALL_DAYS:
+            default:
+                return $datetime_list;
+                break;
+        }
+
+        return $filtered_datetime_list;
+    }
+
+    /**
+     * $set_datetime と $end_datetime がまたぐ日付を CB_DateEx の配列形式で返す
+     *
+     * @param string      $timezone
+     * @param CB_DateTime $set_datetime
+     * @param CB_DateTime $end_datetime
+     *
+     * @return array<CB_DateEx>
+     */
+    private function _getTargetDatesByTimezone(
+        $timezone,
+        $set_datetime,
+        $end_datetime
+    ) {
+        $dates = [];
+        $date = new CB_Date();
+        $date->year = $set_datetime->year;
+        $date->month = $set_datetime->month;
+        $date->day = $set_datetime->day;
+        $date = new CB_DateEx($date);
+        $dates[] = $date;
+
+        $datetime = clone $set_datetime;
+        $datetime->hour = 0;
+        $datetime->minute = 0;
+        $datetime->second = 0;
+
+        $set_timestamp = new CB_TimeStampEx();
+        $set_timestamp->setDateTime($set_datetime);
+        $tmp_date = clone $date;
+        while (cb_datetime_to_timestamp($datetime, $timezone)
+               > $set_timestamp->unix_ts) {
+            $tmp_date->moveDays(-1);
+            $dates[] = clone $tmp_date;
+
+            $datetime->setDate($tmp_date);
+            $datetime->hour = 0;
+            $datetime->minute = 0;
+            $datetime->second = 0;
+        }
+
+        $datetime = clone $end_datetime;
+        $datetime->hour = 0;
+        $datetime->minute = 0;
+        $datetime->second = 0;
+        $end_timestamp = new CB_TimeStampEx();
+        $end_timestamp->setDateTime($end_datetime);
+        $tmp_date = clone $date;
+        while (cb_datetime_to_timestamp($datetime, $timezone)
+               < $end_timestamp->unix_ts) {
+            $tmp_date->moveDays(1);
+            $dates[] = clone $tmp_date;
+
+            $datetime->setDate($tmp_date);
+            $datetime->hour = 0;
+            $datetime->minute = 0;
+            $datetime->second = 0;
+        }
+
+        return $dates;
+    }
+
+    /**
+     * $set_datetime と $end_datetime の範囲から、$from_datetime と $to_datetime の範囲内にある時間帯を見つけ、
+     * 予定調整の検索ロジック内で使用する配列形式で返す
+     *
+     * @param CB_DateTime $set_datetime
+     * @param CB_DateTime $end_datetime
+     * @param CB_DateTime $from_datetime
+     * @param CB_DateTime $to_datetime
+     * @param string      $timezone
+     */
+    private function _getSearchTargetDatetimeArray(
+        $set_datetime,
+        $end_datetime,
+        $from_datetime,
+        $to_datetime,
+        $timezone
+    ) {
+        $set_timestamp = new CB_TimeStampEx();
+        $set_timestamp->setDateTime($set_datetime);
+
+        $end_timestamp = new CB_TimeStampEx();
+        $end_timestamp->setDateTime($end_datetime);
+
+        $tmp_set_datetime = $tmp_end_datetime = null;
+        if ($set_timestamp->unix_ts <= cb_datetime_to_timestamp($from_datetime,
+                $timezone)
+            && cb_datetime_to_timestamp($from_datetime, $timezone)
+               < $end_timestamp->unix_ts
+        ) {
+            $tmp_set_datetime
+                = new CB_DateTimeEx(cb_timestamp_to_datetime(cb_datetime_to_timestamp($from_datetime,
+                $timezone)));
+        }
+
+        if ($set_timestamp->unix_ts < cb_datetime_to_timestamp($to_datetime,
+                $timezone)
+            && cb_datetime_to_timestamp($to_datetime, $timezone)
+               <= $end_timestamp->unix_ts
+        ) {
+            if (is_null($tmp_set_datetime)) {
+                $tmp_set_datetime = clone $set_datetime;
+            }
+
+            $tmp_end_datetime
+                = new CB_DateTimeEx(cb_timestamp_to_datetime(cb_datetime_to_timestamp($to_datetime,
+                $timezone)));
+        }
+
+        if (cb_datetime_to_timestamp($from_datetime, $timezone)
+            <= $set_timestamp->unix_ts
+            && $end_timestamp->unix_ts <= cb_datetime_to_timestamp($to_datetime,
+                $timezone)
+        ) {
+            $tmp_set_datetime = clone $set_datetime;
+            $tmp_end_datetime = clone $end_datetime;
+        }
+
+        if ( ! is_null($tmp_set_datetime)) {
+            if (is_null($tmp_end_datetime)) {
+                $tmp_end_datetime = clone $end_datetime;
+            }
+
+            return [
+                'setdatetime' => $tmp_set_datetime,
+                'enddatetime' => $tmp_end_datetime
+            ];
+        }
+
+        return null;
+    }
+
+    /**
+     * $set_datetime と $end_datetime の間でユーザーの労働日かつ労働時間である日時を
+     * 予定の調整検索ロジックで使用する配列の形式で返す
+     *
+     * @param int         $user_id
+     * @param CB_DateTime $set_datetime
+     * @param CB_DateTime $end_datetime
+     *
+     * @return array
+     */
+    private function _getWorkdayDateTimeList(
+        $user_id,
+        $set_datetime,
+        $end_datetime
+    ) {
+        $user_base_setting = CB_BaseManager::getCurrentBaseSetting($user_id);
+
+        global $G_container_base;
+        $user = $G_container_base->getInstance('uum')->getUser($user_id);
+        $timezone = CB_I18N::getInstance()->getUserTimezone($user);
+
+        $dates = $this->_getTargetDatesByTimezone($timezone, $set_datetime,
+            $end_datetime);
+
+        $work_hours_list = CB_UserWorkHours::selectByUserId($user_id);
+        if (count($work_hours_list) === 0) {
+            $work_hours_list = [];
+            $default_work_hours = CB_BaseManager::getDefaultUserWorkHours();
+            foreach ($default_work_hours as $work_hours) {
+                $work_hours_list[] = $work_hours;
+            }
+        }
+
+        $workday_datetime_list = [];
+        foreach ($dates as $date) {
+            if ($user_base_setting->isWorkday($date)) {
+                foreach ($work_hours_list as $work_hours) {
+                    $work_start = explode(':',
+                        $work_hours->getStart());
+                    $workstart_datetime = new CB_DateTime();
+                    $workstart_datetime->year = $date->year;
+                    $workstart_datetime->month = $date->month;
+                    $workstart_datetime->day = $date->day;
+                    $workstart_datetime->hour = $work_start[0];
+                    $workstart_datetime->minute = $work_start[1];
+                    $workstart_datetime->second = $work_start[2];
+
+                    $work_end = explode(':',
+                        $work_hours->getEnd());
+                    $workend_datetime = new CB_DateTime();
+                    $workend_datetime->year = $date->year;
+                    $workend_datetime->month = $date->month;
+                    $workend_datetime->day = $date->day;
+                    $workend_datetime->hour = $work_end[0];
+                    $workend_datetime->minute = $work_end[1];
+                    $workend_datetime->second = $work_end[2];
+
+                    $datetime
+                        = $this->_getSearchTargetDatetimeArray($set_datetime,
+                        $end_datetime, $workstart_datetime, $workend_datetime,
+                        $timezone);
+
+                    if ( ! is_null($datetime)) {
+                        $workday_datetime_list[] = $datetime;
+                    }
+                }
+            }
+        }
+
+        return $workday_datetime_list;
+    }
+
+    /**
+     * $set_datetime と $end_datetime の間でユーザーの労働日以外の日時を
+     * 予定の調整検索ロジックで使用する配列の形式で返す
+     *
+     * @param int         $user_id
+     * @param CB_DateTime $set_datetime
+     * @param CB_DateTime $end_datetime
+     *
+     * @return array
+     */
+    private function _getHolidayDateTimeList(
+        $user_id,
+        $set_datetime,
+        $end_datetime
+    ) {
+        $user_base_setting = CB_BaseManager::getCurrentBaseSetting($user_id);
+
+        global $G_container_base;
+        $user = $G_container_base->getInstance('uum')->getUser($user_id);
+        $timezone = CB_I18N::getInstance()->getUserTimezone($user);
+
+        $dates = $this->_getTargetDatesByTimezone($timezone, $set_datetime,
+            $end_datetime);
+
+        $holiday_datetime_list = [];
+        foreach ($dates as $date) {
+            if ( ! $user_base_setting->isWorkday($date)) {
+                $holidaystart_datetime = new CB_DateTime();
+                $holidaystart_datetime->year = $date->year;
+                $holidaystart_datetime->month = $date->month;
+                $holidaystart_datetime->day = $date->day;
+                $holidaystart_datetime->hour = 0;
+                $holidaystart_datetime->minute = 0;
+                $holidaystart_datetime->second = 0;
+
+                $holidayend_datetime = new CB_DateTime();
+                $holidayend_datetime->year = $date->year;
+                $holidayend_datetime->month = $date->month;
+                $holidayend_datetime->day = $date->day;
+                $holidayend_datetime->hour = 23;
+                $holidayend_datetime->minute = 59;
+                $holidayend_datetime->second = 59;
+
+                $datetime = $this->_getSearchTargetDatetimeArray($set_datetime,
+                    $end_datetime, $holidaystart_datetime, $holidayend_datetime,
+                    $timezone);
+
+                if ( ! is_null($datetime)) {
+                    $holiday_datetime_list[] = $datetime;
+                }
+            }
+        }
+
+        return $holiday_datetime_list;
+    }
+
+    /**
+     * Create users free time list
+     * 指定されたユーザー/組織の空き時間のリストを生成する
+     *
+     * @access private
+     */
+    function _createUsersFreeTimeList(
+        $user_id_list,
+        $set_datetime,
+        $end_datetime,
+        $around_time = 0
+    ) {
+        $user_freetimes = [];
+
+        $set_timestamp = new CB_TimeStampEx();
+        $set_timestamp->setDateTime($set_datetime);
+
+        $end_timestamp = new CB_TimeStampEx();
+        $end_timestamp->setDateTime($end_datetime);
+
+        // no members ID
+        // メンバーのIDが一つも無い
+        if (count($user_id_list) <= 0) {
+            return [$set_timestamp->unix_ts => $end_timestamp->unix_ts];
+        }
+
+        // 予定の前後XX分を除外する場合、その分予定の取得範囲を広げる
+        // When excepting XX minutes around an event, broaden the range of getting events
+        $start_unix_ts = $set_timestamp->unix_ts - $around_time * 60;
+        $end_unix_ts = $end_timestamp->unix_ts + $around_time * 60;
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('schedule');
+
+        require_once('schedule/system_logic.csp');
+        $systemlogic = GRN_Schedule_SystemLogic::getInstance();
+        $join = '';
+        $condition = '';
+        if ($systemlogic->getAllowAttendanceCheck() == '1') {
+            $join
+                = ' LEFT JOIN tab_grn_schedule_event_attendance_status AS s ON member.col_user = s.col_user AND member.col_event = s.col_event ';
+            $condition = ' AND (s.col_status IS NULL OR s.col_status = "1") ';
+        }
+
+        $query = 'SELECT ' .
+                 'DISTINCT datetime.col_setdatetime, datetime.col_enddatetime, '
+                 .
+                 'user.col_deleted ' .
+                 'FROM tab_grn_schedule_event AS event ' .
+                 'LEFT JOIN tab_grn_schedule_eventdatetime AS datetime ' .
+                 'ON event._id = datetime.col_event ' .
+                 'LEFT JOIN tab_grn_schedule_eventmember AS member ' .
+                 'ON event._id = member.col_event ' .
+                 'LEFT JOIN tab_cb_user AS user ' .
+                 'ON member.col_user = user._id ' .
+                 $join .
+                 'WHERE ' .
+                 '( ' .
+                 '( ( datetime.col_setdatetime <= ' . $start_unix_ts . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime >' . $start_unix_ts . ' ) ) ' .
+                 'OR ' .
+                 '( ( datetime.col_setdatetime <  ' . $end_unix_ts . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime >= ' . $end_unix_ts . ' ) ) ' .
+                 'OR ' .
+                 '( ( datetime.col_setdatetime >=  ' . $start_unix_ts . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime <= ' . $end_unix_ts . ' ) ) ' .
+                 ')' .
+                 $condition;
+
+        $query .= ' AND ( ';
+
+        $user_condition = '';
+        $group_condition = '';
+        $user_multi_condition = false;
+        $group_multi_condition = false;
+        foreach ($user_id_list as $uid) {
+            if (mb_substr($uid, 0, 1) !== 'g') {
+                if ($user_multi_condition) {
+                    $user_condition .= ", '" . $dbconn->escape($uid) . "'";
+                } else {
+                    $user_condition .= "'" . $dbconn->escape($uid) . "'";
+                    $user_multi_condition = true;
+                }
+            } else {
+                if ($group_multi_condition) {
+                    $group_condition .= ", '" . $dbconn->escape(mb_substr($uid,
+                            1)) . "'";
+                } else {
+                    $group_condition .= "'"
+                                        . $dbconn->escape(mb_substr($uid,
+                            1)) . "'";
+                    $group_multi_condition = true;
+                }
+            }
+        }
+
+        if ($user_condition !== '') {
+            $query .= ' member.col_user IN( ' . $user_condition . ' ) ';
+        }
+
+        if ($user_condition !== '' && $group_condition !== '') {
+            $query .= ' OR ';
+        }
+
+        if ($group_condition !== '') {
+            $query .= ' member.col_group IN( ' . $group_condition . ' ) ';
+        }
+
+        $query .= ' ) ';
+        $query .= 'ORDER BY datetime.col_setdatetime ASC, datetime.col_enddatetime DESC;';
+
+        $result = $dbconn->query($query);
+        if ($result === false) {
+            $dbconn->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+
+        // create not freetime list
+        // 空き時間のリストを作るために空いていない時間のリストを作る
+        $tmp_start = null;
+        $tmp_end = null;
+        $user_notfreetimes = [];
+        while (($row = $dbconn->fetch_assoc($result)) != false) {
+            // ユーザー削除フラグが立っていたら無視
+            if ( ! is_null($row['col_deleted'])) {
+                continue;
+            }
+
+            // 予定の前後XX分を除外する場合、その分予定のみなし時間を広げる
+            // When excepting XX minutes around an event, broaden the range of the event time.
+            $row_start = $row['col_setdatetime'] - $around_time * 60;
+            $row_end = $row['col_enddatetime'] + $around_time * 60;
+
+            if (is_null($tmp_start) || is_null($tmp_end)) {
+                $tmp_start = $row_start;
+                $tmp_end = $row_end;
+            } else {
+                /*
+                 * $tmp_start                        $tmp_end
+                 *    |-------------------------------------|
+                 * $row['col_setdatetime']   $row['col_enddatetime']
+                 *    |------------------------------|
+                 */
+                if ($tmp_start === $row_start) {
+                    continue;
+                } /*
+                 * $tmp_start    $tmp_end
+                 *    |-------------|
+                 *                    $row['col_setdatetime']     $row['col_enddatetime']
+                 *                          |------------------------------------|
+                 */
+                elseif ($tmp_end < $row_start) {
+                    $tmp_start = $row_start;
+                    $tmp_end = $row_end;
+                } /*
+                 * $tmp_start                        $tmp_end
+                 *    |----------------------------------|
+                 *     $row['col_setdatetime']     $row['col_enddatetime']
+                 *          |------------------------------------|
+                 */
+                elseif ($tmp_start < $row_start && $tmp_end < $row_end) {
+                    $tmp_end = $row_end;
+                } else {
+                    continue;
+                }
+            }
+            $user_notfreetimes[$tmp_start] = $tmp_end;
+        }
+
+        $dbconn->free_result($result);
+        unset($dbconn);
+
+        // no such schedule is all freetime
+        // 空いていない時間が無ければ全て空き時間
+        if (count($user_notfreetimes) <= 0) {
+            return [$set_timestamp->unix_ts => $end_timestamp->unix_ts];
+        }
+
+        // create freetime list
+        // 空いていない時間のリストから空き時間リストを作成
+        $set_freetime = $set_timestamp->unix_ts;
+        $end_freetime = $end_timestamp->unix_ts;
+        $last_notfreetime_end = $set_timestamp->unix_ts;
+        foreach ($user_notfreetimes as $start => $end) {
+            /*
+             *           $start              $end
+             *             |-------------------|
+             * $set_freetime
+             *     |-------------
+             */
+            if ($start > $set_freetime) {
+                $end_freetime = $start;
+                $user_freetimes[$set_freetime] = $end_freetime;
+                $set_freetime = $end;
+                $end_freetime = $end_timestamp->unix_ts;
+            } /*
+             *    $start         $end
+             *       |-------------|
+             *    $set_freetime
+             *       |-----------
+             *       or
+             *      $set_freetime
+             *            |-------------
+             */
+            elseif ($start <= $set_freetime) {
+                $set_freetime = $end;
+            }
+
+            $last_notfreetime_end = $end;
+        }
+
+        if ($last_notfreetime_end < $end_timestamp->unix_ts) {
+            $user_freetimes[$last_notfreetime_end] = $end_timestamp->unix_ts;
+        }
+
+        return $user_freetimes;
+    }
+
+    /**
+     * Create facility(one facility) free time list
+     * 指定された施設IDの施設の空き時間リストを生成する
+     *
+     * @access private
+     */
+    function _createFacilityFreeTimeList($faid, $set_datetime, $end_datetime)
+    {
+        $facility_freetimes = [];
+
+        $set_timestamp = new CB_TimeStampEx();
+        $set_timestamp->setDateTime($set_datetime);
+
+        $end_timestamp = new CB_TimeStampEx();
+        $end_timestamp->setDateTime($end_datetime);
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('schedule');
+
+        $query = 'SELECT ' .
+                 'datetime.col_setdatetime, datetime.col_enddatetime ' .
+                 'FROM tab_grn_schedule_event AS event ' .
+                 'LEFT JOIN tab_grn_schedule_eventdatetime AS datetime ' .
+                 'ON event._id = datetime.col_event ' .
+                 'LEFT JOIN tab_grn_schedule_eventmember AS member ' .
+                 'ON event._id = member.col_event ' .
+                 'WHERE ' .
+                 '( ' .
+                 '( ( datetime.col_setdatetime <= ' . $set_timestamp->unix_ts
+                 . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime >' . $set_timestamp->unix_ts
+                 . ' ) ) ' .
+                 'OR ' .
+                 '( ( datetime.col_setdatetime <  ' . $end_timestamp->unix_ts
+                 . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime >= ' . $end_timestamp->unix_ts
+                 . ' ) ) ' .
+                 'OR ' .
+                 '( ( datetime.col_setdatetime >=  ' . $set_timestamp->unix_ts
+                 . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime <= ' . $end_timestamp->unix_ts
+                 . ' ) ) ' .
+                 ')';
+
+        $query .= " AND ( member.col_facility = '" . $dbconn->escape($faid)
+                  . "') ";
+        $query .= 'ORDER BY datetime.col_setdatetime ASC, datetime.col_enddatetime DESC;';
+
+        $result = $dbconn->query($query);
+        if ($result === false) {
+            $dbconn->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+
+        // create not freetime list
+        // 空き時間のリストを作るために空いていない時間のリストを作る
+        $tmp_start = null;
+        $tmp_end = null;
+        $facility_notfreetimes = [];
+        while (($row = $dbconn->fetch_assoc($result)) != false) {
+            if (is_null($tmp_start) || is_null($tmp_end)) {
+                $tmp_start = $row['col_setdatetime'];
+                $tmp_end = $row['col_enddatetime'];
+            } else {
+                /*
+                 * $tmp_start                        $tmp_end
+                 *    |-------------------------------------|
+                 * $row['col_setdatetime']   $row['col_enddatetime']
+                 *    |------------------------------|
+                 */
+                if ($tmp_start === $row['col_setdatetime']) {
+                    continue;
+                } /*
+                 * $tmp_start    $tmp_end
+                 *    |-------------|
+                 *                    $row['col_setdatetime']     $row['col_enddatetime']
+                 *                          |------------------------------------|
+                 */
+                elseif ($tmp_end < $row['col_setdatetime']) {
+                    $tmp_start = $row['col_setdatetime'];
+                    $tmp_end = $row['col_enddatetime'];
+                } /*
+                 * $tmp_start                        $tmp_end
+                 *    |----------------------------------|
+                 *     $row['col_setdatetime']     $row['col_enddatetime']
+                 *          |------------------------------------|
+                 */
+                elseif ($tmp_start < $row['col_setdatetime']
+                        && $tmp_end < $row['col_enddatetime']
+                ) {
+                    $tmp_end = $row['col_enddatetime'];
+                } else {
+                    continue;
+                }
+            }
+            $facility_notfreetimes[$tmp_start] = $tmp_end;
+        }
+
+        $dbconn->free_result($result);
+        unset($dbconn);
+
+        // create freetime list
+        // 空いていない時間のリストから空き時間リストを作成
+        $set_freetime = $set_timestamp->unix_ts;
+        $end_freetime = $end_timestamp->unix_ts;
+        $last_notfreetime_end = $set_timestamp->unix_ts;
+        foreach ($facility_notfreetimes as $start => $end) {
+            /*
+             *           $start              $end
+             *             |-------------------|
+             * $set_freetime
+             *     |-------------
+             */
+            if ($start > $set_freetime) {
+                $end_freetime = $start;
+                $facility_freetimes[$set_freetime] = $end_freetime;
+                $set_freetime = $end;
+                $end_freetime = $end_timestamp->unix_ts;
+            } /*
+             *    $start         $end
+             *       |-------------|
+             *    $set_freetime
+             *       |-----------
+             *    or
+             *      $set_freetime
+             *            |-------------
+             */
+            elseif ($start <= $set_freetime) {
+                $set_freetime = $end;
+            }
+
+            $last_notfreetime_end = $end;
+        }
+
+        if ($last_notfreetime_end < $end_timestamp->unix_ts) {
+            $facility_freetimes[$last_notfreetime_end]
+                = $end_timestamp->unix_ts;
+        }
+
+        // Caring for facility without schedule
+        // スケジュールが無い場合の対処
+        if (count($facility_notfreetimes) <= 0) {
+            $facility_freetimes[$set_timestamp->unix_ts]
+                = $end_timestamp->unix_ts;
+        }
+
+        return $facility_freetimes;
+    }
+
+    /**
+     * Merge freetime of users and facility
+     * ユーザー/組織の空き時間リストと施設の空き時間リストをマージする
+     *
+     * @access private
+     */
+    function _mergeFreeTimes($user_freetimes, $facility_freetimes)
+    {
+        if (count($user_freetimes) <= 0) {
+            return $facility_freetimes;
+        }
+        if (count($facility_freetimes) <= 0) {
+            return $user_freetimes;
+        }
+
+        $merge_freetimes = [];
+
+        $tmp_start = 0;
+        $tmp_end = 0;
+        foreach ($facility_freetimes as $fstart => $fend) {
+            foreach ($user_freetimes as $ustart => $uend) {
+                if (($ustart <= $fstart && $uend > $fstart)
+                    || ($ustart < $fend
+                        && $uend >= $fend)
+                    || ($ustart >= $fstart && $uend <= $fend)
+                ) {
+                    // Use the narrower time
+                    // より狭いほうの時間を採用
+                    $tmp_start = ($ustart > $fstart) ? $ustart
+                        : $fstart;
+                    $tmp_end = ($uend < $fend) ? $uend
+                        : $fend;
+                    $merge_freetimes[$tmp_start] = $tmp_end;
+                }
+            }
+        }
+
+        return $merge_freetimes;
+    }
+
+    /**
+     * Create facilities free time list
+     * 指定された施設IDのリストから空き時間のリストを生成する
+     *
+     * @access private
+     */
+    function _createFacilitiesFreeTimeList(
+        $facility_id_list,
+        $set_datetime,
+        $end_datetime
+    ) {
+        $facilities_freetimes = [];
+
+        $set_timestamp = new CB_TimeStampEx();
+        $set_timestamp->setDateTime($set_datetime);
+
+        $end_timestamp = new CB_TimeStampEx();
+        $end_timestamp->setDateTime($end_datetime);
+
+        // no facilities id
+        // 施設IDが一つも無い
+        if (count($facility_id_list) <= 0) {
+            return [$set_timestamp->unix_ts => $end_timestamp->unix_ts];
+        }
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $dbconn = $app_locator->getConnection('schedule');
+
+        $query = 'SELECT ' .
+                 'datetime.col_setdatetime, datetime.col_enddatetime ' .
+                 'FROM tab_grn_schedule_event AS event ' .
+                 'LEFT JOIN tab_grn_schedule_eventdatetime AS datetime ' .
+                 'ON event._id = datetime.col_event ' .
+                 'LEFT JOIN tab_grn_schedule_eventmember AS member ' .
+                 'ON event._id = member.col_event ' .
+                 'WHERE ' .
+                 '( ' .
+                 '( ( datetime.col_setdatetime <= ' . $set_timestamp->unix_ts
+                 . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime >' . $set_timestamp->unix_ts
+                 . ' ) ) ' .
+                 'OR ' .
+                 '( ( datetime.col_setdatetime <  ' . $end_timestamp->unix_ts
+                 . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime >= ' . $end_timestamp->unix_ts
+                 . ' ) ) ' .
+                 'OR ' .
+                 '( ( datetime.col_setdatetime >=  ' . $set_timestamp->unix_ts
+                 . ' ) ' .
+                 'AND ' .
+                 '( datetime.col_enddatetime <= ' . $end_timestamp->unix_ts
+                 . ' ) ) ' .
+                 ')';
+
+        $query .= ' AND ( ';
+
+        $condition = '';
+        $multi_condition = false;
+        foreach ($facility_id_list as $faid) {
+            if ($multi_condition) {
+                $condition .= ", '" . $dbconn->escape($faid) . "'";
+            } else {
+                $condition .= "'" . $dbconn->escape($faid) . "'";
+                $multi_condition = true;
+            }
+        }
+        $query .= 'member.col_facility IN(' . $condition . ')';
+
+        $query .= ' ) ';
+        $query .= 'ORDER BY datetime.col_setdatetime ASC, datetime.col_enddatetime DESC;';
+
+        $result = $dbconn->query($query);
+        if ($result === false) {
+            $dbconn->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+
+        // create not freetime list
+        // 空き時間のリストを作るために空いていない時間のリストを作る
+        $tmp_start = null;
+        $tmp_end = null;
+        $facilities_notfreetimes = [];
+        while (($row = $dbconn->fetch_assoc($result)) != false) {
+            if (is_null($tmp_start) || is_null($tmp_end)) {
+                $tmp_start = $row['col_setdatetime'];
+                $tmp_end = $row['col_enddatetime'];
+            } else {
+                /*
+                 * $tmp_start                        $tmp_end
+                 *    |-------------------------------------|
+                 * $row['col_setdatetime']   $row['col_enddatetime']
+                 *    |------------------------------|
+                 */
+                if ($tmp_start === $row['col_setdatetime']) {
+                    continue;
+                } /*
+                 * $tmp_start    $tmp_end
+                 *    |-------------|
+                 *                    $row['col_setdatetime']     $row['col_enddatetime']
+                 *                          |------------------------------------|
+                 */
+                elseif ($tmp_end < $row['col_setdatetime']) {
+                    $tmp_start = $row['col_setdatetime'];
+                    $tmp_end = $row['col_enddatetime'];
+                } /*
+                 * $tmp_start                        $tmp_end
+                 *    |----------------------------------|
+                 *     $row['col_setdatetime']     $row['col_enddatetime']
+                 *          |------------------------------------|
+                 */
+                elseif ($tmp_start < $row['col_setdatetime']
+                        && $tmp_end < $row['col_enddatetime']
+                ) {
+                    $tmp_end = $row['col_enddatetime'];
+                } else {
+                    continue;
+                }
+            }
+            $facilities_notfreetimes[$tmp_start] = $tmp_end;
+        }
+
+        $dbconn->free_result($result);
+        unset($dbconn);
+
+        // create freetime list
+        // 空いていない時間のリストから空き時間リストを作成
+        $set_freetime = $set_timestamp->unix_ts;
+        $end_freetime = $end_timestamp->unix_ts;
+        $last_notfreetime_end = $set_timestamp->unix_ts;
+        foreach ($facilities_notfreetimes as $start => $end) {
+            /*
+             *           $start              $end
+             *             |-------------------|
+             * $set_freetime
+             *     |-------------
+             */
+            if ($start > $set_freetime) {
+                $end_freetime = $start;
+                $facilities_freetimes[$set_freetime] = $end_freetime;
+                $set_freetime = $end;
+                $end_freetime = $end_timestamp->unix_ts;
+            } /*
+             *    $start         $end
+             *       |-------------|
+             *    $set_freetime
+             *       |-----------
+             *      or
+             *      $set_freetime
+             *            |-------------
+             */
+            elseif ($start <= $set_freetime) {
+                $set_freetime = $end;
+            }
+
+            $last_notfreetime_end = $end;
+        }
+
+        if ($last_notfreetime_end < $end_timestamp->unix_ts) {
+            $facilities_freetimes[$last_notfreetime_end]
+                = $end_timestamp->unix_ts;
+        }
+
+        // Caring for facilities without schedule
+        // スケジュールが無い施設への対処
+        if (count($facilities_notfreetimes) <= 0) {
+            $facilities_freetimes[$set_timestamp->unix_ts]
+                = $end_timestamp->unix_ts;
+        }
+
+        return $facilities_freetimes;
+    }
+}
+
+

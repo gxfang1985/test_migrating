@@ -1,0 +1,1 @@
+{grn_space_members_name_with_dialog spaceMemberCollection=$this_getSpaceUserCollection append_script_file=false}

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="{$encoding}"?>
+<methodResponse>
+  <params>
+    <param>
+      <value>
+        <struct>
+          <member>
+            <name>apiver</name>
+            <value><double>{$api_ver}</double></value>
+          </member>
+          <member>
+            <name>result</name>
+            <value><string>{$result}</string></value>
+          </member>
+        </struct>
+      </value>
+    </param>
+  </params>
+</methodResponse>

@@ -1,0 +1,30 @@
+{* Includes JS files for multi-view *}
+
+{grn_load_javascript file="fw/yui/build/dragdrop/dragdrop-min.js"}
+{grn_load_javascript file="fw/yui/build/selector/selector-min.js"}
+{grn_load_javascript file="grn/html/component/date.js"}
+{grn_load_javascript file="grn/html/component/pubsub.js"}
+{grn_load_javascript file="grn/html/component/user_org_facility_suggest_list.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/util.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/select_user_org_facility_dialog.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/user_facility_picker.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/select_user_org_facility_dropdownlist.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/member_list.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/confirm_dialog.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/time_sheet.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/calendar_item_renderer.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/normal_event_day_stack_list.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/normal_event_renderer.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/without_time_event_renderer.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/banner_renderer.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/event_tooltip.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/date_navigator.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/mini_calendar_navigator.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/event_resize.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/event_drag_drop.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/calendar_footer.js"}
+{grn_load_javascript file="grn/html/component/schedule/multi_view/main.js"}
+{grn_load_javascript file="grn/html/component/pulldown_menu/pulldown_menu.js"}
+{grn_load_javascript file="grn/html/component/member_select_list.js"}
+{grn_load_javascript file="grn/html/component/member_add.js"}
+{grn_load_javascript file="grn/html/component/facility_add.js"}

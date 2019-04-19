@@ -1,0 +1,382 @@
+<?php
+
+use grn\schedule\FacilityApprovalLogic;
+use grn\schedule\ScheduleFacilityApprovalSetting;
+use grn\schedule\ScheduleMemberLogic;
+
+// Smarty をインスタンス化
+require_once("grn/smarty.csp");
+$t = new GRN_Smarty;
+
+// SmartyValidate should be initialized when an input form is there.
+require('SmartyValidate.class.php');
+SmartyValidate::connect($t);
+require_once("grn/controller.csp");
+
+include('_prepend_post.csp');
+//------------------
+
+$user_id = array_key_exists('uid', $G_INPUT) ? $G_INPUT['uid'] : null;
+$group_id = array_key_exists('gid', $G_INPUT) ? $G_INPUT['gid'] : null;
+$event_id = array_key_exists('event', $G_INPUT) ? $G_INPUT['event'] : null;
+$bdate = array_key_exists('bdate', $G_INPUT) ? $G_INPUT['bdate'] : null;
+
+require_once('schedule/system_logic.csp');
+$systemlogic = GRN_Schedule_SystemLogic::getInstance();
+
+require_once('schedule/facility_system_logic.csp');
+$facility_logic = GRN_Facility_SystemLogic::getInstance();
+
+require_once('schedule/access_logic.csp');
+$acc_logic = GRN_Schedule_Access_Logic::getInstance();
+
+// GTM-1676
+$facilityApprovalLogic = new FacilityApprovalLogic();
+
+global $G_container_base;
+$uum = $G_container_base->getInstance('uum');
+require_once('grn/uum_util.csp');
+$uum_util = GRN_UumUtil::getInstance();
+$login = $uum->getLoginUser();
+$login_id = $login->getOID();
+
+// 設定する日付
+$date = new CB_Date();
+if ( ! $date->parse($bdate)) {
+    // 今日を求める
+    $tsex = new CB_TimeStampEx();
+    $date = $tsex->getDate();
+}
+
+$member = null;
+if ( ! $user_id) {
+    $user_id = $login_id;
+    $member = $login;
+} // 組織
+elseif (mb_substr($user_id, 0, 1) == 'g') {
+    $member = $uum->getGroup(mb_substr($user_id, 1));
+    if ( ! $member) {
+        $user_id = $login_id;
+        $member = $login;
+    }
+} // 施設
+elseif (mb_substr($user_id, 0, 1) == 'f') {
+    $member = $facility_logic->getFacility(mb_substr($user_id, 1));
+    if ($member === false) {
+        $user_id = $login_id;
+        $member = $login;
+    }
+} else {
+    $member = $uum->getUser($user_id);
+    if ( ! $member) {
+        $user_id = $login_id;
+        $member = $login;
+    }
+}
+
+$dynamic_roles = $uum->listGrantedRoles();
+// ユーザーの指定があった場合のみそのユーザー/組織/施設に対して登録できるかチェック
+if (array_key_exists('uid', $G_INPUT) && $G_INPUT['uid'] && $member) {
+    // アクセス権のチェック
+    $access = 1;
+    if ( ! is_a($member, 'CB_User') || ($member->getOID() != $login_id)) {
+        // 施設だったら施設グループのアクセス権を優先
+        if (is_a($member, 'GRN_Facility_Facility')) {
+            // 施設のアクセス権はグループをたどって評価する
+            $tmp_array = [$member->getOID() => $member];
+            $access = $acc_logic->evaluateAccessesById($login, $tmp_array,
+                ['read'], $dynamic_roles, 'facility');
+        } else {
+            $access = $acc_logic->evaluateAccess($login, $member, ['read'],
+                $dynamic_roles);
+        }
+    }
+
+    if ( ! $access) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_ENTRY);
+    }
+}
+
+// 全施設が選択可能かどうか
+require_once('schedule/system_logic.csp');
+$system_logic = GRN_Schedule_SystemLogic::getInstance();
+$allow_all_facilities = $system_logic->getAllowAllFacilities();
+$t->assign('allow_all_facilities', $allow_all_facilities);
+
+$referer_key = array_key_exists('referer_key', $G_INPUT)
+    ? $G_INPUT['referer_key'] : null;
+$referer_exists = false;
+
+if ($referer_key) {
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session = $session_manager->getSession('schedule.referer');
+    $referer = $session->get($referer_key);
+
+    if (($referer['page'] == 'schedule/index'
+         || $referer['page'] == 'schedule/group_day'
+         || $referer['page'] == 'schedule/personal_day'
+         || $referer['page'] == 'schedule/personal_week'
+         || $referer['page'] == 'schedule/personal_month')
+        && substr($user_id, 0, 1) == 'f'
+        && strlen($user_id) > 1
+    ) {
+        $fgroup = $facility_logic->getFacilityAffiliationGroup(substr($user_id,
+            1));
+        if ($fgroup) {
+            $group_id = 'f' . $fgroup->getOID();
+
+            $facilities_tmp
+                = $facility_logic->getGroupFacilityArrayList($fgroup->getOID());
+            // 順番を保持するためにキーを取得
+            $facilities_order = array_keys($facilities_tmp);
+
+            $facilities_tmp = $acc_logic->evaluateAccessesById($login,
+                $facilities_tmp, ['read'], $dynamic_roles, 'facility');
+            $facilities = [];
+            foreach ($facilities_order as $key) {
+                // アクセス権があったものだけ返す
+                if (array_key_exists($key, $facilities_tmp)) {
+                    $facilities[$key] = $facilities_tmp[$key];
+                }
+            }
+            // GTM-1676
+            ScheduleFacilityApprovalSetting::evaluateSettingForFacilityObjects($facilities);
+            // end GTM-1676
+
+            $t->assign('show_affiliation_group', false);
+            $facilities_for_select_list = ScheduleMemberLogic::getInstance()
+                                                             ->getFacilitiesRender($facilities);
+            $t->assign('all_facilities', $facilities_for_select_list);
+            $t->assign('default_group_name', $fgroup->get('name'));
+
+            unset($fgroup, $facilities_tmp, $facilities_order);
+        }
+    }
+
+    unset($session_manager, $session, $referer);
+}
+
+//--- add VCBSCH0010 ---s
+// V-CUBEシステムが利用可能かを取得する。
+require_once('schedule/netmeeting_system_logic.csp');
+$netmeeting_system_logic = GRN_Netmeeting_SystemLogic::getInstance();
+$netmeeting_system_available
+    = $netmeeting_system_logic->getNetmeetingAvailable();
+//--- add VCBSCH0010 ---e
+
+if ( ! isset($facilities)) {
+    if ($allow_all_facilities) {
+        $facilities_tmp = $facility_logic->getOrderedFacilityPartInfoList();
+        // 順番を保持するためにキーを取得
+        $facilities_order = array_keys($facilities_tmp);
+
+        $facilities_tmp = $acc_logic->evaluateAccessesById($login,
+            $facilities_tmp, ['read'], $dynamic_roles, 'facility');
+        $facilities = [];
+        foreach ($facilities_order as $key) {
+            // アクセス権があったものだけ返す
+            if (array_key_exists($key, $facilities_tmp)) {
+                $facilities[$key] = $facilities_tmp[$key];
+            }
+        }
+        foreach (array_keys($facilities) as $key) {
+            //--- add VCBSCH0010 ---s
+            // V-CUBEシステムが利用可能で施設がV-CUBE連携対象の場合、対象施設を表示しない。
+            if (($netmeeting_system_available == 1)
+                && ($facilities[$key]['col_netmeeting_available'] == 1)
+            ) {
+                unset($facilities[$key]);
+            }
+            //--- add VCBSCH0010 ---e
+        }
+        $all_facilities = ScheduleMemberLogic::getInstance()
+                                             ->getFacilitiesRender($facilities,
+                                                 true);
+        $t->assign('all_facilities', $all_facilities);
+        $t->assign('show_affiliation_group', true);
+
+        $t->assign('default_group_name',
+            cb_msg('grn/schedule', 'facility_all'));
+    } else {
+        $t->assign('show_affiliation_group', false);
+        $t->assign('default_group_name',
+            cb_msg('grn/schedule', 'choice_facility_group'));
+    }
+}
+
+// 上部に表示するスケジュールデータの設定
+include('_member_day.csp');
+$t->assign('disable_link', true);
+
+$t->assign('show_organize', $systemlogic->getShowOrganize() ? true : false);
+
+// 初期選択ユーザー/施設
+$selected_users = [];
+$selected_facilities = [];
+
+if (is_a($member, 'CB_User')) {
+    $selected_users = ScheduleMemberLogic::getInstance()
+                                         ->getDisplayMember($member);
+} elseif (is_a($member, 'CB_Group')) {
+    $selected_users = ScheduleMemberLogic::getInstance()
+                                         ->getDisplayMember($member);
+} elseif (is_a($member, 'GRN_Facility_Facility')) {
+    $selected_facilities = [$member->getOID() => $member->get('name')];
+}
+
+if (array_key_exists('members', $G_INPUT)) {
+    $members = ScheduleMemberLogic::getInstance()
+                                  ->parseParamListValuesEachType($G_INPUT['members']);
+    $selected_users = ScheduleMemberLogic::getInstance()
+                                         ->getDisplayMemberList($members['members']);
+    $schedule_event['users'] = $selected_users;
+
+    $schedule_event['facilities'] = ScheduleMemberLogic::getInstance()
+                                                       ->getDisplayMemberList($members['facilities']);
+    foreach ($schedule_event['facilities'] as $selected_facility) {
+        $selected_facilities[$selected_facility['id']]
+            = $selected_facility['displayName'];
+    }
+}
+// 条件入力画面から戻ったときに引き継いだ選択されたユーザー/グループ
+if (($sUID = array_key_exists('sUID', $G_INPUT) ? $G_INPUT['sUID'] : false)) {
+    if (is_array($sUID) && count($sUID) > 0) {
+        $selected_users = ScheduleMemberLogic::getInstance()
+                                             ->getAttendeesRenderFromParam($sUID,
+                                                 false, false);
+    }
+}
+
+// 条件入力画面から戻ったときに引き継いだ選択された施設
+if (($sITEM = array_key_exists('sITEM', $G_INPUT) ? $G_INPUT['sITEM']
+    : false)
+) {
+    if (is_array($sITEM)) {
+        $selected_facilities_info = $facility_logic->getFacilitiesInfo($sITEM,
+            CB_DATABASE_NO_LOCK);
+
+        $selected_facilities = [];
+        foreach ($selected_facilities_info as $faid => $info) {
+            $selected_facilities[$faid] = $info['col_name'];
+        }
+    }
+    unset($selected_facilities_info);
+}
+
+require_once('fw/session_manager.csp');
+$sm = CB_SessionManager::getInstance();
+$sm->destroy(cb_get_pagename());
+$sm->destroy(cb_get_pagename() . '/view');
+
+$t->assign('add_plugin', [
+    'name'   => 'schedule',
+    'params' => [
+        'action'       => ['read', 'add'],
+        'session_name' => cb_get_pagename()
+    ]
+]);
+
+$t->assign('view_plugin', [
+    'name'   => 'schedule',
+    'params' => [
+        'action'       => ['read'],
+        'session_name' => cb_get_pagename() . '/view'
+    ]
+]);
+
+$t->assign('selected_users', $selected_users);
+$t->assign('selected_facilities',
+    ScheduleMemberLogic::getInstance()
+                       ->getFacilitiesRenderFromParam(array_keys($selected_facilities)));
+
+$t->assign('user_id', $user_id);
+$t->assign('group_id', $group_id);
+$t->assign('event_id', $event_id);
+$t->assign('bdate', $date->format());
+
+$backlink = cb_pageurl("schedule/index");
+$referer_key = array_key_exists('referer_key', $G_INPUT)
+    ? $G_INPUT['referer_key'] : null;
+$referer_exists = false;
+if ($referer_key) {
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session = $session_manager->getSession('schedule.referer');
+    $referer = $session->get($referer_key);
+    if (is_array($referer)) {
+        // Ajaxスケジューラは日付を移動してもrefererを更新しないので変更後のbdateを受け取ってrefererを更新する
+        $date = new CB_Date();
+        $referer_bdate = array_key_exists('referer_bdate', $G_INPUT)
+            ? $G_INPUT['referer_bdate'] : null;
+        if ($date->parse($referer_bdate)) {
+            $referer['bdate'] = $referer_bdate;
+            $session->set($referer_key, $referer);
+        }
+
+        // page title
+        $page_title = grn_get_current_page_display_name();
+        $t->assign('page_title', $page_title);
+        // site position 
+        $t->assign(
+            'site_position', [
+                $referer,
+                [
+                    'page' => "",
+                    'name' => cb_msg('grn.schedule', 'adjust_site_position')
+                ]
+            ]
+        );
+        $referer_exists = true;
+
+        $page = 'schedule/index';
+        if (array_key_exists('page', $referer) === true) {
+            $page = $referer['page'];
+        }
+
+        $backlink = cb_pageurl($page);
+    }
+}
+
+if ($referer_exists === false) {
+    $page = 'schedule/index';
+    // page title
+    $page_title = grn_get_current_page_display_name();
+    $t->assign('page_title', $page_title);
+    // site position 
+    $t->assign(
+        'site_position', [
+            [
+                'page' => 'schedule/index',
+                'name' => grn_get_page_display_name('schedule/schedule_index')
+            ],
+            [
+                'page' => '',
+                'name' => cb_msg('grn.schedule', 'adjust_site_position')
+            ]
+        ]
+    );
+}
+
+$t->assign('referer_key', $referer_key);
+$t->assign('backlink', $backlink);
+$t->assign('page', $page);
+
+/////////////////////////////////////////////////
+// For tree
+require_once('_view_util.csp');
+
+$extra_node = $group_id == 'f' ? true : false;
+$tree_data
+    = GRN_Schedule_Dropdown_Util::makeFacilityGroupsTreeMenu(cb_get_pagename(),
+    $group_id, $extra_node);
+
+$t->assign('fgroup_list', $tree_data['org']);
+$t->assign('fgroup_selected_id', $tree_data['selected_id']);
+$t->assign('ftree_name', cb_get_pagename());
+$t->assign('ftree_async_page', "schedule/json/accessible_facility_tree");
+
+// Smarty実行
+$t->assign('page_name', cb_get_pagename());
+$t->display(cb_get_pagename() . ".tpl");
+

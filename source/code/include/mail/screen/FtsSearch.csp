@@ -1,0 +1,473 @@
+<?php
+
+namespace grn\mail\screen;
+
+use grn\fts\Application as FtsApplication;
+use grn\fts\FileType;
+use grn\fts\filter\LanguageFilter;
+use grn\fts\SearchConstants;
+use grn\fts\SearchQueryInterface;
+use grn\fts\SortOrder;
+use grn\mail\GrnMailSitePosition;
+
+require_once('grn/smarty.csp');
+require_once('grn/application.csp');
+require_once('mail/utility.csp');
+require_once('mail/folder.csp');
+require_once('mail/folder_tree.csp');
+
+class FtsSearch
+{
+    const TEMPLATE_PATH = 'mail/search_fts.tpl';
+
+    /** @var string */
+    private $text = '';
+    /** @var \grn\fts\SortOrder */
+    private $sortOrder;
+    /** @var bool */
+    private $fileOnly = false;
+    /** @var string */
+    private $fileType = FileType::ALL;
+    /** @var bool */
+    private $titleFilter = false;
+    /** @var string */
+    private $dateLower = SearchQueryInterface::DATE_NOT_SPECIFIED;
+    /** @var string */
+    private $dateUpper = SearchQueryInterface::DATE_NOT_SPECIFIED;
+    /** @var string */
+    private $sender = '';
+    /** @var string */
+    private $receiver = '';
+    /** @var int */
+    private $accountId = null;
+    /** @var string */
+    private $folderId = null;
+    /** @var string */
+    private $preFolderId = null;
+    /** @var string */
+    private $language = LanguageFilter::ALL;
+
+    /**
+     * @param array $input
+     */
+    public function __construct(array $input)
+    {
+        $this->sortOrder = new SortOrder;
+        $this->parseInput($input);
+    }
+
+    /**
+     * @return string
+     * @return bool|mixed|string
+     */
+    public function fetch()
+    {
+        $loginUser = cb_get_login_user();
+        assert('$loginUser');
+        $smarty = new \GRN_Smarty();
+        $smarty->assign('search_text', $this->getText());
+        $smarty->assign('sortByDatetime',
+            $this->getSortOrder() === SortOrder::DATETIME);
+        $smarty->assign('fileOnly', $this->getFileOnly());
+        $smarty->assign('fileType', $this->getFileType());
+        $smarty->assign('titleFilter', $this->getTitleFilter());
+        $smarty->assign('sender', $this->getSender());
+        $smarty->assign('receiver', $this->getReceiver());
+        $smarty->assign('loginUserId', $loginUser->getOID());
+        $smarty->assign('language', $this->getLanguage());
+        $smarty->assign('appName', $this->getAppName());
+        $smarty->assign('is_elasticsearch',
+            FtsApplication::getFtsEngine()->isElasticsearch());
+
+        $accountId = $this->getAccountId();
+        if (is_null($accountId)) {
+            require_once('mail/error_code.csp');
+            cb_throw_error(E_GRN_MAIL_ACCOUNT_DATA_NOT_FOUND);
+        } else {
+            $smarty->assign('accountId', $accountId);
+        }
+
+        $folderId = $this->getFolderId();
+        $folderLogic = \GRN_Mail_FolderLogic::getInstance();
+        if (is_null($folderId)) {
+            require_once('mail/error_code.csp');
+            cb_throw_error(E_GRN_MAIL_FOLDER_DATA_NOT_FOUND);
+        } else {
+            $folder = $folderLogic->_getFolderRow($folderId);
+            if (is_null($folder)) {
+                require_once('mail/error_code.csp');
+                cb_throw_error(E_GRN_MAIL_FOLDER_DATA_NOT_FOUND);
+            }
+            $smarty->assign('folderId', $folderId);
+        }
+
+        $folderTree = new \GRN_Mail_FolderTree(['account_id' => $accountId]);
+        $folderList = $folderLogic->getFolderDataList($accountId,
+            $folderTree->getRoot());
+        $smarty->assign('folderList', $folderList);
+
+        $personalConfig = new \GRN_Mail_PersonalConfig($loginUser);
+        $multiAccount = ($personalConfig->getAccountDataCount() > 1) ? "1"
+            : "0";
+        $smarty->assign('showAnotherAccount', $multiAccount);
+
+        $dateLower = $this->getDateLower();
+        if ($dateLower !== SearchQueryInterface::DATE_NOT_SPECIFIED) {
+            $smarty->assign('dateLower', $dateLower);
+        }
+        $dateUpper = $this->getDateUpper();
+        if ($dateUpper !== SearchQueryInterface::DATE_NOT_SPECIFIED) {
+            $smarty->assign('dateUpper', $dateUpper);
+        }
+
+        $utility = \GRN_Mail_Utility::getInstance();
+        $app = $utility->getMailApp();
+        $title
+            = grn_get_current_page_display_name(['app_name' => $app->getName()]);
+        $smarty->assign('page_title', $title);
+
+        $mailSitePosition = new GrnMailSitePosition();
+        $smarty->assign('site_position',
+            $mailSitePosition->getSitePositionArray("mail/search", [
+                GrnMailSitePosition::ARG_USER             => $loginUser,
+                GrnMailSitePosition::ARG_ACCOUNT_ID       => $this->getAccountId(),
+                GrnMailSitePosition::ARG_FOLDER_ID        => $this->getFolderId(),
+                GrnMailSitePosition::ARG_APPLICATION_NAME => $app->getName()
+            ]));
+
+        if ( ! $this->getFileOnly()) {
+            /* for delete information */
+            $personalConfig = $utility->getPersonalConfig($loginUser);
+            $folder_data = $folderLogic->getFolderData($folderId, false);
+            $folder_code = is_array($folder_data) ? $folder_data['code']
+                : '';
+            switch ($folder_code) {
+                case GRN_MAIL_FOLDER_CODE_ROOT:
+                    $folder_type = '0';
+                    break;
+                case GRN_MAIL_FOLDER_CODE_INBOX:
+                    $folder_type = '1';
+                    break;
+                case GRN_MAIL_FOLDER_CODE_SENTBOX:
+                    $folder_type = '2';
+                    break;
+                case GRN_MAIL_FOLDER_CODE_UNSENT:
+                    $folder_type = '3';
+                    break;
+                case GRN_MAIL_FOLDER_CODE_TRASH:
+                    $folder_type = '4';
+                    break;
+                default:
+                    $folder_type = '5';
+                    break;
+            }
+
+            // previous folder
+            $pre_cid = $this->getPreFolderId();
+            $smarty->assign('pre_cid', $pre_cid);
+            $delete_info_multi = [
+                'title'        => grn_get_page_display_name('mail/delete_multi',
+                    ['app_name' => $app->getName()]),
+                'page'         => 'mail/delete_multi.tpl',
+                'no_confirm'   => false,
+                'data'         => [
+                    'category'       => [
+                        'type' => $folder_type,
+                        'cid'  => $pre_cid,
+                        'aid'  => $accountId
+                    ],
+                    'use_garbagebox' => $personalConfig->useTrash(),
+                    'search'         => true
+                ],
+                'handler'      => [
+                    'btn_delete_multi-top',
+                    'btn_delete_multi-bottom'
+                ],
+                'multi_target' => 'ids[]',
+                'form_target'  => 'search-mail-result-form'
+            ];
+            $smarty->assign('delete_info_multi', $delete_info_multi);
+        }
+
+        $hideFolders = [
+            GRN_MAIL_FOLDER_CODE_UNSENT => true,
+            GRN_MAIL_FOLDER_CODE_TRASH  => true,
+        ];
+        $smarty->assign('hideFolders', $hideFolders);
+
+        $smarty->assign('runBackgroundSearch',
+            FtsApplication::isBackgroundSearchModeEnabled());
+
+        return $smarty->fetch(self::TEMPLATE_PATH);
+    }
+
+    /**
+     * @param array $input
+     */
+    private function parseInput(array $input)
+    {
+        if (isset($input['search_text'])) {
+            $this->setText($input['search_text']);
+        }
+        if (isset($input['sortOrder'])) {
+            $this->setSortOrder($input['sortOrder']);
+        }
+        if (isset($input['fileOnly']) && $input['fileOnly']) {
+            $this->setFileOnly(true);
+        }
+        if (isset($input['fileType'])) {
+            $this->setFileType($input['fileType']);
+        }
+        if (isset($input['titleFilter']) && $input['titleFilter']) {
+            $this->setTitleFilter(true);
+        }
+        if (isset($input['sender'])) {
+            $this->setSender($input['sender']);
+        }
+        if (isset($input['receiver'])) {
+            $this->setReceiver($input['receiver']);
+        }
+        if (isset($input['dateLower'])) {
+            $this->setDateLower($input['dateLower']);
+        }
+        if (isset($input['dateUpper'])) {
+            $this->setDateUpper($input['dateUpper']);
+        }
+        if (isset($input['aid'])) {
+            $this->setAccountId($input['aid']);
+        }
+        if (isset($input['cid'])) {
+            $this->setFolderId($input['cid']);
+        }
+        if (isset($input['pre_cid'])) {
+            $this->setPreFolderId($input['pre_cid']);
+        }
+        if (isset($input['language'])) {
+            $this->setLanguage($input['language']);
+        }
+    }
+
+    /**
+     * @return string
+     */
+    private function getAppName()
+    {
+        $locator = \GRN_ApplicationLocator::instance();
+        $mailApp = $locator->getInstance(SearchConstants::APPLICATION_MAIL);
+
+        return $mailApp->getName();
+    }
+
+    /**
+     * @param string $text
+     */
+    public function setText($text)
+    {
+        $this->text = $text;
+    }
+
+    /**
+     * @return string
+     */
+    public function getText()
+    {
+        return $this->text;
+    }
+
+    /**
+     * @param string $sortOrder
+     */
+    public function setSortOrder($sortOrder)
+    {
+        $this->sortOrder->setSortType($sortOrder);
+    }
+
+    /**
+     * @return string
+     */
+    public function getSortOrder()
+    {
+        return $this->sortOrder->getSortType();
+    }
+
+    /**
+     * @param string $accountId
+     */
+    public function setAccountId($accountId)
+    {
+        $this->accountId = $accountId;
+    }
+
+    /**
+     * @return string
+     */
+    public function getAccountId()
+    {
+        return $this->accountId;
+    }
+
+    /**
+     * @param string $folderId
+     */
+    public function setFolderId($folderId)
+    {
+        $this->folderId = $folderId;
+    }
+
+    /**
+     * @return string
+     */
+    public function getFolderId()
+    {
+        return $this->folderId;
+    }
+
+    /*
+    * @param string $folderId 
+    */
+    public function setPreFolderId($folderId)
+    {
+        $this->preFolderId = $folderId;
+    }
+
+    /**
+     * @return string
+     */
+    public function getPreFolderId()
+    {
+        if (is_null($this->preFolderId)) {
+            $this->preFolderId = $this->folderId;
+        }
+
+        return $this->preFolderId;
+    }
+
+    /**
+     * @param string $sender
+     */
+    public function setSender($sender)
+    {
+        $this->sender = $sender;
+    }
+
+    /**
+     * @return string
+     */
+    public function getSender()
+    {
+        return $this->sender;
+    }
+
+    /**
+     * @param string $receiver
+     */
+    public function setReceiver($receiver)
+    {
+        $this->receiver = $receiver;
+    }
+
+    /**
+     * @return string
+     */
+    public function getReceiver()
+    {
+        return $this->receiver;
+    }
+
+    /**
+     * @param string $dateLower
+     */
+    public function setDateLower($dateLower)
+    {
+        $this->dateLower = $dateLower;
+    }
+
+    /**
+     * @return string
+     */
+    public function getDateLower()
+    {
+        return $this->dateLower;
+    }
+
+    /**
+     * @param string $dateUpper
+     */
+    public function setDateUpper($dateUpper)
+    {
+        $this->dateUpper = $dateUpper;
+    }
+
+    /**
+     * @return string
+     */
+    public function getDateUpper()
+    {
+        return $this->dateUpper;
+    }
+
+    /**
+     * @param boolean $fileOnly
+     */
+    public function setFileOnly($fileOnly)
+    {
+        $this->fileOnly = $fileOnly;
+    }
+
+    /**
+     * @return boolean
+     */
+    public function getFileOnly()
+    {
+        return $this->fileOnly;
+    }
+
+    /**
+     * @param string $fileType
+     */
+    public function setFileType($fileType)
+    {
+        $this->fileType = $fileType;
+    }
+
+    /**
+     * @return string
+     */
+    public function getFileType()
+    {
+        return $this->fileType;
+    }
+
+    /**
+     * @param string $language
+     */
+    public function setLanguage($language)
+    {
+        $this->language = $language;
+    }
+
+    /**
+     * @return string
+     */
+    public function getLanguage()
+    {
+        return $this->language;
+    }
+
+    /**
+     * @return boolean
+     */
+    public function getTitleFilter()
+    {
+        return $this->titleFilter;
+    }
+
+    /**
+     * @param boolean $titleFilter
+     */
+    public function setTitleFilter($titleFilter)
+    {
+        $this->titleFilter = $titleFilter;
+    }
+}
+

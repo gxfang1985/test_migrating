@@ -1,0 +1,531 @@
+<?php
+
+use grn\cydec\slash\FtsWorkerDataBaseCreator;
+use grn\fw\DistributorDBConvert;
+
+require_once('fw/lwc.csp');
+
+class Initialization
+{
+    const INIT_DATA_TYPE_NONE = 0;
+    const INIT_DATA_TYPE_HOLIDAY = 1;
+
+    private $configCommon = null;
+    private $containerBase = null;
+    private $applicationLocator = null;
+
+    private $dbAdminPassword = null;
+    private $dbUserPassword = null;
+    private $garoonAdminPassword = null;
+    private $defaultLocale = null;
+    private $defaultTimezone = null;
+
+    private $initDataType = self::INIT_DATA_TYPE_NONE;
+
+    public function __construct(
+        CB_ConfigManager $configCommon,
+        CB_LWContainer $containerBase,
+        GRN_ApplicationLocator $applicationLocator
+    ) {
+        $this->configCommon = $configCommon;
+        $this->containerBase = $containerBase;
+        $this->applicationLocator = $applicationLocator;
+    }
+
+    private function getConfigCommon()
+    {
+        return $this->configCommon;
+    }
+
+    private function getContainerBase()
+    {
+        return $this->containerBase;
+    }
+
+    private function getApplicationLocator()
+    {
+        return $this->applicationLocator;
+    }
+
+    public function getDbAdminPassword()
+    {
+        return $this->dbAdminPassword;
+    }
+
+    public function setDbAdminPassword($dbAdminPassword)
+    {
+        $this->dbAdminPassword = $dbAdminPassword;
+    }
+
+    public function getDbUserPassword()
+    {
+        return $this->dbUserPassword;
+    }
+
+    public function setDbUserPassword($dbUserPassword)
+    {
+        $this->dbUserPassword = $dbUserPassword;
+    }
+
+    public function getGaroonAdminPassword()
+    {
+        return $this->garoonAdminPassword;
+    }
+
+    public function setGaroonAdminPassword($garoonAdminPassword)
+    {
+        $this->garoonAdminPassword = $garoonAdminPassword;
+    }
+
+    public function getDefaultLocale()
+    {
+        return $this->defaultLocale;
+    }
+
+    public function setDefaultLocale($defaultLocale)
+    {
+        $this->defaultLocale = $defaultLocale;
+    }
+
+    public function getDefaultTimezone()
+    {
+        return $this->defaultTimezone;
+    }
+
+    public function setDefaultTimezone($defaultTimezone)
+    {
+        $this->defaultTimezone = $defaultTimezone;
+    }
+
+    public function getInitDataType()
+    {
+        return $this->initDataType;
+    }
+
+    public function setInitDataType($initDataType)
+    {
+        $this->initDataType = $initDataType;
+    }
+
+    private function updatePasswordInLWC()
+    {
+        $containerBase = $this->getContainerBase();
+        $configCommon = $this->getConfigCommon();
+
+        $db_password = $this->getDbUserPassword();
+
+        $dbConnection = $containerBase->getInstance("dbconn");
+        // set password to lwc.ini
+        $enc_password = '';
+        cb_aes_encode('dsanoster', $db_password, $enc_password);
+        $enc_password = base64_encode($enc_password);
+        $app_name = $configCommon->get('Global', 'app_name');
+        $config_info = ['prop:_password' => "val:$enc_password"];
+        $containerBase->register('dbconn', $config_info);
+        // reinitialize container
+        $containerBase->restartObject("dbconn", $dbConnection);
+    }
+
+    /**
+     * @return CB_DatabaseConnection[]
+     */
+    private function getSlaveDBConnections()
+    {
+        $containerBase = $this->getContainerBase();
+        $configCommon = $this->getConfigCommon();
+
+        $config = new CB_LWContainerFileConfig($configCommon->get('LWC',
+            'config'));
+        $lwc_config = $config->listConfigs();
+
+        $slaves = [];
+        foreach ($lwc_config as $section_name) {
+            $section = $config->getConfig($section_name);
+            if (array_key_exists('class', $section)
+                && strcmp('CB_DatabaseConnection', $section['class']) === 0
+            ) {
+                if ($section_name !== 'dbconn') {
+                    $slaves[] = $containerBase->getInstance($section_name);
+                }
+            }
+        }
+
+        return $slaves;
+    }
+
+    private function initializeSlaveDatabase()
+    {
+        $slaveDatabases = $this->getSlaveDBConnections();
+
+        foreach ($slaveDatabases as $slave) {
+            $slave->query_mysqldb('STOP SLAVE;', 'cbroot',
+                $this->getDbAdminPassword());
+            $slave->dropdb('cbroot', $this->getDbAdminPassword());
+            $slave->createdb('cbroot', $this->getDbAdminPassword());
+            $slave->query_mysqldb('RESET SLAVE;', 'cbroot',
+                $this->getDbAdminPassword());
+        }
+    }
+
+    private function initializeMasterDatabase()
+    {
+        $master = cb_get_master_db();
+        $master->dropdb('cbroot', $this->getDbAdminPassword());
+        $master->createdb('cbroot', $this->getDbAdminPassword());
+
+        if ($this->isBinlogExporting($master, 'cbroot',
+            $this->getDbAdminPassword())
+        ) {
+            $master->query_mysqldb('RESET MASTER;', 'cbroot',
+                $this->getDbAdminPassword());
+        }
+    }
+
+    private function isBinlogExporting(
+        CB_DatabaseConnection $connection,
+        $dbUser,
+        $dbPassword
+    ) {
+        $result = $connection->query_mysqldb('SHOW MASTER STATUS', $dbUser,
+            $dbPassword);
+        $rows = [];
+        while ($row = $connection->fetch_assoc($result)) {
+            $rows[] = $row;
+        }
+        $connection->free_result($result);
+
+        if (count($rows) > 0) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private function startSlaveDatabase()
+    {
+        $slaveDatabases = $this->getSlaveDBConnections();
+
+        foreach ($slaveDatabases as $slave) {
+            $slave->query_mysqldb('START SLAVE;', 'cbroot',
+                $this->getDbAdminPassword());
+        }
+    }
+
+    private function exeInitTableQuery(
+        CB_DatabaseConnection $connection,
+        $filepath
+    ) {
+        $fp = fopen($filepath, "r");
+        if ( ! $fp) {
+            echo $filepath . " File Not Found";
+            echo "Fail Initialize!";
+            die;
+        }
+        fclose($fp);
+
+        $content = file_get_contents($filepath);
+        $queryList = preg_split("/;\\s*\n/", $content);
+
+        foreach ($queryList as $query) {
+            if (strlen($query) > 0) {
+                $connection->query($query);
+            }
+        }
+
+    }
+
+    private function initializeGrnTables()
+    {
+        $this->initializeGaroonTables();
+        if (cb_is_onpremises_distributed_database()) {
+            $this->initializeGaroonTablesForSeparatedDB();
+        } else {
+            $this->initializeGaroonTablesForSimpleDB();
+        }
+    }
+
+    private function initializeGaroonTables()
+    {
+        $configCommon = $this->getConfigCommon();
+        $cgi_dir = $configCommon->get('Global', 'cgi_dir');
+        $root_path = $cgi_dir . DIRECTORY_SEPARATOR . "db";
+
+        $connection = $this->getContainerBase()->getInstance("dbconn");
+        $this->exeInitTableQuery($connection,
+            $root_path . DIRECTORY_SEPARATOR . "schema/master/master.sql");
+        $this->exeInitTableQuery($connection,
+            $root_path . DIRECTORY_SEPARATOR . "init/master/master.sql");
+
+        $this->exeInitTableQuery($connection,
+            $root_path . DIRECTORY_SEPARATOR . "schema/master/others.sql");
+        $this->exeInitTableQuery($connection,
+            $root_path . DIRECTORY_SEPARATOR . "init/master/others.sql");
+
+        $applications = [
+            "cbwebsrv",
+            "cellular",
+            "dezielink",
+            "notification",
+            "portal",
+            "rss",
+            "link",
+            "schedule",
+            "message",
+            "bulletin",
+            "cabinet",
+            "memo",
+            "phonemessage",
+            "timecard",
+            "todo",
+            "address",
+            "mail",
+            "workflow",
+            "report",
+            "star",
+            "presence",
+            "space",
+            "kunai",
+            "favour",
+            "job"
+        ];
+
+        foreach ($applications as $application) {
+            $app = $this->getApplicationLocator()
+                        ->getInstance($application, true);
+            $app->initializeDatabase();
+        }
+
+        require_once("fw/profile.csp");
+        $profile_connections = get_profile_get_connections();
+        foreach ($profile_connections as $connection) {
+            $this->exeInitTableQuery($connection,
+                $root_path . DIRECTORY_SEPARATOR
+                . "schema/profile/profile.sql");
+            $this->exeInitTableQuery($connection,
+                $root_path . DIRECTORY_SEPARATOR . "init/profile/profile.sql");
+        }
+    }
+
+    private function initializeGaroonTablesForSimpleDB()
+    {
+        $configCommon = $this->getConfigCommon();
+        $cgi_dir = $configCommon->get('Global', 'cgi_dir');
+        $root_path = $cgi_dir . DIRECTORY_SEPARATOR . "db";
+        $connection = $this->getContainerBase()->getInstance("dbconn");
+
+        if ($this->getInitDataType() == self::INIT_DATA_TYPE_HOLIDAY) {
+            $this->exeInitTableQuery($connection,
+                $root_path . DIRECTORY_SEPARATOR . "data" . DIRECTORY_SEPARATOR
+                . "holidays_ja.sql");
+            $this->exeInitTableQuery($connection,
+                $root_path . DIRECTORY_SEPARATOR . "data" . DIRECTORY_SEPARATOR
+                . "standard-workflow.sql");
+        }
+    }
+
+    private function initializeGaroonTablesForSeparatedDB()
+    {
+        $distributor = new DistributorDBConvert();
+        $distributor->convertAll();
+    }
+
+    private function setDemoLicense()
+    {
+        $now = new CB_Date;
+        $d = getdate();
+        $now->year = $d['year'];
+        $now->month = $d['mon'];
+        $now->day = $d['mday'];
+        cb_date_move_days($now, 60);
+
+        $license_info['limit'] = $now;
+        $license_info['users'] = 1;
+        $license_info['issue'] = '-';
+        $license_info['key'] = '-';
+        $license_info['type'] = GRN_LICENSE_TYPE_DEMO_GR4;
+        $lm = GRN_LicenseManager::getInstance();
+        $lm->addLicense($license_info);
+        unset($license_info, $date, $lm, $limit, $now);
+    }
+
+    private function initializeApplications()
+    {
+        $this->initializeGrnTables();
+    }
+
+    private function updateGaroonAdminPassword()
+    {
+        $uum = cb_lwc_uum();
+        $uum->changePassword(1, 'cybozu', $this->getGaroonAdminPassword(),
+            true);
+    }
+
+    private function setInitializedFlag()
+    {
+        $containerBase = $this->getContainerBase();
+        $configCommon = $this->getConfigCommon();
+
+        $configCommon->set("Global", "initialized", 1);
+        $configCommon->save();
+    }
+
+    private function updateDefaultTimezone()
+    {
+        $containerBase = $this->getContainerBase();
+        $configCommon = $this->getConfigCommon();
+        $configCommon->set("I18N", "default_timezone",
+            $this->getDefaultTimezone());
+        self::versionupProfileAttribute('I18N', 'fw.i18n.timezone',
+            'default_timezone', $this->getDefaultTimezone(), true);
+        $configCommon->save();
+    }
+
+    private function updateDefaultLocale()
+    {
+        $containerBase = $this->getContainerBase();
+        $configCommon = $this->getConfigCommon();
+        self::versionupProfileAttribute('I18N', 'fw.i18n.locale',
+            'default_locale', $this->getDefaultLocale(), true);
+        $configCommon->set("I18N", "default_locale", $this->getDefaultLocale());
+        $configCommon->save();
+    }
+
+    function findFile($target, $root_path, &$results)
+    {
+        if ($handle = opendir($root_path)) {
+            while (false !== ($file = readdir($handle))) {
+                if (strcmp($file, "..") == 0 || strcmp($file, ".") == 0) {
+                    continue;
+                } elseif (is_dir($root_path . DIRECTORY_SEPARATOR . $file)) {
+                    $this->findFile($target,
+                        $root_path . DIRECTORY_SEPARATOR . $file, $results);
+                } elseif (strcmp($target, $file) == 0) {
+                    array_push($results,
+                        $root_path . DIRECTORY_SEPARATOR . $file);
+                }
+            }
+        }
+        closedir($handle);
+    }
+
+
+    public function start()
+    {
+        if ( ! is_null($this->getDbUserPassword())) {
+            $this->updatePasswordInLWC();
+        }
+
+        if ( ! is_null($this->getDbAdminPassword())) {
+            $this->initializeSlaveDatabase();
+            $this->initializeMasterDatabase();
+            (new FtsWorkerDataBaseCreator())->createDB($this->getDbAdminPassword());
+            $this->startSlaveDatabase();
+
+            $this->initializeApplications();
+        }
+
+        if ( ! is_null($this->getDefaultLocale())) {
+            $this->updateDefaultLocale();
+        }
+
+        if ( ! is_null($this->getDefaultTimezone())) {
+            $this->updateDefaultTimezone();
+        }
+
+        $this->clearDemoLicenseTable();
+        $this->setDemoLicense();
+
+        $this->updateGaroonAdminPassword();
+
+        $this->initializeFilesFolder();
+
+        $this->setInitializedFlag();
+    }
+
+    private function initializeFilesFolder()
+    {
+        $app_ids = [
+            'address',
+            'bulletin',
+            'cabinet',
+            'cbwebsrv',
+            'cellular',
+            'dezielink',
+            'favour',
+            'fts',
+            'job',
+            'kunai',
+            'link',
+            'logging',
+            'mail',
+            'memo',
+            'message',
+            'notification',
+            'phonemessage',
+            'portal',
+            'presence',
+            'report',
+            'rss',
+            'schedule',
+            'space',
+            'star',
+            'system',
+            'timecard',
+            'todo',
+            'workflow'
+        ];
+
+        require_once('grn/file.csp');
+        foreach ($app_ids as $app_id) {
+            grn_initialize_files($app_id);
+        }
+    }
+
+    private function clearDemoLicenseTable()
+    {
+        $containerBase = $this->getContainerBase();
+
+        $master = $containerBase->getInstance("dbconn");
+        $master->query('TRUNCATE TABLE tab_grn_licensehistory');
+        $master->query('ALTER TABLE tab_grn_licensehistory AUTO_INCREMENT=1');
+    }
+
+
+    static private function undefine($object)
+    {
+        return is_null($object) || $object == false || $object === '';
+    }
+
+    static private function getNewProfileAttribute($section, $module, $default)
+    {
+        global $G_config_common;
+        $value = $G_config_common->get($section, $module);
+        if (self::undefine($value)) {
+            return $default;
+        }
+
+        return $value;
+    }
+
+
+    static public function versionupProfileAttribute(
+        $section,
+        $module,
+        $key,
+        $default,
+        $force = false
+    ) {
+
+        $profile = cb_get_system_profile($module);
+        $value = $force ? $default
+            : self::getNewProfileAttribute($section, $module, $default);
+        if ($profile->getAttribute($key, $db_value)) {
+            if (self::undefine($db_value) || $force) {
+                $profile->updateAttribute($key, $value);
+            }
+        } else {
+            $profile->createAttribute($key, $value);
+        }
+    }
+
+}

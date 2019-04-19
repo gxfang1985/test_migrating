@@ -1,0 +1,325 @@
+<?php
+require_once('grn/inspection.csp');
+require_once('grn/server_file.csp');
+require_once('grn/ticket.csp');
+
+class GRN_UploadTicket
+{
+    /**
+     * @param int $user_id
+     *
+     * @return string
+     */
+    public static function create($user_id)
+    {
+        $ticket = self::getRandomUniqueKey();
+        $table = new GRN_UploadTicketUserTable();
+        $table->add($ticket, $user_id);
+
+        return $ticket;
+    }
+
+    /**
+     * @param string $ticket
+     *
+     * @return bool
+     */
+    public static function validate($ticket)
+    {
+        $table = new GRN_UploadTicketUserTable();
+        $row = $table->getRow($ticket);
+        if ( ! $row) {
+            // not exist
+            return false;
+        }
+
+        $seconds = self::getEffectiveTime();
+        if ($row['col_ctime'] + $seconds < time()) {
+            // expired
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @return string  length 64
+     */
+    private static function getRandomUniqueKey()
+    {
+        return hash('sha256', uniqid(rand(), true));
+    }
+
+    /**
+     * @return int  effective seconds
+     */
+    public static function getEffectiveTime()
+    {
+        global $G_config_common;
+        $time = $G_config_common->get('File_Upload', 'effective_time');
+        assert('$time > 0');
+
+        //単位がhourなので秒に直して返す
+        $time = $time * 60 * 60;
+
+        return $time;
+    }
+
+    /**
+     * @param string
+     */
+    public static function removeTicket($ticket)
+    {
+        $table = new GRN_UploadTicketUserTable();
+        $table->removeTicket($ticket);
+    }
+
+    public static function removeIneffectiveTickets()
+    {
+        $table = new GRN_UploadTicketUserTable();
+        $table->removeIneffectiveTickets(self::getEffectiveTime());
+    }
+
+    /**
+     * @param string $ticket
+     *
+     * @return bool
+     */
+    public static function isLoginUserTicket($ticket)
+    {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $login_user = $uum->getLoginUser();
+        $table = new GRN_UploadTicketUserTable();
+        $row = $table->getRow($ticket);
+        if ( ! $row) {
+            // not exist
+            return false;
+        }
+        if ($row['col_user'] == $login_user->getOID()) {
+            return true;
+        }
+
+        return false;
+    }
+}
+
+class GRN_UploadFile extends GRN_ServerFile
+{
+    //upload ticket
+    var $col_ticket = ['type' => 'char', 'notnull' => true];
+
+    //id
+    var $col_fileid = ['type' => 'char', 'notnull' => true];
+
+    //timestamp
+    var $col_ctime = ['type' => 'timestamp', 'notnull' => true];
+
+    /**
+     * @param      $upload_ticket
+     * @param      $fileIdList
+     * @param bool $removeFile
+     *
+     * @return GRN_UploadFile[]
+     */
+    public static function getUploadedFiles(
+        $upload_ticket,
+        $fileIdList,
+        $removeFile = false
+    ) {
+        global $G_INPUT;
+        if (array_key_exists("html5", $G_INPUT)) {
+            $use_html5 = true;
+        } else {
+            $use_html5 = false;
+        }
+
+        //$_FILESにファイルが格納されているなら$_FILESを返す
+        $files = [];
+        if ( ! $use_html5) {
+            foreach ($_FILES as $key => $file) {
+                if ($file['error'] != UPLOAD_ERR_OK) {
+                    continue;
+                }
+
+                $files[$key] = $file;
+            }
+        }
+        if (count($files) > 0) {
+            return $files;
+        }
+
+        if (is_null($upload_ticket)) {
+            return [];
+        }
+
+        //欲しいファイルID一覧が配列でない場合は空配列を返す
+        if ( ! is_array($fileIdList)) {
+            return [];
+        }
+
+        $file_tbl = cb_class2table('GRN_UploadFile');
+        $rowset = new CB_RowSet($file_tbl);
+
+        $condition = $rowset->queryf("col_ticket = '@S'", $upload_ticket);
+        $rowset->addCondition($condition);
+
+        $files = [];
+
+        while ( ! is_null($row = $rowset->iterate())) {
+            /** @var GRN_UploadFile $row */
+            foreach ($fileIdList as $fid) {
+                if (strcmp($row->get('fileid'), $fid) == 0) {
+                    $files[$fid] = $row;
+                }
+            }
+
+            if ($removeFile) {
+                $row->delete();
+            }
+        }
+
+        return $files;
+    }
+
+    public static function getUploadedAllFiles($upload_ticket)
+    {
+        if ( ! GRN_UploadTicket::isLoginUserTicket($upload_ticket)) {
+            return [];
+        }
+
+        $file_tbl = cb_class2table('GRN_UploadFile');
+        $rowset = new CB_RowSet($file_tbl);
+
+        $condition = $rowset->queryf("col_ticket = '@S'", $upload_ticket);
+        $rowset->addCondition($condition);
+
+        $files = [];
+        $count = 0;
+        while ( ! is_null($row = $rowset->iterate())) {
+            $files['file' . $count++] = $row;
+        }
+
+        return $files;
+    }
+
+    function removeUploadedFiles($upload_ticket)
+    {
+        $file_tbl =& cb_class2table('GRN_UploadFile');
+        $rowset = new CB_RowSet($file_tbl);
+
+        $condition = $rowset->queryf("col_ticket = '@S'", $upload_ticket);
+        $rowset->addCondition($condition);
+
+        while ( ! is_null($row = $rowset->iterate())) {
+            $row->delete();
+        }
+
+        GRN_UploadTicket::removeTicket($upload_ticket);
+    }
+
+    public static function removeUploadedFilesByFileIds($upload_ticket, $fids)
+    {
+
+        $file_tbl =& cb_class2table('GRN_UploadFile');
+        $rowset = new CB_RowSet($file_tbl);
+
+        $condition = $rowset->queryf("col_ticket = '@S'", $upload_ticket);
+        $rowset->addCondition($condition);
+        if ( ! is_array($fids) || count($fids) == 0) {
+            $rowset->deleteAllMatched();
+
+            return;
+        }
+        while ( ! is_null($row = $rowset->iterate())) {
+            if ( ! in_array($row->get('fileid'), $fids)) {
+                $row->delete();
+            }
+        }
+    }
+
+    public static function removeIneffectiveFiles()
+    {
+        $file_tbl = cb_class2table('GRN_UploadFile');
+        $rowset = new CB_RowSet($file_tbl);
+
+        $etime = GRN_UploadTicket::getEffectiveTime();
+        $condition = $rowset->queryf("col_ctime < '@S'", time() - $etime);
+        $rowset->addCondition($condition);
+
+        while ( ! is_null($row = $rowset->iterate())) {
+            $row->delete();
+        }
+
+        GRN_UploadTicket::removeIneffectiveTickets();
+    }
+}
+
+class GRN_UploadTicketUserTable
+{
+    const TABLE = 'tab_grn_ticket_user';
+
+    /**
+     * @param string $ticket
+     * @param string $user_id
+     */
+    public function add($ticket, $user_id)
+    {
+        global $G_container_base;
+        $db = $G_container_base->getInstance('dbconn');
+        $query = cb_queryf($db, "INSERT INTO " . self::TABLE
+                                . " SET col_ctime = UNIX_TIMESTAMP(), col_ticket = '@S', col_user = '@S';",
+            $ticket, $user_id);
+        $db->query($query);
+    }
+
+    /**
+     * @param string $ticket
+     *
+     * @return array or FALSE
+     */
+    public function getRow($ticket)
+    {
+        global $G_container_base;
+        $db = $G_container_base->getInstance('dbconn');
+        $query = cb_queryf($db,
+            "SELECT * FROM " . self::TABLE . " WHERE col_ticket = '@S';",
+            $ticket);
+        $result = $db->query($query);
+        $row = $db->fetch_assoc($result);
+        $db->free_result($result);
+
+        return $row;
+    }
+
+    /**
+     * @param string $ticket
+     */
+    public function removeTicket($ticket)
+    {
+        global $G_container_base;
+        $db = $G_container_base->getInstance('dbconn');
+        $query = cb_queryf($db,
+            "DELETE FROM " . self::TABLE . " WHERE col_ticket = '@S';",
+            $ticket);
+        $db->query($query);
+    }
+
+    /**
+     * @param int $seconds
+     */
+    public function removeIneffectiveTickets($seconds)
+    {
+        global $G_container_base;
+        $db = $G_container_base->getInstance('dbconn');
+        $query = cb_queryf($db, "DELETE FROM " . self::TABLE
+                                . " WHERE col_ctime < UNIX_TIMESTAMP() - '@S';",
+            $seconds);
+        $db->query($query);
+    }
+}
+
+function cb_get_upload_path()
+{
+    return cb_get_full_url('grn/command_add_tmp_file');
+}

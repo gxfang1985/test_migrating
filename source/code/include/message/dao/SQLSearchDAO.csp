@@ -1,0 +1,187 @@
+<?php
+
+namespace grn\message\dao;
+
+use grn\fts\api\SearchApiParameter;
+use \grn\fts\SQLSearchDAOAbstract;
+
+require_once("message/table_utility.csp");
+require_once("message/resources.csp");
+
+/**
+ * Throw query to DB and create response of array
+ */
+class SQLSearchDAO extends SQLSearchDAOAbstract
+{
+    const APP = "message";
+
+    /**
+     * @param \grn\fts\api\SearchApiParameter $parameter
+     *
+     * @return SQLSearchDAO
+     */
+    static public function create(SearchApiParameter $parameter)
+    {
+        return new self($parameter, new GrnMessageFoldersDAO());
+    }
+
+    /**
+     * @param \grn\fts\api\SearchApiParameter $parameter
+     * @param                                 $foldersDao GrnMessageFoldersDAO
+     */
+    public function __construct(SearchApiParameter $parameter, $foldersDao)
+    {
+        $this->userId = parent::getLoginUserId();
+        $this->sender = $parameter->getModifier();
+        $this->foldersDao = $foldersDao;
+    }
+
+
+    /**
+     * @param $user_id Integer
+     *
+     * @return \CB_User | boolean
+     */
+    protected function getUser($user_id)
+    {
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+
+        assert(is_numeric($user_id));
+
+        return $uum->getUser($user_id);
+    }
+
+    /**
+     * This method called by parent Template Class.
+     *
+     * @return string
+     */
+    protected function getFolderColumn()
+    {
+        return "folderRelations.col_folder";
+    }
+
+    /**
+     * @return string
+     */
+    public function buildQuery()
+    {
+        $relation
+            = grn_get_personal_tablename_message($this->userId,
+            'tab_grn_message_foldermessagerelations');
+
+        // Query for normal messages
+        $query = "SELECT "
+                 . "folderRelations.col_message AS mid, "
+                 . "messages.col_subject AS title, "
+                 . "COALESCE( messages.col_modifier , messages.col_creator ) AS senderId, "
+                 . "COALESCE( messages.col_mtime, messages.col_ctime ) AS modifiedTime, "
+                 . "COALESCE( messages.col_modifier_name, messages.col_creator_name )  AS displayName, "
+                 . "messages.col_last_mtime AS lastMtime "
+                 . "FROM tab_grn_message_messages messages "
+                 . "INNER JOIN " . $relation
+                 . " folderRelations ON folderRelations.col_message = messages._id AND folderRelations.col_snapshot_message IS NULL "
+                 . "LEFT OUTER JOIN  tab_cb_user AS sender ON "
+                 . "COALESCE( messages.col_modifier , messages.col_creator ) = sender._id "
+                 . "WHERE " . $this->db()
+                                   ->format("folderRelations.col_user = '@S' ",
+                                       [$this->userId])
+                 . " AND messages.col_message_type < " . GRN_MESSAGE_TYPE_DRAFT
+                 . " AND " . $this->buildNameCondition();
+        $query .= $this->getOptionalFilter();
+        $query .= " GROUP BY messages._id ";
+
+        // Query for snapshot messages
+        $query .= " UNION ALL ( ";
+        $query .= "SELECT "
+                  . "messages.col_original_message AS mid, "
+                  . "messages.col_subject AS title, "
+                  . "COALESCE( messages.col_modifier , messages.col_creator ) AS senderId, "
+                  . "COALESCE( messages.col_mtime, messages.col_ctime ) AS modifiedTime, "
+                  . "COALESCE( messages.col_modifier_name, messages.col_creator_name )  AS displayName, "
+                  . "messages.col_last_mtime AS lastMtime "
+                  . "FROM tab_grn_message_messages messages "
+                  . "INNER JOIN " . $relation
+                  . " folderRelations ON folderRelations.col_snapshot_message = messages._id "
+                  . "LEFT OUTER JOIN  tab_cb_user AS sender ON "
+                  . "COALESCE( messages.col_modifier , messages.col_creator ) = sender._id "
+                  . "WHERE " . $this->db()
+                                    ->format("folderRelations.col_user = '@S' ",
+                                        [$this->userId])
+                  . " AND messages.col_message_type < " . GRN_MESSAGE_TYPE_DRAFT
+                  . " AND " . $this->buildNameCondition();
+        $query .= $this->getOptionalFilter();
+        $query .= " GROUP BY messages._id ";
+        $query .= " ) ";
+
+        $query .= " ORDER BY lastMtime DESC ";
+        $query = $this->db()->select_format($query, (int)$this->offset,
+            (int)parent::getLimit(), CB_DATABASE_NO_LOCK);
+
+        return $query;
+    }
+
+    /**
+     * @return string of SQL Condition
+     */
+    public function buildNameCondition()
+    {
+        $name = "COALESCE( sender.col_display_name,"
+                . "messages.col_modifier_name,"
+                . "messages.col_creator_name ) ";
+        $keyword = cb_parse_search_text($this->sender);
+        $conditions = [];
+        foreach ($keyword as $token) {
+            $each_conditions = [];
+            $each_conditions[] = $this->db()
+                                      ->format("{$name} LIKE '%@L%'", [$token]);
+            $each_conditions[] = $this->db()
+                                      ->format("sender.col_nickname LIKE '%@L%'",
+                                          [$token]);
+            $conditions[] = " ( " . implode($each_conditions, " OR ")
+                            . " ) ";
+        }
+        $sender = implode($conditions, " AND ");
+
+        return " ( {$sender} ) ";
+    }
+
+    /**
+     * @return string of modified time
+     */
+    protected function getSearchFilterModifiedTime()
+    {
+        return "messages.col_last_mtime";
+    }
+
+    /**
+     * @return \CB_DatabaseConnection
+     */
+    protected function db()
+    {
+        return \GRN_ApplicationLocator::instance()->getConnection(self::APP);
+    }
+
+    /**
+     * @return mixed "\grn\message\SQLSearchResultDocument"
+     */
+    protected function getDocument()
+    {
+        return new \grn\message\SQLSearchResultDocument();
+    }
+
+    /**
+     * @param SearchApiParameter $parameter
+     */
+    protected function setFolderId(SearchApiParameter $parameter)
+    {
+        $folder_id = $parameter->getMessageFolderId();
+        if (is_null($folder_id)) {
+            return;
+        }
+        assert(is_numeric($folder_id));
+        $this->folder_id = $folder_id;
+        $this->search_folder = true;
+    }
+}

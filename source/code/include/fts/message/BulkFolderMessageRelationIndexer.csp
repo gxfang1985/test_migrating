@@ -1,0 +1,158 @@
+<?php
+
+namespace grn\fts\message;
+
+
+use grn\fts\BulkIndexerChildProcessInterface;
+use grn\fts\ChildProcessArgValue;
+
+class BulkFolderMessageRelationIndexer
+    implements BulkIndexerChildProcessInterface
+{
+
+    /** @var \grn\fts\ChildProcessArgValue */
+    private $value;
+
+    /**
+     * @param array $input
+     */
+    public function __construct(array $input)
+    {
+        $this->value = new ChildProcessArgValue();
+        $this->value->parseInput($input);
+    }
+
+    /**
+     * @return string[]
+     */
+    public function getConnectAppIds()
+    {
+        return ["message"];
+    }
+
+    /**
+     */
+    public function execute()
+    {
+        if ($this->value->getSearchEngine()->isSolr()) {
+            $this->executeForSolr();
+        } else {
+            $this->executeForEs();
+        }
+    }
+
+    private function executeForSolr()
+    {
+        $service = new IndexService($this->value->getSearchEngine());
+        $db = cb_get_app_db('message');
+
+        $result = $db->query(
+            "SELECT m._id AS message_id " .
+            ", f.col_snapshot_message AS snapshot_message_id " .
+            ", f.col_user AS user_id " .
+            ", f.col_folder AS folder_id " .
+            ", f.col_sent_message_flag AS message_type " .
+            "FROM tab_grn_message_foldermessagerelations___p{$db->escape($this->value->getUserTableNum())} AS f "
+            .
+            "INNER JOIN tab_grn_message_messages AS m " .
+            "ON m._id = f.col_message " .
+            "WHERE f._id >= '{$db->escape($this->value->getStartId())}' " .
+            "AND '{$db->escape($this->value->getEndId())}' >= f._id " .
+            "AND m.col_message_type != " . GRN_MESSAGE_TYPE_DRAFT .
+            " FOR UPDATE");
+
+        $rows = [];
+        while ($row = $db->fetch_assoc($result)) {
+            $rows[] = $row;
+        }
+        $db->free_result($result);
+        $service->bulkCreateFolderMessageRelationIndex($rows,
+            $this->value->getForward());
+
+        $rowsCount = count($rows);
+        echo "{$rowsCount} relations of message to folder indexed.";
+        gc_collect_cycles();
+    }
+
+    private function executeForEs()
+    {
+        $service = new IndexService($this->value->getSearchEngine());
+
+        $messages = $this->getFolderRelationsOfEachMessages();
+
+        foreach ($messages as $message_id => $message) {
+            $user_id_list = array_values($message['user_ids']);
+            $folder_id_list = array_values($message['folder_ids']);
+
+            $service->createEsFolderMessageRelationIndex($message_id,
+                $user_id_list, $folder_id_list);
+        }
+
+        $rowsCount = count($messages);
+        echo "{$rowsCount} relations of message to folder indexed.";
+        gc_collect_cycles();
+    }
+
+    /**
+     * Get the following data of the each messages:
+     * - list of folder IDs which the message is in
+     * - the sender ID
+     * - the address IDs
+     *
+     * @return array
+     *         $messages_map[$message_id] = [
+     *            'user_ids' => string[],
+     *            'folder_ids' => string[]
+     *         ]
+     */
+    private function getFolderRelationsOfEachMessages()
+    {
+        $db = cb_get_app_db('message');
+        $messages_map = [];
+        for ($i = 0; $i < cb_get_user_tables(); $i++) {
+            $query_format
+                = <<<SQL
+SELECT r.col_folder AS folder_id, r.col_user AS user_id, r.col_message AS message_id
+  FROM tab_grn_message_foldermessagerelations___p${i} r
+INNER JOIN tab_grn_message_messages m ON m._id = r.col_message
+WHERE (col_message >= '@S' AND '@S' >= col_message)
+  AND col_message_type != '@S'
+FOR UPDATE
+UNION ALL
+SELECT r.col_folder, r.col_user, r.col_snapshot_message
+  FROM tab_grn_message_foldermessagerelations___p${i} r
+INNER JOIN tab_grn_message_messages m ON m._id = r.col_message
+WHERE col_snapshot_message >= '@S' AND '@S' >= col_snapshot_message
+  AND col_message_type != '@S'
+FOR UPDATE
+SQL;
+            $query_params = [
+                $this->value->getStartId(),
+                $this->value->getEndId(),
+                GRN_MESSAGE_TYPE_DRAFT,
+                $this->value->getStartId(),
+                $this->value->getEndId(),
+                GRN_MESSAGE_TYPE_DRAFT,
+            ];
+            $result = $db->query($db->format($query_format,
+                $query_params));
+
+            while ($relation_row = $db->fetch_assoc($result)) {
+                $message_id = $relation_row['message_id'];
+                if ( ! array_key_exists($message_id, $messages_map)) {
+                    $messages_map[$message_id] = [
+                        'folder_ids' => [],
+                        'user_ids'   => []
+                    ];
+                }
+                $messages_map[$message_id]['folder_ids'][]
+                    = $relation_row['folder_id'];
+                $messages_map[$message_id]['user_ids'][]
+                    = $relation_row['user_id'];
+            }
+            $db->free_result($result);
+        }
+
+        return $messages_map;
+    }
+}

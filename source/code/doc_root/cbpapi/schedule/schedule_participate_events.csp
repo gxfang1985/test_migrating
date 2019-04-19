@@ -1,0 +1,212 @@
+<?php
+
+if (isset($cbpapi_service)) {
+    $request = $cbpapi_service->getRequestParameters();
+    $event_ids = $cbpapi_service->selectNodesValue($request, 'event_id');
+    if ( ! isset($event_ids) || ! is_array($event_ids)) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'event_id']);
+    }
+
+    require_once('schedule/application.csp');
+    $app = GRN_Schedule_Application::getInstance();
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+    $login_id = $login->getOID();
+
+    $event_id_list = []; // participated event id list.
+    $date = null;
+    foreach ($event_ids as $event_id) {
+        if (array_key_exists($event_id, $event_id_list)) {
+            continue;
+        }
+        if ( ! is_numeric($event_id)) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+        $event = $app->getEvent($login, $event_id, $date);
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        //Check access privilige
+        require_once('schedule/access_logic.csp');
+        $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+        $dynamic_role = $uum->listGrantedRoles();
+        $access = $acc_logic->getEventAccess($login, $event,
+            ['read', 'modify'], $dynamic_role);
+        if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+        }
+        if ($access['modify'] == GRN_SCHD_ACCESS_DENY) {
+            cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+        }
+
+        // throw error when event is not a nomal or banner event.
+        if (is_a($event, 'GRN_Schedule_RepeatEvent')) {
+            cb_throw_error(E_GRN_SCHD_IS_REPEAT_EVENT);
+        }
+        if (is_a($event, 'GRN_Schedule_TemporaryEvent')) {
+            cb_throw_error(E_GRN_SCHD_IS_TEMPORARY_EVENT);
+        }
+
+        // check participate
+        $is_participate = (is_array($event->users)
+                           && array_key_exists($login_id, $event->users));
+
+        require_once('schedule/facility_system_logic.csp');
+        $facility_logic = GRN_Facility_SystemLogic::getInstance();
+        if (is_array($event->facilities) && count($event->facilities) > 0) {
+            $f_settings
+                = $facility_logic->getFacilitySetting(array_keys($event->facilities));
+            foreach (array_keys($event->facilities) as $key) {
+                $object = &$event->facilities[$key];
+                $faid = $object->getOID();
+                $modify_user
+                    = $facility_logic->getModifyUserByPriority($f_settings,
+                    $faid);
+                // Registered user only has a modification permission.
+                if ($modify_user === 'creator') {
+                    if (is_array($event->facilities)
+                        && count($event->facilities) > 0
+                    ) {
+                        require_once('schedule/facility_privilege.csp');
+                        $privilege_logic
+                            = GRN_Facility_Privilege_Logic::getInstance();
+                        if ( ! $privilege_logic->hasPrivilegeOfFacilities($login,
+                                $event->facilities, 'OR')
+                             && ((is_a($event->creator, 'CB_User')
+                                  && $login_id != $event->creator->getOID())
+                                 || is_string($event->creator))
+                        ) {
+                            cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+                        }
+                    }
+                } // 登録者と共有メンバーに変更を許可する
+                elseif ($modify_user === 'member') {
+                    // 施設で登録者しか変更を許していない場合
+                    if (is_array($event->facilities)
+                        && count($event->facilities) > 0
+                    ) {
+                        require_once('schedule/facility_privilege.csp');
+                        $privilege_logic
+                            = GRN_Facility_Privilege_Logic::getInstance();
+                        // Login user is not a member
+                        if (( ! $is_participate || is_null($event->users))
+                            && ((is_a($event->creator, 'CB_User')
+                                 && $login_id !== $event->creator->getOID())
+                                || is_string($event->creator))
+                            && ! $privilege_logic->hasPrivilegeOfFacilities($login,
+                                $event->facilities, 'OR')
+                        ) {
+                            cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+                        }
+                    }
+                }
+            }
+        }
+
+        $b_found = false;
+        if (is_array($event->users)) {
+            foreach (array_keys($event->users) as $index) {
+                $user = &$event->users[$index];
+                // already participated
+                if ($user->getOID() == $login_id) {
+                    $b_found = true;
+                    break;
+                }
+            }
+        }
+
+        //participate
+        if ( ! $b_found) {
+            if (is_array($event->users)) {
+                $event->users[] = &$login;
+            } else {
+                $event->users = [];
+                $event->users[] = &$login;
+            }
+            $event->modifier = &$login;
+
+            if (($eid = $app->modifyEventWithoutDateTime($event))) {
+                $event_id_list[$eid] = $eid;
+            }
+
+            //Notification
+            $tsex = new CB_TimeStampEx();
+            $notify_date = $tsex->getDate();
+            $bdate = $event->getFirstDate($notify_date);
+
+            require_once('schedule/notification.csp');
+            $util = GRN_Schedule_Notify_Logic::getInstance();
+            if ($notify_date->compare($bdate) <= 0) {
+                // ----- GRN2-4506 -----
+                if ($event instanceof GRN_Schedule_NormalEvent) {
+                    // 通常予定（終日以外）も、イベントのタイムゾーンに変更する
+                    if ($event->setdatetime instanceof CB_DateTimeEx) {
+                        require_once('fw/i18n.csp');
+                        $settimestamp = new CB_TimeStampEx(null,
+                            $event->timezone);
+                        $settimestamp->setDateTime($event->setdatetime,
+                            CB_I18N::getInstance()->getCurrentTimezone());
+                        $event->setdatetime = $settimestamp->getDateTime();
+                        if (isset($event->enddatetime)) {
+                            $endtimestamp = new CB_TimeStampEx(null,
+                                $event->timezone);
+                            $endtimestamp->setDateTime($event->enddatetime,
+                                CB_I18N::getInstance()->getCurrentTimezone());
+                            $event->enddatetime = $endtimestamp->getDateTime();
+                        } else {
+                            $event->enddatetime = $event->setdatetime;
+                        }
+                    }
+                }
+                // ----- GRN2-4506 -----
+
+                $title = '';
+
+                if (is_array($event->users) && count($event->users) > 0) {
+                    $title
+                        = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+                    $app->setNotify($event->users, $login, $event, $bdate,
+                        $title, '', GRN_SCHEDULE_NOTIFY_MODIFY, $tsex);
+                    $app->forwardMail($event,
+                        [GRN_SCHEDULE_NOTIFY_MODIFY => $event->users], $login);
+                    $app->sendPushNotification(
+                        $event, [GRN_SCHEDULE_NOTIFY_MODIFY => $event->users],
+                        $login, true, $bdate, null);
+                }
+
+                // 通知先の指定がある場合
+                if ($event->private && is_array($event->notify_address)
+                    && count($event->notify_address) > 0
+                ) {
+                    $title
+                        = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+                    $app->sendNotificationsToPublic($login, $event, $bdate, '',
+                        $tsex, $title, false, true, GRN_SCHEDULE_NOTIFY_MODIFY);
+                }
+            }
+        }
+    }
+
+    require_once('cbpapi/schedule_logic.csp');
+    $logic = GRN_CBPApi_Schedule_Logic::getInstance();
+    $logic->saveNow();
+
+    $schedule_events = $logic->getEventsForViewByIds($login, $event_id_list);
+
+
+    //response SOAP message
+    require_once("grn/smarty.csp");
+    $t = new GRN_Smarty;
+    $t->assign('xml_namespaces', [
+        grn_cbpapi_get_namespace('common'),
+        grn_cbpapi_get_namespace('schedule')
+    ]);
+    $t->assign('events', $schedule_events);
+    grn_cbpapi_response($t, __FILE__);
+}
+

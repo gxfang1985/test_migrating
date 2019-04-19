@@ -1,0 +1,477 @@
+<?php
+
+/**
+ * weather logic
+ *
+ * @author   Eiji TAEN   2005/03
+ * @package  grn.cbwebsrv
+ */
+
+require_once('cbwebsrv/base.csp');
+require_once('cbwebsrv/WeatherLocationsResource.csp');
+require_once('cbwebsrv/weather_icon_mapping.csp');
+
+/**
+ * Weather service class
+ *
+ * @package  grn.cbwebsrv
+ */
+class GRN_CBWebSrv_WeatherService extends GRN_CBWebSrv_Base
+{
+    /**
+     * constructor
+     *
+     * @access   private
+     */
+    function __construct()
+    {
+        parent::__construct();
+        require_once('cbwebsrv/tool_define.csp');
+        $this->_setEventID(GRN_CBWEBSRV_SERVICE_WEATHER);
+    }
+
+    /**
+     * get a instance
+     *
+     * @return   GRN_CBWebSrv_WeatherService
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+
+        if (is_null($_instance)) {
+            $_instance = new GRN_CBWebSrv_WeatherService();
+        }
+
+        return $_instance;
+    }
+
+    function getCachePath()
+    {
+        return $this->_getCacheDir() . '/weather.xml';
+    }
+
+    /**
+     * get weather forecast information
+     *
+     * @param    array $location_list [] => string   location id
+     *
+     * @option   object  $start       CB_Date   start day (default: null)
+     *                                if $start is null, set today to $start
+     * @option   int     $days        get weather from today to $days days after (default: 6)
+     *
+     * @return   bool | array [location id]              => array    key: location id (prefectureCode & pointCode)
+     *                           ['name']                => string   prefecture name & point name
+     *                           ['date_list']           => array    weather info
+     *                              [date]               => array    key: yyyy-mm-dd
+     *                                  ['weather_code'] => string   weather code
+     *                                  ['weather']      => string   weather name
+     *                                  ['url']          => string   weather information page URL
+     */
+    function getWeather($location_list, $start = null, $days = 6)
+    {
+        // check parameters
+        if ( ! is_array($location_list)
+             || ( ! is_null($start) && ! is_a($start, 'CB_Date'))
+             || ! is_int($days)
+        ) {
+            return false;
+        }
+
+        // start date
+        if (is_null($start)) {
+            require_once('fw/date.csp');
+            $ts = new CB_TimeStamp();
+            $ts->unix_ts = time();
+            $tsx = new CB_TimeStampEx($ts);
+            $start = $tsx->getDate();
+        }
+
+        if (count($location_list) == 0) {
+            return [];
+        }
+
+        return $this->_getWeather($location_list, $start, $days);
+    }
+
+    /**
+     * @access   private
+     */
+    function _getWeather($locations, $start, $days)
+    {
+        // end date
+        $end = new CB_DateEx($start);
+        $end->moveDays($days);
+
+        $tab_weather = $this->_manager->getTableInfo('GRN_CBWebSrv_Weather');
+        $rowset = new CB_MultiRowSet($tab_weather, 'w');
+
+        $condition_event = "col_event_id = '@S'";
+        $condition_event = $rowset->queryf($condition_event,
+            GRN_CBWEBSRV_EVENT_WEATHER);
+        $rowset->addJoin($this->_tab_event,
+            $condition_event,
+            CB_DATABASE_INNER_JOIN,
+            'e'
+        );
+        $condition_event_property
+            = "col_property_id IN(@A) AND p._id = col_property AND col_date >= '@S'"
+              . " AND col_date <= '@S' AND e._id = col_event";
+        $condition_event_property = $rowset->queryf($condition_event_property,
+            $locations, $start->format(), $end->format());
+        $rowset->addJoin($this->_tab_event_property,
+            $condition_event_property,
+            CB_DATABASE_INNER_JOIN,
+            'p'
+        );
+        $rowset->addOrderColumn('col_property_id');
+        $rowset->addOrderColumn('col_date');
+        $rowset->setLock(CB_DATABASE_NO_LOCK);
+
+        $weather = [];
+        foreach ($locations as $l) {
+            $row = $this->getEventProperty(GRN_CBWEBSRV_EVENT_WEATHER, $l);
+            if ( ! $row) {
+                return [];
+            }
+            $location = [];
+            $location['name'] = $row->get('property_name');
+            $location['date_list'] = [];
+            $weather[$l] = $location;
+        }
+
+        $icon_mapping = WeatherIconMapping::getIconMappingArray();
+        while ( ! is_null($row =& $rowset->iterate())) {
+            $date = [];
+            $date['weather_code'] = $row['w']->get('weather_code');
+            $date['weather'] = $row['w']->get('weather');
+            $date['url'] = $row['w']->get('url');
+            $date['image'] = $icon_mapping[$date['weather_code']] ??
+                             GRN_CBWEBSRV_WEATHER_NOT_FOUND_ICON;
+
+            $cb_date = $row['w']->get('date');
+            $weather[$row['p']->get('property_id')]['date_list'][$cb_date->format()]
+                = $date;
+        }
+
+        return $weather;
+    }
+
+    /**
+     * set weather event data
+     *
+     * @param    string $event_name event name
+     * @param    object $utime      CB_TimeStamp   next update time
+     *
+     * @return   object CB_Row        a weather event row
+     */
+    function setWeatherEvent($event_name, & $utime)
+    {
+        $ret = $this->setEvent(GRN_CBWEBSRV_EVENT_WEATHER, $event_name, $utime);
+
+        return $ret;
+    }
+
+    /**
+     * set a weather event property (location information)
+     *
+     * @param    string $property_id   property id   (location id)
+     * @param    string $property_name property name (prefecture name & location name)
+     * @param    object $vtime         CB_TimeStamp valid time
+     *
+     * @return   mixed  CB_Row          a weather event property row
+     *                                  if a weather event doesn't exist, return FALSE
+     */
+    function setWeatherEventProperty($property_id, $property_name, & $vtime)
+    {
+        $__ret = $this->setEventProperty(GRN_CBWEBSRV_EVENT_WEATHER,
+            $property_id, $property_name, $vtime);
+
+        return $__ret;
+    }
+
+    /**
+     * set weather information
+     *
+     * @param    string $property_id
+     * @param    object $date CB_Date
+     * @param    string $weather_code
+     * @param    string $weather_name
+     * @param    string $url  url to the weather information page
+     *
+     * @return   mixed  CB_Row  a weather row
+     *                          if the weather event or event property don't exist, return FALSE
+     */
+    function setWeather(
+        $property_id,
+        & $date,
+        $weather_code,
+        $weather_name,
+        $url
+    ) {
+        $property = $this->getEventProperty(GRN_CBWEBSRV_EVENT_WEATHER,
+            $property_id);
+
+        if ($property === false) {
+            $ret = false;
+
+            return $ret;
+        }
+
+        $ret = $this->_setWeather($property, $date, $weather_code,
+            $weather_name, $url);
+
+        return $ret;
+    }
+
+    /**
+     * @access   private
+     */
+    function _setWeather(
+        & $property,
+        & $date,
+        $weather_code,
+        $weather_name,
+        $url
+    ) {
+        $tab_weather = $this->_manager->getTableInfo('GRN_CBWebSrv_Weather');
+
+        $rowset = new CB_RowSet($tab_weather);
+        $rowset->addCondition('col_property = ' . $property->getOID()
+                              . ' AND col_date = \'' . $date->format()
+                              . '\'');
+
+        $row = $rowset->iterate();
+        $rowset->destroy();
+
+        if (is_null($row)) {
+            $row = $tab_weather->newRow();
+        }
+
+        $row->set('property', $property);
+        $row->set('date', $date);
+        $row->set('weather', $weather_name);
+        $row->set('weather_code', $weather_code);
+        $row->set('url', $url);
+
+        return $row;
+    }
+
+    /**
+     * @param $file
+     *
+     * @return array ['event']                          => array    event list
+     *                  ['id']                          => string   event id
+     *                  ['name']                        => string   event name
+     *                  ['updatetime']                  => string   time
+     *                  ['property_list']               => array    property list
+     *                      [property id]               => array    property id
+     *                          ['prefectureCode']      => string   prefecture code
+     *                          ['prefectureName']      => string   prefecture name
+     *                          ['pointCode']           => string   location code
+     *                          ['pointName']           => string   location code
+     *                          ['date_list']           => array
+     *                              [Y-m-d] => array
+     *                                  [some node]
+     *                                  ...
+     */
+    function _parseEventData($file)
+    {
+        $data_list = [];
+
+        $reader = new XMLReader();
+        $reader->open($file);
+
+        $current_date = '';
+        $current_prefecture_code = '';
+        $current_point_code = '';
+        $reader->read();
+        while (($node_type = $reader->nodeType) != XMLReader::NONE) {
+            if ($node_type == XMLReader::ELEMENT) {
+                $node_name = $reader->name;
+                switch ($node_name) {
+                    case 'event':
+                        $event = [];
+                        break;
+                    case 'id':
+                        $reader->read();
+                        $event['id'] = $reader->value;
+                        break;
+                    case 'name':
+                        $reader->read();
+                        $event['name'] = $reader->value;
+                        break;
+                    case 'updateTime':
+                        $reader->read();
+                        $event['updatetime'] = $reader->value;
+                        break;
+                    case 'eventproperty':
+                        if ( ! array_key_exists('property_list', $event)) {
+                            $event['property_list'] = [];
+                        }
+                        $property = [];
+                        break;
+                    case 'prefectureCode':
+                        $reader->read();
+                        $property['prefectureCode'] = $reader->value;
+                        $current_prefecture_code = $reader->value;
+                        break;
+                    case 'prefectureName':
+                        $reader->read();
+                        $property['prefectureName'] = $reader->value;
+                        break;
+                    case 'pointCode':
+                        $reader->read();
+                        $property['pointCode'] = $reader->value;
+                        $current_point_code = $reader->value;
+                        break;
+                    case 'pointName':
+                        $reader->read();
+                        $property['pointName'] = $reader->value;
+                        break;
+                    case 'date':
+                        if ( ! array_key_exists('date_list', $property)) {
+                            $property['date_list'] = [];
+                        }
+                        $date = [];
+                        break;
+                    case 'day':
+                        $reader->read();
+                        $current_date = $reader->value;
+                        break;
+                    default:
+                        if ($current_date !== '') {
+                            $reader->read();
+                            $date[$node_name] = $reader->value;
+                        }
+                        break;
+                }
+            } elseif ($node_type == XMLReader::END_ELEMENT) {
+                switch ($reader->name) {
+                    case 'event':
+                        $data_list['event'] = $event;
+                        break;
+                    case 'eventproperty':
+                        $event['property_list'][$current_prefecture_code . "-"
+                                                . $current_point_code]
+                            = $property;
+                        $current_point_code = '';
+                        $current_prefecture_code = '';
+                        $property = '';
+                        break;
+                    case 'date':
+                        $property['date_list'][$current_date] = $date;
+                        $current_date = '';
+                        break;
+                }
+            }
+            $reader->read();
+        }
+
+        $error = libxml_get_errors();
+
+        $reader->close();
+
+        // warning log
+        if (count($error) > 0) {
+            // warning log
+            require_once('grn/logger.csp');
+            $lm = CB_LoggerManager::getInstance();
+            $logger =& $lm->getLogger('grn.cbwebsrv');
+            $service_name = cb_msg('grn.cbwebsrv', $this->_event_id);
+            $error_name = 'parse_error';
+            $log_params = [
+                'sid'        => $this->_event_id,
+                'name'       => $service_name,
+                'cache_file' => $file
+            ];
+            $logger->warningEx($error_name, $log_params);
+
+            require_once('cbwebsrv/error_code.csp');
+            cb_throw_error(E_GRN_CBWEBSRV_PARSE_ERROR);
+        }
+
+        return $data_list;
+    }
+
+    function getServerURL()
+    {
+        global $G_config_grn;
+        $dir_config
+            = new CB_LWContainerDirectoryConfig($G_config_grn->get('Application',
+            'ini_dir'));
+        $config = $dir_config->getConfig('cbwebsrv');
+
+        return $config['weather_url'];
+    }
+
+    function setEventData($data_list)
+    {
+        $mapping_point_name = WeatherLocationsResource::getAllLocations();
+
+        foreach ($data_list as $event) {
+            $now = new CB_TimeStamp();
+            $now->unix_ts = time();
+            $row = $this->setWeatherEvent($event['name'], $now);
+            $row->updateNow();
+
+            foreach ($event['property_list'] as $property_id => $property) {
+                $point_name = $mapping_point_name[$property_id] ??
+                              $property['pointName'];
+                $property_name = json_encode(
+                    [
+                        GRN_CBWEBSRV_WEATHER_PREFECTURE_NAME => $property['prefectureName'],
+                        GRN_CBWEBSRV_WEATHER_POINT_NAME      => $point_name
+                    ],
+                    JSON_UNESCAPED_UNICODE);
+                $row = $this->setWeatherEventProperty($property_id,
+                    $property_name, $now);
+                $row->updateNow();
+
+                foreach ($property['date_list'] as $date => $weather) {
+                    $cb_date = new CB_Date();
+                    $cb_date->parse($date);
+
+                    $this->setWeather($property_id, $cb_date,
+                        $weather['weatherCode'], $weather['weatherName'],
+                        $weather['url']);
+                }
+            }
+        }
+    }
+
+    /**
+     * Delete old data
+     */
+    function deleteEventData()
+    {
+        $tab_event = $this->_manager->getTableInfo('GRN_CBWebSrv_event');
+        $rowset = new CB_RowSet($tab_event);
+        $rowset->addCondition($rowset->queryf("col_event_id = '@S'",
+            GRN_CBWEBSRV_EVENT_WEATHER));
+
+        $rowset->deleteAllMatched();
+    }
+
+    /**
+     * Get location tree with checked location in setting
+     *
+     * @param array $location_list_setting : checked location in setting with format: array of "{prefectureCode}-{pointCode}"
+     *
+     * @return array $location_list: the location with tree format
+     *
+     */
+    public function getLocationTree($location_list_setting)
+    {
+        if ( ! $this->isExistEventProperties(GRN_CBWEBSRV_EVENT_WEATHER)) {
+            return [];
+        }
+        require_once("cbwebsrv/WeatherLocationsResource.csp");
+        $location_list
+            = WeatherLocationsResource::getLocationTree($location_list_setting);
+
+        return $location_list;
+    }
+}
+
+

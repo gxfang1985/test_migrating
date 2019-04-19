@@ -1,0 +1,474 @@
+<?php
+
+use grn\schedule\AttendanceStatusLogic;
+
+if ( ! isset($facility_logic)) {
+    require_once('schedule/facility_system_logic.csp');
+    $facility_logic = GRN_Facility_SystemLogic::getInstance();
+}
+
+//GTM-1625 Get attendance status setting;
+$attendanceStatusLogic = new AttendanceStatusLogic();
+$isEnableAttendanceStatus = $attendanceStatusLogic->isEnableAttendanceCheck();
+// 表示するメンバーの初期化が行われていない場合
+if ( ! isset($member)) {
+    if ( ! isset($user_id)) {
+        $user_id = isset($member_id) ? $member_id : false;
+    }
+
+    if ( ! $user_id) {
+        $user_id = $login_id;
+        $member = $login;
+    } // 組織
+    elseif (mb_substr($user_id, 0, 1) == 'g') {
+        $member = $uum->getGroup(mb_substr($user_id, 1));
+        if ( ! $member) {
+            $user_id = $login_id;
+            $member = $login;
+        }
+    } // 施設
+    elseif (mb_substr($user_id, 0, 1) == 'f') {
+        $member = $facility_logic->getFacility(mb_substr($user_id, 1));
+        if ($member === false) {
+            $user_id = $login_id;
+            $member = $login;
+        }
+    } else {
+        $member = $uum->getUser($user_id);
+        if ( ! $member) {
+            $user_id = $login_id;
+            $member = $login;
+        } else {
+            $user_id = $member->getOID();
+        }
+    }
+
+    $member_access = 1;
+    if ( ! is_a($member, 'CB_User') || ($member->getOID() != $login_id)) {
+        if (is_a($member, 'GRN_Facility_Facility')) {
+            // 施設のアクセス権はグループをたどって評価する
+            $tmp_array = [$member->getOID() => $member];
+            $member_access = $acc_logic->evaluateAccessesById($login,
+                $tmp_array, ['read'], $dynamic_roles, 'facility');
+        } else {
+            $member_access = $acc_logic->evaluateAccess($login, $member,
+                ['read'], $dynamic_roles);
+        }
+    }
+
+    if ( ! $member_access) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_ENTRY);
+    }
+}
+
+// 登録アイコンなどのリンクを表示するかどうか
+if ( ! isset($disable_link)) {
+    $disable_link = false;
+}
+
+require_once('schedule/personal_logic.csp');
+$personallogic = GRN_Schedule_PersonalLogic::getInstance();
+require_once('schedule/system_logic.csp');
+$systemlogic = GRN_Schedule_SystemLogic::getInstance();
+$showendtime = $personallogic->getShowEndTime($login);
+$hiddenprivate = $systemlogic->getHiddenPrivate();
+$showholiday = $systemlogic->getShowHoliday();
+
+if ( ! isset($util)) {
+    require_once('schedule/view_util.csp');
+    $util = GRN_Schedule_View_Util::getInstance();
+}
+
+if ( ! isset($app)) {
+    require_once('schedule/application.csp');
+    $app = GRN_Schedule_Application::getInstance();
+}
+
+
+$tsex = new CB_TimeStampEx();
+// 日付の準備
+$week = [];
+$dateex = new CB_DateEx($date);
+$datetime = $tsex->getDateTime();
+$datetime->setDate($dateex);
+$datetime->hour = 0;
+$datetime->minute = 0;
+$datetime->second = 0;
+$tsex->setDateTime($datetime);
+$timestamp = $tsex->unix_ts;
+for ($i = 0; $i < 7; ++$i) {
+    $week[] = [
+        'format' => $dateex->format(),
+        'type'   => $util->getDayType($dateex),
+        'date'   => $dateex
+    ];
+    $dateex = clone $dateex;
+    $dateex->moveDays(1);
+}
+$week[0]['timestamp'] = $timestamp;
+$week[6]['timestamp'] = $timestamp + 86400 * 7;
+
+// 祝日などのデータの取得
+require_once('grn/calendar.csp');
+$calendar_service = GRN_CalendarService::getInstance();
+$calendars = $calendar_service->getDaysInfo($week[0]['date'],
+    $week[6]['date'], $login);
+
+foreach ($week as $key => $week_date) {
+    if ($util->isWorkday($week_date['date'], $calendars, $login)) {
+        $week[$key]['type'] = 's_date_workday';
+    } elseif ($showholiday) {
+        if ($util->isHoliday($week_date['date'], $calendars)) {
+            $week[$key]['type'] = 's_date_holiday';
+        }
+    }
+}
+
+$shared_calendar
+    = $calendar_service->getDaysInfoFromSharedCalendar($week[0]['date'],
+    $week[6]['date'], $login);
+$calendars = array_merge_recursive($calendars, $shared_calendar);
+
+// カレンダーから余計なデータを削除
+if ( ! is_a($member, 'CB_User') || $member->getOID() != $login_id) {
+    foreach (array_keys($calendars) as $key1) {
+        foreach (array_keys($calendars[$key1]) as $key2) {
+            // 個人データの削除
+            if (($calendars[$key1][$key2]['type']
+                 == GRN_CALENDAR_TYPE_MEMORIALDAY)
+                || ($calendars[$key1][$key2]['type']
+                    == GRN_CALENDAR_TYPE_USER_MEMO)
+            ) {
+                unset($calendars[$key1][$key2]);
+                continue;
+            }
+            if ( ! $showholiday) {
+                if ($calendars[$key1][$key2]['type']
+                    == GRN_CALENDAR_TYPE_PUBLICHOLIDAY
+                ) {
+                    unset($calendars[$key1][$key2]);
+                }
+            }
+        }
+    }
+} elseif ( ! $showholiday) {
+    foreach (array_keys($calendars) as $key1) {
+        foreach (array_keys($calendars[$key1]) as $key2) {
+            // 祝日以外は削除
+            if ($calendars[$key1][$key2]['type']
+                == GRN_CALENDAR_TYPE_PUBLICHOLIDAY
+            ) {
+                unset($calendars[$key1][$key2]);
+            }
+        }
+    }
+}
+
+$b_conflict = true;
+if (is_a($member, 'GRN_Facility_Facility')) {
+    $sc_type = GRN_SCHEDULE_EVENT_TYPE_NORMAL;
+    $title_type = $facility_logic->getFacilityTitle();
+    $b_conflict = false;
+} else {
+    $sc_type = GRN_SCHEDULE_EVENT_TYPE_NORMAL
+               + GRN_SCHEDULE_EVENT_TYPE_DAILYEVENT;
+}
+
+$schedule_event = [];
+$events = $app->getEventsForWeek($member, $week[0]['date'],
+    $week[6]['date'], $login, $sc_type, $hiddenprivate, $week, $b_conflict,
+    $isEnableAttendanceStatus);
+
+//GTM-1625: ( Note: No support attendance check for facility and group)
+$isUserMember = is_a($member, 'CB_User');
+
+foreach (array_keys($week) as $key1) {
+    $date_info = &$week[$key1];
+    $day_event = [];
+    $day_event['date_type'] = $date_info['type'];
+    $day_event['date'] = $date_info['format'];
+    $day_event['event'] = [];
+
+    // 終日予定がある
+    if (array_key_exists($date_info['format'], $events['allday'])) {
+        $allday_events = &$events['allday'][$date_info['format']];
+        foreach (array_keys($allday_events) as $key2) {
+            $member_event = &$allday_events[$key2];
+            $temp = [];
+            $temp['id'] = $member_event['id'];
+            $temp['type']
+                = $util->getViewEventType($member_event['event_type'],
+                $member_event['share']);
+            $temp['time_schedule'] = $util->getViewHour($date_info['date'],
+                $member_event['setdate'],
+                $member_event['enddate'],
+                $member_event['event_type'], $showendtime);
+            //GTM-103
+            $temp['event_detail'] = $member_event['event_detail'];
+            $temp['event_menu'] = $member_event['event_menu'];
+            $temp['event_menu_color'] = $member_event['event_menu_color'];
+            //End GTM-103
+            if ($member_event['private'] == GRN_EVENT_PRIVATE_HIDDEN) {
+                $temp['data'] = cb_msg('grn.schedule',
+                    'event_hidden');
+                $temp['type'] = 'normal';
+                $temp['private'] = true;
+                $temp['event_detail'] = $temp['data'];
+                $temp['event_menu'] = '';
+                $temp['event_menu_color'] = '';
+            } elseif ($member_event['private'] == GRN_EVENT_PRIVATE_PRIVATE) {
+                $temp['data'] = $member_event['title'];
+                $temp['is_private'] = true;
+            } else {
+                $temp['data'] = $member_event['title'];
+            }
+            $temp['allday'] = true;
+            //GTM-1625
+            //Using attendance check function and in the case end user confirmed absent, this event not show in schedule list.
+            if ($isUserMember) {
+                if ( ! $util->createAttendanceStatusForUserEvent($isEnableAttendanceStatus,
+                    $temp, $member_event)
+                ) {
+                    continue;
+                }
+            }
+
+            $day_event['event'][] = $temp;
+        }
+    }
+
+    // 通常予定がある
+    if (array_key_exists($date_info['format'], $events['normal'])) {
+        $normal_events = &$events['normal'][$date_info['format']];
+        foreach (array_keys($normal_events) as $key2) {
+            $member_event = &$normal_events[$key2];
+            $temp = [];
+            $temp['id'] = $member_event['id'];
+            $temp['type']
+                = $util->getViewEventType($member_event['event_type'],
+                $member_event['share']);
+            $temp['time_schedule'] = $util->getViewHour($date_info['date'],
+                $member_event['setdatetime'],
+                $member_event['enddatetime'],
+                $member_event['event_type'], $showendtime);
+            //GTM-103
+            $temp['event_detail'] = $member_event['event_detail'];
+            $temp['event_menu'] = $member_event['event_menu'];
+            $temp['event_menu_color'] = $member_event['event_menu_color'];
+            //End GTM-103
+            if ($member_event['private'] == GRN_EVENT_PRIVATE_HIDDEN) {
+                $temp['data'] = cb_msg('grn.schedule',
+                    'event_hidden');
+                $temp['type'] = 'normal';
+                $temp['private'] = true;
+                $temp['event_detail'] = $temp['data'];
+                $temp['event_menu'] = '';
+                $temp['event_menu_color'] = '';
+            } elseif ($member_event['private'] == GRN_EVENT_PRIVATE_PRIVATE) {
+                $temp['data'] = $member_event['title'];
+                $temp['is_private'] = true;
+            } else {
+                $temp['data'] = $member_event['title'];
+            }
+            $temp['conflict'] = array_key_exists('conflict', $member_event)
+                ? $member_event['conflict'] : false;
+            //GTM-1625
+            //Using attendance check function and in the case end user confirmed absent, this event not show in schedule list.
+            if ($isUserMember) {
+                if ( ! $util->createAttendanceStatusForUserEvent($isEnableAttendanceStatus,
+                    $temp, $member_event)
+                ) {
+                    continue;
+                }
+            }
+
+            $day_event['event'][] = $temp;
+        }
+    }
+
+    // 祝日の設定
+    if (array_key_exists($date_info['format'], $calendars)) {
+        $day_event['calendar'] = $calendars[$date_info['format']];
+    }
+
+    // スケジュールの入れ込み
+    $schedule_event[] = $day_event;
+
+}
+
+$work_date = new CB_DateEx($date);
+// バナーの処理
+$banner_events = [];
+foreach (array_keys($events['banner']) as $key) {
+
+    $member_event = &$events['banner'][$key];
+
+    $work_date->year = $member_event['setdate']->year;
+    $work_date->month = $member_event['setdate']->month;
+    $work_date->day = $member_event['setdate']->day;
+
+    $b_add = false;
+    foreach (array_keys($banner_events) as $key1) {
+        $banner = end($banner_events[$key1]);
+
+        // 開始時間が終了時間の後
+        if ($work_date->compare($banner['enddate']) > 0) {
+            // この行に追加
+            $b_add = true;
+
+            // データの挿入
+            $temp = [
+                'id'      => $member_event['id'],
+                'setdate' => $member_event['setdate'],
+                'enddate' => $member_event['enddate']
+            ];
+            $temp['type'] = $util->getViewEventType($member_event['event_type'],
+                $member_event['share']);
+            if ($week[0]['date']->compare($member_event['setdate']) >= 0) {
+                $temp['date'] = $week[0]['format'];
+            } else {
+                $temp['date'] = $member_event['setdate']->format();
+            }
+            $temp['term'] = $util->getBannerTerm($member_event['setdate'],
+                $member_event['enddate'], $week[0]['date'], $week[6]['date']);
+            $temp['data'] = cb_date_format('DateShort_MD',
+                    $member_event['setdate']) . '-'
+                            . cb_date_format('DateShort_MD',
+                    $member_event['enddate']) . ' ' . $member_event['title'];
+            //GTM-103
+            $temp['event_detail'] = $member_event['event_detail'];
+            $temp['event_menu'] = $member_event['event_menu'];
+            $temp['event_menu_color'] = $member_event['event_menu_color'];
+            //End GTM-103
+            $banner_events[$key1][] = $temp;
+
+            break;
+        }
+    }
+
+    if ($b_add) {
+        continue;
+    }
+
+    // データの挿入
+    $temp = [
+        'id'      => $member_event['id'],
+        'setdate' => $member_event['setdate'],
+        'enddate' => $member_event['enddate']
+    ];
+    $temp['type'] = $util->getViewEventType($member_event['event_type'],
+        $member_event['share']);
+    if ($week[0]['date']->compare($member_event['setdate']) >= 0) {
+        $temp['date'] = $week[0]['format'];
+    } else {
+        $temp['date'] = $member_event['setdate']->format();
+    }
+    $temp['term'] = $util->getBannerTerm($member_event['setdate'],
+        $member_event['enddate'], $week[0]['date'], $week[6]['date']);
+    $temp['data'] = cb_date_format('DateShort_MD', $member_event['setdate'])
+                    . '-' . cb_date_format('DateShort_MD',
+            $member_event['enddate']) . ' ' . $member_event['title'];
+    // 改行
+    //GTM-103
+    $temp['event_detail'] = $member_event['event_detail'];
+    $temp['event_menu'] = $member_event['event_menu'];
+    $temp['event_menu_color'] = $member_event['event_menu_color'];
+    //End GTM-103
+    $banner_events[] = [$temp];
+
+}
+
+$member_access = null;
+if (is_a($member, 'CB_User') && $login_id == $user_id) {
+    $member_access = ['read' => '1', 'add' => '1'];
+} else {
+    // CB_Userからuidを取得しているので、第2引数にTRUEを渡して削除フラグチェックを行わない
+    $user_groups = $uum->getUserGroupsInfo($login_id, true);
+    $user_roles = $uum->getUserRolesInfo($login_id, true);
+    if (is_a($member, 'GRN_Facility_Facility')) {
+        $affiliation_group
+            = $facility_logic->getFacilityAffiliationGroup($member->getOID());
+
+        // 施設だったら施設グループと合わせて評価して、厳しいほうにする
+        if ( ! $affiliation_group) {
+            // 施設グループに所属していない
+            $member_access = $acc_logic->getEvaluateAccessList($login, $member,
+                ['read', 'add'], 'read_add', $dynamic_roles, $user_groups,
+                $user_roles);
+        } else {
+            $affiliation_groups
+                = [$affiliation_group->getOID() => $affiliation_group];
+
+            $member_accesses = $acc_logic->getEvaluateAccessesListById($login,
+                $affiliation_groups,
+                'facilitygroup',
+                ['read', 'add'],
+                $dynamic_roles);
+
+            $access_group = $member_accesses[$affiliation_group->getOID()];
+
+            $member_access = $acc_logic->getEvaluateAccessList($login,
+                $member,
+                ['read', 'add'],
+                'read_add',
+                $dynamic_roles,
+                $user_groups,
+                $user_roles);
+            foreach (['read', 'add'] as $auth) {
+                if ($access_group[$auth] == GRN_SCHD_ACCESS_DENY) {
+                    $member_access[$auth] = GRN_SCHD_ACCESS_DENY;
+                }
+            }
+        }
+    } else {
+        $member_access = $acc_logic->getEvaluateAccessList($login, $member,
+            ['read', 'add'], 'read_add', $dynamic_roles, $user_groups,
+            $user_roles);
+    }
+}
+
+$users_event = [
+    'id'             => $user_id,
+    'schedule_event' => $schedule_event,
+    'banner_event'   => $banner_events,
+    'access'         => $member_access
+];
+
+if (is_a($member, 'GRN_Facility_Facility')) {
+    $facility_memo = '';
+    $faid = $member->getOID();
+    $f_settings = $facility_logic->getFacilitySetting([$faid], true);
+    // get show memo by facility setting
+    $facility_memo = $facility_logic->getShowMemoByPriority($f_settings, $faid);
+
+    $users_event['facility_id'] = $member->getOID();
+    $users_event['facility_title'] = $member->get('name');
+
+    //GRN2-337
+    require_once('grn/controller.csp');
+    $users_event['facility_memo'] = grn_prevent_tag_script($facility_memo);
+}
+
+
+// カスタマイズ項目処理
+foreach (array_keys($users_event['schedule_event']) as $key) {
+    $events_temp = &$users_event['schedule_event'][$key];
+    foreach (array_keys($events_temp['event']) as $key2) {
+        $event_temp = &$events_temp['event'][$key2];
+        if (array_key_exists('private', $event_temp) === true
+            && $event_temp['private'] === true
+        ) {
+            continue;
+        }
+        if (isset($event_temp['id'])) {
+            $event_temp['data'] .= $facility_logic->getDataTitle($event_temp['id']);
+        }
+    }
+}
+
+$t->assign('schedule', $users_event);
+
+$t->assign('week_start', $week[0]['date']);
+$t->assign('week_end', $week[6]['date']);
+
+

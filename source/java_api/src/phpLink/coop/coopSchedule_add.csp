@@ -1,0 +1,328 @@
+<?php
+/*
+ * Created on 2006/10/31
+ *****注意****************************************************************************************************
+ *
+ * 繰り返し予定対応部分のソースについては、復活もあるかもしれないので残しておく
+ * 基本的にJAVA側で、通常・バナー予定のパラメータしか渡さないよう制御する
+ *
+ *************************************************************************************************************
+ *
+ * スケジュール登録機能
+ * 
+ * ■データ受信仕様
+ *
+ *     項目名        |通常予定|期間予定|説明
+ *     --------------+--------------------------------------------------
+ *     event         |        |        |EventIDを指定します。必須
+ *     menu          |        |        |予定メニューを指定します。
+ *     title         |        |        |予定タイトルを指定します。
+ *     start_year    |        |        |予定の開始日(年)を指定します。
+ *     start_month   |        |        |予定の開始日(月)を指定します。
+ *     start_day     |        |        |予定の開始日(日)を指定します。
+ *     start_hour    |        |  無効  |予定開始時刻(時)を指定します。
+ *     start_minute  |        |  無効  |予定開始時刻(分)を指定します。
+ *     end_year      |        |        |予定の終了日(年)を指定します。
+ *     end_month     |        |        |予定の終了日(月)を指定します。
+ *     end_day       |        |        |予定の終了日(日)を指定します。
+ *     end_hour      |        |  無効  |予定終了時刻(時)を指定します。
+ *     end_minute    |        |  無効  |予定終了時刻(分)を指定します。
+ *     private       |        |  無効  |0:公開 1:非公開
+ *     memo          |        |        |予定メモを指定します。
+ *     user_account[]|        |        |参加者のユーザーアカウントを指定します。
+ *     sITEM_CODE[]  |        |  無効  |施設コードを指定します
+ *     registrant    |        |        |coopLoginにて使用  更新者を指定します。(→このユーザーでLoginAs)
+ *                   |        |        |パラメータがなければログインユーザーで更新
+ *     page          |        |        |coopLoginにて使用"_coopSchedule_modify.csp" 
+ *     app           |        |        |coopLoginにて使用"schedule"
+ *
+ *     期間予定の場合は、パラメータ 'BN' を渡す(valueはない)
+ * 制限事項
+ *  公開先への通知は行わない
+ *  繰り返し予定のパラメータがわたってくることはないが、念のため残しておく
+ *  →JAVA側でパラメータの繰り返し予定のパラメータがわたらないよう制御を行う
+ *
+ * 施設予約対応（施設予約可能期間は無視する=チェックを行わない)
+ * アクセス権のチェックは行わない
+ */
+
+use grn\schedule\ScheduleMemberLogic;
+
+global $G_INPUT;
+/////////////////////////////////////////////////////////////////////////////////////////
+//20061120修正
+//coopファイルが存在しないとFatal Erorrになるためファイル存在チェック
+//$nextpage = basename($G_INPUT['page']);
+$nextpage = "coopLogin.csp";
+if (is_file(cb_basedir() . '/code/doc_root/' . dirname(cb_get_pagename()) . '/'
+            . $nextpage)
+) {
+    //20061120修正
+    //require( $nextpage );
+} else {
+    //コピーライトとHTML閉じタグ出力しない
+    global $G_state_set;
+    $G_state_set->set('copyright_should_be_written', false);
+    $G_state_set->set('html_should_be_closed', false);
+
+    //   2007/03/27 coopLogin.cspがない場合のエラーメッセージ修正 不具合管理(199)
+    include_once('error_code.csp');
+    header("X-Cybozu-Error:" . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Header Data><CR><LF>");
+    print("1," . E_API_COMMON_COOPLOGIN_NOT_FOUND);
+    print("<Footer Data><CR><LF>");
+    print("ERROR<CR><LF>");
+    cb_safe_exit();
+}
+
+//ログイン認証
+require('coopLogin.csp');
+
+/////////////////////////////////////////////////////////////////////////////////////////
+unset($G_application);
+
+//Java側でわたってくることはないが、
+//念のため、繰り返し予定と仮予約の区分パラメータがわたってきたらクリアし、通常予定扱いとする
+if (array_key_exists('RP', $G_INPUT)
+    || array_key_exists('temporary', $G_INPUT)
+) {
+    unset($G_INPUT['RP']);
+    unset($G_INPUT['temporary']);
+}
+
+if (array_key_exists('BR', $G_INPUT)) { //バナー予定で施設コードetcが指定された場合は無視
+    //項目をunset
+    unset(
+        $G_INPUT['start_hour'],
+        $G_INPUT['start_minute'],
+        $G_INPUT['end_hour'],
+        $G_INPUT['end_minute'],
+        $G_INPUT['private'],
+        $G_INPUT['sITEM_CODE']);
+}
+///パラメータのチェック
+$date = new CB_Date();
+if ( ! $date->parse($G_INPUT['bdate'])) {
+    // 今日を求める
+    $tsex = new CB_TimeStampEx();
+    $date = $tsex->getDate();
+}
+require_once('schedule/utility.csp');
+
+// パラメータ(アカウント)からユーザーIDを取得
+if (array_key_exists('user_account', $G_INPUT)) {
+    for ($i = 0; $i < count($G_INPUT['user_account']); $i++) {
+        $user = &$uum->getUserByForeignKey($G_INPUT['user_account'][$i]);
+        if ($user) {
+            $G_INPUT['sUID'][$i] = $user->getOID();
+        } else {
+            cb_throw_error(E_GRN_USER_NOT_FOUND);
+
+        }
+    }
+} else {
+    cb_throw_error(E_GRN_SCHD_NOT_MEMBER);
+}
+// -------- 
+// brabrabra after success
+// --------
+// イベントの取得
+require_once('schedule/application.csp');
+$app = GRN_Schedule_Application::getInstance();
+require_once('schedule/view_util.csp');
+$util = GRN_Schedule_View_Util::getInstance();
+
+////////////////////////////////////////////////////////日付・時刻チェック
+// 許容する日付を 1970/01/01 以降　2037/12/31 以前　とする
+// 終了日(上限)に関しては、変わる可能性あり？
+// 開始日と終了日の逆転はここではチェックしない
+$timestampex = new CB_TimeStampEx();
+$current_date = $timestampex->getDate();
+$date = new CB_Date();
+
+if ($G_INPUT['start_year'] != "") {
+    //start 2008/01/16 G2.5対応
+    //$start_year = max(0, min($G_INPUT['start_year'], $current_date->year) - 2);
+    //$date->parse( $start_year."-1-1");
+    $date->parse($G_INPUT['start_year'] . "-1-1");
+    //end 2008/01/16 G2.5対応
+    if ( ! cb_date_validate_date($date)) {
+        cb_throw_error(E_COMMON_INVALID_DATE);
+    }
+}
+
+if ($G_INPUT['end_year'] != "") {
+    //start 2008/01/16 G2.5対応
+    //$end_year = min(9999, max($G_INPUT['end_year'], $current_date->year) + 7);  
+    //$date->parse( $end_year."-12-31");
+    $date->parse($G_INPUT['end_year'] . "-12-31");
+    //end 2008/01/16 G2.5対応
+    if ( ! cb_date_validate_date($date)) {
+        cb_throw_error(E_COMMON_INVALID_DATE);
+    }
+}
+
+require_once('schedule/system_logic.csp');
+$systemlogic = GRN_Schedule_SystemLogic::getInstance();
+$schedule_unit = $systemlogic->getScheduleUnit();
+//予定（予約）を設定する単位が異なっている場合はエラー
+if (array_key_exists('start_minute', $G_INPUT) && $G_INPUT['start_minute']) {
+    if (intval($G_INPUT['start_minute']) % intval($schedule_unit) != 0) {
+        cb_throw_error(E_COMMON_INVALID_DATE);
+    }
+
+}
+if (array_key_exists('end_minute', $G_INPUT) && $G_INPUT['end_minute']) {
+    if (intval($G_INPUT['end_minute']) % intval($schedule_unit) != 0) {
+        cb_throw_error(E_COMMON_INVALID_DATE);
+    }
+
+}
+
+//非公開設定OFFなのに 非公開用のパラメータがきた！場合はエラー
+$use_private = $systemlogic->getUsePrivate();
+if ( ! $use_private && array_key_exists('private', $G_INPUT)
+     && $G_INPUT['private']
+) {
+    //   2007/03/26 システム設定側非公開設定OFFなのに 非公開用のパラメータがきた場合のエラーメッセージ修正(196)
+    include_once('error_code.csp');
+    api_response_data(null, E_API_SCHEDULE_PRIVATE_PERMIT);
+    cb_safe_exit();
+}
+
+////////////////////////////////////////////////////////日付チェック
+
+//施設コード対応分///////////////////////////////////////ここから
+require_once('schedule/facility_system_logic.csp');
+$facility_logic = GRN_Facility_SystemLogic::getInstance();
+
+//施設コードから施設IDを取得
+if (array_key_exists('sITEM_CODE', $G_INPUT)) {
+    $f_count = 0;
+    for ($i = 0; $i < count($G_INPUT['sITEM_CODE']); $i++) {
+        $fid
+            = &$facility_logic->getFacilityByForeignKey($G_INPUT['sITEM_CODE'][$i]);
+        if ($fid) {
+            $G_INPUT['sITEM'][$f_count] = $fid->getOID();
+            $f_count++;
+        } else {
+            //施設見つかりませんエラー
+            cb_throw_error(E_GRN_FCLT_NOTFOUND_FACILITY);
+        }
+    }
+}
+
+//タイトルとメニューの改行除去 + 100文字以上ぶった切り
+$description = preg_replace('/\x0D\x0A|\x0D|\x0A/', '', @$G_INPUT['title']);
+if (mb_strlen($description) > 100) {
+    $description = mb_substr($description, 0, 100);
+}
+$G_INPUT['title'] = $description;
+
+$description = preg_replace('/\x0D\x0A|\x0D|\x0A/', '', @$G_INPUT['menu']);
+if (mb_strlen($description) > 100) {
+    $description = mb_substr($description, 0, 100);
+}
+$G_INPUT['menu'] = $description;
+
+//////////////////////////////////////////////////////////ここまで
+$event = &$util->createEvent($G_INPUT);
+
+if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+    // It's not supported to input 'facility_using_purpose' value.
+    $using_purpose = ''; // Set empty value for validation.
+    $event->setUsingPurpose(
+        $using_purpose, function () {
+        require_once("error_code.csp");
+        api_response_data(null,
+            E_API_SCHEDULE_PARAM_WRONG . "[facility_using_purpose]");
+        cb_safe_exit();
+    }
+    );
+}
+
+$event->attendanceCheck
+    = null; // Java API does not support Attendance check function
+
+// 2007.04.23 アクセス権メッセージが不正な箇所が存在する 不具合管理(238)
+// アクセス権のチェック
+require_once('schedule/access_logic.csp');
+$acc_logic = GRN_Schedule_Access_Logic::getInstance();
+$dynamic_role = $uum->listGrantedRoles();
+$access = $acc_logic->getEventAccess($G_login, $event, ['read', 'add'],
+    $dynamic_role, false);
+if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+    cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+}
+if ($access['add'] == GRN_SCHD_ACCESS_DENY) {
+    cb_throw_error(E_GRN_SCHD_ACCESSDENY_ENTRY);
+}
+
+// データのチェック
+$app->checkEventData($event);
+
+// 公開先のチェック
+ScheduleMemberLogic::getInstance()->checkAddPublicToUser($event);
+
+if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+    if (is_a($event->setdatetime, 'CB_DateTime')
+        && is_a($event->enddatetime, 'CB_Date')
+    ) {
+        $event->enddatetime = null;
+    }
+}
+
+//施設の場合の予約期間チェック はしない//
+
+// 登録情報
+$event->creator = &$G_login;
+
+$eid = $app->entryEvent($event);
+
+//start 2008-03-07 不具合321
+// 施設があれば、カスタマイズ項目を登録する
+if (is_array($event->facilities) && count($event->facilities) > 0) {
+    // カスタマイズ項目登録
+    $facility_logic->registerData($eid);
+}
+//end 2008-03-07 不具合321
+
+// 今日を求める
+$tsex = new CB_TimeStampEx();
+$today = $tsex->getDate();
+
+$bdate = &$event->getFirstDate($today);
+
+$b_notify = true;
+if ($today->compare($bdate) > 0) {
+    $b_notify = false;
+}
+
+// 通知のタイトルの作成
+if ($b_notify) {
+    $title = '';
+    if (is_a($event, 'GRN_Schedule_NormalEvent')) {
+        $title = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+    } elseif (is_a($event, 'GRN_Schedule_BannerEvent')) {
+        $title = $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+    }
+}
+
+// 登録の通知
+if ($b_notify && $event->users && count($event->users) > 0) {
+    $app->setNotify($event->users, $G_login, $event, $bdate, $title, '',
+        GRN_SCHEDULE_NOTIFY_ENTRY, $tsex);
+
+    // メール通知
+    $app->forwardMail($event, [GRN_SCHEDULE_NOTIFY_ENTRY => $event->users],
+        $G_login);
+}
+
+
+// 通知先の指定 があってもなにもしない///
+
+//  スケジュールIDを返す
+printf("<Header Data><CR><LF>");
+printf("0,%s", $eid);
+printf("<Footer Data><CR><LF>");
+printf("NOERROR<CR><LF>");

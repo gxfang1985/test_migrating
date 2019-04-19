@@ -1,0 +1,896 @@
+<?php
+
+/**
+ * メールアプリケーションロジック
+ *
+ * @package grn.mail
+ * @author  Ikeda, ATSUSHI 2004/12
+ * @version 1.0
+ */
+
+use grn\mail\dao\AutomaticEventDAO;
+
+require_once('fw/uum_core.csp');
+require_once('grn/application.csp');
+require_once('mail/error_code.csp');
+require_once('mail/resources.csp');
+
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+ * メールアプリモジュール
+ *
+ * @author  IKEDA, Atsushi 2004/12
+ * @version 1.0
+ * @package grn.mail
+ */
+class GRN_Mail_App extends GRN_ApplicationBase
+{
+    const CLEANUP_LIMIT_MAX = 200000;
+
+    /**
+     * コンストラクタ
+     */
+    function __construct()
+    {
+        parent::__construct(GRN_MAIL_APP_ID);
+    }
+
+    function getUtility()
+    {
+        if (is_null($this->_utility)) {
+            require_once('mail/utility.csp');
+            $this->_utility = GRN_Mail_Utility::getInstance();
+        }
+
+        return $this->_utility;
+    }
+
+    /**
+     * @param string $name optional configuration name.
+     *
+     * @return mixed         array of configurations if $name is NULL;
+     *                       or any value if $name is not null.
+     *                       FALSE if no configuration is available.
+     */
+    function getConfig($name = null)
+    {
+        if ($name == "max_receive_count") {
+            // 最大受信件数
+            $max_receive_count = parent::getConfig($name);
+            if ($max_receive_count === false) {
+                $max_receive_count = 100;
+            }
+
+            return $max_receive_count;
+        }
+
+        return parent::getConfig($name);
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    // メンバ変数
+    /**
+     * @access private
+     */
+    var $_utility = null;                           // ユーティリティクラス
+    var $_on_login = false;                         // ログイン直後か
+    //////////////////////////////////////////////////////////////////////////
+    // private method
+
+    //////////////////////////////////////////////////////////////////////////
+    // public method
+
+    /**
+     * ログイン直後かどうかをセットする
+     *
+     * @param   boolean $b_login ログイン直後ならTRUE
+     */
+    function setLoginFlag($b_login = true)
+    {
+        if (is_bool($b_login)) {
+            $this->_on_login = $b_login;
+        }
+    }
+
+    /**
+     * ログイン直後かどうかを返す
+     *
+     * @return  boolean ログイン直後ならTRUE
+     */
+    function getLoginFlag()
+    {
+        return $this->_on_login;
+    }
+
+    /**
+     * Return the amount of disk usage for the named user.
+     * Applications should override this to reflect their specific
+     * knowledge about the disk usage.
+     *
+     * @param CB_User $user
+     *
+     * @return int    Disk usage in kilo bytes.
+     */
+    function getDiskUsage($user)
+    {
+        if ( ! is_object($user)) {
+            return 0;
+        }
+
+        $utility =& $this->getUtility();
+        $personal_config =& $utility->getPersonalConfig($user);
+
+        return $personal_config->getMailSize(null);
+    }
+
+    /**
+     * メールの最大受信件数を取得
+     *
+     * @return  int     メールの最大受信件数
+     */
+    function getMaxReceiveCount()
+    {
+        return $this->getConfig('max_receive_count');
+    }
+
+    /**
+     * This property is added by GRN2-5879
+     * See Also: http://wiki.dev.cybozu.co.jp/pages/viewpage.action?pageId=16456797
+     * 最大受信トライアル回数を取得する。もし24mail.iniで値が定義されていなければ、
+     * 1000件とする
+     *
+     * @return int      メールの最大受信試行回数
+     */
+    public function getMaxReceiveTrialCount()
+    {
+        $config_value = $this->getConfig('max_receive_trial_count');
+
+        return $config_value === false ? 1000 : $config_value;
+    }
+
+    /**
+     * 通知の既読処理
+     */
+    function confirmApplicationData(
+        & $user,
+        $module_id,
+        $unique_id,
+        $org_data,
+        $timestamp
+    ) {
+        $utility = $this->getUtility();
+        $mail_logic = $utility->getMailLogic();
+        $mail_logic->readMail($unique_id, $timestamp, false, true);
+
+        return true;
+    }
+
+    /**
+     * 通知データのページ情報の取得
+     * 通知アプリから呼び出される
+     *
+     * @param  object $user      対象となるユーザー
+     * @param  string $app_id    アプリケーションID
+     * @param  string $unique_id 通知元データのユニークID
+     * @param  array  $org_data  通知元データのオリジナルデータ配列
+     * @param  string $status    通知元データの状態（'unread', 'update', 'confirmed'）
+     * @param  string $action_id 通知元データのアクションID（'create'）
+     * @param  string $sub_module_id
+     *
+     * @return mixed    ページ情報の配列
+     *                  'subject_page'  => 標題用ページ名（ex:'bulletin/view'）
+     *                  'abstract_page' => 内容用ページ名（ex:'bulletin/download'）
+     *                  'subject_icon'  => 標題用アイコン名（ex:'bulletin20'）
+     *                  'abstract_icon' => 内容用アイコン名（ex:'file20'）
+     *                  'url_params'    => URLに積むパラメータの配列（標題、内容共通）
+     */
+    function getNotificationPageInfo(
+        $user,
+        $app_id,
+        $unique_id,
+        & $org_data,
+        $status,
+        $action_id,
+        $sub_module_id
+    ) {
+        $attached = false;
+        $url_params = [];
+        if (is_array($org_data)) {
+            foreach ($org_data as $key => $value) {
+                if ($key == 'attached') {
+                    $attached = $value;
+                } else {
+                    $url_params[$key] = $value;
+                }
+            }
+        }
+
+        $page_info = [];
+        $page_info['subject_page'] = 'mail/view';
+        $page_info['subject_icon'] = $attached ? 'mail_clip30x20' : 'mail20';
+        $page_info['url_params'] = $url_params;
+
+
+        $page_info['abstract_icon'] = 'mailaccount20';
+        $page_info['url_params'] = $url_params;
+
+        return $page_info;
+    }
+
+    /**
+     * メールページ情報を取得する
+     *
+     * @param      $func_name  string  機能の名前(送信：'send')
+     * @param null $params
+     * @option $params    array   メールページ情報に割り当てるパラメータ
+     *
+     * @return mixed      FALSEが返るときは失敗、それ以外はメールページ情報
+     */
+    function getMailPageInfo($func_name, $params = null)
+    {
+        assert('! is_null( $func_name )');
+        assert('strlen( $func_name ) > 0');
+
+        switch ($func_name) {
+            case 'send':
+                $page_info = [
+                    'page'            => 'mail/send',
+                    'rcpt_param_name' => 'to'
+                    //'params'          => $params
+                ];
+
+                return $page_info;
+
+            default:
+                break;
+        }
+
+        return false;
+    }
+
+    /**
+     * アプリケーションポートレットリストの取得
+     *
+     * @return array $portlet_list
+     *          このアプリケーションが持つ
+     *          アプリケーションポートレット情報を返します
+     */
+    function &getPortletList()
+    {
+        require_once('fw/i18n.csp');
+        $portlet_list = [];
+
+        // 新着メール情報ポートレットの定義
+        $news_portlet = [
+            'name'             => cb_msg($this->getModuleId(),
+                'portlet_view_news'),
+            // 名前
+            'type'             => 'grn.mail.news',
+            // 種別
+            'version'          => '1.0',
+            // バージョン
+            'set_template'     => 'mail/portlet/set_news.csp',
+            // 設定用テンプレート名
+            'command_template' => 'mail/portlet/command_set_news.csp',
+            // 設定用テンプレート名
+            'view_template'    => 'mail/portlet/view_news.csp'
+            // 表示用テンプレート名
+        ];
+        $portlet_list[] = $news_portlet;
+
+        // メール一覧ポートレットの定義
+        $list_portlet = [
+            'name'             => cb_msg($this->getModuleId(),
+                'portlet_view_data_list'),
+            // 名前
+            'type'             => 'grn.mail.data_list',
+            // 種別
+            'version'          => '1.0',
+            // バージョン
+            'set_template'     => 'mail/portlet/set_data_list.csp',
+            // 設定用テンプレート名
+            'command_template' => 'mail/portlet/command_set_data_list.csp',
+            // 設定用テンプレート名
+            'view_template'    => 'mail/portlet/view_data_list.csp'
+            // 表示用テンプレート名
+        ];
+        $portlet_list[] = $list_portlet;
+
+        return $portlet_list;
+    }
+
+    /**
+     * システム設定
+     */
+    function getSystemConfigArray()
+    {
+        $system_config = [
+            'mail_config' =>
+                [
+                    [
+                        'page' => 'mail/system/common_set',
+                        'icon' => 'general32'
+                    ],
+                    [
+                        'page' => 'mail/system/mailserver',
+                        'icon' => 'mailserver32'
+                    ],
+                    [
+                        'page' => 'mail/system/user_account',
+                        'icon' => 'mailaccount32'
+                    ],
+                    [
+                        'page' => 'mail/system/user_disk_size',
+                        'icon' => 'limit32'
+                    ],
+                    [
+                        'page' => 'mail/system/mail_limit',
+                        'icon' => 'limit32'
+                    ],
+                    [
+                        'page' => 'mail/system/import_index',
+                        'icon' => 'import32'
+                    ],
+                    [
+                        'page' => 'mail/system/export_index',
+                        'icon' => 'export32'
+                    ],
+                ]
+        ];
+
+        return $system_config;
+    }
+
+    /**
+     * 個人設定
+     */
+    function getPersonalConfigArray()
+    {
+        $utility = $this->getUtility();
+        $system_config = $utility->getSystemConfig();
+
+        if ($system_config->canUseMail() === false) {
+            return false;
+        }
+
+        //////////////////////////////////////////////////////////////////////////
+        // 共通の設定 / アカウントごとの設定
+
+        $return_array = [
+            'common_config'  => [
+                [
+                    'page' => 'mail/personal/common_set',
+                    'icon' => 'general32'
+                ],
+                [
+                    'page' => 'mail/personal/trash',
+                    'icon' => 'trashbox32'
+                ],
+            ],
+            'account_config' => [
+                [
+                    'page' => 'mail/personal/account_list',
+                    'icon' => 'mailaccount32'
+                ],
+                [
+                    'page' => 'mail/personal/signature_list',
+                    'icon' => 'signature32'
+                ],
+                [
+                    'page' => 'mail/personal/send_set',
+                    'icon' => 'mailsend32'
+                ],
+                [
+                    'page' => 'mail/personal/folder_subscribe',
+                    'icon' => 'notifyfolder32'
+                ],
+                [
+                    'page' => 'mail/personal/filter',
+                    'icon' => 'mailfilter32'
+                ],
+            ],
+        ];
+
+        //////////////////////////////////////////////////////////////////////////
+        // 付加機能の設定
+
+        if ($system_config->canUserUseConfirm()
+            || $system_config->canUserUseStatus()
+            || $system_config->canUserUseHistory()
+        ) {
+            $return_array['option_config'] = [];
+        }
+
+        if ($system_config->hasPermissionOfAutomaticMailService()) {
+            $return_array["account_config"][] = [
+                'page' => 'mail/personal/automation',
+                'icon' => 'mail_forward32'
+            ];
+        }
+
+        // 開封確認機能使用権限チェック
+        if ($system_config->canUserUseConfirm()) {
+            $return_array['option_config'][] = [
+                'page' => 'mail/personal/opencheck_set',
+                'icon' => 'general32'
+            ];
+        }
+
+        // ステータス管理機能使用権限チェック
+        if ($system_config->canUserUseStatus()) {
+            $return_array['option_config'][] = [
+                'page' => 'mail/personal/status_set',
+                'icon' => 'mail_status32'
+            ];
+        }
+
+        //////////////////////////////////////////////////////////////////////////
+        // データの読み込み/書き出し/削除
+
+        $return_array['data_config'] = [
+            [
+                'page' => 'mail/personal/import1',
+                'icon' => 'import32'
+            ],
+            [
+                'page' => 'mail/personal/export',
+                'icon' => 'export32'
+            ],
+        ];
+
+        $return_array['data_config'][] = [
+            'page' => 'mail/personal/delete_all',
+            'icon' => 'deleteall32'
+        ];
+
+        return $return_array;
+    }
+
+    /**
+     * ユーザーのデフォルトメールアカウント情報を取得する
+     *
+     * @param  $user    object  ユーザーオブジェクト（CB_User）
+     *
+     * @return mixed    存在しない場合またはメール使用不可設定の場合はnull or それ以外はメールアカウント情報
+     *                  'account_info'      GRN_Mail_AccountInfoのオブジェクト
+     *                                      email
+     *                                      from_name
+     *                                      retrieve_account
+     *                                      retrieve_password
+     *                                      retrieve_save
+     *                                      server_id
+     *                                      smtp_account
+     *                                      smtp_password
+     *                  'server'            サーバー情報の配列
+     *                      'server_info'   GRN_Mail_ServerInfoのオブジェクト（ソースを参照のこと）
+     */
+    function getDefaultMailAccountInfo(& $user)
+    {
+        if ( ! is_object($user)) {
+            return null;
+        }
+
+        // メール使用停止設定チェック
+        $utility = $this->getUtility();
+        $system_config = $utility->getSystemConfig();
+        if ( ! $system_config->canUseMail()) {
+            return null;
+        }
+
+        $personal_config = $utility->getPersonalConfig($user);
+
+        return $personal_config->getDefaultAccountData(true, false);
+    }
+
+    public function getDefaultMailAccountInfoOfAllUsers()
+    {
+        $utility = $this->getUtility();
+        $system_config = $utility->getSystemConfig();
+
+        if ( ! $system_config->canUseMail()) {
+            return null;
+        }
+        $dao = new \grn\mail\dao\GrnMailAccountDAO();
+
+        return $dao->selectDefaountAccountDataOfAllUser();
+    }
+
+
+    /**
+     * ユーザーのデフォルトメールアカウント情報を取得する
+     *
+     * @param   object  $user          送信ユーザーオブジェクト（CB_User）
+     * @param   string  $account_id    アカウントID
+     * @param   array   $properties    プロパティ
+     *                                 $properties['subject']          標題
+     *                                 $properties['data']             本文
+     *                                 $properties['html_data']        HTML本文
+     *                                 $properties['from']             From
+     *                                 $properties['to']               To
+     *                                 $properties['cc']               Cc
+     *                                 $properties['bcc']              Bcc
+     *                                 $properties['sign_data']        署名
+     *                                 $properties['in_reply_to']      In-Reply-To
+     *                                 $properties['reply_to']         Reply-To
+     *                                 $properties['confirmation_req'] 開封確認要求フラグ（戻りは自分）
+     * @param   array   $files         添付ファイル（$_FILES) or null
+     * @param   boolean $b_save_object 送信メールをオブジェクトとして保存するするか(default:FALSE)
+     * @param   mixed   $locale        ロケール文字列 or null（デフォルトロケールを使用する場合）
+     *
+     * @return  boolean     成否
+     */
+    function sendMail(
+        & $user,
+        $account_id,
+        $properties,
+        $files,
+        $b_save_object = false,
+        $locale = null
+    ) {
+        if ( ! is_object($user) || ! is_string($account_id)
+             || ! is_array($properties)
+        ) {
+            return false;
+        }
+
+        $utility =& $this->getUtility();
+        $send_logic =& $utility->getSendLogic();
+
+        return $send_logic->sendMail($user, $account_id, $properties, $files,
+            null, null, null, null, $b_save_object, $b_save_object, false,
+            $locale);
+    }
+
+
+    /**
+     * 指定したファイル名のメールソースを取り込む（例外は極力吐かない）
+     *
+     * @param   string  $login_name         メールを取り込むユーザーのログイン名
+     * @param   array   $filename           入力ファイル名の配列
+     * @param   mixed   $folder_id          出力先フォルダID or null（振り分けされる）
+     *                                      $folder_idが指定されている場合、$account_idは無視されます
+     * @param   mixed   $account_id         出力先アカウントID or null
+     *                                      $account_idと$folder_idの両方がnullの場合はデフォルトアカウントが適用されます
+     * @param   boolean $b_delete_file      成功時に入力ファイルを削除するか（default:FALSE）
+     *
+     * @return  mixed       受信したメール数 or FALSE
+     */
+    function importMails(
+        $login_name,
+        $filenames,
+        $folder_id,
+        $account_id = null,
+        $b_delete_file = false
+    ) {
+        if (is_null($login_name) || ! is_array($filenames)) {
+            return false;
+        }
+
+        if (count($filenames) == 0) {
+            return 0;
+        }
+
+        global $G_container_base;
+        $uum =& $G_container_base->getInstance('uum');
+        $user =& $uum->getUserByForeignKey($login_name);
+        if ( ! is_object($user)) {
+            return false;
+        }
+
+        $utility =& $this->getUtility();
+        $system_config =& $this->_utility->getSystemConfig();
+        if ( ! $system_config->canUseMail()) {
+            // メール使用不可
+            return false;
+        }
+
+        if ( ! is_null($folder_id)) {
+            $folder_logic =& $this->_utility->getFolderLogic();
+            $folder =& $folder_logic->_getFolderRow($folder_id);
+            if ( ! is_object($folder)) {
+                // 指定されたフォルダがない
+                return false;
+            }
+
+            // フォルダのユーザーチェック
+            $folder_owner =& $folder->get('user');
+            if ( ! is_object($folder_owner)
+                 || ($folder_owner->getOID() != $user->getOID())
+            ) {
+                // 指定されたフォルダとそのフォルダのユーザーが一致しない
+                return false;
+            }
+
+            // フォルダからアカウントを取得（$account_idは無視）
+            $account =& $folder->get('account');
+        } else {
+            if ( ! is_null($account_id)) {
+                // アカウント取得
+                $account =& $system_config->_getAccountRow($account_id);
+            } else {
+                // デフォルトアカウント取得
+                $personal_config =& $utility->getPersonalConfig($user);
+                $account =& $personal_config->_getDefaultAccountRow();
+            }
+
+            // フォルダIDが未指定の場合は振り分け
+            $folder = null;
+        }
+
+        if ( ! is_object($account)) {
+            // アカウントデータがない
+            return false;
+        }
+
+        $mail_logic =& $this->_utility->getMailLogic();
+
+        $count = 0;
+        foreach ($filenames as $filename) {
+            if (strlen($filename) == 0) {
+                continue;
+            }
+
+            // メールをファイルから取り込む
+            if ($mail_logic->importMailDatasFromEmlFile($user, $filename,
+                    $account, $folder, false) === false
+            ) {
+                continue;
+            }
+
+            // ソースファイル削除
+            if ($b_delete_file) {
+                unlink($filename);
+            }
+
+            $count++;
+        }
+
+        return $count;
+    }
+
+    /**
+     * @param    object $user CB_User
+     *
+     * @return   boolean
+     */
+    function hideSendLink(& $user)
+    {
+        $utility =& $this->getUtility();
+        $system_config =& $utility->getSystemConfig();
+        $personal_config =& $utility->getPersonalConfig($user);
+
+        $system_config->getGeneralSetting($general_settings);
+        $disable_mail = false;
+        if ($general_settings['disable_mail'] !== false) {
+            $disable_mail = true;
+        }
+
+        $available_account_num = $personal_config->getAccountDataCount(true,
+            false);
+        $no_account = false;
+        if ($available_account_num == 0) {
+            $no_account = true;
+        }
+
+        return $disable_mail || $no_account;
+    }
+
+    /**
+     * @param    object $user CB_User
+     *
+     * @return   boolean
+     */
+    function disabledSendLink(& $user)
+    {
+        $utility =& $this->getUtility();
+        $system_config =& $utility->getSystemConfig();
+        $personal_config =& $utility->getPersonalConfig($user);
+
+        // 総メールサイズ上限を取得
+        $user_id = $user->getOID();
+        $system_config->getSizeUserLimitSetting($size_settings, $user_id);
+
+        // ユーザーの総メールサイズを取得
+        $mail_size = $personal_config->getMailSize(null);
+
+        // 総サイズチェック
+        $size_over = false;
+        if (($size_settings['user_limit_' . $user_id] >= 0)
+            && ($mail_size >= $size_settings['user_limit_' . $user_id] * 1024
+                              * 1024)
+        ) {
+            $size_over = true;
+        }
+
+        $available_account_num = $personal_config->getAccountDataCount(false,
+            false);
+        $no_account = false;
+        if ($available_account_num == 0) {
+            $no_account = true;
+        }
+
+        return $size_over || $no_account;
+    }
+
+    /**
+     * アプリケーションのデータをクリーンアップする
+     */
+    function cleanup()
+    {
+        $this->_cleanup_mail_sourcefilebody();
+        $this->_cleanup_mail_filebody();
+        $this->cleanupAutomaticEvent();
+    }
+
+    /**
+     * 削除されたユーザーのメールのソースファイルを削除
+     *
+     * @access private
+     */
+    function _cleanup_mail_sourcefilebody()
+    {
+        global $G_container_base;
+        $logger = $G_container_base->getInstance('cleanup_logger');
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $manager = $app_locator->getTableManager('mail');
+
+        require_once('mail/table.csp');
+        $user_tables = cb_get_user_tables();
+        $numOfWillBeDeleted = self::CLEANUP_LIMIT_MAX;
+
+        for ($i = 0; $i < $user_tables && $numOfWillBeDeleted > 0; $i++) {
+            $suffix = CB_DATABASE_USER_TABLE_PREFIX . $i;
+            $tab_sourcefilebody = cb_class2table(GRN_MAIL_SOURCEFILEBODY_TABLE,
+                $suffix, true);
+
+            $rowset = new CB_RowSet($tab_sourcefilebody, 'sourcefilebody');
+            $rowset->addCondition('sourcefilebody.col_mail IS NULL AND sourcefilebody.col_user IS NULL');
+            $rowset->limit(0, $numOfWillBeDeleted);
+            $rowset->setLock(CB_DATABASE_NO_LOCK);
+
+            while ( ! is_null($file = $rowset->iterate())) {
+                $file_id = $file->getOID();
+                $logger->log('[delete] mail sourcefilebody(pid:' . $suffix
+                             . ', fid:' . $file_id . ')');
+                $file->delete();
+                $numOfWillBeDeleted -= 1;
+                if ($numOfWillBeDeleted < 1) {
+                    break;
+                }
+            }
+            $rowset->destroy();
+        }
+
+        unset($tab_sourcefilebody, $rowset, $manager, $app_locator, $logger);
+    }
+
+    /**
+     * 削除されたユーザーのメールの添付ファイルを削除
+     *
+     * @access private
+     */
+    function _cleanup_mail_filebody()
+    {
+        global $G_container_base;
+        $logger = $G_container_base->getInstance('cleanup_logger');
+
+        $app_locator = GRN_ApplicationLocator::instance();
+        $manager = $app_locator->getTableManager('mail');
+
+        require_once('mail/table.csp');
+        $user_tables = cb_get_user_tables();
+        $numOfWillBeDeleted = self::CLEANUP_LIMIT_MAX;
+
+        for ($i = 0; $i < $user_tables && $numOfWillBeDeleted > 0; $i++) {
+            $suffix = CB_DATABASE_USER_TABLE_PREFIX . $i;
+            $tab_filebody = cb_class2table(GRN_MAIL_FILEBODY_TABLE, $suffix,
+                true);
+
+            $rowset = new CB_RowSet($tab_filebody, 'filebody');
+            $rowset->addCondition('filebody.col_mail IS NULL AND filebody.col_user IS NULL');
+            $rowset->limit(0, $numOfWillBeDeleted);
+            $rowset->setLock(CB_DATABASE_NO_LOCK);
+
+            while ( ! is_null($file = $rowset->iterate())) {
+
+                $file_id = $file->getOID();
+                $logger->log('[delete] mail filebody(pid:' . $suffix . ', fid:'
+                             . $file_id . ')');
+                $file->delete();
+                $numOfWillBeDeleted -= 1;
+                if ($numOfWillBeDeleted < 1) {
+                    break;
+                }
+            }
+            $rowset->destroy();
+        }
+
+        unset($tab_filebody, $rowset, $manager, $app_locator, $logger);
+    }
+
+    /**
+     * Star Logic: Add function
+     *
+     * @param       $user CB_User
+     * @param array $params
+     *
+     * @return GRN_Star_Data
+     */
+    function getStarData($user, $params = [])
+    {
+        assert('is_array($params) && count($params) > 0');
+        $mail_id = null;
+        if (array_key_exists('mid', $params)) {
+            $mail_id = $params['mid'];
+        }
+        require_once('mail/utility.csp');
+        $utility = GRN_Mail_Utility::getInstance();
+
+        $mail_logic = $utility->getMailLogic();
+        $mail_data = $mail_logic->getMailData($mail_id, false);
+
+        if (is_null($mail_data)) {
+            cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+        }
+        if ( ! array_key_exists('user_id', $mail_data)
+             || $mail_data['user_id'] != $user->getOID()
+        ) {
+            cb_throw_error(E_GRN_MAIL_MAIL_ACCESS_DENIED);
+        }
+        $folder_logic = $utility->getFolderLogic();
+        $folder_data =& $folder_logic->getFolderData($mail_data['folder_id']);
+        if ($folder_data['code'] == GRN_MAIL_FOLDER_CODE_TRASH) {
+            cb_throw_error(E_GRN_MAIL_MAIL_DATA_NOT_FOUND);
+        }
+
+        require_once('star/logic.csp');
+        $data = new GRN_Star_Data();
+        $data->setModuleId($this->getModuleId());
+        $data->setUniqueId($mail_data['id']);
+        $subject = null;
+        if (isset($mail_data['subject'])
+            && mb_strlen($mail_data['subject']) > 0
+        ) {
+            $subject = $mail_data['subject'];
+        } else {
+            $subject = cb_msg('grn.mail', 'no_title');
+        }
+        $data->setSubjectData($subject);
+        $data->setTimeStampData($mail_data['timestamp']);
+
+        $name_key = 'from';
+        $org_data = ['mid' => $mail_id];
+        if ($mail_data['draft']) {
+            $org_data['type'] = '2';
+            $name_key = 'to';
+        } else {
+            $org_data['type'] = $mail_data['sent'] ? '1' : '0';
+        }
+        if (array_key_exists('message_id', $mail_data)) {
+            $org_data['message_id'] = $mail_data['message_id'];
+        }
+        $data->setOrgData($org_data);
+
+        $config = $utility->getPersonalConfig($user);
+        $name_format = $config->getListNameFormatSetting();
+        if ($name_format == 'name') {
+            $name_key .= '_name';
+        } elseif ($name_format == 'email') {
+            $name_key .= '_email';
+        }
+        $data->setSenderData($mail_data[$name_key], null);
+
+        return $data;
+    }
+
+    private function cleanupAutomaticEvent()
+    {
+        $dao = new AutomaticEventDao();
+        $dao->deleteObsoleteAutomaticEvent();
+    }
+
+}
+
+

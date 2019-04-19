@@ -1,0 +1,284 @@
+<?php
+
+use grn\grn\access\service\AppAccess;
+
+global $G_INPUT;
+
+require_once('grn/smarty.csp');
+$t = new GRN_Smarty;
+
+////////////////////////////////////////////////////////////////
+
+// アドレス帳を取得する
+require_once('address/application.csp');
+$app_locator = GRN_ApplicationLocator::instance();
+/** @var GRN_Address_Application $app */
+$app = $app_locator->getInstance(GRN_ADDRESS_APPLICATION_ID);
+if ( ! is_object($app) || ! is_a($app, 'GRN_Address_Application')) {
+    cb_throw_error(E_GRN_APPLICATION_NOT_AVAILABLE);
+}
+$book_manager = $app->getBookManager();
+
+// ログインユーザーを取得する
+global $G_container_base;
+$uum = $G_container_base->getInstance('uum');
+$login = $uum->getLoginUser();
+if ( ! is_object($login) || ! is_a($login, 'CB_User')) {
+    cb_throw_error(E_GRN_USER_NOT_FOUND);
+}
+$login_id = $login->getOID();
+
+// アドレス帳の設定を取得する
+require_once('address/config.csp');
+$config_manager = GRN_Address_ConfigManager::getInstance();
+$system_config = $config_manager->getSystemConfig();
+$personal_config = $config_manager->getPersonalConfig($login);
+require_once('grn/ui.csp');
+$ui_config_manager = GRN_UIConfigManager::getInstance();
+$ui_config = $ui_config_manager->getUserConfig($login);
+
+// 使用権限を取得する
+require_once('address/access.csp');
+$access_manager = GRN_Address_AccessManager::getInstance();
+if ( ! ($row = $access_manager->getAbstractData(GRN_ADDRESS_AVAILABLE))) {
+    assert('FALSE');
+}
+
+// ダイナミックロールを取得する
+$dynamic_roles = $uum->listGrantedRoles();
+
+// 使用権限を評価する
+$authorities = ['private_address', 'shared_address'];
+$security_model = $access_manager->getSecurityModel($row);
+$access = $access_manager->evaluateAccess($row, $login, $dynamic_roles,
+    $authorities, $security_model);
+
+// 個人アドレス帳の使用権限を評価する
+$authorities = ['private_address'];
+$access_for_view['private_address'] = $access_manager->isAllowedAccess($access,
+    $authorities, $security_model);
+
+// 共有アドレス帳の使用権限を評価する
+$authorities = ['shared_address'];
+$access_for_view['shared_address'] = $access_manager->isAllowedAccess($access,
+    $authorities, $security_model);
+
+$books = [];
+$allow_books = [];
+$books_for_view = [];
+$accesses = [];
+require_once('address/view_util.csp');
+$view_util = GRN_Address_ViewUtil::getInstance();
+if ($access_for_view['shared_address']) {
+    // 共有アドレスブック一覧を取得する
+    $books = $book_manager->listSharedAddressBooks();
+
+    if (0 < count($books)) {
+        // 共有アドレスブック一覧の閲覧権限を評価する
+        $rows = [];
+        foreach (array_keys($books) as $book_id) {
+            $rows[$book_id] = $books[$book_id]->getRow();
+        }
+        $authorities = ['browse', 'editing', 'operation'];
+        $accesses = $access_manager->evaluateAccesses($rows, $login,
+            $dynamic_roles, $authorities);
+
+        $authorities = ['browse'];
+        foreach ($accesses as $book_id => $access) {
+            $row =& $rows[$book_id];
+            $security_model = $access_manager->getSecurityModel($row);
+            if ($access_manager->isAllowedAccess($accesses[$book_id],
+                $authorities, $security_model)
+            ) {
+                $allow_books[$book_id] =& $row;
+            }
+        }
+
+        // 共有アドレスブック情報一覧を取得する
+        $books_for_view = $view_util->listBooks($books, $allow_books);
+    }
+}
+
+// GET/POSTされたパラメータを取得する
+$bid = null;
+if (array_key_exists('bid', $G_INPUT)) {
+    $bid = $G_INPUT['bid'];
+}
+if (0 == strlen($bid)) {
+    $bid = $personal_config->getLastOpenedBook();
+
+    if (0 == strlen($bid)) {
+        cb_switch_page('address/user_list.csp');
+    }
+    if (-2 == $bid) {
+        cb_switch_page('address/mygroup_list.csp');
+    }
+}
+
+// ブックを取得する
+if (0 < $bid || (0 > $bid && false === $access_for_view['private_address'])) {
+    if (array_key_exists($bid, $allow_books)) {
+        // 共有アドレスブックを取得する
+        $book =& $books[$bid];
+    } else {
+        $indices = array_keys($allow_books);
+        if (0 < count($indices)) {
+            // 表示順番が最初の共有アドレスブックを取得する
+            $bid = $indices[0];
+            $book =& $books[$bid];
+        } else {
+            // 個人アドレスブックを取得する
+            $bid = -1;
+        }
+    }
+
+    if (0 < $bid) {
+        // 共有アドレスブックの閲覧、編集権限を評価する
+        $row = $book->getRow();
+        $authorities = ['browse', 'editing'];
+        $security_model = $access_manager->getSecurityModel($row);
+        $access_for_view['add']
+            = $access_manager->isAllowedAccess($accesses[$bid],
+            $authorities, $security_model);
+
+        $authorities = ['operation'];
+        $security_model = GRN_ADDRESS_SECURITYMODEL_GRANT;
+        $access = $access_manager->evaluateAccess($row, $login,
+            $dynamic_roles, $authorities);
+        $access_for_view['operation']
+            = $access_manager->isAllowedAccess($access,
+            $authorities, $security_model);
+    }
+}
+if (0 > $bid) {
+    if ($access_for_view['private_address']) {
+        // 個人アドレスブックを取得する
+        if ( ! ($book
+            = $book_manager->getPrivateAddressBookByUserId($login_id))
+        ) {
+            if ( ! ($book =& $book_manager->addPrivateAddressBook('cyde',
+                $login_id, []))
+            ) {
+                cb_throw_error(E_GRN_ADDRESS_PRIVATE_ADDRESS_BOOK_NOT_FOUND);
+            }
+        }
+        $access_for_view['add'] = true;
+    } else {
+        // ユーザー名簿ブックにリダイレクト
+        //cb_switch_page( 'address/user_list.csp' );
+        cb_switch_page('address/mygroup_list.csp');   // Huy added
+    }
+    $book_name = cb_plain_msg('grn.address', 'private',
+        ['application_name' => $app->getName()]);
+} else {
+    if ( ! array_key_exists($bid, $books)) {
+        cb_throw_error(E_GRN_ADDRESS_INVALID_BOOK_ID);
+    }
+    $book_name = $book->getProperty('display_name');
+}
+
+// 組み込み項目情報一覧を取得する
+$builtin_items = $view_util->listBuiltinItems($book);
+
+// 拡張項目情報一覧を取得する
+$extended_items = $view_util->listExtendedItems($book);
+
+// 一覧表示フラグを取得する
+$personal_config->getDisplayFlag($book, $builtin_items, $extended_items);
+
+// Huy add
+$condition = null;
+
+// Incremental Find on Reading name
+require_once('address/charmap_util.csp');
+$char_map = GRN_Address_CharMap_Util::getInstance();
+
+$cidx = null;
+if (array_key_exists('cidx', $G_INPUT)) {
+    $cidx = $G_INPUT['cidx'];
+}
+
+$selected_hira_char = null;
+if ($builtin_items['personal_sort_key']['use']) {
+    $selected_chars = $char_map->getCharsByIndex($cidx);
+    if ( ! is_null($selected_chars)) {
+        $selected_hira_char = $selected_chars[0];
+
+        foreach ($selected_chars as $c) {
+            $conditions[]
+                = "concat( ltrim(col_family_sort_key), ltrim(col_given_sort_key) ) LIKE '"
+                  . $c . "%'";
+        }
+
+        $condition = implode(" OR ", $conditions);
+    }
+}
+
+$t->assign('selected_char', $selected_hira_char);
+// Huy added end
+
+// n件ナビゲーション情報を取得する
+require_once('grn/controller.csp');
+$controller_util = new GRN_ControllerUtil();
+$offset = $controller_util->getNaviStartPosition();
+$controller_util->setNaviStartPosition($offset);
+$limit = $ui_config->getListMax();
+
+$datas_for_view = $book->listDatasByPronunciationFast($offset, $limit + 1,
+    $condition);
+
+$isExistsNextPage = count($datas_for_view) > $limit;
+if ($isExistsNextPage) {
+    array_pop($datas_for_view);
+}
+
+$view_set = $controller_util->makeSimpleNaviInformation($offset, $limit,
+    count($datas_for_view), $isExistsNextPage, ['cidx' => $cidx]);// Huy
+
+
+// 最後に開いたブックを記録する
+$personal_config->setLastOpenedBook($book);
+
+// サイボウズNETが利用可能か検証する
+$is_cbwebsrv
+    = AppAccess::isAppAvailableInternalAccess(GRN_ADDRESS_CYBOZUNET_ID);
+
+// リソース一覧を生成する
+$resources = ['application_name' => $app->getName()];
+
+$t->assign('book_id', $bid);
+$t->assign('is_cbwebsrv', $is_cbwebsrv);
+$t->assign('view_set', $view_set);
+$t->assign('access', $access_for_view);
+$t->assign('books', $books_for_view);
+$t->assign('cards', $datas_for_view);
+$t->assign('builtin_items', $builtin_items);
+$t->assign('extended_items', $extended_items);
+$t->assign('resources', $resources);
+
+////////////////////////////////////////////////////////////////
+
+// Smartyにページタイトルを割り当てる
+$page_title = grn_get_page_display_name('address/index');
+$t->assign('page_title', $page_title);
+
+// Smartyにサイトポジションを割り当てる
+$page_infos = ['index' => null];
+$site_position = $controller_util->makeSitePosition('address/', $page_infos);
+$t->assign('site_position', $site_position);
+$delete_info_multi = [
+    'title'        => grn_get_page_display_name('address/delete_multi'),
+    'page'         => 'address/delete_multi.tpl',
+    'no_confirm'   => false,
+    'data'         => [
+        'book_id' => $bid,
+        'book'    => ['display_name' => $book_name]
+    ],
+    'handler'      => ['btn_delete_multi1', 'btn_delete_multi2'],
+    'multi_target' => 'cid[]',
+    'form_target'  => 'address/index',
+];
+$t->assign('delete_info_multi', $delete_info_multi);
+// Smartyを実行する
+$t->display(cb_get_pagename() . '.tpl');
+

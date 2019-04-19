@@ -1,0 +1,203 @@
+<?php
+
+namespace grn\grn\access\logic;
+
+use grn\grn\access\bean\Availability;
+use grn\grn\access\exception\AppNotAvailableForInternalException;
+use grn\grn\access\utility\AppAvailabilityUtil;
+
+require_once('grn/application.csp');
+
+class AppAvailabilityLogic
+{
+    private $appUtil;
+    private $applicationLocator;
+    private $availabilityLogic;
+
+    public function __construct()
+    {
+        $this->appUtil = new AppAvailabilityUtil();
+        $this->availabilityLogic = new AvailabilitySettingLogic();
+        $this->applicationLocator = \GRN_ApplicationLocator::instance();
+    }
+
+    /**
+     * @param string   $app_id
+     * @param null|int $user_id
+     *
+     * @return bool
+     */
+    function isAppAvailableForUser($app_id, $user_id = null)
+    {
+        if (isset($user_id)) {
+            $uum = cb_lwc_uum();
+            $user = $uum->getUser($user_id);
+        } else {
+            $user = cb_get_login_user();
+        }
+
+        if ( ! $user) {
+            return false;
+        }
+        $user_id = $user->getOID();
+        if ( ! isset($app_id) || cb_trim($app_id) === ''
+             || ! $this->applicationLocator->isActive($app_id)
+             || ! $this->applicationLocator->isLicensed($app_id)
+        ) {
+            return false;
+        }
+        //The app id does not include 13 app ids support privilege. EX app_id is memo
+        if ( ! in_array($app_id, AppAvailabilityUtil::getActiveAppIds())) {
+            return true;
+        }
+        $available_app_ids = $this->getAvailableAppIdsByUserId($user_id);
+
+        return in_array($app_id, $available_app_ids);
+    }
+
+    public function checkForUserAccess($app_id, $user_id = null)
+    {
+        if ( ! $this->isAppAvailableForUser($app_id, $user_id)) {
+            throw new AppNotAvailableForInternalException();
+        }
+    }
+
+    /**
+     * Get a list of application ids which the user can use.
+     *
+     * @param            $user_id
+     * @param array|NULL $app_ids_evaluate
+     *
+     * @return array
+     */
+    public function getAvailableAppIdsByUserId(
+        $user_id,
+        array $app_ids_evaluate = null
+    ) {
+        return array_keys(array_filter($this->getAvailabilityAppIdsByUserIds([$user_id],
+            $app_ids_evaluate)[$user_id]));
+    }
+
+    /**
+     * @param            $user_id
+     * @param array|NULL $app_ids_evaluate
+     *
+     * @return array
+     * array(schedule=>0, message=>1, .., cellular=>1)
+     */
+    public function getAvailabilityAppIdsByUserId(
+        $user_id,
+        array $app_ids_evaluate = null
+    ) {
+        return $this->getAvailabilityAppIdsByUserIds([$user_id],
+            $app_ids_evaluate)[$user_id];
+    }
+
+    /**
+     * @param   array    $user_ids            array id of the user such as array (1,2,3,4,5,6,...)
+     * @param array|NULL $app_ids_to_evaluate if provide, only get privilege using of this app
+     *
+     * @return array
+     * array (  1=>(schedule=>0, message=>1, .., cellular=>1),
+     *          2=>(schedule=>1, message=>1, .., cellular=>0),
+     *          3=>(schedule=>0, message=>0, .., cellular=>1),
+     * )
+     */
+    public function getAvailabilityAppIdsByUserIds(
+        array $user_ids,
+        array $app_ids_to_evaluate = null
+    ) {
+        $user_ids_length = count($user_ids);
+        if ($user_ids_length < 1) {
+            return [];
+        }
+        $active_app_ids = AppAvailabilityUtil::getActiveAppIds();
+        $app_ids_privilege = AppAvailabilityUtil::getAppIdsSupportPrivilege();
+        if ( ! isset($app_ids_to_evaluate) || count($app_ids_to_evaluate) < 1) {
+            $app_ids_to_evaluate = $app_ids_privilege;
+        }
+        $app_ids_length = count($app_ids_to_evaluate);
+        $app_ids_availability = array_fill_keys($app_ids_to_evaluate,
+            AppAvailabilityUtil::ACCESS_DENIED);
+        $result_setting = array_fill_keys($user_ids,
+            $app_ids_availability);
+        $target_settings = [];
+        $targets = [
+            Availability::DYNAMIC_ROLE,
+            Availability::STATIC_ROLE,
+            Availability::GROUP,
+            Availability::USER
+        ];
+        for ($i = 0; $i < $user_ids_length; $i++) {
+            $app_ids_allow = [];
+            $user_id = $user_ids[$i];
+            foreach ($targets as $target) {
+                $is_dynamic = $target === Availability::DYNAMIC_ROLE;
+                if ( ! array_key_exists($target, $target_settings)) {
+                    $target_settings[$target] = $is_dynamic
+                        ? $this->availabilityLogic->getAll($target)
+                        : $this->availabilityLogic->getByUserIds($user_ids,
+                            $target);
+                }
+                $app_settings = $is_dynamic ? $target_settings[$target]
+                    : cb_at($target_settings[$target], $user_id, []);
+                foreach ($app_settings as $app_setting) {
+                    /** @var $app_setting Availability */
+                    $app_id_allow
+                        = array_keys(array_filter($app_setting->getAppsAvailability(),
+                        function ($value) {
+                            return $value['internal']
+                                   == AppAvailabilityUtil::ACCESS_ALLOWED;
+                        }));
+                    $app_ids_allow
+                        = array_unique(array_merge($app_ids_allow,
+                        $app_id_allow));
+                    $app_ids_allow = array_intersect($app_ids_allow,
+                        $active_app_ids);
+                    $user_ids_app_ids_allow = array_fill_keys($app_ids_allow,
+                        AppAvailabilityUtil::ACCESS_ALLOWED);
+                    $result_setting[$user_id]
+                        = array_merge($app_ids_availability,
+                        $user_ids_app_ids_allow);
+
+                    if (count($app_ids_allow) === $app_ids_length
+                        && count(array_diff($app_ids_to_evaluate,
+                            $app_ids_allow)) === 0
+                    ) {
+                        if ($i === 0 && $is_dynamic) {
+                            $app_ids_result
+                                = array_fill_keys($app_ids_to_evaluate,
+                                AppAvailabilityUtil::ACCESS_ALLOWED);
+
+                            return array_fill_keys($user_ids, $app_ids_result);
+                        }
+                        continue 3;
+                    }
+                }
+            }
+        }
+
+        return $result_setting;
+    }
+
+    /**
+     * @param array $user_ids this is array user_id ex: (1,2,3,4,5,6,7,8,9...)
+     * @param mixed $app_id
+     *
+     * @return array app list
+     */
+    public function filterUserIdsByAppId(array $user_ids, $app_id)
+    {
+        $availability_user_ids
+            = $this->getAvailabilityAppIdsByUserIds($user_ids, [$app_id]);
+        foreach ($user_ids as $user_id) {
+            if ($availability_user_ids[$user_id][$app_id]
+                == AppAvailabilityUtil::ACCESS_DENIED
+            ) {
+                unset($user_ids[array_search($user_id, $user_ids)]);
+            }
+        }
+
+        return $user_ids;
+    }
+}

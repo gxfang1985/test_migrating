@@ -1,0 +1,303 @@
+<?php
+
+use grn\grn\access\service\AppAccess;
+
+use grn\grn\push_notification\phonemessage\PushConversionData;
+use grn\grn\push_notification\PushNotificationRegister;
+
+if (0 == strcasecmp(@ $_SERVER['REQUEST_METHOD'], 'POST')) {
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty;
+
+    // 電話メモを取得する
+    require_once('phonemessage/application.csp');
+    $app_locator = GRN_ApplicationLocator::instance();
+    /** @var GRN_PhoneMessage_Application $app */
+    $app = $app_locator->getInstance(GRN_PHONEMESSAGE_APPLICATION_ID);
+
+    if ( ! is_object($app) || ! is_a($app, 'GRN_PhoneMessage_Application')) {
+        cb_throw_error(E_GRN_APPLICATION_NOT_AVAILABLE);
+    }
+
+    // GET/POSTされたパラメータを取得する
+    $uid = array_key_exists('uid', $G_INPUT) ? $G_INPUT['uid'] : '';
+    if (0 == strlen($uid)) {
+        cb_throw_error(E_GRN_PHONEMESSAGE_INVALID_USER_ID);
+    }
+
+    $inputClientName = array_key_exists('client_name', $G_INPUT)
+        ? $G_INPUT['client_name'] : '';
+    //countermeasure for mail header injection STM-1176
+    $inputClientName = preg_replace('/\\r|\\n|%0d|%0a/', '', $inputClientName);
+
+    $inputMatter = array_key_exists('matter', $G_INPUT)
+        ? $G_INPUT['matter'] : '';
+    $inputTelephoneNumber = array_key_exists('telephone_number', $G_INPUT)
+        ? $G_INPUT['telephone_number'] : '';
+    $inputTelephoneNumber = preg_replace('/\\r|\\n|%0d|%0a/', '',
+        $inputTelephoneNumber);
+    $inputMessage = array_key_exists('message', $G_INPUT)
+        ? $G_INPUT['message'] : '';
+    $inputCurrentTimestamp = array_key_exists('current_timestamp', $G_INPUT)
+        ? $G_INPUT['current_timestamp'] : '';
+    $inputFixedHour = array_key_exists('fixed_hour', $G_INPUT)
+        ? $G_INPUT['fixed_hour'] : '';
+    $inputFixedMinute = array_key_exists('fixed_minute', $G_INPUT)
+        ? $G_INPUT['fixed_minute'] : '';
+
+    $send_timestamp = new CB_TimeStamp();
+    $send_timestamp->unix_ts = intval($inputCurrentTimestamp);
+    $send_timestamp = new CB_TimeStampEx($send_timestamp);
+    $tempSendDatetime = $send_timestamp->getDateTime();
+    $tempSendDatetime->hour = intval($inputFixedHour);
+    $tempSendDatetime->minute = intval($inputFixedMinute);
+    $tempSendDatetime->second = 0;
+    $send_timestamp->setDateTime($tempSendDatetime);
+
+
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+
+    require_once('phonemessage/controller.csp');
+    $controller_util = new GRN_PhoneMessage_ControllerUtil();
+
+
+    // 受信者を取得する
+    /** @var GRN_Uum $uum */
+    $receiver = $uum->getUser($uid);
+    if ( ! is_object($receiver) || ! is_a($receiver, 'CB_User')) {
+        cb_throw_error(E_GRN_USER_NOT_FOUND);
+    }
+    $receiver_id = $receiver->getOID();
+
+    // 受信者のLocaleを取得する
+    require_once("fw/i18n/locale.csp");
+    $receiverLangCode = CB_LocaleManager::getCurrentLanguage($receiver_id);
+
+    // 受信者の設定言語で定型文言を取得する
+    $rcvLangMatter = $controller_util->cb_plain_msg("grn.phonemessage",
+        $inputMatter, null, $receiverLangCode);
+
+
+    // 送信者を取得する
+    $sender = $uum->getLoginUser();
+    if ( ! is_object($sender) || ! is_a($sender, 'CB_User')) {
+        cb_throw_error(E_GRN_USER_NOT_FOUND);
+    }
+    $sender_id = $sender->getOID();
+
+
+    // ダイナミックロールを取得する
+    $dynamic_roles = $uum->listGrantedRoles();
+
+
+    // ユーザーにおけるアクセスの制限を評価する
+    require_once('phonemessage/access.csp');
+    $access_manager = GRN_PhoneMessage_AccessManager::getInstance();
+    $users = [$receiver_id => $receiver];
+    $authorities = ['browse', 'add'];
+    $user_info = $access_manager->getObjectInfo($users);
+    $user_info['accesses'] = (0 < count($user_info['objects']))
+        ? $access_manager->evaluateAccesses($user_info['objects'], $sender,
+            $dynamic_roles, $authorities) : [];
+
+    // 組織におけるアクセスの制限を評価する
+    $groups = $uum->getGroupList();    // 組織一覧を取得する
+    $group_info = $access_manager->getObjectInfo($groups);
+    $group_info['accesses'] = (0 < count($group_info['objects']))
+        ? $access_manager->evaluateAccesses($group_info['objects'], $sender,
+            $dynamic_roles, $authorities) : [];
+
+    // スタティックロールにおけるアクセスの制限を評価する
+    $roles = $uum->listStaticRoles();    // スタティックロール一覧を取得する
+    $role_info = $access_manager->getObjectInfo($roles);
+    $role_info['accesses'] = (0 < count($role_info['objects']))
+        ? $access_manager->evaluateAccesses($role_info['objects'], $sender,
+            $dynamic_roles, $authorities) : [];
+
+    // ユーザー、組織、スタティックロールにおけるアクセスの制限を評価する
+    $accesses_for_view = $controller_util->evaluateAccesses($users, $user_info,
+        $group_info, $role_info);
+
+
+    // 自分自身のアクセス権は無視する
+    if (array_key_exists($sender_id, $accesses_for_view)) {
+        $accesses_for_view[$sender_id] = [];
+    }
+
+    if (array_key_exists($receiver_id, $accesses_for_view)) {
+        if (array_key_exists('add', $accesses_for_view[$receiver_id])) {
+            cb_throw_error(E_GRN_PHONEMESSAGE_ACCESS_DENY_ADD);
+        }
+    } else {
+        assert('FALSE');
+    }
+
+
+    //電話メモを登録する
+    $messageParams = [];
+    $messageParams['client_name'] = $inputClientName;
+    $messageParams['matter'] = $rcvLangMatter;
+    $messageParams['message'] = $inputMessage;
+    $messageParams['receiver'] = $receiver;
+    $messageParams['receiver_name'] = $receiver->get('display_name');
+    $messageParams['send_time'] = $send_timestamp;
+    $messageParams['sender'] = $sender;
+    $messageParams['sender_name'] = $sender->get('display_name');
+    $messageParams['telephone_number'] = $inputTelephoneNumber;
+
+    $message_manager = $app->getMessageManager();
+    if ($message = $message_manager->add($messageParams)) {
+        // 通知データを登録する
+        $mid = $message->getOID();
+        $timestamp = new CB_TimeStamp();
+        $timestamp->unix_ts = time();
+
+        if (0 < strlen($inputClientName)) {
+            $args = ['client_name' => $inputClientName];
+            $subject = $controller_util->cb_plain_msg('grn.phonemessage',
+                'notify_client_name', $args, $receiverLangCode);
+        } else {
+            $subject = $controller_util->cb_plain_msg('grn.phonemessage',
+                'notify_default', null, $receiverLangCode);
+        }
+
+        require_once('grn/notification.csp');
+        $notify_data = new GRN_Notification_Data;
+        $notify_data->setModuleId($app->getModuleId());
+        $notify_data->setUniqueId($mid);
+        $notify_data->setOrgData(['uid' => $receiver_id]);
+        $notify_data->setAbstractData($rcvLangMatter);
+        $notify_data->setSubjectData($subject);
+        $notify_data->setSenderData($sender->get('display_name'),
+            $sender->getOID());
+        $notify_data->setTimeStampData($timestamp);
+        $notify_data->setConfirmRequiredFlag(true);
+        $notify_data->setStatusToUnread();
+
+        // 通知データを登録する
+        $notify_service = GRN_Notification_Service::getInstance();
+        $notify_service->addNotifyData($receiver, $notify_data);
+    }
+
+
+    if (AppAccess::isAppAvailableInternalAccess(GRN_PHONEMESSAGE_APPLICATION_ID,
+        $uid)
+    ) {
+        // メール転送する
+        require_once('phonemessage/config.csp');
+        $config_manager = GRN_PhoneMessage_ConfigManager::getInstance();
+        $personal_config
+            = $config_manager->getPersonalConfig($receiver);      // 電話メモの設定を取得する
+        if ($personal_config->getForwardEmailFlag()
+            && $uum->isActiveUser($uid)
+        ) {
+            // システムメールアカウントの状態を取得する
+            require_once('grn/system_mail.csp');
+            $system_email_config_manager
+                = GRN_SystemMailConfigManager::getInstance();
+            if ($system_email_config_manager->isAvailable()) {
+                // Toを取得する
+                if ($personal_config->getForwardUserEmailFlag()) {
+                    // 受信者のユーザー情報のメールアドレスを取得する
+                    $toMailAddress = $receiver->get('email_address');
+                } else {
+                    // 受信者の指定メールアドレスを取得する
+                    $toMailAddress = $personal_config->getOtherEmailAddress();
+                }
+
+                if (0 < strlen($toMailAddress)) {
+                    // ReplyToを取得する
+                    $replyToMailAddress = '';
+                    require_once('mail/application.csp');
+                    /** @var GRN_Mail_App $mail_app */
+                    $mail_app = $app_locator->getInstance(GRN_MAIL_APP_ID);
+                    if (is_object($mail_app)
+                        && is_a($mail_app, 'GRN_Mail_App')
+                    ) {
+                        if ($mail_app->isAvailableFor($sender)) {
+                            if ($mail_account_info
+                                = $mail_app->getDefaultMailAccountInfo($sender)
+                            ) {
+                                // 送信者の個人メールアカウントのメールアドレスを取得する
+                                $replyToMailAddress
+                                    = $mail_account_info['account_info']->email;
+                            }
+                        }
+                    }
+
+                    if (0 == strlen($replyToMailAddress)) {
+                        // 送信者のユーザー情報のメールアドレスを取得する
+                        $replyToMailAddress = $sender->get('email_address');
+                    }
+
+
+                    // 送信するメールを作成する
+                    $sender_user_info = [
+                        'col_display_name'          => 'display_name',
+                        'col_valid'                 => 'valid',
+                        'col_display_name_language' => 'display_name_language',
+                        'col_nickname'              => 'nickname',
+                        'col_position'              => 'position',
+                        'col_foreign_key'           => 'foreign_key'
+                    ];
+                    foreach ($sender_user_info as $col => $val) {
+                        $sender_user_info[$col] = $sender->get($val);
+                    }
+
+                    $args = [];
+                    $args['matter'] = $rcvLangMatter;
+                    $args['message'] = $inputMessage;
+                    $args["receiver_uid"] = $receiver_id;
+                    $args['sender_name'] = $uum->getNameOf($receiver,
+                        $sender_user_info, true);
+                    $args['client_name'] = $inputClientName;
+                    $args['telephone_number'] = $inputTelephoneNumber;
+                    $args['send_time'] = $send_timestamp;
+
+                    $mail_info = $controller_util->formatMail($args,
+                        $receiverLangCode);
+                    $mail_info['to'] = $toMailAddress;
+                    if (0 < strlen($replyToMailAddress)) {
+                        $mail_info['reply_to'] = $replyToMailAddress;
+                    }
+
+                    require_once('grn/locale.csp');
+                    $locale_manager = GRN_Locale_ConfigManager::getInstance();
+                    $locale_personal
+                        = $locale_manager->getPersonalConfig($receiver);
+                    $charset
+                        = $locale_personal->getReceivingEmailCharset();
+                    if ($charset == 'auto') {
+                        require_once('fw/i18n.csp');
+                        $i18n = CB_I18N::getInstance();
+                        $charset
+                            = $i18n->getEncodingByLocale($receiverLangCode);
+                    }
+
+                    // システムメールアカウントからメールを送信する
+                    $controller_util->sendSystemMail($mail_info,
+                        $receiverLangCode, $charset);
+
+                }
+            }
+        }
+
+        $push_notification_register = new PushNotificationRegister();
+        if ($push_notification_register->isAvailable()) {
+            $conversion_data = new PushConversionData(
+                $inputClientName,
+                $inputMatter,
+                $inputMessage,
+                $receiver,
+                $sender,
+                $inputTelephoneNumber
+            );
+            $push_notification_register->enqueuePushRequest($conversion_data);
+        }
+    }
+
+    cb_redirect('phonemessage/history', ['cid' => 'sent', 'uid' => $sender_id]);
+}
+
+

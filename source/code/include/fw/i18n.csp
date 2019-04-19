@@ -1,0 +1,1301 @@
+<?php
+
+/**
+ * Internationalization (I18N) utilities (locales, timezones).
+ *
+ * @package fw.core
+ */
+
+require_once('fw/module.csp');
+require_once('fw/persistent.csp');
+
+define('CB_I18N_LOCALE_KEY', 'lcl');
+define('CB_I18N_LOCALE_AVAILABLE', 1);
+define('CB_I18N_LOCALE_INFO_FILENAME', 'info.ini');
+define('CB_I18N_DEFUALT_LANGUAGE_CODE', 'def');
+
+/**
+ * In-memory cache using a path-based access method implemented using a nested array structure.
+ *
+ * Items are retrieved using paths. Querying a cache with the following example layout using
+ * the call
+ *
+ *     $my_cache->read( "en", "message", "grn/widget/factory", "name" );
+ *
+ * will return the value associated with the "name" key in the associative array,
+ * "Rube Goldberg Monkey Mechanic". Likewise, the call
+ *
+ *     $my_cache->read( "en" );
+ *
+ * will return the value associated with the top-level "en" key, which is an array.
+ *
+ * Array(
+ *     [en] => Array(
+ *         [message] => Array(
+ *             [grn/widget/factory] => Array(
+ *                 [mold] => Engine Housing Pattern #3
+ *                 [name] => Rube Goldberg Monkey Mechanic
+ *                 ...
+ *             )
+ *             ...
+ *         )
+ *         ...
+ *     )
+ *     [ja] => Array(
+ *         ...
+ *     )
+ *     ...
+ * )
+ *
+ * Items can be written using any path. Non-existant parents are created as
+ * necessary. Existing leaf nodes are overwritten. The leaf nodes (the values
+ * in the associative array) can be of any type; but all branch nodes are
+ * either of type array, or are keys in an associative array. Given an empty
+ * cache, the call
+ *
+ *     $my_cache->write( "a", "b", "c", "d", new Widget() );
+ *
+ * results in the following structure:
+ *
+ * Array(
+ *     [a] => Array(
+ *         [b] => Array(
+ *             [c] => Array(
+ *                 [d] => (Object)
+ *             )
+ *         )
+ *     )
+ * )
+ *
+ * Notice that the last two parameters are treated as the key and value in
+ * the associative array specified by the parameters that come before. In
+ * the example, "a", "b" & "c" are treated as the path, and "d" & the Widget
+ * object are treated as the key and value, respectively.
+ *
+ * @package fw.core
+ */
+class CB_I18N_Cache
+{
+    /**
+     * @access private
+     */
+    var $_cache = [];
+
+    /**
+     * Usage: read( path element, path element ... )
+     *
+     * @return mixed    Specified resource (string, array, etc.), or null if the path doesn't exist.
+     */
+    function read()
+    {
+        $cursor =& $this->_cache;
+        $args = func_get_args();
+        foreach ($args as $arg) {
+            if ( ! array_key_exists($arg, $cursor)) {
+                return null;
+            }
+            $cursor =& $cursor[$arg];
+        }
+
+        return $cursor;
+    }
+
+    /**
+     * Usage: write( path element, path element ..., value )
+     */
+    function write()
+    {
+        // Navigate down into the nested array structure
+        $cursor =& $this->_cache;
+        $max = func_num_args();
+
+        // Implementation note: We walk down the path provided by the function arguments until the last 2 parameters.
+        // The parameters that come before them are treated as the path.
+        for ($i = 0; $i <= $max - 3; $i++) // Magic number 3 means ignore the last 2 parameters.
+        {
+            $path_el = func_get_arg($i);
+            if ( ! array_key_exists($path_el, $cursor)
+                 or ! is_array($cursor[$path_el])
+            ) {
+                $cursor[$path_el] = [];
+            }
+            $cursor =& $cursor[$path_el];
+        }
+
+        // Associate the 2nd last parameter with the last parameter at this level in the nested array structure
+        $cursor[func_get_arg($max - 2)] = func_get_arg(
+            $max - 1
+        ); // Magic numbers: 2nd to last parameter, and last parameter, respectively
+    }
+}
+
+/**
+ * Manage current locale setting, and provide locale-dependent methods.
+ *
+ * @package fw.core
+ */
+class CB_I18N extends CB_ModuleBase
+{
+    /**
+     * @access private
+     */
+    var $_cache = null;
+    /**
+     * @access private
+     */
+    var $_default_locale;
+    /**
+     * @access private
+     */
+    var $_default_timezone;
+    /**
+     * @access private
+     */
+    var $_current_locale;
+    /**
+     * @access private
+     */
+    var $_current_timezone;
+    /**
+     * @access private
+     */
+    var $_current_timenotation;
+    /**
+     * @access private
+     */
+    var $_session = null;
+
+    var $_force_locale = null;
+
+    //GTM-129 for server side customization
+    private $_resource_filename_pattern = null;
+    private $_custom_filename_pattern = null;
+
+    private static $_instance = null;
+
+    private static $available_timezones = null;
+
+    private static $timezone_regions = null;
+
+    const LOCALE_WITHOUT_DB_CONNECTION = 'en';
+    const TIMEZONE_WITHOUT_DB_CONNECTION = 'UTC';
+    const DEFAULT_TIMEZONE = 'Asia/Tokyo';
+
+    /**
+     * Get CB_I18n instance statically
+     *
+     * @return CB_I18n
+     */
+    public static function getInstance()
+    {
+        if (self::$_instance === null) {
+            self::$_instance = new self();
+        }
+
+        return self::$_instance;
+    }
+
+    /**
+     * Set instance without DB access.
+     *
+     * @return CB_I18N
+     */
+    private function setInstanceWithoutDBConnection()
+    {
+        // DB接続が行えないときは、ロケールはen、タイムゾーンはUTCを使用する
+        $this->_current_locale = self::LOCALE_WITHOUT_DB_CONNECTION;
+        $this->_default_locale = self::LOCALE_WITHOUT_DB_CONNECTION;
+        $this->_current_timezone = self::TIMEZONE_WITHOUT_DB_CONNECTION;
+        date_default_timezone_set(self::DEFAULT_TIMEZONE);
+        $this->_current_timenotation = '';
+        self::$_instance = $this;
+    }
+
+    function __construct()
+    {
+        parent::__construct('fw.i18n');
+
+        // In-memory resource cache
+        $this->_cache = new CB_I18N_Cache();
+
+        // CB_I18Nの初期化中にエラーが出たときのためにインスタンスを設定しておく
+        $this->setInstanceWithoutDBConnection();
+
+        // ここまではDB接続が行われてはいけない
+
+        global $G_config_common, $G_INPUT, $G_state_set;
+        require_once("fw/i18n/locale.csp");
+        $this->_default_locale = CB_LocaleManager::getDefaultLanguage();
+        $this->_default_timezone = self::getInitDefaultTimezone();
+        //In case run command line to version up from GR 2.x,
+        //the default_timezone = JST is not supported in list of timzone. So replace default timezone by "Asia/Tokyo"
+        if ($this->_default_timezone == 'JST') {
+            $this->_default_timezone = 'Asia/Tokyo';
+        }
+        if ( ! date_default_timezone_set($this->_default_timezone)) {
+            require_once('fw/error_code.csp');
+            cb_throw_error(E_COMMON_MISSING_TIMEZONE, null, null,
+                ['timezone' => $this->_default_timezone]);
+        }
+
+        // Force English if invoked by command-line.
+        if ($G_state_set->get('command_line')) {
+            $this->_current_locale = 'en';
+            $this->_current_timezone = $this->_default_timezone;
+            $this->_current_timenotation = '';
+
+            return;
+        }
+
+        $this->_current_locale = $this->_default_locale;
+        $this->_current_timezone = $this->_default_timezone;
+
+        $session = $this->getSession();
+        $this->_session = $session;
+
+        $current_locale = $session->get('locale');
+        if ( ! is_null($current_locale)) {
+            $this->_current_locale = $current_locale;
+        }
+
+        $this->_current_timenotation = $session->get('timenotation');
+
+        $this->_force_locale = null;
+    }
+
+    /**
+     * @param $locale
+     */
+    function forceLocale($locale)
+    {
+        $this->_force_locale = $locale;
+    }
+
+    /**
+     * @param $locale
+     */
+    function switchUserLocale($locale = null)
+    {
+        global $G_config_common, $G_container_base;
+
+        $user = null;
+        // Identify the current user, if any
+        $uum = $G_container_base->getInstance('uum');
+        $user = $uum->getLoginUser();
+        if ( ! is_a($user, 'CB_User')) {
+            $user = null;
+        }
+
+        $this->switchCurrentLocale($locale, $user);
+    }
+
+    /**
+     * @param         $locale
+     * @param CB_User $user
+     */
+    function switchCurrentLocale($locale = null, $user = null)
+    {
+        // Decide what the current locale should become
+        global $G_config_common;
+
+        require_once("fw/i18n/locale.csp");
+        $available = CB_LanguageManager::getAvailableLanguages();
+
+        $user_id = is_null($user) ? null : $user->getOID();
+        $user_language = CB_LocaleManager::getCurrentLanguage($user_id);
+
+        $locale = coalesce($locale, $user_language);
+        $locale = in_array($locale, $available) ? $locale
+            : $this->_default_locale;
+
+        $this->setCurrentLocale($locale);
+    }
+
+    /**
+     * @param $timezone
+     */
+    public function switchTimezone($timezone = null)
+    {
+        global $G_config_common;
+
+        if (is_null($timezone)) {
+            global $G_container_base;
+            /** @var GRN_Uum $uum */
+            $uum = $G_container_base->getInstance('uum');
+            $login = $uum->getLoginUser();
+            if ($login instanceof CB_User) {
+                $timezone = $this->getUserTimezone($login);
+            }
+        }
+
+        if (self::isAvailableTimezone($timezone)) {
+            $this->_current_timezone = $timezone;
+        }
+    }
+
+    /**
+     * Get the $user's timezone.
+     *
+     * @param CB_User $user
+     *
+     * @return string        $user's timezone
+     */
+    public static function getUserTimezone($user)
+    {
+        static $_cache = [];
+
+        assert('$user instanceof CB_User');
+
+        $user_id = $user->getOID();
+        if ( ! isset($_cache[$user_id])) {
+            $_cache[$user_id] = $user->get('timezone');
+        }
+
+        return $_cache[$user_id];
+    }
+
+
+    /**
+     * Set the $user's timezone.
+     *
+     * @param CB_User $user
+     * @param string  $timezone
+     */
+    public function setUserTimezone($user, $timezone)
+    {
+        global $G_container_base;
+        /** @var GRN_Uum $uum */
+        $uum = $G_container_base->getInstance('uum');
+        $uum->setUserProperties($user->getOID(), ['timezone' => $timezone]);
+    }
+
+    /**
+     * @param $locale
+     */
+    function setCurrentLocale($locale)
+    {
+        $this->_current_locale = $locale;
+
+        if ( ! is_null($this->_session)) {
+            $this->_session->set('locale', $locale);
+        }
+    }
+
+    /**
+     * @return null|string
+     */
+    function getCurrentLanguage()
+    {
+        if (is_null($this->_force_locale)) {
+            return $this->_current_locale;
+        }
+
+        return $this->_force_locale;
+    }
+
+    /**
+     * @return string
+     */
+    public function getDefaultLanguage()
+    {
+        return $this->_default_locale;
+    }
+
+    /**
+     * @return string
+     */
+    function getDefaultEncoding()
+    {
+        $locale = $this->getCurrentLanguage();
+        $encoding = $this->getEncodingByLocale($locale);
+
+        return $encoding;
+    }
+
+    /**
+     * ロケールに対応するエンコードを返す
+     * TODO 設定をcommon.iniなど外部に抜き出す
+     *
+     * @param string $locale
+     *
+     * @return string
+     */
+    function getEncodingByLocale($locale)
+    {
+        switch ($locale) {
+            case 'ja':
+                return 'SJIS-win';
+            case 'zh':
+                return 'GB2312';
+            case 'th':
+                return 'TIS-620';
+            case 'en':
+            default :
+                return 'UTF-8';
+        }
+    }
+
+    /**
+     * @return array
+     */
+    function getAvailableEncodings()
+    {
+        global $G_config_common;
+        $available_encodings = explode(' ',
+            $G_config_common->get('I18N', 'available_encodings'));
+
+        return $available_encodings;
+    }
+
+    /**
+     * @param $tz
+     */
+    function setCurrentTimezone($tz)
+    {
+        $this->_current_timezone = $tz;
+
+        if ( ! is_null($this->_session)) {
+            $this->_session->set('timezone', $tz);
+        }
+    }
+
+    /**
+     * @return string
+     */
+    function getCurrentTimezone()
+    {
+        return $this->_current_timezone;
+    }
+
+    /**
+     * @return string
+     */
+    public function getDefaultTimezone()
+    {
+        return $this->_default_timezone;
+    }
+
+    /**
+     *  set time notation
+     *
+     * @param  string $timenotation '12' or '24'
+     */
+    function setCurrentTimeNotation($timenotation)
+    {
+        $this->_current_timenotation = $timenotation;
+
+        if ( ! is_null($this->_session)) {
+            $this->_session->set('timenotation', $timenotation);
+        }
+    }
+
+    /**
+     * @return string
+     */
+    function getCurrentTimeNotation()
+    {
+        return $this->_current_timenotation;
+    }
+
+    /**
+     * @access private
+     */
+    var $_resource_table = [];
+
+
+    /**
+     * Given a locale, resolves the parent locale. For example, 'zh_CN'
+     * resolves to 'zh'.
+     *
+     * @param string $locale
+     *
+     * @return mixed Either a string representing the parent locale if
+     *               there is one, or FALSE otherwise.
+     */
+    function resolveParentLocale($locale)
+    {
+        $locale = str_replace('-', '_', $locale);
+        if (strpos($locale, '_') === false) {
+            return false;
+        }
+
+        $t = explode('_', $locale);
+
+        return $t[0];
+    }
+
+    /**
+     * Find and return locale dependent resources.
+     *
+     * @param string      $type   Resource type (case insensitive).
+     * @param string      $module Module ID (case insensitive).
+     *                            This must be unique in a resource type.
+     * @param string      $id     Resource ID.
+     *                            This must be unique in a module.
+     * @param bool|string $enable_assertion
+     *                            Boolean,
+     * @param string      $locale Locale tag (case sensitive).
+     *
+     * @return mixed           Specified resource (string, array, etc.).
+     */
+    function getResource(
+        $type,
+        $module,
+        $id,
+        $enable_assertion = true,
+        $locale = null
+    ) {
+        //
+        // Establish the order resource locales will be searched
+        //
+
+        $locale_search_order = [];
+
+        // Search the requested locale first
+        array_unshift($locale_search_order,
+            ($locale !== null ? $locale : $this->getCurrentLanguage()));
+
+        // If there is a parent locale, add it to the search order
+        $parent_locale = $this->resolveParentLocale($locale);
+        if (strlen($parent_locale) >= 1) {
+            array_push($locale_search_order, $parent_locale);
+        }
+
+        // Use the default locale as the last resort
+        //GRN2-3236
+        $locale = $this->getDefaultLanguage();
+        array_push($locale_search_order, $locale);
+        //GRN2-3236
+        //
+        // Search the locale resources in order until the requested resource is found
+
+        //
+        $type = strtolower($type);
+        $module = strtolower(str_replace('.', '/',
+            $module));
+        $this->_resource_filename_pattern = cb_basedir() . '/locale/%s/' . $type
+                                            . '/' . $module;
+        $resource = [];
+
+        //GTM-129 for server side customization
+        if (defined('ON_FOREST') && ($type !== 'tplrc')) {
+            require_once('grn/CustomUtil.csp');
+            $customutil = GRN_Custom_Util::getInstance();
+            $this->_custom_filename_pattern
+                = $customutil->getCustomResourceFile($type, $module);
+        }
+
+        foreach ($locale_search_order as $l) {
+            // Check the in-memory cache
+            $rez = $this->_cache->read($l, $type, $module, $id);
+            if ( ! empty($rez)) {
+                // We found the requested resource in the cache ("cache hit")
+                return $rez;
+            }
+
+            // GTM-129 for server side customization
+            // set the resource file name of application resource
+            $filename = $this->_confirmResourceFile($l, null);
+
+            // If the requested resource wasn't found in the cache, check the on-disc resources next ("cache miss")
+            if ($filename !== null) {
+                // Try to access the specified resource in this locale
+                unset($G_resources);
+
+                include($filename);
+                if ( ! is_array($G_resources)) {
+                    cb_throw_error(); // TODO Does this error screen help users resolve the problem?
+                }
+
+                if (array_key_exists($id, $G_resources)) {
+                    // Cache the resource array ..
+                    $this->_cache->write($l, $type, $module, $G_resources);
+
+                    // .. and return the requested resource
+                    return $G_resources[$id];
+                }
+                unset($G_resources);
+            }
+            // Search common locales
+            // Check the in-memory cache
+            $rez = $this->_cache->read('common', $type, $module, $id, $l);
+            if ( ! empty($rez)) {
+                // We found the requested resource in the cache ("cache hit")
+                return $rez;
+            }
+
+            // GTM-129 for server side customization
+            // set the resource file name of common resource
+            $filename = $this->_confirmResourceFile($l, $id);
+
+            // If the requested resource wasn't found in the cache, check the on-disc resources next ("cache miss")
+            if ($filename !== null) {
+                // Try to access the specified resource in this locale
+                unset($G_resources);
+
+                include($filename);
+                if ( ! is_array($G_resources)) {
+                    cb_throw_error(); // TODO Does this error screen help users resolve the problem?
+                }
+
+                if (array_key_exists($l, $G_resources)) {
+                    // Cache the resource array ..
+                    $this->_cache->write('common', $type, $module, $id,
+                        $G_resources);
+
+                    // .. and return the requested resource
+                    return $G_resources[$l];
+                }
+                unset($G_resources);
+            }
+        }
+
+
+        //
+        // The resource wasn't found; handle this error condition.
+        //
+
+        global $G_config_common;
+        $is_develop = $G_config_common->get('Global', 'develop');
+        if ($is_develop && ($type == 'tplrc')) {
+            // Return a conspicuous string that loosely indicates "I don't have
+            // a localized resource for that key."
+            return 'XX' . "$module.$id" . 'XX';
+        }
+        if ($enable_assertion) {
+            // This is likely in a production environment, so use cb_throw_error()
+            // to report information that will help the customer easily communicate
+            // the issue to customer support.
+            cb_throw_error();
+        }
+
+        return false;
+    }
+
+    // GTM-129 for server side customization
+    // if the resource file exists return the file name
+    private function _confirmResourceFile($lang, $key)
+    {
+        if ($this->_custom_filename_pattern !== null) {
+            if ($key === null) {
+                $filename = sprintf($this->_custom_filename_pattern, $lang)
+                            . '.csp';
+            } else {
+                $filename = sprintf($this->_custom_filename_pattern, 'common')
+                            . '/' . strtolower($key) . '.csp';
+            }
+
+            if (file_exists($filename)) {
+                return $filename;
+            }
+        }
+
+        if ($key === null) {
+            $filename = sprintf($this->_resource_filename_pattern, $lang)
+                        . '.csp';
+        } else {
+            $filename = sprintf($this->_resource_filename_pattern, 'common')
+                        . '/' . strtolower($key) . '.csp';
+        }
+
+        if (file_exists($filename)) {
+            return $filename;
+        }
+
+        return null;
+    }
+
+    /**
+     * Return the associative array of available encoding keys
+     * and names.  Encoding names are printed denepnding on the
+     * current locale.
+     *
+     * @return array An associative array of encoding key and name.
+     */
+    function getEncodingNames()
+    {
+        static $gotten_encoding_names = null;
+        if ( ! is_null($gotten_encoding_names)) {
+            return $gotten_encoding_names;
+        }
+
+        // get application specific available_encodings definition.
+        $available_encodings = $this->getAvailableEncodings();
+
+        // select encoding names based on the current locale
+        $gotten_encoding_names = [];
+        foreach ($available_encodings as $encoding) {
+            $gotten_encoding_names[$encoding] = cb_msg('fw.encodings',
+                $encoding);
+        }
+
+        return $gotten_encoding_names;
+    }
+
+    /**
+     * @return mixed
+     */
+    function getAvailableLanguages()
+    {
+        require_once("fw/i18n/locale.csp");
+
+        return CB_LanguageManager::getAvailableLanguages();
+    }
+
+    /**
+     * @return null
+     */
+    public static function getAvailableTimezones()
+    {
+        if (is_null(self::$available_timezones)) {
+            global $G_container_base;
+            $tzfactory = $G_container_base->getInstance('timezoneinfo_factory');
+            self::$available_timezones = $tzfactory->getTimezoneNames();
+        }
+
+        return self::$available_timezones;
+    }
+
+    /**
+     * @static
+     *
+     * @param $timezone
+     *
+     * @return bool
+     */
+    public static function isAvailableTimezone($timezone)
+    {
+        return in_array($timezone, self::getAvailableTimezones());
+    }
+
+    /**
+     * @static
+     *
+     * @param $locale
+     *
+     * @return bool
+     */
+    public static function isAvailableLocale($locale)
+    {
+        require_once("fw/i18n/locale.csp");
+
+        return in_array($locale, CB_LanguageManager::getAvailableLanguages());
+    }
+
+    /**
+     * @return string
+     */
+    public static function getInitDefaultTimezone()
+    {
+        global $G_config_common;
+        $default_timezone = self::DEFAULT_TIMEZONE;
+        if ( ! cb_is_init_process()) {
+            require_once('fw/module.csp');
+            $module = new CB_ModuleBase('fw.i18n.timezone');
+            $profile = $module->getSystemProfile();
+            $profile->getAttribute("default_timezone", $default_timezone);
+        }
+
+        return $default_timezone;
+    }
+
+    /**
+     * @param $timezone
+     */
+    public static function setDefaultTimezone($timezone)
+    {
+        if (self::isAvailableTimezone($timezone)) {
+            global $G_config_common;
+
+            require_once('fw/module.csp');
+            $module = new CB_ModuleBase('fw.i18n.timezone');
+            $profile = $module->getSystemProfile();
+
+            // GRN35-220
+            $temp;
+            if ( ! $profile->getAttribute("default_timezone", $temp)) {
+                $profile->createAttribute('default_timezone', $timezone);
+            } else {
+                $profile->updateAttribute('default_timezone', $timezone);
+            }
+            // GRN35-220
+        }
+    }
+
+    protected static $encoding_aliases
+        = [
+            'cn-gb'       => 'GB2312',
+            'euc_cn'      => 'GB2312',
+            'euccn'       => 'GB2312',
+            'x-euc-cn'    => 'GB2312',
+            'euc'         => 'EUC-JP',
+            'euc_jp'      => 'EUC-JP',
+            'eucjp'       => 'EUC-JP',
+            'x-euc-jp'    => 'EUC-JP',
+            'shift-jis'   => 'Shift_JIS',
+            'sjis'        => 'Shift_JIS',
+            'x-sjis'      => 'Shift_JIS',
+            'jis'         => 'ISO-2022-JP',
+            'jis-ms'      => 'ISO-2022-JP',
+            'windows-874' => 'TIS-620',
+        ];
+
+    /**
+     * @param $encoding
+     *
+     * @return mixed
+     */
+    function getEncoder($encoding)
+    {
+        $ret = false;
+        if (array_key_exists(strtolower($encoding), self::$encoding_aliases)) {
+            $encoding = self::$encoding_aliases[strtolower($encoding)];
+        }
+
+        $loader = $this->getPluginLoader();
+        $ret = $loader->loadDriver(strtolower(str_replace('-', '_',
+            $encoding)));
+
+        return $ret;
+    }
+
+    /**
+     * @return mixed
+     */
+    function getLanguageFromHttpHeader()
+    {
+        $langs = cb_get_http_accept_language();
+        $browser_locale = null;
+        foreach ($langs as $l) {
+            if ($l = $this->convertToAvailableLanguage($l)) {
+                $browser_locale = $l;
+                break;
+            }
+        }
+
+        return $browser_locale;
+    }
+
+    /**
+     * @param $language
+     *
+     * @return mixed
+     */
+    function convertToAvailableLanguage($language)
+    {
+        $available_languages = $this->getAvailableLanguages();
+        $language = str_replace('-', '_', $language);
+        if (preg_match('/^zh.*_tw$/i', $language)) {
+            $language = 'zh-tw';
+        }
+
+        while ( ! in_array($language, $available_languages)
+                && $language != false) {
+            $language = CB_I18N::resolveParentLocale($language);
+        }
+
+        return $language;
+    }
+
+    /**
+     * @return array|null
+     */
+    public static function getTimezoneRegions()
+    {
+        if (is_null(self::$timezone_regions)) {
+            $regions = [];
+            $regions[] = '(All)';
+            $timezones = self::getAvailableTimezones();
+            foreach ($timezones as $timezone) {
+                $tokens = explode('/', $timezone);
+                $region = $tokens[0];
+                if ( ! array_key_exists($region, $regions)) {
+                    $regions[$region] = $region;
+                }
+            }
+            self::$timezone_regions = $regions;
+        }
+
+        return self::$timezone_regions;
+    }
+
+    /**
+     * Get offset info between two timezones
+     *
+     * @param string $src_timezone
+     * @param string $dst_timezone
+     * @param int    $timestamp
+     *
+     * @return array array('hour'=>int, 'minute'=>positive int)
+     */
+    public static function getTimezonesOffsetInfo(
+        $src_timezone,
+        $dst_timezone,
+        $timestamp = null
+    ) {
+        if (is_null($timestamp)) {
+            $timestamp = time();
+        }
+
+        $offset = cb_get_timezone_offset($src_timezone, $timestamp)
+                  - cb_get_timezone_offset(
+                      $dst_timezone, $timestamp
+                  );
+        $hour = (int)($offset / CB_TimeUnit::SECONDS_OF_HOUR);
+        $minute = $offset % CB_TimeUnit::SECONDS_OF_HOUR
+                  / CB_TimeUnit::MINUTES_OF_HOUR;
+
+        if ($minute < 0) {
+            $hour--;
+            $minute += CB_TimeUnit::MINUTES_OF_HOUR;
+        }
+
+        assert('$minute >= 0');
+
+        return ['hour' => $hour, 'minute' => $minute];
+    }
+
+    /**
+     * Translate $datetime from $src_timezone to $dst_timezone.
+     *
+     * @param CB_DateTime $datetime
+     * @param string      $src_timezone
+     * @param string      $dst_timezone
+     *
+     * @return CB_DateTimeEx|CB_DateTime
+     */
+    public static function translateDatetimeTimezone(
+        $datetime,
+        $src_timezone,
+        $dst_timezone
+    ) {
+        if ($src_timezone === $dst_timezone) {
+            return $datetime;
+        }
+
+        return new CB_DateTimeEx(
+            cb_timestamp_to_datetime(cb_datetime_to_timestamp($datetime,
+                $src_timezone), $dst_timezone)
+        );
+    }
+}
+
+/**
+ * Character Encoder Base class
+ *
+ * @auther   Eiji TAEN
+ * @abstract
+ */
+class CB_I18N_EncoderBase
+{
+    var $_charset = null;
+
+    /**
+     * constructor
+     */
+    function __construct($charset = null)
+    {
+        $this->_charset = $charset;
+    }
+
+    /**
+     * must override this function in the inherited class.
+     */
+    function getCharset()
+    {
+        return $this->_charset;
+    }
+
+    /**
+     * must override this function in the inherited class.
+     */
+    function convFromUTF8($str)
+    {
+        $ret = $str;
+
+        return $ret;
+    }
+
+    /**
+     * must override this function in the inherited class.
+     */
+    function convToUTF8($str)
+    {
+        $ret = $str;
+
+        return $ret;
+    }
+
+    /**
+     * return string array which is converted from UTF-8
+     */
+    function convFromUTF8Array($str_array)
+    {
+        $conv = [];
+        foreach ($str_array as $key => $str) {
+            $conv[$key] = $this->convFromUTF8($str);
+        }
+
+        return $conv;
+    }
+
+    /**
+     * return string array which is converted to UTF-8
+     */
+    function convToUTF8Array($str_array)
+    {
+        $conv = [];
+        foreach ($str_array as $key => $str) {
+            $conv[$key] = $this->convToUTF8($str);
+        }
+
+        return $conv;
+    }
+}
+
+/**
+ * 国際化メッセージリソース変換関数.
+ *
+ * $args で埋め込む内容は、使われるロケールにあわせて
+ * 国際化されていなければならない。 htmlspecialchars() されて埋め込まれる。
+ *
+ * @param string $module      モジュール名
+ * @param string $resourceKey リソースのキー(モジュールごとに一意)
+ * @param array  $args        オプションで指定可能な埋め込みパラメータの連想配列。
+ * @param string $locale      使用する言語( null or 省略した場合はユーザーのロケール)
+ *
+ * @return string 国際化されたメッセージ
+ */
+function cb_msg($module, $resourceKey, $args = null, $locale = null)
+{
+    static $message = [];
+    $key = $module . "-" . $resourceKey . "-" . $locale;
+    if (isset($message[$key])) {
+        $translatedText = $message[$key];
+    } else {
+        $i18n = CB_I18N::getInstance();
+        $translatedText = $i18n->getResource('message', $module, $resourceKey,
+            false, $locale);
+        $message[$key] = $translatedText;
+    }
+
+    if ( ! is_null($args)) {
+        $translatedText = cb_fillInTemplate($translatedText, $args);
+    }
+
+    return $translatedText;
+}
+
+/**
+ * @param string $module
+ * @param string $resourceKey
+ *
+ * @return string|bool
+ */
+function cb_msg_tplrc($module, $resourceKey)
+{
+    global $G_config_common;
+    $is_develop = $G_config_common->get('Global', 'develop');
+    if ( ! $is_develop) {
+        return false;
+    }
+
+    $i18n = CB_I18N::getInstance();
+    $translatedText = $i18n->getResource('tplrc', $module, $resourceKey, false);
+
+    return $translatedText;
+}
+
+/**
+ * @param string $template_string
+ * @param array  $args
+ *
+ * @return string
+ */
+function cb_fillInTemplate($template_string, $args)
+{
+    //assert('is_string($template_string)');
+    // $template_string is null when this function called from cb_msg("fw.error", "Default Developer Info").
+    assert('is_array($args)');
+    $search = [];
+    $replace = [];
+    foreach ($args as $key => $value) {
+        $search[] = "&&{$key}&&";
+        if (array_key_exists('noescape', $args)
+            && $args['noescape'] == 'true'
+        ) {
+            $replace[] = $value;
+        } else {
+            $replace[] = htmlspecialchars($value);
+        }
+    }
+
+    return str_replace($search, $replace, $template_string);
+}
+
+
+/**
+ * 国際化メッセージリソース変換関数.
+ *
+ * $args で埋め込む内容は、使われるロケールにあわせて
+ * 国際化されていなければならない。
+ * $argsはhtmlspecialchars() されない。
+ *
+ * @param string $module      モジュール名
+ * @param string $resourceKey リソースのキー(モジュールごとに一意)
+ * @param array  $args        オプションで指定可能な埋め込みパラメータの連想配列。
+ * @param string $locale      使用する言語( null or 省略した場合はユーザーのロケール)
+ *
+ * @return string 国際化されたメッセージ
+ */
+function cb_plain_msg($module, $resourceKey, $args = null, $locale = null)
+{
+    $i18n = CB_I18N::getInstance();
+    $translatedText = $i18n->getResource('message', $module, $resourceKey, true,
+        $locale);
+
+    if ( ! is_null($args)) {
+        $matches = [];
+        foreach ($args as $key => $value) {
+            $offset = 0;
+            while (($start = strpos($translatedText, "&&${key}&&", $offset))
+                   !== false) {
+                $len = strlen("&&${key}&&");
+                $matches[$start] = ['len' => $len, 'replace' => $value];
+                $offset = $start + $len;
+            }
+        }
+        ksort($matches);
+        $matches[strlen($translatedText)] = ['len' => 0, 'replace' => ''];
+
+        $ptr = 0;
+        $ret_string = '';
+        foreach ($matches as $start => $info) {
+            if ($start < $ptr) {
+                continue;
+            }
+
+            $ret_string .= substr($translatedText, $ptr, $start - $ptr);
+            $ret_string .= $info['replace'];
+            $ptr = $start + $info['len'];
+        }
+
+        $translatedText = $ret_string;
+    }
+
+    return $translatedText;
+}
+
+/**
+ * Returns the first non-empty parameter (as defined by the PHP empty()
+ * function); or the last argument otherwise.
+ */
+function coalesce()
+{
+    $max = func_num_args();
+    for ($i = 0; $i < $max - 1; $i++) {
+        $value = func_get_arg($i);
+        if ( ! empty($value)) {
+            return $value;
+        }
+    }
+
+    return func_get_arg($max - 1);
+}
+
+function CB_I18N_IS_AVAILABLE($var)
+{
+    if ($var & CB_I18N_LOCALE_AVAILABLE) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * @param string      $str
+ * @param string      $to_encoding
+ * @param string|null $from_encoding
+ *
+ * @return string
+ */
+function cb_encode($str, $to_encoding, $from_encoding = null)
+{
+    $i18n = CB_I18N::getInstance();
+    if (strlen((string)$from_encoding) === 0) {
+        $from_encoding = mb_internal_encoding();
+    } elseif (mb_is_support_encoding($from_encoding) === false) {
+        $encoder = $i18n->getEncoder($from_encoding);
+        if ($encoder === false) {
+            $from_encoding = mb_detect_encoding($str);
+        } else {
+            $str = $encoder->convToUTF8($str);
+            $from_encoding = 'UTF-8';
+        }
+    } else {
+        $encoder = $i18n->getEncoder($from_encoding);
+        if ($encoder) {
+            $from_encoding = $encoder->getCharset();
+        }
+    }
+
+    $to_encoder = $i18n->getEncoder($to_encoding);
+    if ($to_encoder) {
+        $to_encoding = $to_encoder->getCharset();
+    }
+
+    if ($from_encoding === 'UTF-8') {
+        if ($to_encoder !== false) {
+            $internal = mb_internal_encoding();
+            if (strcasecmp($internal, 'UTF-8') !== 0) {
+                $str = mb_convert_encoding($str, 'UTF-8', $internal);
+            }
+            $encoded_str = $to_encoder->convFromUTF8($str);
+        } else {
+            $encoded_str = mb_convert_encoding($str, $to_encoding,
+                $from_encoding);
+        }
+    } else {
+        $encoded_str = mb_convert_encoding($str, $to_encoding, $from_encoding);
+    }
+
+    return $encoded_str;
+}
+
+/**
+ * Get multi langugage values from $G_INPUT given from the fields generated by smarty_function_grn_text_multilanguage.
+ *
+ * @param string $element_name the name of the element
+ * @param array  $input        $G_INPUT
+ *
+ * @return array array( "ja" => "東京", "en" => "Tokyo", ... )
+ */
+function getMultiLanguageText($element_name, $input)
+{
+    require_once("fw/i18n/locale.csp");
+
+    $lang_list = CB_LanguageManager::getAvailableLanguages();
+    $lang_list[] = CB_I18N_DEFUALT_LANGUAGE_CODE;
+    // array( "ja", "en", "zh", "def" );
+
+    $ret = [];
+
+    foreach ($lang_list as $lang) {
+        if (array_key_exists($element_name . "-" . $lang, $input)) {
+            $ret[$lang] = $input[$element_name . "-" . $lang];
+        }
+    }
+
+    if (array_key_exists($element_name . "-edit", $input)
+        && array_key_exists(
+            $element_name . "-edit-lang", $input
+        )
+    ) {
+        $ret[$input[$element_name . "-edit-lang"]] = $input[$element_name
+                                                            . "-edit"];
+    }
+
+    return $ret;
+}
+
+

@@ -1,0 +1,146 @@
+<?php
+
+namespace grn\fts;
+
+use grn\fts\exception\SearchException;
+
+class AccessControlledSearchLogic implements SearchLogicInterface
+{
+    const SIZE_LIMIT = 100;
+
+    /** @var string */
+    private $spaceAccessMode = '';
+
+    /** @var int */
+    private $requestTimeout = 10;
+
+    /** @var SearchLogicInterface */
+    private $searchLogic;
+
+    /**
+     * @param SearchLogicInterface $search_logic
+     */
+    public function __construct(SearchLogicInterface $search_logic)
+    {
+        global $G_config_common;
+        if ($requestTimeout = $G_config_common->get('FTS', 'request_timeout')) {
+            if (ctype_digit($requestTimeout) && $requestTimeout > 0) {
+                $this->requestTimeout = (int)$requestTimeout;
+            }
+        }
+        $this->searchLogic = $search_logic;
+    }
+
+    /**
+     * Search documents with considering access control.
+     *
+     * @param SearchQueryInterface $query
+     *
+     * @throws exception\NoServerConnectionException
+     * @throws exception\SearchException
+     * @return SearchResponseInterface
+     */
+    public function search(SearchQueryInterface $query)
+    {
+        $maxSize = $query->getSize();
+        if ($maxSize > self::SIZE_LIMIT) {
+            $maxSize = self::SIZE_LIMIT;
+        }
+
+        $size = 0;
+        $continuable = false;
+        $numChecked = $query->getStart();
+        $logic = $this->getSearchLogic();
+        $controller = $this->getAccessController();
+        $loginUser = cb_get_login_user();
+
+        // Not to repeat searching, multiply 1.5 by the size of the search query.
+        $query->setSize((int)($query->getSize() * 1.5));
+
+        $documents = [];
+        $startMicroTime = $this->getCurrentMicroTime();
+        $processingTime = 0;
+        do {
+            try {
+                $response = $logic->search($query);
+            } catch (SearchException $e) {
+                throw new SearchException("SearchLogic::search throws error", 0,
+                    $e);
+            }
+
+            $processingTime += $response->getProcessingTime();
+
+            foreach ($response->getDocuments() as $document) {
+                $numChecked++;
+
+                if ($controller->isAccessible($document, $loginUser)) {
+                    $size++;
+                    $documents[] = $document;
+                    if ($size === $maxSize) {
+                        $continuable = true;
+                        // break do-while loop.
+                        break 2;
+                    }
+                }
+            }
+
+            if ($this->getCurrentMicroTime() - $startMicroTime
+                > $this->requestTimeout
+            ) {
+                // when timeout, break and return response.
+                $continuable = true;
+                break;
+            }
+
+            $query->setStart($numChecked);
+        } while ($response->getContinuable());
+
+        $accessControlledResponse = new SearchResponse($documents, $numChecked,
+            $continuable, $processingTime);
+
+        return $accessControlledResponse;
+    }
+
+    /**
+     * @return \grn\fts\SearchLogicInterface
+     */
+    protected function getSearchLogic()
+    {
+        return $this->searchLogic;
+    }
+
+    /**
+     * @return \grn\fts\AccessControllerInterface
+     */
+    protected function getAccessController()
+    {
+        $controller = new AccessController();
+        $controller->setSpaceAccessMode($this->getSpaceAccessMode());
+
+        return $controller;
+    }
+
+    /**
+     * @return float
+     */
+    protected function getCurrentMicroTime()
+    {
+        return microtime(true);
+    }
+
+    /**
+     * @return string
+     */
+    public function getSpaceAccessMode()
+    {
+        return $this->spaceAccessMode;
+    }
+
+    /**
+     * @param string $spaceAccessMode
+     */
+    public function setSpaceAccessMode($spaceAccessMode)
+    {
+        $this->spaceAccessMode = $spaceAccessMode;
+    }
+}

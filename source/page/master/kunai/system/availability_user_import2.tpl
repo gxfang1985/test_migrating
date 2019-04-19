@@ -1,0 +1,2 @@
+{include file='kunai/system/_availability_user_csv_columns.tpl'}
+{include file='grn/std_import2.tpl' prev_page='kunai/system/availability_user_import1' column_explanation=$smarty.capture.explanation config_id='system' app_id='kunai'}

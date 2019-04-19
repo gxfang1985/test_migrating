@@ -1,0 +1,299 @@
+<?php
+
+use grn\grn\access\service\AppAccess;
+
+require_once('grn/application.csp');
+
+global $G_INPUT;
+
+require_once('grn/smarty.csp');
+$t = new GRN_Smarty;
+
+////////////////////////////////////////////////////////////////
+
+// 電話メモを取得する
+require_once('phonemessage/application.csp');
+$app_locator = GRN_ApplicationLocator::instance();
+/** @var GRN_PhoneMessage_Application $app */
+$app = $app_locator->getInstance(GRN_PHONEMESSAGE_APPLICATION_ID);
+if ( ! is_object($app) || ! is_a($app, 'GRN_PhoneMessage_Application')) {
+    cb_throw_error(E_GRN_APPLICATION_NOT_AVAILABLE);
+}
+$application_name = $app->getName();
+
+// GET/POSTされたパラメータを取得する
+$gid = null;
+if (array_key_exists('gid', $G_INPUT)) {
+    $gid = $G_INPUT['gid'];
+}
+
+if (array_key_exists('sf', $G_INPUT)) {
+    // セッションからパラメータを取得する
+    $session =& $app->getSession();
+
+    $search_text = $session->get('search_text');
+    $sensitive = $session->get('sensitive');
+} else {
+    $search_text = '';
+    if (array_key_exists('search_text', $G_INPUT)) {
+        $search_text = $G_INPUT['search_text'];
+    }
+    $search_text = cb_trim($search_text);
+
+    $sensitive = false;
+    if (array_key_exists('sensitive', $G_INPUT)) {
+        $sensitive = $G_INPUT['sensitive'];
+    }
+}
+
+$offset = 0;
+$limit = 0;
+$user_count = 0;
+require_once('phonemessage/controller.csp');
+$controller_util = new GRN_PhoneMessage_ControllerUtil();
+
+// ログインユーザーを取得する
+$uum = cb_lwc_uum();
+$login = $uum->getLoginUser();
+if ( ! is_object($login) || ! is_a($login, 'CB_User')) {
+    cb_throw_error(E_GRN_USER_NOT_FOUND);
+}
+$login_for_view = $uum->getLoginUserInfo();
+$login_id = $login->getOID();
+
+// 電話メモの設定を取得する
+require_once('grn/ui.csp');
+$ui_config_manager = GRN_UIConfigManager::getInstance();
+$ui_config = $ui_config_manager->getUserConfig($login);
+$limit = $ui_config->getListMax();
+
+require_once('phonemessage/config.csp');
+$config_manager = GRN_PhoneMessage_ConfigManager::getInstance();
+$system_config = $config_manager->getSystemConfig();
+
+$app_locator = GRN_ApplicationLocator::instance();
+$dbconn = $app_locator->getConnection('phonemessage');
+
+$search_words = [];
+$users_for_view = [];
+$isExistsNextPage = false;
+if (0 < strlen($search_text)) {
+    require_once('fw/string_util.csp');
+    $search_words = cb_parse_search_text($search_text);
+
+    $search_keys = [
+        'display_name',
+        'sort_key'
+    ];
+
+    // 組織IDを取得する
+    if (0 == strlen($gid)) {
+        // 優先する組織から取得する
+        $group_info = $uum->getUserPrimaryGroupInfo($login_id);
+        $group_id = ($group_info === false) ? -1 : $group_info['_id'];
+        $gid = $group_id;
+    } elseif ('m' == $gid{0}) {
+        // Myグループから取得する
+        $group_id = substr($gid, 1);
+        $groups_info = $uum->getMyGroupsInfo($login_id);
+        if ( ! array_key_exists($group_id, $groups_info)) {
+            cb_throw_error(E_GRN_MYGROUP_NOT_FOUND);
+        }
+    } elseif (0 >= $gid) {
+        // 全体を取得する
+        $group_id = -1;
+        $gid = -1;
+    } else {
+        // 組織から取得する
+        $group_id = $gid;
+        $groups_info = $uum->getGroupInfoList();
+        if ( ! array_key_exists($group_id, $groups_info)) {
+            cb_throw_error(E_GRN_GROUP_NOT_FOUND);
+        }
+    }
+
+    $usergroups_info = $uum->getUserGroupsInfo($login_id);
+
+    // ダイナミックロールを取得する
+    $dynamic_roles = $uum->listGrantedRoles();
+
+    require_once('grn/org_util.csp');
+    require_once('grn/org_util_search.csp');
+
+    // ユーザー一覧を取得する
+    $offset = $controller_util->getNaviStartPosition();
+    $controller_util->setNaviStartPosition($offset);
+    if (-1 == $group_id) {
+        // 全ユーザーを取得する
+        $poid = null;
+    } elseif ('m' == $gid{0}) {
+        // Myグループから取得する
+        $poid = $gid;
+    } else {
+        $poid = $group_id;
+    }
+
+    $system_flg = false;
+    $condition = grn_get_user_info_search_condition($poid, $search_text,
+        $system_flg, $sensitive);
+
+    $navi_params = [
+        'oid'         => $poid,
+        'search_text' => $search_text,
+        'gid'         => $gid,
+        'sf'          => 1
+    ];
+    $users_for_view =& grn_search_user_info_by_application($poid, $condition,
+        $navi_info, false, $navi_params, $limit,
+        GRN_PHONEMESSAGE_APPLICATION_ID);
+
+    // ユーザー一覧のアクセス権を評価する
+    require_once('phonemessage/access.csp');
+    $access_manager = GRN_PhoneMessage_AccessManager::getInstance();
+    $users_info
+        = $access_manager->listObjectsInfo(array_keys($users_for_view),
+        'user');
+    $authorities = ['browse', 'add'];
+    if (0 < count($users_info['by_object_id'])) {
+        $users_info['accesses']
+            = $access_manager->evaluateAccessesFast($users_info['by_object_id'],
+            'user', $login_id, $dynamic_roles, $authorities);
+    } else {
+        $users_info['accesses'] = [];
+    }
+
+    // 組織一覧を取得する
+    $groups_info = $uum->getGroupInfoList();
+
+    // 組織一覧のアクセス権を評価する
+    $groups_info = $access_manager->listObjectsInfo(array_keys($groups_info),
+        'group');
+    if (0 < count($groups_info['by_object_id'])) {
+        $groups_info['accesses']
+            = $access_manager->evaluateAccessesFast($groups_info['by_object_id'],
+            'group', $login_id, $dynamic_roles, $authorities);
+    } else {
+        $groups_info['accesses'] = [];
+    }
+
+    // スタティックロール一覧を取得する
+    $roles_info = $uum->listStaticRolesInfo();
+
+    // スタティックロール一覧のアクセス権を評価する
+    $roles_info = $access_manager->listObjectsInfo(array_keys($roles_info),
+        'role');
+    if (0 < count($roles_info['by_object_id'])) {
+        $roles_info['accesses']
+            = $access_manager->evaluateAccessesFast($roles_info['by_object_id'],
+            'role', $login_id, $dynamic_roles, $authorities);
+    } else {
+        $roles_info['accesses'] = [];
+    }
+
+    // 組織、スタティックロールを考慮し、ユーザーのアクセス権を再評価する
+    $accesses_for_view
+        = $controller_util->evaluateAccessesFast(array_keys($users_for_view),
+        $users_info, $groups_info, $roles_info);
+    // 自分自身のアクセス権は無視する
+    if (array_key_exists($login_id, $accesses_for_view)) {
+        $accesses_for_view[$login_id] = [];
+    }
+
+    // ユーザー情報一覧を取得する
+    $controller_util->listUsersFast($users_for_view);
+
+    // シングルサインオン一覧を取得する
+    require_once('grn/sso.csp');
+    $sso_service = GRN_SSO_Service::getInstance();
+    $sso_list = $sso_service->getSSOMethodList('phonemessage');
+
+    // ユーザー名に割り当てたシングルサインオンを取得する
+    $sso_id = $system_config->getSSO();
+    if ( ! array_key_exists($sso_id, $sso_list)) {
+        $sso_id = GRN_PHONEMESSAGE_SSO_DEFAULT;
+    }
+
+    //--- k.niizeki add　
+    // 電話メモの設定を取得する
+    require_once('phonemessage/config.csp');
+
+    //表示されているユーザー毎のフラグ情報を取得
+    $email_flags = [];
+
+    $users = [];
+    if (0 < count($users_for_view)) {
+        $uids = implode(',', array_keys($users_for_view));
+        $add_condition = "_id IN({$uids})";
+        $users = $uum->getUsers(0, count($users_for_view),
+            'col_position,_id', $add_condition);
+    }
+
+    foreach (array_keys($users) as $user_id) {
+        $user =& $users[$user_id];
+        $config_manager = GRN_PhoneMessage_ConfigManager::getInstance();
+        $config = $config_manager->getPersonalConfig($user);
+        $email_flags[$user_id] = $config->getForwardEmailFlag();
+    }
+
+    foreach (array_keys($accesses_for_view) as $k) {
+        $accesses_for_view[$k]['email_flags'] = $email_flags[$k];
+    }
+
+    $users_id = array_keys($accesses_for_view);
+    $accesses_users_info = $uum->getUsersInfo($users_id,
+        ['col_display_name', 'col_valid']);
+    $t->assign('accesses_users_info', $accesses_users_info);
+
+    //--- k.niizeki add end
+
+    $t->assign('group_id', $gid);
+    $t->assign('search_text', $search_text);
+    $t->assign('sensitive', $sensitive);
+    $t->assign('users', $users_for_view);
+    $t->assign('accesses', $accesses_for_view);
+    $t->assign('sso', $sso_id);
+}
+
+require_once('grn/application.csp');
+$locator = GRN_ApplicationLocator::instance();
+if (AppAccess::isAppAvailable('schedule')) {
+    include('_get_schedules.csp');
+    $schedule_available = true;
+    $t->assign('users_event', $users_event);
+} else {
+    $schedule_available = false;
+}
+$t->assign('schedule_available', $schedule_available);
+
+// n件ナビゲーション情報を生成する
+if ( ! isset($navi_info)) {
+    $params = ['gid' => $gid, 'sf' => 1];
+    $navi_info = $controller_util->makeSimpleNaviInformation($offset, $limit,
+        count($users_for_view), $isExistsNextPage, $params);
+}
+$t->assign('view_set', $navi_info);
+
+// セッションに検索条件を保存する
+$session = $app->getSession();
+$session->set('search_text', $search_text);
+$session->set('sensitive', $sensitive);
+
+////////////////////////////////////////////////////////////////
+
+// Smartyにページタイトルを割り当てる
+$page_title = grn_get_page_display_name('phonemessage/search');
+$t->assign('page_title', $page_title);
+
+// Smartyにサイトポジションを割り当てる
+$page_info = [
+    'index'  => ['sf' => 1, 'gid' => $gid],
+    'search' => null
+];
+$site_position = $controller_util->makeSitePosition('phonemessage/',
+    $page_info);
+$t->assign('site_position', $site_position);
+
+// Smartyを実行する
+$t->display(cb_get_pagename() . '.tpl');
+
+

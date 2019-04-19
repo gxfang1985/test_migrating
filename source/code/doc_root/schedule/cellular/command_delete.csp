@@ -1,0 +1,306 @@
+<?php
+
+require_once("grn/smarty.csp");
+$smarty = new GRN_Smarty;
+
+// 使用するパラメータの定義（セッションから参照するかどうかの定義）
+$use = [];
+
+// SmartyValidate should be initialized when an input form is there.
+require_once('SmartyValidate.class.php');
+SmartyValidate::connect($smarty);
+$form_name = 'schedule/cellular/delete';
+SmartyValidate::register_form($form_name);
+$use['eid'] = (isset($G_INPUT['eid'])) ? $G_INPUT['eid'] : null;
+$use['day'] = (isset($G_INPUT['day'])) ? $G_INPUT['day'] : null;
+$use['mid'] = (isset($sess_sche['mid'])) ? $sess_sche['mid'] : null;
+
+// validate after a POST
+if (SmartyValidate::is_valid($G_INPUT, $form_name)) {
+    $use['flag'] = $G_INPUT['flag'];
+
+    $apply = null;
+    $login_id = $G_login_user->getOID();
+
+    $date = new CB_Date();
+    if ( ! $date->parse($use['day'])) {
+        $date = null;
+    }
+
+    if (array_key_exists('flag', $G_INPUT)) {
+        $use['flag'] = $G_INPUT['flag'];
+    }
+
+    if (isset($use['eid'])) {
+        // スケジュールの取得
+        $event = $G_application->getEvent($G_login_user, $use['eid'], $date);
+        if ( ! $event) {
+            cb_throw_error(E_GRN_SCHD_NOTFOUND_EVENT);
+        }
+
+        // 通常/バナー予定 削除可能
+        if (is_a($event, 'GRN_Schedule_NormalEvent')
+            || is_a($event, 'GRN_Schedule_BannerEvent')
+        ) {
+            require_once('schedule/facility_system_logic.csp');
+            $facility_logic = GRN_Facility_SystemLogic::getInstance();
+            if (is_array($event->facilities) && count($event->facilities) > 0) {
+                $f_settings
+                    = $facility_logic->getFacilitySetting(array_keys($event->facilities));
+                foreach (array_keys($event->facilities) as $key) {
+                    $object = $event->facilities[$key];
+                    $faid = $object->getOID();
+                    $modify_user
+                        = $facility_logic->getModifyUserByPriority($f_settings,
+                        $faid);
+                    // 登録者にのみ変更を許可する
+                    if ($modify_user === 'creator') {
+                        // 施設で登録者しか変更を許していない場合
+                        if (is_array($event->facilities)
+                            && count($event->facilities) > 0
+                        ) {
+                            require_once('schedule/facility_privilege.csp');
+                            $privilege_logic
+                                = GRN_Facility_Privilege_Logic::getInstance();
+                            if ( ! $privilege_logic->hasPrivilegeOfFacilities($G_login_user,
+                                    $event->facilities, 'OR')
+                                 && ((is_a($event->creator, 'CB_User')
+                                      && $login_id != $event->creator->getOID())
+                                     || is_string($event->creator))
+                            ) {
+                                cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+                            }
+                        }
+                    } // 登録者と共有メンバーに変更を許可する
+                    elseif ($modify_user === 'member') {
+                        // 施設で登録者と共有メンバーしか変更を許していない場合
+                        if (is_array($event->facilities)
+                            && count($event->facilities) > 0
+                        ) {
+                            require_once('schedule/facility_privilege.csp');
+                            $privilege_logic
+                                = GRN_Facility_Privilege_Logic::getInstance();
+                            if ( ! $privilege_logic->hasPrivilegeOfFacilities($G_login_user,
+                                    $event->facilities, 'OR')
+                                 && (
+                                     (is_array($event->users)
+                                      && ! array_key_exists($login_id,
+                                             $event->users))
+                                     || is_null($event->users)
+                                 )
+                                 && ((is_a($event->creator, 'CB_User')
+                                      && $login_id
+                                         !== $event->creator->getOID())
+                                     || is_string($event->creator))
+                            ) {
+                                cb_throw_error(E_GRN_FCLT_DENY_MODIFY);
+                            }
+                        }
+                    }
+                }
+            }
+
+
+            // アクセス権のチェック
+            require_once('schedule/access_logic.csp');
+            $acc_logic = GRN_Schedule_Access_Logic::getInstance();
+            $dynamic_role = $G_uum->listGrantedRoles();
+            $access = $acc_logic->getEventAccess($G_login_user, $event,
+                ['read', 'delete'], $dynamic_role);
+            if ($access['read'] == GRN_SCHD_ACCESS_DENY) {
+                cb_throw_error(E_GRN_SCHD_ACCESSDENY_EVENT);
+            }
+            if ($access['delete'] == GRN_SCHD_ACCESS_DENY) {
+                cb_throw_error(E_GRN_SCHD_ACCESSDENY_DELETE);
+            }
+
+            // 日付
+            $base_date = new CB_Date();
+            if ( ! $base_date->parse($use['day'])) {
+                $base_date = null;
+            }
+
+            $b_notify = true;
+            $tsex = new CB_TimeStampEx();
+            $notify_date = $tsex->getDate();
+
+            // 共有スケジュールでイベントから自分が抜ける
+            if ($event->isShared() && $use['flag'] == 2) {
+                $bFind = false;
+                foreach (array_keys($event->users) as $index) {
+                    $user = $event->users[$index];
+                    if ($user->getOID() == $login_id) {
+                        unset($event->users[$index]);
+                        $event->modifier = $G_login_user;
+
+                        $event_id
+                            = $G_application->modifyEventWithoutDateTime($event,
+                            $date, $apply);
+
+                        $bdate = $event->getFirstDate($notify_date);
+
+                        // GRB-16976 Remove attendance status when delete from my schedule
+                        if ($event instanceof \GRN_Schedule_NormalEvent) {
+                            $attendanceStatLogic
+                                = new \grn\schedule\AttendanceStatusLogic();
+                            $attendanceStatLogic->deleteAttendanceStatusByEventIdAndUserId($event->id,
+                                $login_id);
+                        }
+
+                        $title = '';
+                        if ($notify_date->compare($bdate) <= 0) {
+                            // ----- GRN2-4506 -----
+                            // 通知のタイムゾーン対応のために、setdatetimeなどを変換する。
+                            if ($event instanceof GRN_Schedule_NormalEvent) {
+                                // 通常予定（終日以外）も、イベントのタイムゾーンに変更する
+                                if ($event->setdatetime instanceof
+                                    CB_DateTimeEx
+                                ) {
+                                    require_once('fw/i18n.csp');
+                                    $settimestamp = new CB_TimeStampEx(null,
+                                        $event->timezone);
+                                    $settimestamp->setDateTime($event->setdatetime,
+                                        CB_I18N::getInstance()
+                                               ->getCurrentTimezone());
+                                    $event->setdatetime
+                                        = $settimestamp->getDateTime();
+                                    if (isset($event->enddatetime)) {
+                                        $endtimestamp = new CB_TimeStampEx(null,
+                                            $event->timezone);
+                                        $endtimestamp->setDateTime($event->enddatetime,
+                                            CB_I18N::getInstance()
+                                                   ->getCurrentTimezone());
+                                        $event->enddatetime
+                                            = $endtimestamp->getDateTime();
+                                    } else {
+                                        $event->enddatetime
+                                            = $event->setdatetime;
+                                    }
+                                }
+                            }
+                            // ----- GRN2-4506 -----
+                            if (is_array($event->users)
+                                && count($event->users) > 0
+                            ) {
+                                $title
+                                    = _schedule_cellular_command_delete_getNotifyTitle($event);
+                                $G_application->setNotify($event->users,
+                                    $G_login_user, $event, $bdate, $title, '',
+                                    GRN_SCHEDULE_NOTIFY_MODIFY, $tsex);
+                                $G_application->forwardMail($event,
+                                    [GRN_SCHEDULE_NOTIFY_MODIFY => $event->users],
+                                    $G_login_user);
+                                $G_application->sendPushNotification(
+                                    $event,
+                                    [GRN_SCHEDULE_NOTIFY_MODIFY => $event->users],
+                                    $G_login_user, true, $bdate, null);
+                            }
+
+                            // 通知先の指定がある場合
+                            if ($event->private
+                                && is_array($event->notify_address)
+                                && count($event->notify_address) > 0
+                            ) {
+                                $title
+                                    = _schedule_cellular_command_delete_getNotifyTitle($event);
+                                $G_application->sendNotificationsToPublic($G_login_user,
+                                    $event, $bdate, '', $tsex, $title, false,
+                                    true, GRN_SCHEDULE_NOTIFY_MODIFY);
+                            }
+                        }
+                        break;
+                    }
+                }
+            } else {
+                $title = '';
+                $event_type = $event->getEventType();
+                if ($notify_date->compare($date) <= 0) {
+                    // ----- GRN2-4506 -----
+                    // 通知のタイムゾーン対応のために、setdatetimeなどを変換する。
+                    if ($event instanceof GRN_Schedule_NormalEvent) {
+                        // 通常予定（終日以外）も、イベントのタイムゾーンに変更する
+                        if ($event->setdatetime instanceof CB_DateTimeEx) {
+                            require_once('fw/i18n.csp');
+                            $settimestamp = new CB_TimeStampEx(null,
+                                $event->timezone);
+                            $settimestamp->setDateTime($event->setdatetime,
+                                CB_I18N::getInstance()->getCurrentTimezone());
+                            $event->setdatetime = $settimestamp->getDateTime();
+                            if (isset($event->enddatetime)) {
+                                $endtimestamp = new CB_TimeStampEx(null,
+                                    $event->timezone);
+                                $endtimestamp->setDateTime($event->enddatetime,
+                                    CB_I18N::getInstance()
+                                           ->getCurrentTimezone());
+                                $event->enddatetime
+                                    = $endtimestamp->getDateTime();
+                            } else {
+                                $event->enddatetime = $event->setdatetime;
+                            }
+                        }
+                    }
+                    // ----- GRN2-4506 -----
+
+                    // 参加者に削除通知
+                    if (is_array($event->users) && count($event->users) > 0) {
+                        $title
+                            = _schedule_cellular_command_delete_getNotifyTitle($event);
+                        $G_application->setNotify($event->users, $G_login_user,
+                            $event, $date, $title, '',
+                            GRN_SCHEDULE_NOTIFY_DELETE, $tsex);
+                        $G_application->forwardMail($event,
+                            [GRN_SCHEDULE_NOTIFY_DELETE => $event->users],
+                            $G_login_user);
+                        $G_application->sendPushNotification(
+                            $event,
+                            [GRN_SCHEDULE_NOTIFY_DELETE => $event->users],
+                            $G_login_user, true, $date, null);
+                    }
+
+                    // 通知先の指定がある場合
+                    if ($event->private && is_array($event->notify_address)
+                        && count($event->notify_address) > 0
+                    ) {
+                        $title
+                            = _schedule_cellular_command_delete_getNotifyTitle($event);
+                        $G_application->sendNotificationsToPublic($G_login_user,
+                            $event, $date, '', $tsex, $title, false, true,
+                            GRN_SCHEDULE_NOTIFY_DELETE);
+                    }
+                }
+                // 削除
+                $G_application->deleteEvent($G_login_user, $event->id,
+                    $event_type, $date, $apply);
+
+            }
+        } else {
+            SmartyValidate::unregister_form($form_name);
+            // GRN_Schedule_RepeatEvent
+            // GRN_Schedule_TemporaryEvent
+            // に関しては削除できない仕様、そもそも削除リンクを出さない
+            grn_cellular_switch_page($G_pagepath . "/look1");
+        }
+
+        SmartyValidate::unregister_form($form_name);
+        // redirect
+        grn_cellular_redirect($G_pagepath . "/day",
+            ['day' => $use['day'], 'mid' => $use['mid']]);
+    } else {
+
+        SmartyValidate::unregister_form($form_name);
+        // session lost
+        grn_cellular_switch_page("cellular/index");
+    }
+} else {
+    grn_cellular_switch_page($G_pagepath . "/delete",
+        ['eid' => $use['eid'], 'day' => $use['day'], 'mid' => $use['mid']]);
+}
+
+function _schedule_cellular_command_delete_getNotifyTitle($event)
+{
+    require_once('schedule/view_util.csp');
+    $util = GRN_Schedule_View_Util::getInstance();
+
+    return $util->getNotifyTitle(html_entity_decode($event->getTitle()));
+}
+

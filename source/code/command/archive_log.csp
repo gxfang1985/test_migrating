@@ -1,0 +1,635 @@
+<?php
+
+if (defined('ON_FOREST')) {
+    return;
+}
+
+ini_set('memory_limit', '-1');
+
+gc_enable();
+
+cb_require_role('CommandLine');
+
+require_once('grn/cli.csp');
+require_once('fw/i18n.csp');
+require_once('system/logging/file.csp');
+require_once('fw/transaction.csp');
+
+$opts = cb_cli_start(
+// Mandatory command-line options
+    [
+    ],
+
+    // Optional command-line options
+    [
+        new CB_CLI_MAX_WEEK_OPTION()
+    ]
+);
+
+//Get command parameter
+$max_week = 3;
+if (array_key_exists(CB_CLI_MAX_WEEK_OPTION, $opts)) {
+    $max_week = intval($opts[CB_CLI_MAX_WEEK_OPTION]);
+    if ($max_week < 1) {
+        cb_cli_log("Maximum week parameter is invalid. Please try again with parameter from 1 to 50.");
+        die();
+    } elseif ($max_week > 50) {
+        cb_cli_log("Maximum week parameter is invalid. Please try again with parameter from 1 to 50.");
+        die();
+    }
+}
+
+//Get config in common.ini
+global $G_config_common;
+$rotation = $G_config_common->get('Logging', 'rotation');
+if (empty($rotation) || $rotation < 100000 || $rotation > 500000) {
+    //Default value
+    $rotation = 100000;
+}
+
+$retention_period = (int)$G_config_common->get('Logging',
+    'retention_period');   // GTM-1601
+if (empty($retention_period) || $retention_period < 1
+    || $retention_period > 365
+) // GTM-1601
+{
+    //Default value
+    $retention_period = 90;
+}
+
+//Path
+global $G_config_common;
+$root_path = $G_config_common->get('Files', 'dir');
+$root_path .= '/logging/';
+if ( ! is_dir($root_path)) {
+    mkdir($root_path, 0755);
+}
+
+//Get archive settings
+require_once('grn/logger.csp');
+$config = GRN_Logging_SystemConfig::getInstance();
+$export_format = $config->getExportFormat();
+if (empty($export_format)) {
+    $export_format = 'xlsx';
+}
+
+//Log
+$logic = GRN_LoggingLogic::getInstance();
+
+//I18N
+$i18n = CB_I18N::getInstance();
+$timezone_default = $i18n->getDefaultTimezone();
+$timezone_header = cb_msg('fw.timezone', $timezone_default);
+$timezone_header = substr($timezone_header, 0, 11);
+
+//Date
+require_once('fw/date.csp');
+$milestones = mktime(0, 0, 0);
+$max_ts = $milestones - ($retention_period * 24 * 60 * 60); //GTM-1601
+$week_ts = 7 * 24 * 60 * 60;
+
+//Max limit
+$max_limit = 500000;
+
+//Command result
+$result = [];
+
+//Using CSV
+if ($export_format == 'csv(s-jis)' || $export_format == 'csv(utf-8)') {
+    require_once('fw/csv.csp');
+
+    //Charset
+    $charset = 'SJIS';
+    if ($export_format == 'csv(utf-8)') {
+        $charset = 'UTF-8';
+    }
+
+    $end_ts = -1;
+    for ($w = $max_week; $w > 0; $w--) {
+        if ($end_ts != -1) {
+            $condition = "col_timestamp >= " . $end_ts . " AND col_timestamp < "
+                         . $max_ts . " ORDER BY col_timestamp LIMIT 1";
+        } else {
+            $condition = "col_timestamp < " . $max_ts
+                         . " ORDER BY col_timestamp LIMIT 1";
+        }
+
+        $query = CB_LoggerQuery::getInstance();
+        $query->setForceIndex('idx_ts');
+        $query->setCondition($condition);
+        $query->select();
+        if ($row = $query->fetch_assoc()) {
+            $query->freeResult();
+            $ts = new CB_TimeStamp();
+            $ts->unix_ts = $row['col_timestamp'];
+            $datetime = $logic->timestamp_to_datetime($ts);
+            $start_ts = mktime(0, 0, 0, $datetime->month, $datetime->day,
+                $datetime->year);
+            $end_ts = $start_ts + $week_ts;
+            //start GTM-1601
+            if ($end_ts > $max_ts) {
+                $end_ts = $max_ts;
+            }
+            //end GTM-1601
+
+            //Get record number
+            $condition = "col_timestamp >= " . $start_ts
+                         . " AND col_timestamp < " . $end_ts . " LIMIT "
+                         . $max_limit;
+            $num_row = countRows($condition);
+
+            //Condition
+            $condition = "col_timestamp >= " . $start_ts
+                         . " AND col_timestamp < " . $end_ts
+                         . " ORDER BY col_timestamp LIMIT " . ($num_row - 1)
+                         . ", 1";
+            $query->setCondition($condition);
+            $query->select();
+            if ($row = $query->fetch_assoc()) {
+                $query->freeResult();
+                $ts->unix_ts = $row['col_timestamp'];
+                $datetime = $logic->timestamp_to_datetime($ts);
+            } else {
+                return;
+            }
+
+            $file_name = 'log' . $datetime->year . ($datetime->month < 10
+                    ? '0' . $datetime->month : $datetime->month)
+                         . ($datetime->day < 10 ? '0' . $datetime->day
+                    : $datetime->day);
+            $archive_path = $root_path . $file_name;
+            $archive_path_csv = $archive_path . '.csv';
+            $csv = new CB_CSVWriter($charset, $archive_path_csv);
+
+            //Header of the first file
+            $line = [];
+            $line[] = $logic->getMessage('col_date') . ' ' . $timezone_header;
+            $line[] = $logic->getMessage('col_time') . ' ' . $timezone_header;
+            $line[] = $logic->getMessage('col_category');
+            $line[] = $logic->getMessage('col_priority');
+            $line[] = $logic->getMessage('col_msg');
+            $line[] = $logic->getMessage('col_user');
+            $line[] = $logic->getMessage('col_account');
+            $line[] = $logic->getMessage('col_remote_host');
+            $line[] = $logic->getMessage('col_remote_addr');
+            $line[] = $logic->getMessage('col_action');
+            $line[] = $logic->getMessage('col_object');
+            $csv->writeLine($line);
+
+            $condition = "col_timestamp >= " . $start_ts
+                         . " AND col_timestamp < " . $end_ts
+                         . " ORDER BY col_timestamp LIMIT " . $max_limit;
+            $query->setCondition($condition);
+            $query->select();
+
+            $ts = new CB_TimeStamp();
+            $count = 0;
+            while (($count < $rotation) && ($row = $query->fetch_assoc())) {
+                $count++;
+                $line = [];
+                $ts->unix_ts = $row['col_timestamp'];
+                $datetime = $logic->timestamp_to_datetime($ts);
+                $dt = new CB_DateTimeEx($datetime);
+                $d = $dt->getDate();
+                $line[] = $d->format();
+                $t = $dt->getTime();
+                $line[] = $t->format();
+
+                $line[] = $logic->getCategoryName($row['col_category']);
+                $line[] = $logic->getThresholdName($row['col_priority']);
+                $line[] = $row['col_msg'];
+                $line[] = $row['col_user'];
+                $line[] = $row['col_account'];
+                $line[] = $row['col_remote_host'];
+                $line[] = $row['col_remote_addr'];
+                $line[] = $row['col_action'];
+                $line[] = $row['col_object'];
+                $csv->writeLine($line);
+            }
+
+            $csv->close();
+
+            $fm = new GRN_Logging_FileManager_Core();
+            $file = $fm->createFile(null, $archive_path_csv, "");
+            CB_TransactionManager::getInstance()->commit();
+
+            $result[] = $file_name . '.csv';
+
+            $num_add_file = ceil($num_row / $rotation);
+
+            for ($i = 2; $i < ($num_add_file + 1); $i++) {
+                $archive_path_csv = $archive_path . '_' . $i . '.csv';
+                $csv = new CB_CSVWriter($charset,
+                    $archive_path_csv);
+
+                //Header
+                $line = [];
+                $line[] = $logic->getMessage('col_date') . ' '
+                          . $timezone_header;
+                $line[] = $logic->getMessage('col_time') . ' '
+                          . $timezone_header;
+                $line[] = $logic->getMessage('col_category');
+                $line[] = $logic->getMessage('col_priority');
+                $line[] = $logic->getMessage('col_msg');
+                $line[] = $logic->getMessage('col_user');
+                $line[] = $logic->getMessage('col_account');
+                $line[] = $logic->getMessage('col_remote_host');
+                $line[] = $logic->getMessage('col_remote_addr');
+                $line[] = $logic->getMessage('col_action');
+                $line[] = $logic->getMessage('col_object');
+
+                $csv->writeLine($line);
+
+                $count = 0;
+                while (($count < $rotation) && ($row = $query->fetch_assoc())) {
+                    $count++;
+                    $line = [];
+                    $ts->unix_ts = $row['col_timestamp'];
+                    $datetime = $logic->timestamp_to_datetime($ts);
+                    $dt = new CB_DateTimeEx($datetime);
+                    $d = $dt->getDate();
+                    $line[] = $d->format();
+                    $t = $dt->getTime();
+                    $line[] = $t->format();
+
+                    $line[] = $logic->getCategoryName($row['col_category']);
+                    $line[] = $logic->getThresholdName($row['col_priority']);
+                    $line[] = $row['col_msg'];
+                    $line[] = $row['col_user'];
+                    $line[] = $row['col_account'];
+                    $line[] = $row['col_remote_host'];
+                    $line[] = $row['col_remote_addr'];
+                    $line[] = $row['col_action'];
+                    $line[] = $row['col_object'];
+
+                    $csv->writeLine($line);
+                }
+
+                $csv->close();
+
+                $fm = new GRN_Logging_FileManager_Core();
+                $file = $fm->createFile(null, $archive_path_csv, "");
+                CB_TransactionManager::getInstance()->commit();
+
+                $result[] = $file_name . '_' . $i . '.csv';
+            }
+            $query->freeResult();
+
+            //Delete Log
+            $condition = "col_timestamp >= " . $start_ts
+                         . " AND col_timestamp < " . $end_ts
+                         . " ORDER BY col_timestamp LIMIT " . $max_limit;
+            $query->setCondition($condition);
+            $query->delete();
+
+            $max_limit -= $num_row;
+            if ($max_limit < 1) {
+                break;
+            }
+        }
+    }
+} elseif ($export_format == 'xlsx') {
+    $rotation = 100000;
+
+    // Include path
+    $dir = cb_basedir() . '/code/plugin/grn/phpexcel/';
+    $is_win = (strncasecmp(php_uname('s'), 'WIN', 3) == 0);
+    if ($is_win) {
+        ini_set('include_path', ini_get('include_path') . ';' . $dir);
+    } else {
+        ini_set('include_path', ini_get('include_path') . ':' . $dir);
+    }
+
+    //PHPExcel
+    require_once('PHPExcel.php');
+
+    //PHPExcel_Writer_Excel2007
+    require_once('PHPExcel/Writer/Excel2007.php');
+
+    $cacheMethod = PHPExcel_CachedObjectStorageFactory::cache_in_memory_gzip;
+    PHPExcel_Settings::setCacheStorageMethod($cacheMethod);
+
+    $query = CB_LoggerQuery::getInstance();
+    $query->setForceIndex('idx_ts');
+    $end_ts = -1;
+    for ($w = $max_week; $w > 0; $w--) {
+        if ($end_ts != -1) {
+            $condition = "col_timestamp >= " . $end_ts . " AND col_timestamp < "
+                         . $max_ts . " ORDER BY col_timestamp LIMIT 1";
+        } else {
+            $condition = "col_timestamp < " . $max_ts
+                         . " ORDER BY col_timestamp LIMIT 1";
+            if ( ! defined('PCLZIP_TEMPORARY_DIR')) {
+                define('PCLZIP_TEMPORARY_DIR',
+                    PHPExcel_Shared_File::sys_get_temp_dir() . '/');
+            }
+        }
+
+        $query->setCondition($condition);
+        $query->select();
+        if ($row = $query->fetch_assoc()) {
+            $query->freeResult();
+            $ts = new CB_TimeStamp();
+            $ts->unix_ts = $row['col_timestamp'];
+            $datetime = $logic->timestamp_to_datetime($ts);
+            $start_ts = mktime(0, 0, 0, $datetime->month, $datetime->day,
+                $datetime->year);
+            $end_ts = $start_ts + $week_ts;
+            //start GTM-1601
+            if ($end_ts > $max_ts) {
+                $end_ts = $max_ts;
+            }
+            //end GTM-1601
+
+            //Get record number
+            $condition = "col_timestamp >= " . $start_ts
+                         . " AND col_timestamp < " . $end_ts . " LIMIT "
+                         . $max_limit;
+            $num_row = countRows($condition);
+
+            //Condition
+            $condition = "col_timestamp >= " . $start_ts
+                         . " AND col_timestamp < " . $end_ts
+                         . " ORDER BY col_timestamp LIMIT " . ($num_row - 1)
+                         . ", 1";
+            $query->setCondition($condition);
+            $query->select();
+            if ($row = $query->fetch_assoc()) {
+                $query->freeResult();
+                $ts->unix_ts = $row['col_timestamp'];
+                $datetime = $logic->timestamp_to_datetime($ts);
+            } else {
+                return;
+            }
+
+            $file_name = 'log' . $datetime->year . ($datetime->month
+                                                    < 10 ? '0'
+                                                           . $datetime->month
+                    : $datetime->month) . ($datetime->day < 10 ? '0'
+                                                                 . $datetime->day
+                    : $datetime->day);
+            $archive_path = $root_path . $file_name;
+            $archive_path_xlsx = $archive_path . '.xlsx';
+
+            //Create new PHPExcel object
+            $objPHPExcel = new PHPExcel();
+            $objPHPExcel->setActiveSheetIndex(0);
+
+            //Header
+            $line = [];
+            $line[] = $logic->getMessage('col_date') . ' ' . $timezone_header;
+            $line[] = $logic->getMessage('col_time') . ' ' . $timezone_header;
+            $line[] = $logic->getMessage('col_category');
+            $line[] = $logic->getMessage('col_priority');
+            $line[] = $logic->getMessage('col_msg');
+            $line[] = $logic->getMessage('col_user');
+            $line[] = $logic->getMessage('col_account');
+            $line[] = $logic->getMessage('col_remote_host');
+            $line[] = $logic->getMessage('col_remote_addr');
+            $line[] = $logic->getMessage('col_action');
+            $line[] = $logic->getMessage('col_object');
+
+            $objPHPExcel->getActiveSheet()->SetCellValue('A1', $line[0]);
+            $objPHPExcel->getActiveSheet()->SetCellValue('B1', $line[1]);
+            $objPHPExcel->getActiveSheet()->SetCellValue('C1', $line[2]);
+            $objPHPExcel->getActiveSheet()->SetCellValue('D1', $line[3]);
+            $objPHPExcel->getActiveSheet()->SetCellValue('E1', $line[4]);
+            $objPHPExcel->getActiveSheet()->SetCellValue('F1', $line[5]);
+            $objPHPExcel->getActiveSheet()->SetCellValue('G1', $line[6]);
+            $objPHPExcel->getActiveSheet()->SetCellValue('H1', $line[7]);
+            $objPHPExcel->getActiveSheet()->SetCellValue('I1', $line[8]);
+            $objPHPExcel->getActiveSheet()->SetCellValue('J1', $line[9]);
+            $objPHPExcel->getActiveSheet()->SetCellValue('K1', $line[10]);
+
+            $condition = "col_timestamp >= " . $start_ts
+                         . " AND col_timestamp < " . $end_ts
+                         . " ORDER BY col_timestamp LIMIT " . $max_limit;
+            $query->setCondition($condition);
+            $query->select();
+
+            $ts = new CB_TimeStamp();
+            $count = 1;
+            $category_name = '';
+            $threshold_name = '';
+            while (($count <= $rotation) && ($row = $query->fetch_assoc())) {
+                $count++;
+                $line = [];
+                $ts->unix_ts = $row['col_timestamp'];
+                $datetime = $logic->timestamp_to_datetime($ts);
+                $dt = new CB_DateTimeEx($datetime);
+                $d = $dt->getDate();
+                $line[] = $d->format();
+                $t = $dt->getTime();
+                $line[] = $t->format();
+
+                $category_name = $logic->getCategoryName($row['col_category']);
+                $threshold_name
+                    = $logic->getThresholdName($row['col_priority']);
+                $line[] = $category_name ? $category_name : '';
+                $line[] = $threshold_name ? $threshold_name : '';
+                $line[] = $row['col_msg'];
+                $line[] = $row['col_user'];
+                $line[] = $row['col_account'];
+                $line[] = $row['col_remote_host'];
+                $line[] = $row['col_remote_addr'];
+                $line[] = $row['col_action'];
+                $line[] = $row['col_object'];
+
+                $objPHPExcel->getActiveSheet()->SetCellValue('A' . $count,
+                    $line[0]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('B' . $count,
+                    $line[1]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('C' . $count,
+                    $line[2]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('D' . $count,
+                    $line[3]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('E' . $count,
+                    $line[4]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('F' . $count,
+                    $line[5]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('G' . $count,
+                    $line[6]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('H' . $count,
+                    $line[7]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('I' . $count,
+                    $line[8]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('J' . $count,
+                    $line[9]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('K' . $count,
+                    $line[10]);
+            }
+
+            //Save Excel 2007 file
+            $objWriter = new PHPExcel_Writer_Excel2007($objPHPExcel);
+            $objWriter->save($archive_path_xlsx);
+            $objPHPExcel->disconnectWorksheets();
+            unset($objPHPExcel);
+            unset($objWriter);
+
+            $fm = new GRN_Logging_FileManager_Core();
+            $file = $fm->createFile(null, $archive_path_xlsx, "");
+            CB_TransactionManager::getInstance()->commit();
+
+            $result[] = $file_name . '.xlsx';
+
+            $num_add_file = ceil($num_row / $rotation);
+
+            for ($i = 2; $i < ($num_add_file + 1); $i++) {
+                $archive_path_xlsx = $archive_path . '_' . $i . '.xlsx';
+
+                //Create new PHPExcel object
+                $objPHPExcel = new PHPExcel();
+                $objPHPExcel->setActiveSheetIndex(0);
+
+                //Header
+                $line = [];
+                $line[] = $logic->getMessage('col_date') . ' '
+                          . $timezone_header;
+                $line[] = $logic->getMessage('col_time') . ' '
+                          . $timezone_header;
+                $line[] = $logic->getMessage('col_category');
+                $line[] = $logic->getMessage('col_priority');
+                $line[] = $logic->getMessage('col_msg');
+                $line[] = $logic->getMessage('col_user');
+                $line[] = $logic->getMessage('col_account');
+                $line[] = $logic->getMessage('col_remote_host');
+                $line[] = $logic->getMessage('col_remote_addr');
+                $line[] = $logic->getMessage('col_action');
+                $line[] = $logic->getMessage('col_object');
+
+                $objPHPExcel->getActiveSheet()->SetCellValue('A1', $line[0]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('B1', $line[1]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('C1', $line[2]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('D1', $line[3]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('E1', $line[4]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('F1', $line[5]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('G1', $line[6]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('H1', $line[7]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('I1', $line[8]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('J1', $line[9]);
+                $objPHPExcel->getActiveSheet()->SetCellValue('K1', $line[10]);
+
+                $count = 1;
+                while (($count <= $rotation)
+                       && ($row
+                        = $query->fetch_assoc())) {
+                    $count++;
+                    $line = [];
+                    $ts->unix_ts = $row['col_timestamp'];
+                    $datetime = $logic->timestamp_to_datetime($ts);
+                    $dt = new CB_DateTimeEx($datetime);
+                    $d = $dt->getDate();
+                    $line[] = $d->format();
+                    $t = $dt->getTime();
+                    $line[] = $t->format();
+
+                    $category_name
+                        = $logic->getCategoryName($row['col_category']);
+                    $threshold_name
+                        = $logic->getThresholdName($row['col_priority']);
+                    $line[] = $category_name ? $category_name : '';
+                    $line[] = $threshold_name ? $threshold_name : '';
+                    $line[] = $row['col_msg'];
+                    $line[] = $row['col_user'];
+                    $line[] = $row['col_account'];
+                    $line[] = $row['col_remote_host'];
+                    $line[] = $row['col_remote_addr'];
+                    $line[] = $row['col_action'];
+                    $line[] = $row['col_object'];
+
+                    $objPHPExcel->getActiveSheet()->SetCellValue('A' . $count,
+                        $line[0]);
+                    $objPHPExcel->getActiveSheet()->SetCellValue('B' . $count,
+                        $line[1]);
+                    $objPHPExcel->getActiveSheet()->SetCellValue('C' . $count,
+                        $line[2]);
+                    $objPHPExcel->getActiveSheet()->SetCellValue('D' . $count,
+                        $line[3]);
+                    $objPHPExcel->getActiveSheet()->SetCellValue('E' . $count,
+                        $line[4]);
+                    $objPHPExcel->getActiveSheet()->SetCellValue('F' . $count,
+                        $line[5]);
+                    $objPHPExcel->getActiveSheet()->SetCellValue('G' . $count,
+                        $line[6]);
+                    $objPHPExcel->getActiveSheet()->SetCellValue('H' . $count,
+                        $line[7]);
+                    $objPHPExcel->getActiveSheet()->SetCellValue('I' . $count,
+                        $line[8]);
+                    $objPHPExcel->getActiveSheet()->SetCellValue('J' . $count,
+                        $line[9]);
+                    $objPHPExcel->getActiveSheet()->SetCellValue('K' . $count,
+                        $line[10]);
+                }
+
+                //Save Excel 2007 file
+                $objWriter = new PHPExcel_Writer_Excel2007($objPHPExcel);
+                $objWriter->save($archive_path_xlsx);
+                $objPHPExcel->disconnectWorksheets();
+                unset($objPHPExcel);
+                unset($objWriter);
+
+                $fm = new GRN_Logging_FileManager_Core();
+                $file = $fm->createFile(null, $archive_path_xlsx, "");
+                CB_TransactionManager::getInstance()->commit();
+
+                $result[] = $file_name . '_' . $i . '.xlsx';
+            }
+            $query->freeResult();
+
+            //Delete Log
+            $condition = "col_timestamp >= " . $start_ts
+                         . " AND col_timestamp < " . $end_ts
+                         . " ORDER BY col_timestamp LIMIT " . $max_limit;
+            $query->setCondition($condition);
+            $query->delete();
+
+            $max_limit -= $num_row;
+            if ($max_limit < 1) {
+                break;
+            }
+        }
+    }
+}
+
+//Delete temp file
+$sfm = cb_lwc_file_manager();
+
+$total = count($result);
+for ($i = 0; $i < $total; $i++) {
+    if (is_file($root_path . $result[$i])) {
+        $sfm->markAsTemporaryFile($root_path . $result[$i]);
+    }
+}
+
+//Display result
+$summary = 'No archived file';
+if ($total > 0) {
+    $summary = 'Archived files : ';
+    for ($i = 0; $i < $total - 1; $i++) {
+        $summary .= $result[$i] . ', ';
+    }
+    $summary .= $result[$total - 1];
+
+}
+
+cb_cli_end($summary);
+
+//Call delete_log_file command
+$basedir = cb_basedir();
+$appfile = cb_get_cli_path();
+$commandPath = implode([$basedir, "code", "command", "delete_log_file.csp"],
+    DIRECTORY_SEPARATOR);
+$phandle_handle = popen(cb_get_fopen_execute_path($appfile, $commandPath), "w");
+
+function countRows($condition)
+{
+    global $G_container_base;
+    $query = "SELECT COUNT(*) FROM (SELECT _id FROM tab_cb_logevent WHERE "
+             . $condition . ") AS tab";
+    $dbconn =& $G_container_base->getInstance('dbconn');
+    $ret = $dbconn->query($query);
+    $row = $dbconn->fetch_row($ret);
+    $dbconn->free_result($ret);
+
+    return intval($row[0]);
+}

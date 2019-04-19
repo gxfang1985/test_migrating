@@ -1,0 +1,230 @@
+<?php
+require_once("grn/smarty.csp");
+require_once('report/controller_util.csp');
+require_once('report/search_logic.csp');
+require_once('report/utility.csp');
+require_once('grn/ui.csp');
+
+$G_state_set->set('html_should_be_closed', false);
+$G_state_set->set('copyright_should_be_written', false);
+
+global $G_container_base;
+$grn_uum = $G_container_base->getInstance('uum');
+$login_user = $grn_uum->getLoginUser();
+
+//Get Login User Config
+$manager = GRN_UIConfigManager::getInstance();
+$config = $manager->getUserConfig($login_user);
+
+$util = GRN_Report_Filter_Controller_Utility::getInstance();
+$inputs = [];
+if ( ! $util->validate($inputs)) {
+    cb_throw_error('FW00043');
+}
+
+global $G_INPUT;
+$criteria = createCriteria($G_INPUT);
+$result = search($criteria);
+
+$creators = [];
+$sign = "";
+foreach ($result['reports'] as $report) {
+    $creators[] = $report['col_creator'];
+}
+
+require_once('report/controller_util.csp');
+require_once('grn/controller.csp');
+$tmp_key = grn_get_temporary_key();
+
+require_once('fw/session_manager.csp');
+$session_manager = CB_SessionManager::getInstance();
+$session = $session_manager->getSession('export_csv' . $tmp_key);
+$session->unset_by('conditions');
+$session->set('conditions', $G_INPUT);
+
+global $G_container_base;
+$creators_info = GRN_ControllerUtil::getUserInfoToShowUserName($creators,
+    $login_user);
+
+$t = new GRN_Smarty();
+$t->assign('reports', $result['reports']);
+$t->assign('category_id', cb_at($G_INPUT, 'cid'));
+$t->assign('form_id', cb_at($G_INPUT, 'fid'));
+$t->assign('creators_info', $creators_info);
+$t->assign('tmp_key', $tmp_key);
+$t->assign('navi', $result['navi']);
+$t->assign('count_reports', count($result['reports']));
+$t->assign('from', cb_at($G_INPUT, 'from'));
+$t->assign('name_width', $config->getNameWidth());
+if (strlen(cb_at($G_INPUT, 'sort')) > 0) {
+    $t->assign('sort', cb_at($G_INPUT, 'sort'));
+} else {
+    $t->assign('sort', 'mtd');
+}
+if (strpos(cb_get_pagename(), 'operation')) {
+    $t->assign('link', 'report/operation/export');
+}
+if (strpos(cb_get_pagename(), 'system')) {
+    $t->assign('link', 'report/system/export');
+}
+
+$t->display(cb_get_pagename() . ".tpl");
+
+/**
+ * クライテリアを元に検索を行う。
+ *
+ * @param $criteria GRN_Report_Search_Criteria
+ *
+ * @return array
+ */
+function search($criteria)
+{
+    global $login_user;
+
+    //Get Login User Config
+    $manager = GRN_UIConfigManager::getInstance();
+    $config = $manager->getUserConfig($login_user);
+
+    $offset = grn_report_get_offset();
+    $limit = $config->getListMax();
+
+    //ページングに関する条件を追加
+    $criteria->index = $offset;
+    $criteria->count = $limit + 1;
+
+    $reports = GRN_Report_Search_Logic::search($criteria);
+    $isExistsNextPage = count($reports) > $limit;
+    if ($isExistsNextPage) {
+        array_pop($reports);
+    }
+
+    foreach ($reports as $rid => $report) {
+        $ts = new CB_TimeStamp();
+        $ts->unix_ts = $report['col_mtime'];
+        $reports[$rid]['mtime'] = $ts;
+    }
+
+    require_once('report/controller_util.csp');
+    $utility = new GRN_Report_ControllerUtil();
+    $n_navigation_for_view = $utility->makeSimpleNaviInformation($offset,
+        $limit, count($reports), $isExistsNextPage);
+
+    return ['reports' => $reports, 'navi' => $n_navigation_for_view];
+}
+
+
+/**
+ * クライテリアの作成を行う。
+ *
+ * @param $input
+ *
+ */
+function createCriteria($input)
+{
+    global $login_user, $grn_uum;
+    $criteria = new GRN_Report_Search_Criteria($login_user);
+    $criteria->target = $input['target'];
+    $criteria->and_or = $input['and_or'];
+    $criteria->filter_id = cb_at($input, 'filter_id');
+    $criteria->form_id = cb_at($input, 'fid');
+    //フォームの絞込み
+    $formtype = cb_at($input, 'select_form') ? cb_at($input, 'select_form_type')
+        : GRN_REPORT_FILTER_FORM_TYPE_ALL;
+
+    require_once('report/controller_util.csp');
+    $filter_util = GRN_Report_Filter_Controller_Utility::getInstance();
+
+    for ($i = 0; $i < count($input['type']); $i++) {
+        if ($input['type_item'][$i] == 'item') {
+            $type = GRN_REPORT_FILTER_TYPE_ITEMDATA;
+            $formtype = GRN_REPORT_FILTER_FORM_TYPE_SELECT;
+        } else {
+            $type = $input['type'][$i];
+        }
+        $condition = $input['condition'][$i];
+        $item_id = explode("_", @$input['item_id'][$i]);
+        $item_id = $item_id[0];
+        $item_type = @$input['item_type'][$i];
+        $item_index = @$input['item_index'][$i] ? $input['item_index'][$i] : 0;
+
+        $value = $filter_util->getConditionValue($input, $i, $type, $item_type,
+            $formtype, $item_index);
+
+        if ($formtype == GRN_REPORT_FILTER_FORM_TYPE_SELECT
+            && is_numeric($item_id)
+        ) {
+            $type = GRN_REPORT_FILTER_TYPE_ITEMDATA_DETAIL;
+        }
+
+        //条件の追加
+        $criteria->addCondition($type, $value, $condition, $item_id);
+    }
+
+    //ソートルールを追加
+    $criteria->orders = getSortRule(cb_at($input, 'sort'));
+
+    if ($criteria->target === GRN_REPORT_SEARCH_TARGET_OPERATION
+        || $criteria->target === GRN_REPORT_SEARCH_TARGET_SYSTEM
+    ) {
+        {
+            switch ($criteria->target) {
+                // Operators
+                case GRN_REPORT_SEARCH_TARGET_OPERATION:
+                    $form_id = cb_at($input, 'fid');
+                    require_once('report/form_logic_base.csp');
+                    $form_logic_base
+                        = GRN_Report_Form_Logic_Base::getInstance();
+                    $form = $form_logic_base->getDirect($form_id,
+                        ['_id, col_category'], [], CB_DATABASE_NO_LOCK);
+                    $category_util
+                        = GRN_Report_Category_Controller_Utility::getInstance();
+                    if ($category_util->checkManage($form['col_category'],
+                        false, CB_DATABASE_NO_LOCK)
+                    ) {
+                        $criteria->isManage = true;
+                    }
+                    break;
+                // Administrators
+                case GRN_REPORT_SEARCH_TARGET_SYSTEM:
+                    $roles = $grn_uum->getUserRolesInfo($login_user->getOID());
+                    if (isset($roles[GRN_UUM_ADMINISTRATION_ROLE])) {
+                        $criteria->isManage = true;
+                    }
+                    break;
+            }
+        }
+    }
+
+    return $criteria;
+}
+
+//クライテリアに格納するソート条件を取得
+function getSortRule($sort)
+{
+    $order = null;
+    switch ($sort) {
+        case 'mtd':
+            $order = ['report.col_mtime', 'DESC'];
+            break;
+        case 'mtu':
+            $order = ['report.col_mtime', 'ASC'];
+            break;
+        case 'rnd':
+            $order = ['report.col_name', 'DESC'];
+            break;
+        case 'rnu':
+            $order = ['report.col_name', 'ASC'];
+            break;
+        case 'cnd':
+            $order = ['report.col_creator_name', 'DESC'];
+            break;
+        case 'cnu':
+            $order = ['report.col_creator_name', 'ASC'];
+            break;
+        default:
+            $order = ['report.col_mtime', 'DESC'];
+            break;
+    }
+
+    return [$order];
+}

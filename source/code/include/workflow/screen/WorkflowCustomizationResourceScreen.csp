@@ -1,0 +1,243 @@
+<?php
+
+namespace grn\workflow\screen;
+
+use grn\grn\customization\logic\InspectionUtil;
+use grn\grn\customization\bean\ResourceForm;
+use grn\grn\customization\service\ResourceService;
+use grn\grn\customization\screen\ResourceScreen;
+use grn\grn\customization\screen\ResourceTemplates;
+use grn\workflow\CustomizationUtil;
+
+class WorkflowCustomizationResourceScreen extends ResourceScreen
+{
+    const ARG_FORM_ID = 'fid';
+
+    const APP_ID = 'workflow';
+    const CUSTOMIZATION_TARGET = 'form.';
+
+    private $formId;
+    private $categoryId;
+    private $screenType;
+    private $resourceService;
+
+    /**
+     * @param $input
+     */
+    public function __construct($input)
+    {
+        parent::__construct($input);
+
+        $this->resourceService = new ResourceService('workflow');
+
+        $is_system_page = cb_is_system_page();
+        $this->screenType = $is_system_page == true ? 'system' : 'operation';
+
+        require_once('workflow/error_code.csp');
+
+        require_once('workflow/category_logic.csp');
+        require_once('workflow/controller_util.csp');
+
+        $this->formId = cb_at($input, self::ARG_FORM_ID);
+
+        // Check the form exists and get the category id of the form
+        $category_logic = \GRN_Workflow_Category_Logic::getInstance();
+        $category_id = $category_logic->getIdByFormId($this->formId);
+        if ($category_id === false) {
+            $category_id = GRN_WORKFLOW_CATEGORY_NONPARTY_ID;
+        }
+        $this->categoryId = $category_id;
+
+        // Check the logged in operational administrator has the access right of the category
+        if ( ! $is_system_page) {
+            $category_util
+                = \GRN_Workflow_Category_Controller_Utility::getInstance();
+            $category_util->checkManage($category_id, true,
+                CB_DATABASE_NO_LOCK);
+            $category_util->checkAccess($category_id, true,
+                CB_DATABASE_NO_LOCK);
+        }
+
+        if ( ! CustomizationUtil::allowCustomization()) {
+            cb_throw_error(E_GRN_WRKF_CUSTOMIZATION_IS_DEACTIVATED);
+        }
+    }
+
+    public function fetch()
+    {
+        require_once('grn/smarty.csp');
+        $t = new \GRN_Smarty();
+
+        $form_util = \GRN_Workflow_Form_Controller_Utility::getInstance();
+        $translation_map_form = [
+            'fid'                     => '_id',
+            'is_customization_active' => 'is_customization_active'
+        ];
+        $form_for_view = $form_util->getView($this->formId,
+            $translation_map_form, $this->categoryId);
+        $is_customization_active = $form_for_view['is_customization_active'];
+        $this->assignApplyStatus($t,
+            CustomizationUtil::parseIsActivateCustomizationStatus($is_customization_active));
+
+        $resources
+            = $this->resourceService->getJsCssResources($this->getTarget());
+        $this->assignResources($t, $resources['js'], $resources['css']);
+        $this->assignStaticPart($t);
+
+        include('grn/_upload_prepend.csp');
+
+        return $t->fetch(ResourceTemplates::SETTING_RESOURCE);
+    }
+
+    /**
+     * @param $input
+     */
+    public function post($input)
+    {
+        $form = new ResourceForm($input);
+
+        //create new files
+        $new_resources
+            = $this->resourceService->updateResources($this->getTarget(),
+            $form);
+        $file_names
+            = $this->resourceService->getFileNamesFromResources($new_resources);
+
+        $apply_status = null;
+        if (count($new_resources) > 0) {
+            $apply_status = cb_at($input, 'apply_status');
+            $apply_status = ($apply_status == '1') ? 1 : 0;
+        }
+
+        $input = $this->getInput();
+
+        require_once('workflow/form_logic.csp');
+        $form_id = cb_at($input, 'fid');
+        $form_logic = \GRN_Workflow_Form_Logic::getInstance();
+        $form_logic->setActiveCustomization($form_id, $apply_status);
+
+        $this->inspectionRecordForPost($form_id, $apply_status, $new_resources,
+            $file_names);
+
+        cb_redirect($this->getRedirectPage(), $this->getRedirectParams());
+    }
+
+    /**
+     * @param string $fid
+     * @param int    $apply_status
+     * @param array  $resources
+     * @param array  $file_names
+     */
+    private function inspectionRecordForPost(
+        $fid,
+        $apply_status,
+        array $resources,
+        array $file_names
+    ) {
+        require_once('workflow/inspection.csp');
+        $inspection = \GRN_Workflow_Customization_Inspection::getInstance();
+        if ($inspection->isEnabled()) {
+            $message_args = array_merge(
+                [
+                    'fid'          => $fid,
+                    'apply_status' => InspectionUtil::getApplyStatusLogValue($apply_status)
+                ],
+                InspectionUtil::getResourcesLogParams($resources, $file_names)
+            );
+
+            $template_items = [];
+            $template_string = '(';
+            foreach ($message_args as $key => $message) {
+                $template_string .= '<%s>';
+                $template_items[] = $key;
+            }
+            $template_string .= ')';
+
+            $template_name = 'customization_modify';
+            $template = [
+                'template' => $template_string,
+                'items'    => $template_items,
+                'action'   => 'modify',
+                'target'   => 'customization'
+            ];
+            $inspection->addTemplate($template_name, $template);
+            $inspection->record($template_name, $message_args);
+        }
+    }
+
+    /**
+     * @return array
+     */
+    public function getRedirectParams()
+    {
+        return ['cid' => $this->categoryId, 'fid' => $this->formId];
+    }
+
+    /**
+     * @return string
+     */
+    public function getRedirectPage()
+    {
+        return "workflow/{$this->screenType}/form_view";
+    }
+
+    /**
+     * @return array
+     */
+    public function getCommandParams()
+    {
+        return ['cid' => $this->categoryId, 'fid' => $this->formId];
+    }
+
+    /**
+     * @return string
+     */
+    public function getCommandPage()
+    {
+        return "workflow/{$this->screenType}/command_customization_resource";
+    }
+
+    /**
+     * @return array
+     */
+    public function getSitePosition()
+    {
+        $site_position = [];
+        if ( ! cb_is_system_page()) {
+            require_once('fw/session_manager.csp');
+            $session_manager = \CB_SessionManager::getInstance();
+            $session_form_list
+                = $session_manager->getSession('workflow/operation/form_list');
+            $folder_id = $session_form_list->get('folder_id');
+            $site_position[] = [
+                'page' => 'workflow/index',
+                'name' => grn_get_page_display_name('workflow/index'),
+                'fid'  => $folder_id,
+                'sf'   => 1
+            ];
+        }
+        $site_position[] = [
+            'page' => "workflow/{$this->screenType}/form_list",
+            'name' => grn_get_page_display_name("workflow/{$this->screenType}/form_list"),
+            'cid'  => $this->categoryId,
+            'sf'   => 1
+        ];
+        $site_position[] = [
+            'page' => "workflow/{$this->screenType}/form_view",
+            'name' => grn_get_page_display_name("workflow/{$this->screenType}/form_view"),
+            'cid'  => $this->categoryId,
+            'fid'  => $this->formId
+        ];
+        $site_position[] = [
+            'page' => '',
+            'name' => grn_get_current_page_display_name()
+        ];
+
+        return $site_position;
+    }
+
+    private function getTarget()
+    {
+        return self::CUSTOMIZATION_TARGET . $this->formId;
+    }
+}

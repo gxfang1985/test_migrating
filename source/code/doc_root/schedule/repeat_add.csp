@@ -1,0 +1,852 @@
+<?php
+
+use grn\grn\customization\CustomizationJsCssLoader;
+use grn\grn\customization\schedule\CreateShowJsApiEvent;
+use grn\grn\customization\schedule\ScheduleJsApiLoader;
+use grn\schedule\api\EventBuilder;
+use grn\schedule\api\model\Event;
+use grn\schedule\api\RenderMemberProvider;
+use grn\schedule\ScheduleMemberLogic;
+
+// Smarty をインスタンス化
+require_once("grn/smarty.csp");
+$t = new GRN_Smarty;
+
+// SmartyValidate should be initialized when an input form is there.
+require('SmartyValidate.class.php');
+SmartyValidate::connect($t);
+
+require_once("grn/controller.csp");
+
+include('_prepend_post.csp');
+//------------------
+
+$user_id = array_key_exists('uid', $G_INPUT) ? $G_INPUT['uid'] : null;
+$group_id = array_key_exists('gid', $G_INPUT) ? $G_INPUT['gid'] : null;
+$str_date = array_key_exists('bdate', $G_INPUT) ? $G_INPUT['bdate'] : null;
+$event = null;
+
+require_once('schedule/application.csp');
+$app = GRN_Schedule_Application::getInstance();
+require_once('schedule/view_util.csp');
+$util = GRN_Schedule_View_Util::getInstance();
+
+require_once('schedule/system_logic.csp');
+$systemlogic = GRN_Schedule_SystemLogic::getInstance();
+require_once('schedule/personal_logic.csp');
+$personallogic = GRN_Schedule_PersonalLogic::getInstance();
+
+require_once('schedule/facility_system_logic.csp');
+$facility_logic = GRN_Facility_SystemLogic::getInstance();
+
+require_once('schedule/access_logic.csp');
+$acc_logic = GRN_Schedule_Access_Logic::getInstance();
+
+global $G_container_base;
+$uum = $G_container_base->getInstance('uum');
+require_once('grn/uum_util.csp');
+$uum_util = GRN_UumUtil::getInstance();
+$login = $uum->getLoginUser();
+$login_id = $login->getOID();
+
+$is_reuse_schedule = false;
+
+// 予定メニュー
+include('_menus.csp');
+
+// 設定する日付
+$date = new CB_Date();
+if ( ! $date->parse($str_date)) {
+    // 今日を求める
+    $ts = new CB_TimeStamp();
+    $ts->unix_ts = time();
+    $tsex = new CB_TimeStampEx($ts);
+    $date = $tsex->getDate();
+}
+
+$member = null;
+if ( ! $user_id) {
+    $user_id = $login_id;
+    $member = $login;
+} // 組織
+elseif (mb_substr($user_id, 0, 1) == 'g') {
+    $member = $uum->getGroup(mb_substr($user_id, 1));
+    if ( ! $member) {
+        $user_id = $login_id;
+        $member = $login;
+    }
+} // 施設
+elseif (mb_substr($user_id, 0, 1) == 'f') {
+    $member = $facility_logic->getFacility(mb_substr($user_id, 1));
+    if ($member === false) {
+        $user_id = $login_id;
+        $member = $login;
+    }
+} else {
+    $member = $uum->getUser($user_id);
+    if ( ! $member) {
+        $user_id = $login_id;
+        $member = $login;
+    }
+}
+
+$dynamic_roles = $uum->listGrantedRoles();
+// ユーザーの指定があった場合のみそのユーザー/組織に対して登録できるかチェック
+if (array_key_exists('uid', $G_INPUT) && $G_INPUT['uid'] && $member) {
+    // アクセス権のチェック
+    $access = 1;
+
+    if ( ! is_a($member, 'CB_User') || ($member->getOID() != $login_id)) {
+        if (is_a($member, 'GRN_Facility_Facility')) {
+            // 施設のアクセス権はグループをたどって評価する
+            $tmp_array = [$member->getOID() => $member];
+            $access = $acc_logic->getFacilityGroupAccessList($login,
+                $tmp_array, ['read', 'add'], $dynamic_roles);
+            $access += $acc_logic->getEvaluateAccessesListById($login,
+                $tmp_array, 'facility', ['read', 'add'], $dynamic_roles);
+            foreach ($access as $access_item) {
+                if ($access_item['add'] == GRN_SCHD_ACCESS_DENY) {
+                    $access = false;
+                    break;
+                }
+            }
+        } else {
+            $access = $acc_logic->evaluateAccess($login, $member,
+                ['read', 'add'], $dynamic_roles);
+        }
+    }
+    if ( ! $access) {
+        cb_throw_error(E_GRN_SCHD_ACCESSDENY_ENTRY);
+    }
+}
+
+//--- add VCBSCH0010 ---s
+// V-CUBEシステムが利用可能かを取得する。
+require_once('schedule/netmeeting_system_logic.csp');
+$netmeeting_system_logic = GRN_Netmeeting_SystemLogic::getInstance();
+$netmeeting_system_available
+    = $netmeeting_system_logic->getNetmeetingAvailable();
+//--- add VCBSCH0010 ---e
+
+// 全施設が選択可能かどうか
+require_once('schedule/system_logic.csp');
+$system_logic = GRN_Schedule_SystemLogic::getInstance();
+$allow_all_facilities = $system_logic->getAllowAllFacilities();
+$t->assign('allow_all_facilities', $allow_all_facilities);
+$referer_key = array_key_exists('referer_key', $G_INPUT)
+    ? $G_INPUT['referer_key'] : null;
+$referer_exists = false;
+if ($referer_key) {
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session = $session_manager->getSession('schedule.referer');
+    $referer = $session->get($referer_key);
+
+    if (($referer['page'] == 'schedule/index'
+         || $referer['page'] == 'schedule/group_day'
+         || $referer['page'] == 'schedule/personal_day'
+         || $referer['page'] == 'schedule/personal_week'
+         || $referer['page'] == 'schedule/personal_month')
+        && substr($user_id, 0, 1) == 'f'
+        && strlen($user_id) > 1
+    ) {
+        $fgroup = $facility_logic->getFacilityAffiliationGroup(substr($user_id,
+            1));
+        if ($fgroup) {
+            $group_id = 'f' . $fgroup->getOID();
+
+            $facilities_tmp
+                = $facility_logic->getGroupFacilityArrayList($fgroup->getOID());
+            // 順番を保持するためにキーを取得
+            $facilities_order = array_keys($facilities_tmp);
+            $facilities_tmp = $acc_logic->evaluateAccessesById($login,
+                $facilities_tmp, ['add'], $dynamic_roles, 'facility');
+            $facilities = [];
+            foreach ($facilities_order as $key) {
+                // アクセス権があったものだけ返す
+                if (array_key_exists($key, $facilities_tmp)) {
+                    $facilities[$key] = $facilities_tmp[$key];
+                }
+
+            }
+            require_once('schedule/facility_privilege.csp');
+            $priv = GRN_Facility_Privilege_Logic::getInstance();
+            // GTM-1676
+            $checkRepeatAndApproval
+                = $facility_logic->getSettingsOfFacilities(array_keys($facilities),
+                ['approval', 'regulary']);
+            foreach (array_keys($facilities) as $key) {
+                // 繰り返し予定ができないものは消す。
+                if ( ! ($checkRepeatAndApproval[$key]['regulary']
+                        || $priv->hasPrivilegeOfFacility($login,
+                        $facility_logic->getFacility($key)))
+                ) {
+                    unset($facilities[$key]);
+                    //--- add VCBSCH0010 ---s
+                } // V-CUBEシステムが利用可能で施設がV-CUBE連携対象の場合、対象施設を表示しない。
+                elseif ($netmeeting_system_available == 1) {
+                    $fa = $facility_logic->getFacility($key);
+                    if ($fa->get('netmeeting_available') == 1) {
+                        unset($facilities[$key]);
+                    }
+                    //--- add VCBSCH0010 ---e
+                }
+
+                // GTM-1676
+                if (array_key_exists($key, $checkRepeatAndApproval)
+                    && $checkRepeatAndApproval[$key]['approval']
+                ) {
+                    unset($facilities[$key]);
+                }
+                // end GTM-1676
+
+            }
+            $all_facilities = ScheduleMemberLogic::getInstance()
+                                                 ->getFacilitiesRender($facilities,
+                                                     true);
+            $t->assign('all_facilities', $all_facilities);
+            $t->assign('show_affiliation_group', false);
+            $t->assign('default_group_name', $fgroup->get('name'));
+
+            unset($fgroup, $facilities_tmp, $facilities_order);
+        }
+    }
+    unset($session_manager, $session, $referer);
+}
+
+if ( ! isset($facilities)) {
+    if ($allow_all_facilities) {
+        $facilities_tmp = $facility_logic->getOrderedFacilityPartInfoList();
+        // 順番を保持するためにキーを取得
+        $facilities_order = array_keys($facilities_tmp);
+        $facilities_tmp = $acc_logic->evaluateAccessesById($login,
+            $facilities_tmp, ['add'], $dynamic_roles, 'facility');
+        $facilities = [];
+
+        foreach ($facilities_order as $key) {
+            // アクセス権があったものだけ返す
+            if (array_key_exists($key, $facilities_tmp)) {
+                $facilities[$key] = $facilities_tmp[$key];
+            }
+        }
+
+        require_once('schedule/facility_privilege.csp');
+        $priv = GRN_Facility_Privilege_Logic::getInstance();
+        // GTM-1676
+        $checkRepeatAndApproval
+            = $facility_logic->getSettingsOfFacilities(array_keys($facilities),
+            ['approval', 'regulary']);
+
+        foreach (array_keys($facilities) as $key) {
+            // 繰り返し予定ができないものは消す。
+            if ( ! ($checkRepeatAndApproval[$key]['regulary']
+                    || $priv->hasPrivilegeOfFacility($login,
+                    $facility_logic->getFacility($key)))
+            ) {
+                unset($facilities[$key]);
+                //--- add VCBSCH0010 ---s
+            } // V-CUBEシステムが利用可能で施設がV-CUBE連携対象の場合、対象施設を表示しない。
+            elseif ($netmeeting_system_available == 1) {
+                $fa = $facility_logic->getFacility($key);
+                if ($fa->get('netmeeting_available') == 1) {
+                    unset($facilities[$key]);
+                }
+                //--- add VCBSCH0010 ---e
+            }
+
+            // GTM-1676
+            if (array_key_exists($key, $checkRepeatAndApproval)
+                && $checkRepeatAndApproval[$key]['approval']
+            ) {
+                unset($facilities[$key]);
+            }
+            // end GTM-1676
+        }
+
+        $all_facilities = ScheduleMemberLogic::getInstance()
+                                             ->getFacilitiesRender($facilities,
+                                                 true);
+        $t->assign('all_facilities', $all_facilities);
+        $t->assign('show_affiliation_group', true);
+
+        $t->assign('default_group_name',
+            cb_msg('grn/schedule', 'facility_all'));
+        $group_id = 'f';
+    } else {
+        $t->assign('show_affiliation_group', false);
+        $t->assign('default_group_name',
+            cb_msg('grn/schedule', 'choice_facility_group'));
+        $group_id = 'f';
+    }
+}
+
+// 上部に表示するスケジュールデータの設定
+include('_member_day.csp');
+$t->assign('disable_link', true);             // 登録画面ではスケジュール内のリンクはOff
+
+// 非公開が登録できるかどうか
+$t->assign('use_private', $systemlogic->getUsePrivate());
+$t->assign('minute_interval', $systemlogic->getScheduleUnit());
+$t->assign('show_organize', $systemlogic->getShowOrganize() ? true : false);
+
+$t->assign('show_group_role',
+    ScheduleMemberLogic::getInstance()->isAllowSettingGroupRoleToWatchers());
+
+$repeat_limit = $systemlogic->getRepeatLimit();
+$repeat_limit = $repeat_limit < 12
+    ?
+    cb_msg('grn.schedule', 'repeatlimit_month', ['limit' => $repeat_limit])
+    :
+    cb_msg('grn.schedule', 'repeatlimit_year', ['limit' => 1]);
+$t->assign('repeat_limit', $repeat_limit);
+
+$schedule_event = [];
+$schedule_event['selectmenu'] = '';
+$schedule_event['title'] = '';
+$schedule_event['memo'] = '';
+$schedule_event['additional_items'] = '';
+$schedule_event['start_date'] = $date;
+$limit_date = new CB_DateEx($date);
+$limit_date->moveMonths(1);
+$limit_date->moveDays(-1);
+$schedule_event['end_date'] = &$limit_date;
+$schedule_event['start_time'] = null;
+$schedule_event['end_time'] = null;
+$schedule_event['wday'] = cb_get_day_of_week($date->year,
+    $date->month, $date->day);
+$schedule_event['day'] = $date->day;
+$schedule_event['private_setting'] = $system_logic->getDefaultPrivateSet();
+if (is_a($member, 'CB_User')) {
+    $schedule_event['users'] = ScheduleMemberLogic::getInstance()
+                                                  ->getDisplayMember($member);
+} elseif (is_a($member, 'CB_Group')) {
+    $schedule_event['users'] = ScheduleMemberLogic::getInstance()
+                                                  ->getDisplayMember($member);
+} elseif (is_a($member, 'GRN_Facility_Facility')) {
+    require_once('schedule/facility_privilege.csp');
+    $priv = GRN_Facility_Privilege_Logic::getInstance();
+    // GTM-1676
+    $memberId = $member->getOID();
+    $checkRepeatAndApproval
+        = $facility_logic->getSettingsOfFacilities([$memberId],
+        ['approval', 'regulary']);
+
+    if (($checkRepeatAndApproval[$memberId]['regulary']
+         || $priv->hasPrivilegeOfFacility($login,
+                $facility_logic->getFacility($memberId)))
+        && ! $checkRepeatAndApproval[$memberId]['approval']
+    ) {
+        $schedule_event['facilities'] = ScheduleMemberLogic::getInstance()
+                                                           ->getDisplayMember($member);
+    } else {
+        $schedule_event['facilities'] = [];
+    }
+}
+$current_timezone = CB_I18N::getInstance()->getCurrentTimezone();
+$schedule_event['timezone'] = $current_timezone;
+$schedule_event['end_timezone'] = $current_timezone;
+
+// カスタマイズ項目取得
+$extended_items = $facility_logic->listItemsView();
+foreach (array_keys($extended_items) as $key) {
+    $item = &$extended_items[$key];
+    if (array_key_exists($item['oid'], $G_INPUT)) {
+        if ($item['type'] == GRN_SCHEDULE_ITEM_MENU) {
+            $item['item_menu_text'] = $G_INPUT[$item['oid']];
+        } else {
+            $item['value'] = $G_INPUT[$item['oid']];
+        }
+    }
+}
+$t->assign('extended_items', $extended_items);
+
+if (array_key_exists('tab', $G_INPUT) && $G_INPUT['tab']) {
+    $schedule_event['timezone'] = isset($G_INPUT['timezone'])
+        ? $G_INPUT['timezone'] : $schedule_event['timezone'];
+    $schedule_event['end_timezone'] = $schedule_event['timezone'];
+    $schedule_event['selectmenu'] = array_key_exists('menu', $G_INPUT)
+        ? $G_INPUT['menu'] : null;
+    $schedule_event['title'] = array_key_exists('title', $G_INPUT)
+        ? $G_INPUT['title'] : null;
+    $schedule_event['memo'] = array_key_exists('memo', $G_INPUT)
+        ? $G_INPUT['memo'] : null;
+    $schedule_event['additional_items'] = array_key_exists('additional_items',
+        $G_INPUT) ? $G_INPUT['additional_items'] : null;
+
+    if (isset($G_INPUT["from_simple_add"])) {
+        $notify_address_candidate = ScheduleMemberLogic::getInstance()
+                                                       ->getDefaultPublicByUserId($login_id,
+                                                           ScheduleMemberLogic::PLUG_IN_TYPE_VIEW,
+                                                           true, true);
+        if (count($notify_address_candidate) > 0) {
+            $schedule_event['notify_address']
+                = ScheduleMemberLogic::getInstance()
+                                     ->getDisplayMemberList($notify_address_candidate);
+        }
+    }
+
+    if (array_key_exists('private', $G_INPUT)) {
+        switch ($G_INPUT['private']) {
+            case 1:
+                $schedule_event['private_setting']
+                    = GRN_PRIVATE_SETTING_PRIVATE;
+                break;
+            case 2:
+                $schedule_event['private_setting']
+                    = GRN_PRIVATE_SETTING_MANAGED;
+                $p_sUID = array_key_exists('p_sUID', $G_INPUT)
+                    ? $G_INPUT['p_sUID'] : [];
+                $schedule_event['notify_address']
+                    = ScheduleMemberLogic::getInstance()
+                                         ->getNotifyAddressRenderFromParam($p_sUID);
+                break;
+            default:
+                $schedule_event['private_setting'] = GRN_PRIVATE_SETTING_PUBLIC;
+        }
+    }
+
+    if ($G_INPUT['tab'] == 'add') {
+        $start_hour = array_key_exists('start_hour', $G_INPUT)
+            ? $G_INPUT['start_hour'] : null;
+        $start_minute = array_key_exists('start_minute', $G_INPUT)
+            ? $G_INPUT['start_minute'] : null;
+        $end_hour = array_key_exists('end_hour', $G_INPUT)
+            ? $G_INPUT['end_hour'] : null;
+        $end_minute = array_key_exists('end_minute', $G_INPUT)
+            ? $G_INPUT['end_minute'] : null;
+
+        $schedule_event['start_time']
+            = $util->createDateTimeFromParameters(null,
+            null, null, $start_hour, $start_minute);
+        $schedule_event['end_time'] = $util->createDateTimeFromParameters(null,
+            null, null, $end_hour, $end_minute);
+    }
+
+    // 参加者
+    $sUID = array_key_exists('sUID', $G_INPUT)
+        ? $G_INPUT['sUID'] : [];
+    $schedule_event["users"] = ScheduleMemberLogic::getInstance()
+                                                  ->getAttendeesRenderFromParam($sUID,
+                                                      false, false);
+
+    // 施設
+    $s_faid = array_key_exists('sITEM', $G_INPUT) ? $G_INPUT['sITEM'] : null;
+    if (is_array($s_faid) && count($s_faid) > 0) {
+        $facility_ids = [];
+        require_once('schedule/facility_privilege.csp');
+        $priv = GRN_Facility_Privilege_Logic::getInstance();
+        // GTM-1676
+        $checkRepeatAndApproval
+            = $facility_logic->getSettingsOfFacilities($s_faid,
+            ['approval', 'regulary']);
+        foreach ($s_faid as $faid) {
+            $facility_tmp = $facility_logic->getFacility($faid);
+            if ( ! $checkRepeatAndApproval[$faid]['regulary']
+                 && ! $priv->hasPrivilegeOfFacility($login, $facility_tmp)
+            ) {
+                continue;
+            }
+            //--- add VCBSCH0010 ---s
+            if (($netmeeting_system_available == 1)
+                && ($facility_tmp->get('netmeeting_available') == 1)
+            ) {
+                continue;
+            }
+            //--- add VCBSCH0010 ---e
+            // GTM-1676
+            if ($checkRepeatAndApproval[$faid]['approval']) {
+                continue;
+            }
+            // end GTM-1676 
+
+            $facility_ids[] = $faid;
+        }
+        $schedule_event['facilities'] = ScheduleMemberLogic::getInstance()
+                                                           ->getFacilitiesRenderFromParam($facility_ids);
+    }
+
+    $address = [];
+    $address['company_name'] = array_key_exists('company_name', $G_INPUT)
+        ? $G_INPUT['company_name'] : null;
+    $address['zip_code'] = array_key_exists('zip_code', $G_INPUT)
+        ? $G_INPUT['zip_code'] : null;
+    $address['physical_address'] = array_key_exists('physical_address',
+        $G_INPUT) ? $G_INPUT['physical_address'] : null;
+    $address['route'] = array_key_exists('route', $G_INPUT)
+        ? $G_INPUT['route'] : null;
+    $address['route_time'] = array_key_exists('route_time', $G_INPUT)
+        ? $G_INPUT['route_time'] : null;
+    $address['route_fare'] = array_key_exists('route_fare', $G_INPUT)
+        ? $G_INPUT['route_fare'] : null;
+    $address['company_telephone_number']
+        = array_key_exists('company_telephone_number',
+        $G_INPUT) ? $G_INPUT['company_telephone_number'] : null;
+    $address['facsimile_number'] = array_key_exists('facsimile_number',
+        $G_INPUT) ? $G_INPUT['facsimile_number'] : null;
+    $address['url'] = array_key_exists('url', $G_INPUT)
+        ? $G_INPUT['url'] : null;
+
+    $b_not_null = false;
+    foreach ($address as $data) {
+        if (is_string($data) && mb_strlen($data) > 0) {
+            $b_not_null = true;
+            break;
+        }
+    }
+    if ($b_not_null) {
+        $schedule_event['address'] = $address;
+    }
+} elseif (($event_id = array_key_exists('event', $G_INPUT) ? $G_INPUT['event']
+    : false)
+) {
+    // 再利用登録の場合
+    $new_entry = array_key_exists('new', $G_INPUT) ? $G_INPUT['new'] : null;
+    $event = $app->getEvent($login, $event_id, $date);
+    // イベントがある場合は、そのイベントを利用して初期値を設定する
+    if ($event && ! $new_entry) {
+        $is_reuse_schedule = true;
+        $schedule_event['timezone'] = $event->timezone;
+        $schedule_event['end_timezone'] = isset($event->end_timezone)
+            ? $event->end_timezone : $event->timezone;
+
+        $schedule_event['selectmenu'] = $event->menu;
+        $schedule_event['menucolor'] = $event->menucolor;
+        $schedule_event['title'] = $event->detail;
+        $schedule_event['start_date'] = $event->setdate;
+        $schedule_event['end_date'] = $event->enddate;
+        $schedule_event['start_time'] = $event->settime;
+        $schedule_event['end_time'] = $event->endtime;
+        $schedule_event['memo'] = $event->memo;
+        $schedule_event['additional_items'] = $event->additional_items;
+        $schedule_event['type'] = $event->repeat_type;
+        $schedule_event['wday'] = $event->wday;
+        $schedule_event['day'] = $event->day;
+
+        if ($event->private) {
+            // 通知先が指定されているか
+            if (is_array($event->notify_address)
+                && count($event->notify_address) > 0
+            ) {
+                $schedule_event['private_setting']
+                    = GRN_PRIVATE_SETTING_MANAGED;
+                $schedule_event['notify_address']
+                    = ScheduleMemberLogic::getInstance()
+                                         ->getNotifyAddressRender($event->notify_address);
+            } else {
+                $schedule_event['private_setting']
+                    = GRN_PRIVATE_SETTING_PRIVATE;
+            }
+        } else {
+            $schedule_event['private_setting'] = GRN_PRIVATE_SETTING_PUBLIC;
+        }
+
+        $users = [];
+        if ($event->groups) {
+            foreach (array_keys($event->groups) as $key) {
+                $member = &$event->groups[$key];
+                if ( ! $member) {
+                    continue;
+                }
+
+                $users['g' . $member->getOID()] = '[' . $member->get('name')
+                                                  . ']';
+            }
+        }
+
+        $schedule_event['users'] = ScheduleMemberLogic::getInstance()
+                                                      ->getAttendeesRenderFromEvent($event);
+
+        $facilities = [];
+        if ($event->facilities) {
+            foreach (array_keys($event->facilities) as $key) {
+                $member = &$event->facilities[$key];
+                if ( ! $member) {
+                    continue;
+                }
+
+                $facilities[$member->getOID()] = $member;
+            }
+
+            require_once('schedule/facility_privilege.csp');
+            $priv = GRN_Facility_Privilege_Logic::getInstance();
+            // GTM-1676
+            $checkRepeatAndApproval
+                = $facility_logic->getSettingsOfFacilities(array_keys($facilities),
+                ['approval', 'regulary']);
+            foreach (array_keys($facilities) as $key) {
+                // 繰り返し予定ができないものは消す。
+                if ( ! ($checkRepeatAndApproval[$key]['regulary']
+                        || $priv->hasPrivilegeOfFacility($login,
+                        $facility_logic->getFacility($key)))
+                ) {
+                    unset($facilities[$key]);
+                    //--- add VCBSCH0010 ---s
+                } // V-CUBEシステムが利用可能で施設がV-CUBE連携対象の場合、対象施設を表示しない。
+                elseif ($netmeeting_system_available == 1) {
+                    $fa = $facility_logic->getFacility($key);
+                    if ($fa->get('netmeeting_available') == 1) {
+                        unset($facilities[$key]);
+                    }
+                    //--- add VCBSCH0010 ---e
+                }
+
+                // GTM-1676
+                if (array_key_exists($key, $checkRepeatAndApproval)
+                    && $checkRepeatAndApproval[$key]['approval']
+                ) {
+                    unset($facilities[$key]);
+                }
+                // end GTM-1676
+            }
+        }
+        $schedule_event['facilities'] = ScheduleMemberLogic::getInstance()
+                                                           ->getFacilitiesRender($facilities);
+
+        if ( ! is_null($event->company_name)
+             ||
+             ! is_null($event->zip_code)
+             ||
+             ! is_null($event->physical_address)
+             ||
+             ! is_null($event->map)
+             ||
+             ! is_null($event->route)
+             ||
+             ! is_null($event->route_time)
+             ||
+             ! is_null($event->route_fare)
+             ||
+             ! is_null($event->company_telephone_number)
+             ||
+             ! is_null($event->facsimile_number)
+             ||
+             ! is_null($event->company_url)
+        ) {
+            $address = [];
+            $address['company_name'] = $event->company_name;
+            $address['zip_code'] = $event->zip_code;
+            $address['physical_address'] = $event->physical_address;
+            $address['route'] = $event->route;
+            $address['route_time'] = $event->route_time;
+            $address['route_fare'] = $event->route_fare;
+            $address['company_telephone_number']
+                = $event->company_telephone_number;
+            $address['facsimile_number'] = $event->facsimile_number;
+            $address['URL'] = $event->company_url;
+
+            $schedule_event['address'] = $address;
+
+        }
+        // カスタマイズ項目取得
+        $extended_items = $facility_logic->getData($event_id);
+        $t->assign('extended_items', $extended_items);
+    } // メンバーだけ利用
+    elseif ($event && $new_entry) {
+        $users = [];
+        if ($event->groups) {
+            foreach (array_keys($event->groups) as $key) {
+                $member = &$event->groups[$key];
+                if ( ! $member) {
+                    continue;
+                }
+
+                $users['g' . $member->getOID()] = '[' . $member->get('name')
+                                                  . ']';
+            }
+        }
+
+        $schedule_event['users'] = ScheduleMemberLogic::getInstance()
+                                                      ->getAttendeesRenderFromEvent($event);
+
+        $facilities = [];
+        if ($event->facilities) {
+            foreach (array_keys($event->facilities) as $key) {
+                $member = &$event->facilities[$key];
+                if ( ! $member) {
+                    continue;
+                }
+
+                $facilities[$member->getOID()] = $member->get('name');
+            }
+
+            require_once('schedule/facility_privilege.csp');
+            $priv = GRN_Facility_Privilege_Logic::getInstance();
+            $checkRepeatAndApproval
+                = $facility_logic->getSettingsOfFacilities(array_keys($facilities),
+                ['approval', 'regulary']);
+            foreach (array_keys($facilities) as $key) {
+                // 繰り返し予定ができないものは消す。
+                if ( ! ($checkRepeatAndApproval[$key]['regulary']
+                        || $priv->hasPrivilegeOfFacility($login,
+                        $facility_logic->getFacility($key)))
+                ) {
+                    unset($facilities[$key]);
+                } // GTM-1676
+                elseif ($checkRepeatAndApproval[$key]['approval']) {
+                    unset($facilities[$key]);
+                }
+                // end GTM-1676
+            }
+
+        }
+        $schedule_event['facilities'] = ScheduleMemberLogic::getInstance()
+                                                           ->getFacilitiesRender($facilities);
+    }
+} else {
+    $notify_address_candidate = ScheduleMemberLogic::getInstance()
+                                                   ->getDefaultPublicByUserId($login_id,
+                                                       ScheduleMemberLogic::PLUG_IN_TYPE_VIEW,
+                                                       true, true);
+    if (count($notify_address_candidate) > 0) {
+        $schedule_event['notify_address'] = ScheduleMemberLogic::getInstance()
+                                                               ->getDisplayMemberList($notify_address_candidate);
+    }
+}
+$t->assign('schedule_event', $schedule_event);
+
+$t->assign('user_id', $user_id);
+$t->assign('group_id', $group_id);
+$t->assign('bdate', $date->format());
+
+require_once('fw/session_manager.csp');
+$sm = CB_SessionManager::getInstance();
+$sm->destroy(cb_get_pagename());
+$sm->destroy(cb_get_pagename() . '/view');
+
+$t->assign('add_plugin', [
+    'name'   => 'schedule',
+    'params' => [
+        'action'       => ['read', 'add'],
+        'session_name' => cb_get_pagename()
+    ]
+]);
+
+$t->assign('view_plugin', [
+    'name'   => 'schedule',
+    'params' => [
+        'action'       => ['read'],
+        'session_name' => cb_get_pagename() . '/view'
+    ]
+]);
+
+$referer_key = array_key_exists('referer_key', $G_INPUT)
+    ? $G_INPUT['referer_key'] : null;
+$referer_exists = false;
+if ($referer_key) {
+    require_once('fw/session_manager.csp');
+    $session_manager = CB_SessionManager::getInstance();
+    $session = $session_manager->getSession('schedule.referer');
+    $referer = $session->get($referer_key);
+    if (is_array($referer)) {
+        // page title
+        $page_title = grn_get_current_page_display_name();
+        $t->assign('page_title', $page_title);
+        // site position 
+        $t->assign(
+            'site_position', [
+                $referer,
+                ['page' => "", 'name' => $page_title]
+            ]
+        );
+        $referer_exists = true;
+    }
+}
+
+if ($referer_exists === false) {
+    // page title
+    $page_title = grn_get_current_page_display_name();
+    $t->assign('page_title', $page_title);
+    // site position 
+    $t->assign(
+        'site_position', [
+            [
+                'page' => "schedule/index",
+                'name' => grn_get_page_display_name('schedule/schedule_index')
+            ],
+            ['page' => "", 'name' => $page_title]
+        ]
+    );
+}
+
+$t->assign('referer_key', $referer_key);
+$t->assign('page_name', cb_get_pagename());
+
+/////////////////////////////////////////////////
+// For tree
+require_once('_view_util.csp');
+
+$extra_node = $group_id == 'f' ? true : false;
+$tree_data
+    = GRN_Schedule_Dropdown_Util::makeFacilityGroupsTreeMenu(cb_get_pagename(),
+    $group_id, $extra_node);
+
+$t->assign('fgroup_list', $tree_data['org']);
+$t->assign('fgroup_selected_id', $tree_data['selected_id']);
+$t->assign('ftree_name', cb_get_pagename());
+$t->assign('ftree_async_page', 'schedule/json/accessible_facility_tree');
+if (ScheduleJsApiLoader::getInstance()->isCustomizationAvailable()) {
+    $event = ! $event ? new GRN_Schedule_RepeatEvent() : $event;
+    $event->id = null;
+    $event->creator = null;
+    $event->ctime = null;
+    $event->modifier = null;
+    $event->mtime = null;
+    $event->menu = $schedule_event['selectmenu'] ?? '';
+    $event->detail = $schedule_event['title'] ?? '';
+    $event->memo = $schedule_event['memo'] ?? '';
+
+    $visibility_type = $schedule_event['private_setting'];
+
+    $render_member_provider = new RenderMemberProvider([$event], [
+        RenderMemberProvider::PRESET_DATA_ATTENDEES      => $schedule_event['users']
+                                                            ?? [],
+        RenderMemberProvider::PRESET_DATA_NOTIFY_ADDRESS => $schedule_event['notify_address']
+                                                            ?? [],
+        RenderMemberProvider::PRESET_DATA_FACILITIES     => $schedule_event['facilities']
+                                                            ?? []
+    ]);
+    $event_builder = new EventBuilder($render_member_provider);
+    $event_builder->initEvent($event, Event::EVENT_TYPE_REPEATING,
+        $visibility_type);
+    $event_builder->buildCompany($schedule_event['address'] ?? []);
+    $event_builder->buildUseAttendanceCheck($schedule_event['attendance_check']
+                                            ?? null);
+    $event_builder->buildVersion(null);
+    $event_builder->buildAttendeesFromRenderValues($schedule_event['users'] ??
+                                                   []);
+    $event_builder->buildAttendeesCandidate([]);
+    $event_builder->buildFacilitiesFromRenderValues($schedule_event['facilities']
+                                                    ?? []);
+    $event_builder->buildFacilitiesCandidate($all_facilities ?? []);
+    if ($schedule_event['facilities'] ?? []) {
+        $event_builder->buildFacilityReservation($extended_items);
+    }
+    $event_builder->buildWatchersFromRenderValues($schedule_event['notify_address']
+                                                  ?? []);
+    $event_builder->buildWatchersCandidate([]);
+
+    $repeat_type = $schedule_event['type'] ?? 'week';
+    $event_builder->buildRepeatInfo($repeat_type, $schedule_event['start_date'],
+        $schedule_event['end_date'],
+        $schedule_event['start_time'], $schedule_event['end_time'],
+        $schedule_event['timezone'],
+        $schedule_event['day'], $schedule_event['wday']);
+
+    $event_builder->buildCustomItem($schedule_event['additional_items']);
+
+    $event_data = $event_builder->getEvent()->toArray();
+    $screen_properties = [
+        'data' => [
+            'no_trigger' => true,
+            'reuse'      => $is_reuse_schedule,
+            'event'      => $event_data
+        ]
+    ];
+    CustomizationJsCssLoader::getInstance()->addEvent(
+        ScheduleJsApiLoader::getInstance(),
+        new CreateShowJsApiEvent($screen_properties)
+    );
+}
+// Smarty実行
+$t->display(cb_get_pagename() . ".tpl");
+

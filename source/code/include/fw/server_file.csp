@@ -1,0 +1,718 @@
+<?php
+
+/**
+ * Manage files stored on the server using the persistent layer.
+ *
+ * @package fw.persistent
+ */
+
+require_once('fw/persistent.csp');
+
+/**
+ * Interface for file controll classes.
+ */
+interface CB_FileManager
+{
+    /**
+     * Add a file to copy.
+     * This is called when a file is uploaded or copied.
+     *
+     * @param CB_ServerFile $server_file
+     */
+    public function addToCopy(CB_ServerFile $server_file);
+
+    /**
+     * Add a file to remove.
+     * This is called when a file is deleted.
+     *
+     * @param CB_ServerFile $server_file
+     */
+    public function addToRemove(CB_ServerFile $server_file);
+
+    /**
+     * Return a file path/URL.
+     *
+     * @param CB_ServerFile $server_file
+     * @param bool          $create TRUE if this is called to create a file.
+     *
+     * @return string
+     */
+    public function formatPath(CB_ServerFile $server_file, $create = false);
+
+    /**
+     * Return whether a file exists or not.
+     *
+     * @param CB_ServerFile $server_file
+     *
+     * @return bool
+     */
+    public function exists(CB_ServerFile $server_file);
+
+    /**
+     * Download a file.
+     *
+     * @param CB_ServerFile $server_file
+     *
+     * @return bool
+     */
+    public function download(CB_ServerFile $server_file);
+
+    /**
+     * @abstract
+     *
+     * @param string $path
+     */
+    public function markAsTemporaryFile($path);
+
+    /**
+     * @param string $uri
+     *
+     * @return bool|string
+     */
+    public function getContents($uri);
+
+    /**
+     * @param string $uri
+     * @param string $mode
+     *
+     * @return resource|bool
+     */
+    public function openFile($uri, $mode);
+}
+
+/**
+ * Cooperate database transactions to save/remove persistent files.
+ * Methods of {@link CB_ServerFile} implicitly use this class.
+ *
+ * @package fw.persistent
+ */
+class CB_ServerFileManager implements CB_FileManager
+{
+    private $_root = null;
+
+    private $temporaryFileList;
+
+    /** @var \grn\fw\ServerFileAddManager */
+    private $fileAddManager;
+    /** @var \grn\fw\ServerFileRemoveManager */
+    private $fileRemoveManager;
+
+    public function __construct()
+    {
+        global $G_config_common;
+        $this->_root = $G_config_common->get('Files', 'dir');
+
+        if ( ! is_writable($this->_root)) {
+            cb_throw_error(E_COMMON_FILES_DIR_NO_WRITE_PRIV,
+                null, ['dir' => $this->_root]);
+        }
+
+        $this->temporaryFileList = [];
+        require_once('fw/ServerFileAddManager.csp');
+        require_once('fw/ServerFileRemoveManager.csp');
+        $this->fileAddManager = new \grn\fw\ServerFileAddManager($this);
+        $this->fileRemoveManager = new \grn\fw\ServerFileRemoveManager();
+    }
+
+    /**
+     * 渡されたファイルを一時ファイルとみなして、トランザクションの最後に消します。
+     * トランザクションが commit されても abort されても、とにかく消します。
+     *
+     * @param string $path
+     */
+    public function markAsTemporaryFile($path)
+    {
+        $this->temporaryFileList[] = $path;
+    }
+
+    /**
+     * 一時ファイルを消して、内部で持っている一時ファイルのリストを空にします。
+     *
+     * @return bool
+     */
+    public function deleteTemporaryFile()
+    {
+        foreach ($this->temporaryFileList as $file) {
+            @unlink($file);
+        }
+
+        $this->temporaryFileList = [];
+
+        return true;
+    }
+
+    public function boot()
+    {
+        $tm = CB_TransactionManager::getInstance();
+        $tm->register(CB_TRANSACTION_LEVEL_FILE, $this->fileAddManager);
+        $tm->register(CB_TRANSACTION_LEVEL_SUBSIDIARY,
+            $this->fileRemoveManager);
+    }
+
+    public function addToCopy(CB_ServerFile $server_file)
+    {
+        $from = $server_file->getTmpName();
+        $to = $this->formatPath($server_file, true);
+        $this->fileRemoveManager->unsetToRemove($to);
+        $this->fileAddManager->addToCopy($to, $from);
+    }
+
+    public function addToRemove(CB_ServerFile $server_file)
+    {
+        $path = $this->formatPath($server_file);
+        $this->fileRemoveManager->addToRemove($path);
+    }
+
+    /**
+     * @param CB_ServerFile $server_file
+     * @param bool          $create
+     *
+     * @return string
+     */
+    public function formatPath(CB_ServerFile $server_file, $create = false)
+    {
+        $oid = $server_file->getOID();
+        $table_info = $server_file->getTableInfo();
+        $table_name = $table_info->getTableName();
+
+        $app_name = isset($server_file->_app_id) ? $server_file->_app_id : null;
+        if (empty($app_name)) {
+            $app_name = 'system';
+        }
+
+        $dir1 = '0';
+        $dir2 = '0';
+        $file = '';
+
+        $len = strlen($oid);
+        if ($len > 6) {
+            $limit = $len - 6;
+            $dir1 = substr($oid, 0, $limit);
+            $dir2 = substr($oid, $limit, 3);
+            $file = substr($oid, $limit + 3, 3);
+        } elseif ($len > 3) {
+            $limit = $len - 3;
+            $dir2 = substr($oid, 0, $limit);
+            $file = substr($oid, $limit, 3);
+        } else {
+            $file = $oid;
+        }
+
+        $root = $this->_root;
+        if ($create) {
+            $t = "${root}/${app_name}/${table_name}/${dir1}/${dir2}";
+            cb_mkdir($t, 0777, true, true);
+
+            if ( ! is_writable($t)) {
+                cb_throw_error(E_COMMON_FILES_DIR_NO_WRITE_PRIV,
+                    null, ['dir' => $t]);
+            }
+
+            if (is_file($t . "/${file}")) {
+                @unlink($t . "/${file}");
+                if (is_file($t . "/${file}")) {
+                    cb_throw_error(E_COMMON_FILES_CANNOT_CREATE_FILE,
+                        null, ['file' => $t . "/${file}"]);
+                }
+            }
+
+            return $t . "/${file}";
+        } else {
+            $dir = "${root}/${app_name}/${table_name}/${dir1}/${dir2}";
+            if ( ! is_writable($dir)) {
+                cb_throw_error(E_COMMON_FILES_DIR_NO_WRITE_PRIV,
+                    null, ['dir' => $dir]);
+            }
+
+            return "${dir}/${file}";
+        }
+    }
+
+    /**
+     * @deprecated
+     * @return bool
+     */
+    public function commit()
+    {
+        $this->fileAddManager->commit();
+        $this->fileRemoveManager->commit();
+
+        return true;
+    }
+
+    /**
+     * @param \CB_ServerFile $server_file
+     *
+     * @return bool
+     */
+    public function exists(CB_ServerFile $server_file)
+    {
+        $path = $server_file->getPath();
+
+        return is_file($path);
+    }
+
+    /**
+     * @param \CB_ServerFile $server_file
+     *
+     * @return bool
+     */
+    public function download(CB_ServerFile $server_file)
+    {
+        $path = $server_file->getPath();
+
+        return readfile($path);
+    }
+
+    public function disconnect()
+    {
+    }
+
+    /**
+     * @param string $uri
+     *
+     * @return bool|string
+     */
+    public function getContents($uri)
+    {
+        return file_get_contents($uri);
+    }
+
+    /**
+     * @param string $uri
+     * @param string $mode
+     *
+     * @return resource|bool
+     */
+    public function openFile($uri, $mode)
+    {
+        return fopen($uri, $mode);
+    }
+}
+
+/**
+ * Implement the base class of all persistent files.
+ * Application writers should extends this class to add
+ * application-specific information.
+ *
+ * @package fw.persistent
+ * @abstract
+ */
+class CB_ServerFile extends CB_PersistentBase
+{
+    public function __construct($row)
+    {
+        if (is_null($row)) {
+            die('CB_ServerFile may not be transient!');
+        }
+
+        parent::__construct($row);
+    }
+
+    var $col_name
+        = [
+            'type'    => 'char',
+            'notnull' => true,
+            'length'  => CB_DATABASE_MAX_STRINDEX
+        ];
+    var $col_mime = ['type' => 'char', 'notnull' => true];
+    var $col_size = ['type' => 'int', 'notnull' => true];
+    var $col_charset = ['type' => 'char'];
+    var $col_blob = ['type' => 'char', 'length' => 49];
+    var $col_hash = ['type' => 'char', 'length' => 40];
+
+    private $_tmp_name = null;
+
+    public function getTmpName()
+    {
+        return $this->_tmp_name;
+    }
+
+    /**
+     * Copy file contents indicated by $file.  $file can be one of
+     * 1) an instance of CB_ServerFile or its subclass, 2) an element
+     * of $_FILES super global, or 3) a full path string of a file.
+     *
+     * This may move file if $file indicates an uploaded file.
+     *
+     * @param mixed $file              file information.
+     * @param bool  $detect_encoding   TRUE to detect character encoding
+     *                                 if $file is a text file.
+     *
+     * @return bool         TRUE if copy succeeds; otherwise FALSE.
+     */
+    public function copy($file, $detect_encoding = true)
+    {
+        global $G_container_base;
+        /** @var CB_FileManager $fm */
+        $fm = $G_container_base->getInstance('file_manager');
+
+        if (is_object($file) && is_a($file, 'CB_ServerFile')) {
+            /** @var CB_ServerFile $file */
+            $this->_tmp_name = $fm->formatPath($file);
+            $this->set('name', $file->get('name'));
+            $this->set('mime', $file->get('mime'));
+            $this->set('size', $file->get('size'));
+            $this->set('charset', $file->get('charset'));
+            $this->set('hash', $file->get('hash'));
+
+            $fm->addToCopy($this);
+
+            return true;
+        }
+
+        if (is_array($file))    // an element of $_FILES super global.
+        {
+            // these properties must be specified
+            $this->_tmp_name = $file['tmp_name'];
+            $this->set('name', $file['name']);
+
+            if (array_key_exists('type', $file) && strlen($file['type']) > 0) {
+                $mime = $file['type'];
+                $pos = strpos($mime, ';');
+                if ($pos !== false) {
+                    $mime = substr($mime, 0, $pos);
+                }
+                $this->set('mime', $mime);
+
+                // detect character encoding for text files.
+                if ($detect_encoding) {
+
+                    if (preg_match('#^text/.*;.*charset=([a-zA-Z0-9-]+).*$#',
+                        $file['type'], $regs)
+                    ) {
+                        $this->set('charset', $regs[1]);
+
+                    } elseif (preg_match('#^text/.*$#', $file['type'])) {
+                        $encoding
+                            = @mb_detect_encoding(file_get_contents($file['tmp_name']));
+                        if (strlen($encoding) > 0) {
+                            $encoding = mb_preferred_mime_name($encoding);
+                            $this->set('charset', $encoding);
+                        }
+                    }
+
+                } else {
+                    $this->set('charset', null);
+                }
+
+            } else {
+                $this->set('mime', 'application/octet-stream');
+                $this->set('charset', null);
+            }
+
+            if (array_key_exists('is_temporary_file', $file)
+                && $file["is_temporary_file"]
+            ) {
+                $fm->markAsTemporaryFile($file['tmp_name']);
+            }
+
+            if (array_key_exists('size', $file)) {
+                $this->set('size', $file['size']);
+            } else {
+                $this->set('size', filesize($file['tmp_name']));
+            }
+
+            $this->setHash();
+
+            $fm->addToCopy($this);
+
+            return true;
+        }
+
+        // otherwise, $file indicates the full path of a file.
+        if ( ! is_file($file)) {
+            return false;
+        }
+        $this->_tmp_name = $file;
+        $lp1 = strrchr($file, '/');
+        $lp2 = strrchr($file, "\\");
+        if (($lp1 === false) && ($lp2 === false)) {
+            return false;
+        }
+        if ($lp1 === false) {
+            $this->set('name', substr($lp2, 1));
+        } elseif ($lp2 === false) {
+            $this->set('name', substr($lp1, 1));
+        } elseif (strlen($lp1) < strlen($lp2)) {
+            $this->set('name', substr($lp1, 1));
+        } else {
+            $this->set('name', substr($lp2, 1));
+        }
+        $this->set('size', filesize($file));
+        $this->set('mime', 'application/octet-stream');
+        $this->set('charset', null);
+
+        $this->setHash();
+
+        $fm->addToCopy($this);
+
+        return true;
+    }
+
+    /**
+     * Set sha1 hash if this file is inline image file.
+     */
+    private function setHash()
+    {
+        require_once('grn/mime.csp');
+        $mime_manager = GRN_MIMEConfigManager::getInstance();
+        if ($mime_manager->isInlineImageMimeType($this->get('mime'))) {
+            $this->set('hash', sha1_file($this->_tmp_name));
+        }
+    }
+
+    public function delete()
+    {
+        global $G_container_base;
+        /** @var CB_FileManager $fm */
+        $fm = $G_container_base->getInstance('file_manager');
+        $fm->addToRemove($this);
+
+        // ToDo: remove from toCopy array of CB_ServerFileManager.
+        // ... pending ...; not very important.
+        return parent::delete();
+    }
+
+    /**
+     * Get a path/URL.
+     * A file can be read from this path/URL.
+     *
+     * @return string
+     */
+    public function getPath()
+    {
+        global $G_container_base;
+        /** @var CB_FileManager $fm */
+        $fm = $G_container_base->getInstance('file_manager');
+
+        return $fm->formatPath($this);
+    }
+
+    public function f_open($mode)
+    {
+        if ( ! $this->exists()) {
+            cb_throw_error(E_COMMON_NOT_FOUND_DOWNLOAD_FILE);
+        }
+
+        return $this->openFile($mode);
+    }
+
+    /**
+     * @return bool
+     */
+    public function exists()
+    {
+        global $G_container_base;
+        /** @var CB_FileManager $fm */
+        $fm = $G_container_base->getInstance('file_manager');
+
+        return $fm->exists($this);
+    }
+
+    /**
+     * @param bool   $allow_inline
+     * @param string $mime
+     *
+     * @return bool
+     */
+    public function download($allow_inline = true, $mime = null)
+    {
+        if (is_null($mime)) {
+            $mime = $this->get('mime');
+            if ( ! is_null($this->get('charset'))) {
+                $mime .= '; charset=' . $this->get('charset');
+            }
+        }
+
+        if ( ! $this->exists()) {
+            cb_throw_error(E_COMMON_NOT_FOUND_DOWNLOAD_FILE);
+        }
+
+        cb_prepare_download($this->get('name'), $mime, $allow_inline,
+            $this->getOutputExpires());
+
+        global $G_container_base;
+        /** @var CB_FileManager $fm */
+        $fm = $G_container_base->getInstance('file_manager');
+
+        return $fm->download($this);
+    }
+
+    /**
+     * Returns whether to output Expiers header for cache or not.
+     *
+     * @return bool
+     */
+    private function getOutputExpires()
+    {
+        global $G_INPUT;
+        if (isset($G_INPUT['hash'])
+            && $G_INPUT['hash'] === $this->get('hash')
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param string $mode
+     *
+     * @return resource|bool
+     */
+    public function openFile($mode)
+    {
+        $file_manager = cb_lwc_file_manager();
+
+        return $file_manager->openFile($this->getPath(), $mode);
+    }
+}
+
+
+class CB_ServerFileUtil
+{
+    private function __construct()
+    {
+    }
+
+    /**
+     * This function can open both a local file or a remote BLOB file.
+     *
+     * If $uri is a URL of a remote BLOB file, this function will append
+     * a X-Cybozu-Request-Id header to the request, and handle error if the request is failed.
+     *
+     * @param string $uri
+     * @param string $mode
+     *
+     * @return resource|bool
+     */
+    public static function tryFopen($uri, $mode)
+    {
+        if (cb_is_onpremises() || ! self::isUrl($uri)) {
+            return fopen($uri, $mode);
+        }
+
+        $error_info = null;
+        set_error_handler(function () use (&$error_info) {
+            $error_info = func_get_args();
+        });
+
+        $handle = fopen($uri, $mode, false, self::createContext());
+        restore_error_handler();
+
+        if ($handle !== false) {
+            return $handle;
+        }
+
+        $error_message = null;
+        if ( ! is_null($error_info)) {
+            $error_message = $error_info[1] ?? '';
+        }
+
+        $status_code = null;
+        if (isset($http_response_header)) {
+            $status_code
+                = self::getStatusCodeFromResponseHeaders($http_response_header);
+            if ($status_code === 404) {
+                // This case is unexpected because we should make sure that the file exists before downloading it.
+                cb_throw_error();
+            }
+        }
+
+        self::handleError(E_COMMON_BLOB_GET_FAILED, $status_code, $uri,
+            $error_message);
+    }
+
+    /**
+     * @param string $garoon_error_code
+     * @param string $http_status_code
+     * @param string $http_request_url
+     * @param string $error_message
+     */
+    private static function handleError(
+        $garoon_error_code,
+        $http_status_code,
+        $http_request_url,
+        $error_message
+    ) {
+        cb_http_error_to_log_file($http_status_code, $http_request_url, null,
+            $error_message);
+        cb_throw_error($garoon_error_code);
+    }
+
+    /**
+     * This function can get contents both a local file or a remote BLOB file.
+     * However, please use the latter when both this method and CB_FileManager::getContents() are available.
+     *
+     * @param string $uri
+     *
+     * @return bool|string
+     */
+    public static function fileGetContents($uri)
+    {
+        if (cb_is_onpremises() || ! self::isUrl($uri)) {
+            return file_get_contents($uri);
+        }
+
+        $blob_http_client = new CB_BlobHttpClient();
+
+        return $blob_http_client->get($uri)->getBody();
+    }
+
+    /**
+     * @return resource
+     */
+    private static function createContext()
+    {
+        return stream_context_create([
+            'http' => ['header' => cb_get_request_id_header()]
+        ]);
+    }
+
+    /**
+     * @param array $http_response_headers
+     *
+     * @return int|null
+     */
+    private static function getStatusCodeFromResponseHeaders(
+        array $http_response_headers
+    ) {
+        if ( ! isset($http_response_headers[0])) {
+            return null;
+        }
+
+        return self::getStatusCodeFromStatusLine($http_response_headers[0]);
+    }
+
+    /***
+     * @param string $status_line
+     *
+     * @return int|null
+     */
+    public static function getStatusCodeFromStatusLine($status_line)
+    {
+        $tokens = explode(' ', $status_line);
+        if (isset($tokens[1])) {
+            return (int)$tokens[1];
+        }
+
+        return null;
+    }
+
+    /**
+     * @param string $url
+     *
+     * @return bool
+     */
+    public static function isUrl($url)
+    {
+        $fragments = parse_url($url);
+        if ( ! isset($fragments['scheme'])) {
+            return false;
+        }
+
+        return $fragments['scheme'] === 'http'
+               || $fragments['scheme'] === 'https';
+    }
+}

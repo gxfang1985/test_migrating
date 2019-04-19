@@ -1,0 +1,227 @@
+<?php
+
+require_once('cabinet/table.csp');
+require_once('cabinet/base_util.csp');
+
+define('GRN_CABINET_FILELIST_MODE_ALL', 1);
+define('GRN_CABINET_FILELIST_MODE_NOT_IN_TRASH', 2);
+define('GRN_CABINET_FILELIST_MODE_IN_TRASH', 3);
+
+/**
+ * ファイル一覧クラス
+ *
+ * @package grn.cabinet
+ */
+class GRN_Cabinet_FileList extends GRN_Cabinet_ListBase
+{
+    /**
+     * @access private
+     */
+    var $_user = null;
+    /**
+     * @access private
+     */
+    var $_folder = null;
+
+    // Huy added
+    /**
+     * @access private
+     */
+    var $_list_mode = GRN_CABINET_FILELIST_MODE_NOT_IN_TRASH;
+
+
+    function __construct(& $user, & $folder)
+    {
+        parent::__construct();
+
+        if ( ! $folder) {
+            // フォルダ指定がなければ管理者権限が必要
+            require_once('cabinet/access.csp');
+            $acc = GRN_Cabinet_AccessManager::getInstance();
+            if ( ! $acc->isSuperAdmin($user)) {
+                cb_throw_error(E_GRN_CABINET_ACCESS_DENY_READ);
+            }
+        }
+
+        $this->_folder =& $folder;
+        $this->_user =& $user;
+    }
+
+    /**
+     * @access private
+     */
+    function _getAlias($type)
+    {
+        $type2alias = [
+            'file'     => 'f',
+            'body'     => 'b',
+            'read'     => 'r',
+            'relation' => 'l'
+        ];
+
+        if (array_key_exists($type, $type2alias)) {
+            return $type2alias[$type];
+        }
+
+        return $type2alias['file'];
+    }
+
+    function _getColumnType($column)
+    {
+        $column2type = [
+            'title'          => 'file',
+            'title_sort_key' => 'file',
+            'ctime'          => 'file',
+            'mtime'          => 'file',
+            'creator_name'   => 'file',
+            'modifier_name'  => 'file',
+            'name'           => 'body',
+            'size'           => 'body',
+            'mime'           => 'body',
+        ];
+
+        return @ $column2type[$column];
+    }
+
+    /**
+     * @param string $column
+     *
+     * @return string
+     */
+    function _getAliasByColumn($column)
+    {
+        if (($type = $this->_getColumnType($column))) {
+            return $this->_getAlias($type);
+        }
+
+        return $this->_getAlias('file');
+    }
+
+    /**
+     * @param object $object
+     * @param string $column
+     *
+     * @return mixed
+     */
+    function _getColumnValue(& $object, $column)
+    {
+        if ($this->_getColumnType($column) == 'body') {
+            if (is_a($object, 'grn_file')) {
+                $body =& $object->getCurrentBody();
+
+                return parent::_getColumnValue($body, $column);
+            }
+        }
+
+        return parent::_getColumnValue($object, $column);
+    }
+
+    function _isNotNullColumn($column)
+    {
+        return $column != 'title';
+    }
+
+
+    /**
+     * 一覧するRowSetを生成
+     *
+     * @access protected
+     * @return CB_MultiRowSet
+     */
+    function _createRowSet()
+    {
+        $tab_relation = $this->getTableInfo('GRN_Cabinet_FileRelation');
+        $tab_file = $this->getTableInfo('GRN_Cabinet_File');
+        $tab_filebody = $this->getTableInfo('GRN_Cabinet_FileBody');
+
+        $al = $this->_getAlias('relation');
+        $af = $this->_getAlias('file');
+        $ab = $this->_getAlias('body');
+
+        $rowset = new CB_MultiRowSet($tab_relation, $al);
+
+        if ($this->_folder) {
+            $rowset->addCondition($al . '.col_folder = '
+                                  . $this->_folder->getOID());
+        }
+
+        // Huy added
+        switch ($this->_list_mode) {
+            case GRN_CABINET_FILELIST_MODE_ALL:
+                break;
+            case GRN_CABINET_FILELIST_MODE_NOT_IN_TRASH:
+                $rowset->addCondition($af . '.col_dtime is null');
+                break;
+            case GRN_CABINET_FILELIST_MODE_IN_TRASH:
+                $rowset->addCondition($af . '.col_dtime is not null');
+                break;
+        }
+        // end Huy added
+
+        $rowset->addJoin($tab_file,
+            $al . '.col_file = ' . $af . '._id',
+            CB_DATABASE_INNER_JOIN, $af);
+
+        $rowset->addJoin($tab_filebody,
+            $af . '._id = ' . $ab . '.col_file AND ' . $af . '.col_version = '
+            . $ab . '.col_version',
+            CB_DATABASE_INNER_JOIN, $ab);
+
+        if ($this->_user) {
+            $tab_readstatus = $this->getTableInfo('GRN_Cabinet_ReadStatus');
+            $ar = $this->_getAlias('read');
+
+            $rowset->addJoin($tab_readstatus,
+                $al . '.col_file = ' . $ar . '.col_file AND ' . $ar
+                . '.col_user = ' . $this->_user->getOID(),
+                CB_DATABASE_LEFT_JOIN, $ar);
+        }
+
+        return $rowset;
+    }
+
+
+    /**
+     * RowSetの返却値からオブジェクトを取得
+     *
+     * @override
+     */
+    function &_row2object(& $row)
+    {
+        $af = $this->_getAlias('file');
+        $ab = $this->_getAlias('body');
+        $ar = $this->_getAlias('read');
+
+        if ( ! @ $row[$af]) {
+            $ret = null;
+
+            return $ret;
+        }
+
+        if (@ $row[$ar]) {
+            $r =& $row[$ar];
+            $user = $r->get('user');
+            require_once('cabinet/readstatus.csp');
+            $fr = GRN_Cabinet_FileReadStatus::getInstance();
+            $fr->cache($user, $row[$af], $r);
+        }
+
+        // TENTATIVE
+        // 超強引にファイル本体を結びつける
+        // どうにかしてファイル情報とファイル本体を同時にロードした
+        if (@ $row[$ab]) {
+            $row[$af]->_current =& $row[$ab];
+        }
+        $f =& $row[$af];
+
+        return $f;
+    }
+
+    // Huy added
+    function setFileListMode($mode)
+    {
+        $this->_list_mode = $mode;
+    }
+}
+
+

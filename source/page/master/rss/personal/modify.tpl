@@ -1,0 +1,2 @@
+{capture name='grn_rss_personal_GRN_RSS_PE_4'}{cb_msg module='grn.rss.personal' key='GRN_RSS_PE-4' replace='true'}{/capture}{capture name='grn_rss_personal_GRN_RSS_PE_5'}{cb_msg module='grn.rss.personal' key='GRN_RSS_PE-5' replace='true'}{/capture}{include file='rss/_std_form.tpl' config_id='personal' post_page='rss/personal/command_modify' attention='1' explanation=$smarty.capture.grn_rss_personal_GRN_RSS_PE_4 code_title='URL' code_explanation=$smarty.capture.grn_rss_personal_GRN_RSS_PE_5}
+

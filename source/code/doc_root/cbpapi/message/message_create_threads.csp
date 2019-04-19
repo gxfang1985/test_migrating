@@ -1,0 +1,222 @@
+<?php
+if (isset($cbpapi_service)) {
+    $action = $cbpapi_service->getAction();
+    global $G_container_base;
+    $uum = $G_container_base->getInstance('uum');
+    $login = $uum->getLoginUser();
+
+    // get parameters of SOAP message
+    $node_parameters = $cbpapi_service->getRequestParameters();
+    $node_create_thread = $cbpapi_service->selectNodes($node_parameters,
+        'create_thread');
+    if ( ! $node_create_thread) {
+        require_once('cbpapi/error_code.csp');
+        cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+            ['param' => 'create_thread']);
+    }
+    $threads_for_view = [];
+    $mids = [];
+    require_once('cbpapi/message_logic.csp');
+    $cbpapi_message_logic = GRN_CBPApi_Message_Logic::getInstance();
+    foreach (array_keys($node_create_thread) as $create_thread_key) {
+        $params = [];
+        $params = $cbpapi_message_logic->getInputParamerters($cbpapi_service,
+            $node_create_thread[$create_thread_key]);
+        $draft_id = null;
+        if (array_key_exists('attributes',
+            $node_create_thread[$create_thread_key])
+        ) {
+            $attributes = $node_create_thread[$create_thread_key]['attributes'];
+            if (array_key_exists('draft_id', $attributes)) {
+                $draft_id = $attributes['draft_id'];
+                $my_draft_message = $cbpapi_message_logic->hasPrivilege($login,
+                    $draft_id);
+                if ($my_draft_message === false) {
+                    require_once('message/error_code.csp');
+                    cb_throw_error(E_GRN_MESSAGE_MESSAGE_NOT_FOUND,
+                        [
+                            'app_name' => cb_msg(GRN_MESSAGE_MODULEID,
+                                'application_name')
+                        ],
+                        [
+                            'app_name' => cb_msg(GRN_MESSAGE_MODULEID,
+                                'application_name')
+                        ],
+                        [
+                            'app_name' => cb_msg(GRN_MESSAGE_MODULEID,
+                                'application_name')
+                        ]);
+                }
+                $message_type = $my_draft_message['message_type'];
+                if ($message_type != GRN_MESSAGE_TYPE_DRAFT) {
+                    require_once('message/error_code.csp');
+                    cb_throw_error(E_GRN_MESSAGE_FAIL_TO_SEND_MESSAGE,
+                        [
+                            'app_name' => cb_msg(GRN_MESSAGE_MODULEID,
+                                'application_name')
+                        ],
+                        [
+                            'app_name' => cb_msg(GRN_MESSAGE_MODULEID,
+                                'application_name')
+                        ]);
+                }
+            }
+        }
+        $sUIDs = @ $params['sUID'];
+        if ( ! is_array($sUIDs) || count($sUIDs) <= 0) {
+            require_once('message/error_code.csp');
+            cb_throw_error(E_GRN_MESSAGE_ADDRESSEES_NOT_SELECTED,
+                null,
+                [
+                    'app_name' => cb_msg(GRN_MESSAGE_MODULEID,
+                        'application_name')
+                ]);
+        }
+        // check existing of user address
+        require_once('grn/uum_util.csp');
+        $uum_util = GRN_UumUtil::getInstance();
+        $uum_util->selectUsers($login, $sUIDs);
+
+        require_once('fw/string_util.csp');
+        $subject = @ cb_trim($params['subject']);
+        if (strlen($subject) <= 0) {
+            require_once('message/error_code.csp');
+            cb_throw_error(E_GRN_MESSAGE_SUBJECT_NOT_INPUTTED);
+        }
+
+        // create message data
+        $message = [];
+        $message['subject'] = $subject;
+        $message['format_type'] = 0;
+        $message['data'] = $params['data'];
+
+        if (@ $params['confirm'] === 'false') {
+            $message['confirm'] = 0;
+        } else {
+            $message['confirm'] = 1;
+        }
+
+        // create addressees data
+        $addressees = [];
+        foreach ($sUIDs as $key => $sUID) {
+            $addressee = [];
+            $addressee['addressee_id'] = $sUID;
+            $addressee['addressee_order'] = $key;
+            $addressee['addressee_is_operator'] = ($login->getOID() == $sUID)
+                ? 1 : 0;
+            $addressees[] = $addressee;
+        }
+
+        // attached files
+        $attached_files = [];
+
+        // if is draft message
+        if (strlen($draft_id) > 0) {
+            // old attached files
+            require_once('message/file.csp');
+            $fm = new GRN_Message_FileManager();
+            $old_attached_files = $fm->getMessageFiles($draft_id, false);
+            $remove_file_ids = [];
+            if (array_key_exists('remove_file_ids', $params)) {
+                $remove_file_ids = $params['remove_file_ids'];
+                if (count($remove_file_ids) > 0) {
+                    foreach (array_keys($remove_file_ids) as $remove_key) {
+                        if (array_key_exists($remove_key,
+                            $old_attached_files)
+                        ) {
+                            unset($old_attached_files[$remove_key]);
+                        }
+                    }
+                }
+            }
+            require_once('grn/controller.csp');
+            $old_files = grn_init_attached_file('message/draft_modify',
+                $old_attached_files, false, 'message');
+            $fids = [];
+            if (is_array($old_files) && count($old_files) > 0) {
+                global $G_INPUT;
+                $G_INPUT['fids'] = array_keys($old_files);
+            }
+
+            // get old attached files from session file
+            $files = grn_get_attached_files('message/draft_modify', 'message');
+
+            // append old attached files to new attached files
+            foreach (array_keys($files) as $fid) {
+                $attached_files[$fid] = $files[$fid];
+            }
+        }
+
+        // get new attach files
+        if (array_key_exists('files', $params)) {
+            $files = $params['files'];
+            foreach ($files as $file_key => $value) {
+                $attached_files['file' . $file_key]
+                    = cbpapi_upload_file($value);
+            }
+        }
+        require_once('message/message_logic.csp');
+        $message_logic = new GRN_Message_Logic();
+        // send message
+        $message_row = $message_logic->sendMessage($login, $message,
+            $addressees, $attached_files);
+        if ($message_row === false) {
+            require_once('message/error_code.csp');
+            cb_throw_error(E_GRN_MESSAGE_FAIL_TO_SEND_MESSAGE,
+                [
+                    'app_name' => cb_msg(GRN_MESSAGE_MODULEID,
+                        'application_name')
+                ],
+                [
+                    'app_name' => cb_msg(GRN_MESSAGE_MODULEID,
+                        'application_name')
+                ]);
+        }
+        $mid = $message_row->getOID();
+        $mids[] = $mid;
+        // delete a draft message
+        if (strlen($draft_id) > 0) {
+            $message_row =& $message_logic->deleteDraft($login, $draft_id);
+            if ($message_row === false) {
+                require_once('message/error_code.csp');
+                cb_throw_error(E_GRN_MESSAGE_MESSAGE_NOT_FOUND,
+                    [
+                        'app_name' => cb_msg(GRN_MESSAGE_MODULEID,
+                            'application_name')
+                    ],
+                    [
+                        'app_name' => cb_msg(GRN_MESSAGE_MODULEID,
+                            'application_name')
+                    ],
+                    [
+                        'app_name' => cb_msg(GRN_MESSAGE_MODULEID,
+                            'application_name')
+                    ]);
+            }
+        }
+
+    }
+
+    $cbpapi_message_logic->saveNow();
+    $message_ids = [];
+    foreach ($mids as $mid) {
+        $sent_relation = $cbpapi_message_logic->getSentMessageRelation($login,
+            $mid);
+        if ( ! is_null($sent_relation) && is_array($sent_relation)) {
+            if (array_key_exists('rid', $sent_relation)) {
+                $rid = $sent_relation['rid'];
+                $message_ids[$rid] = $mid;
+            }
+        }
+    }
+    // get send for view
+    $threads_for_view = $cbpapi_message_logic->getMessageForViewByIds($login,
+        $message_ids, true);
+    require_once('grn/smarty.csp');
+    $t = new GRN_Smarty;
+    $t->assign('xml_namespaces', [grn_cbpapi_get_namespace('message')]);
+    $t->assign('threads', $threads_for_view);
+    $t->assign('action', $action);
+    grn_cbpapi_response($t, __FILE__);
+}
+

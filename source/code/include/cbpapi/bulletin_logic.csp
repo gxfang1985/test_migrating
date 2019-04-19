@@ -1,0 +1,783 @@
+<?php
+
+use grn\grn\Validate;
+
+require_once('bulletin/error_code.csp');
+
+class GRN_CBPApi_Bulletin_Logic
+{
+    /**
+     * @return GRN_CBPApi_Bulletin_Logic
+     */
+    public static function getInstance()
+    {
+        static $_instance = null;
+        if (is_null($_instance)) {
+            $_instance = new GRN_CBPApi_Bulletin_Logic();
+        }
+
+        return $_instance;
+    }
+
+    var $_dbconn = null;
+
+    function _getDBConnection()
+    {
+        if (is_null($this->_dbconn)) {
+            $app_locator = GRN_ApplicationLocator::instance();
+            $this->_dbconn = $app_locator->getConnection('bulletin');
+        }
+
+        return $this->_dbconn;
+    }
+
+    function getTopicForViewByIds($login, $topic_ids, $is_draft = false)
+    {
+        if ( ! is_array($topic_ids) || count($topic_ids) <= 0) {
+            return [];
+        }
+        $topics_for_view = [];
+        foreach ($topic_ids as $key => $topic_id) {
+            $article_follows_list = [];
+            $category_id = null;
+            $article = null;
+            if ($is_draft) {
+                require_once('bulletin/draft.csp');
+                $obj_draft = GRN_Bulletin_DraftManager::getInstance();
+                if ( ! ($article = $obj_draft->getDraft($login, $topic_id))) {
+                    cb_throw_error(E_GRN_BULLETIN_DRAFT_NOT_FOUND);
+                }
+                $category_id = -2;
+                $read_status = false;
+            } else {
+                require_once('bulletin/article.csp');
+                $obj_article = GRN_Bulletin_ArticleManager::getInstance();
+                if ( ! ($article = $obj_article->getArticle($login, $topic_id,
+                    GRN_BULLETIN_ACCESS_R, true, CB_DATABASE_NO_LOCK))
+                ) {
+                    cb_throw_error(E_GRN_BULLETIN_ARTICLE_NOT_FOUND);
+                }
+                $creator = $article->get('creator');
+                if ( ! is_null($creator)) {
+                    $creator_id = $creator->getOID();
+                } else {
+                    $creator_id = null;
+                }
+                $read_status = true;
+                if ( ! $article->isPublished()) {
+                    $category_id = -1;
+                    if ($creator_id != $login->getOID()) {
+                        cb_throw_error(E_GRN_BULLETIN_ARTICLE_NOT_FOUND);
+                    }
+                } else {
+                    $category_id = $article->getId('category');
+                }
+                // フォロー
+                require_once('bulletin/follow_util.csp');
+                $list = new GRN_Bulletin_FollowList($login, $article);
+                $list->setLockMode(CB_DATABASE_NO_LOCK);
+                while ( ! is_null(($row = $list->iterate()))) {
+                    $follow = [];
+                    $follow['id'] = $row->getOID();
+                    $follow['follow_id']
+                        = $row->get('follow_id');
+                    $article_follows_list[$row->getOID()] = $follow;
+                }
+            }
+
+            require_once('bulletin/controller.csp');
+            $utility = new GRN_Bulletin_ControllerUtil();
+            $article_for_view = $utility->getArticleView($login,
+                $article, $read_status);
+            $article_for_view['cid'] = $category_id;
+
+            require_once('cbpapi/util.csp');
+            // create date
+            $create_date = grn_cbpapi_iso8601($article_for_view['ctime']);
+            $article_for_view['creator_date'] = $create_date;
+            // modify date
+            $modify_date = $article_for_view['ctime'];
+            if ( ! is_null($article_for_view['mtime'])) {
+                $modify_date = $article_for_view['mtime'];
+            }
+            $modify_date = grn_cbpapi_iso8601($modify_date);
+            $article_for_view['modifier_date'] = $modify_date;
+
+            $version = $article_for_view['ctime']->unix_ts;
+            if ( ! is_null($article_for_view['mtime'])) {
+                $version = $article_for_view['mtime']->unix_ts;
+            }
+            $article_for_view['version'] = $version;
+
+            if ($article_for_view['stime']) {
+                $start_datetime
+                    = grn_cbpapi_iso8601($article_for_view['stime']);
+                $article_for_view['stime'] = $start_datetime;
+            }
+            if ($article_for_view['etime']) {
+                $end_datetime = grn_cbpapi_iso8601($article_for_view['etime']);
+                $article_for_view['etime'] = $end_datetime;
+            }
+            if ($is_draft) {
+                $article_for_view['is_draft'] = true;
+            } else {
+                $article_for_view['is_draft'] = false;
+                // set read
+                $article->read($login);
+            }
+            if (count($article_follows_list) > 0) {
+                $article_for_view['follows'] = $article_follows_list;
+            }
+
+            $topics_for_view[$topic_id] = $article_for_view;
+        }
+
+        return $topics_for_view;
+    }
+
+    function getFileRelation($login, $file_id)
+    {
+        $db = $this->_getDBConnection();
+        $condition = cb_queryf($db, "col_file = '@S' ", $file_id);
+        $query = "SELECT * from tab_grn_bulletin_filerelation WHERE ";
+
+        $ret = $db->query($query . $condition);
+        $file = null;
+        while ($row = $db->fetch_assoc($ret)) {
+            $draft_id = $row['col_draft'];
+            if ($draft_id) {
+                require_once('bulletin/draft.csp');
+                $obj_draft = GRN_Bulletin_DraftManager::getInstance();
+                if ( ! ($article = $obj_draft->getDraft($login, $draft_id))) {
+                    cb_throw_error(E_GRN_BULLETIN_DRAFT_NOT_FOUND);
+                }
+                $file = $article->getFile($file_id);
+            } else {
+                $article_id = $row['col_article'];
+                require_once('bulletin/article.csp');
+                $obj_article = GRN_Bulletin_ArticleManager::getInstance();
+                if ( ! ($article = $obj_article->getArticle($login,
+                    $article_id))
+                ) {
+                    cb_throw_error(E_GRN_BULLETIN_ARTICLE_NOT_FOUND);
+                }
+                $follow_id = $row['col_follow'];
+                if ($follow_id) {
+                    if ( ! ($follow = $article->getFollow($follow_id))) {
+                        cb_throw_error(E_GRN_BULLETIN_FOLLOW_NOT_FOUND);
+                    }
+                    $file = $follow->getFile($file_id);
+                } else {
+                    $file = $article->getFile($file_id);
+                }
+            }
+        }
+
+        return $file;
+    }
+
+    function getInputParamerters(
+        &$cbpapi_service,
+        $raw_params,
+        $is_modify = false
+    ) {
+        $param = [];
+        $topic = array_key_exists('children', $raw_params)
+            ? $raw_params['children'] : null;
+        if (0 >= count($topic)) {
+            require_once('cbpapi/error_code.csp');
+            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                ['param' => 'topic']);
+        }
+        if ($is_modify) {
+            $attributes = $raw_params['attributes'];
+            $param['is_notified'] = array_key_exists('is_notified', $attributes)
+                ? $attributes['is_notified'] : true;
+        }
+        $remove_file_ids = [];
+        $file_contents = [];
+        foreach (array_keys($topic) as $topic_key) {
+            $node = $topic[$topic_key]['node_name'];
+            if ($node == 'topic') {
+                $required_fields = [
+                    'id',
+                    'subject',
+                    'version',
+                    'can_follow',
+                    'category_id'
+                ];
+                if (array_key_exists('attributes', $topic[$topic_key])) {
+                    $attributes = $topic[$topic_key]['attributes'];
+                    foreach ($required_fields as $field) {
+                        if ( ! array_key_exists($field, $attributes)) {
+                            require_once('cbpapi/error_code.csp');
+                            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                                ['param' => $field]);
+                        }
+                    }
+                    $param['id'] = $attributes['id'];
+                    $param['version'] = $attributes['version'];
+
+                    $param['manually_enter_sender'] = null;
+                    if (array_key_exists('manually_enter_sender',
+                        $attributes)
+                    ) {
+                        require_once('grn/application.csp');
+                        $locator = GRN_ApplicationLocator::instance();
+                        $bulletin_app
+                            = $locator->getInstance('bulletin', true);
+                        $system_config
+                            = $bulletin_app->getSystemConfig(cb_get_login_user());
+                        $enable_manually_enter_sender
+                            = $system_config->getEnableManuallyEnterSender();
+                        if ($enable_manually_enter_sender) {
+                            require_once('fw/string_util.csp');
+                            $manually_enter_sender
+                                = $attributes['manually_enter_sender'];
+                            if (Validate::isNull(cb_trim($manually_enter_sender))) {
+                                cb_throw_error(E_GRN_BULLETIN_MANUALLY_ENTER_SENDER_PARAMETER_EMPTY);
+                            } else {
+                                $param['manually_enter_sender']
+                                    = $manually_enter_sender;
+                            }
+                        }
+                    }
+
+                    $can_follow = $attributes['can_follow'];
+                    if ($can_follow == 'true') {
+                        $param['can_follow'] = 1;
+                    } else {
+                        $param['can_follow'] = 0;
+                    }
+                    $param['subject'] = $attributes['subject'];
+                    $param['cid'] = $attributes['category_id'];
+                    if (array_key_exists('creator_group_id', $attributes)) {
+                        $param['creator_group_id']
+                            = $attributes['creator_group_id'];
+                    }
+                    $param['start_datetime'] = null;
+                    $param['start_is_datetime'] = null;
+                    $param['end_timestamp'] = null;
+                    $param['end_is_datetime'] = null;
+                    $start_date = null;
+                    $end_date = null;
+                    require_once('cbpapi/util.csp');
+                    if (array_key_exists('start_datetime', $attributes)) {
+                        $start_date_time
+                            = grn_cbpapi_parse_iso8601($attributes['start_datetime']);
+                        if ($start_date_time) {
+                            $start_date
+                                = convert_datetime_to_local($start_date_time);
+                            $param['start_is_datetime'] = 1;
+                        } else {
+                            $date = new CB_Date();
+                            if ($date->parse($attributes['start_datetime'])) {
+                                $param['start_is_datetime'] = 0;
+                                $start_date = new CB_DateTime();
+                                $start_date->year = $date->year;
+                                $start_date->month = $date->month;
+                                $start_date->day = $date->day;
+                                $start_date->hour = null;
+                                $start_date->minute = null;
+                                $start_date->second = null;
+                            } else {
+                                cb_throw_error(E_COMMON_INVALID_DATE);
+                            }
+                        }
+                        if ($start_date->year) {
+                            if ( ! $start_date->month || ! $start_date->day) {
+                                cb_throw_error(E_GRN_BULLETIN_INVALID_TERM);
+                            }
+                        } elseif ($start_date->month || $start_date->day) {
+                            cb_throw_error(E_GRN_BULLETIN_INVALID_TERM);
+                        }
+                    }
+                    if (array_key_exists('end_datetime', $attributes)) {
+                        $end_date_time
+                            = grn_cbpapi_parse_ISO8601($attributes['end_datetime']);
+                        if ($end_date_time) {
+                            $end_date
+                                = convert_datetime_to_local($end_date_time);
+                            $param['end_is_datetime'] = 1;
+                        } else {
+                            $date = new CB_Date();
+                            if ($date->parse($attributes['end_datetime'])) {
+                                $param['end_is_datetime'] = 0;
+                                $end_date = new CB_DateTime();
+                                $end_date->year = $date->year;
+                                $end_date->month = $date->month;
+                                $end_date->day = $date->day;
+                                $end_date->hour = null;
+                                $end_date->minute = null;
+                                $end_date->second = null;
+                            }
+                        }
+                        if ($end_date->year) {
+                            if ( ! $end_date->month || ! $end_date->day) {
+                                cb_throw_error(E_GRN_BULLETIN_INVALID_TERM);
+                            }
+                        } elseif ($end_date->month || $end_date->day) {
+                            cb_throw_error(E_GRN_BULLETIN_INVALID_TERM);
+                        }
+                    }
+
+                    require_once('fw/date.csp');
+                    if ($start_date && cb_date_validate_datetime($start_date)) {
+                        $start = new CB_TimeStampEx();
+                        $start->setDateTime($start_date);
+                        if ( ! $is_modify) {
+                            $now = new CB_TimeStampEx();
+                            if ( ! is_null($start_date->minute)
+                                 || ! is_null($start_date->hour)
+                            ) {
+                                if ($start->compare($now) <= 0) {
+                                    cb_throw_error(E_GRN_BULLETIN_INVALID_TERM);
+                                }
+                            }
+                        }
+                        $param['start_datetime'] = $start;
+                    }
+
+                    if ($end_date && cb_date_validate_datetime($end_date)) {
+                        $end = new CB_DateTimeEx($end_date);
+
+                        // 終了日を1日進める（0時を境に掲示期間の判定を行うため）
+                        // 開始日と終了日に同日が設定されている場合にその日1日の掲示となる
+                        if (is_null($end_date->hour)) {
+                            $end->moveDays(1);
+                        }
+
+                        $ts = new CB_TimeStampEx();
+                        $ts->setDateTime($end);
+
+                        $now = new CB_TimeStampEx();
+
+                        if (( ! empty($start) && $start->compare($ts) >= 0)
+                            || $ts->compare($now) < 0
+                        ) {
+                            // 終了日は現在より過去にはならない
+                            cb_throw_error(E_GRN_BULLETIN_INVALID_TERM);
+                        }
+                        $ts->setDateTime($end);
+                        $param['end_timestamp'] = $ts;
+                    }
+                }
+                $node_content
+                    = $cbpapi_service->selectSingleNode($topic[$topic_key],
+                    'content');
+                if ( ! $node_content) {
+                    require_once('cbpapi/error_code.csp');
+                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                        ['param' => 'content']);
+                }
+                $elements_children = array_key_exists('children',
+                    $topic[$topic_key]) ? $topic[$topic_key]['children'] : [];
+                $files = [];
+                foreach (array_keys($elements_children) as $children_key) {
+                    $element = $elements_children[$children_key];
+                    $node_name = $element['node_name'];
+                    if ($node_name == 'content') {
+                        $attrs = array_key_exists('attributes', $element)
+                            ? $element['attributes'] : [];
+                        $body = '';
+                        if ( ! array_key_exists('body', $attrs)) {
+                            require_once('cbpapi/error_code.csp');
+                            cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                                ['param' => 'body']);
+                        } else {
+                            $body = $attrs['body'];
+                        }
+                        $param['data'] = $body;
+                        if (array_key_exists('html_body', $attrs)) {
+                            $html_body = $attrs['html_body'];
+                            $param['html_text'] = $html_body;
+                        }
+
+                        $content_children = array_key_exists('children',
+                            $element) ? $element['children'] : [];
+                        foreach (array_keys($content_children) as $file_key) {
+                            $file_element = $content_children[$file_key];
+                            $node_name = $file_element['node_name'];
+                            if ($node_name == 'file') {
+                                $file_attrs = array_key_exists('attributes',
+                                    $file_element) ? $file_element['attributes']
+                                    : [];
+                                $size = array_key_exists('size',
+                                    $file_attrs) ? $file_attrs['size'] : null;
+                                $mime_type = array_key_exists('mime_type',
+                                    $file_attrs) ? $file_attrs['mime_type']
+                                    : null;
+                                if ( ! array_key_exists('id', $file_attrs)) {
+                                    require_once('cbpapi/error_code.csp');
+                                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                        null, ['param' => 'id']);
+                                }
+                                if ( ! array_key_exists('name', $file_attrs)) {
+                                    require_once('cbpapi/error_code.csp');
+                                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER,
+                                        null, ['param' => 'name']);
+                                }
+                                $files[$file_attrs['id']] = [
+                                    'file_id'   => $file_attrs['id'],
+                                    'name'      => $file_attrs['name'],
+                                    'size'      => $size,
+                                    'mime_type' => $mime_type
+                                ];
+                            }
+                        }
+
+                    }
+                }
+                $param['files'] = $files;
+            }
+
+            if ($node == 'remove_file_id') {
+                if (array_key_exists('text', $topic[$topic_key])) {
+                    $file_id = $topic[$topic_key]['text'];
+                    $remove_file_ids[$file_id] = $file_id;
+                }
+            }
+
+            $param['remove_file_ids'] = $remove_file_ids;
+
+            if ($node == 'file') {
+                $file_attrs = $topic[$topic_key]['attributes'];
+                if ( ! array_key_exists('id', $file_attrs)) {
+                    require_once('cbpapi/error_code.csp');
+                    cb_throw_error(E_GRN_CBPAPI_MISSING_PARAMETER, null,
+                        ['param' => 'id']);
+                }
+                $file_id = $file_attrs['id'];
+                $file_child = [];
+                if (isset($topic[$topic_key]['children'][0])) {
+                    $file_child = $topic[$topic_key]['children'][0];
+                }
+                if (is_array($file_child)
+                    && array_key_exists('text', $file_child)
+                ) {
+                    $content_value = $file_child['text'];
+                    $file_contents[$file_id] = $content_value;
+                }
+            }
+            $this->_getFilesContentInput($param, $file_contents);
+        }
+
+        return $param;
+    }
+
+    function _getFilesContentInput(&$param, $file_content)
+    {
+        if (count($file_content) <= 0) {
+            return $param;
+        }
+        foreach ($param as $key => $file_info) {
+            if ((strcasecmp($key, 'files') == 0)) {
+                foreach (array_keys($file_content) as $file_id) {
+                    if (is_array($file_info) && count($file_info) > 0) {
+                        foreach (array_keys($file_info) as $file_key) {
+                            if ($file_info[$file_key]['file_id'] == $file_id) {
+                                $param['files'][$file_key]['content']
+                                    = $file_content[$file_id];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return $param;
+    }
+
+    function getDraftTopicVersionList($start_ts = null, $last_ts = null)
+    {
+        $draft_list = $this->_getTopicVersion(-2, $start_ts, $last_ts);
+
+        return $draft_list;
+    }
+
+    function getTopicVersionList($folder_ids, $start_ts = null, $last_ts = null)
+    {
+        $topics_list = [];
+        // get all
+        if (count($folder_ids) == 0) {
+            $wait_list = $this->_getTopicVersion(-1, $start_ts, $last_ts);
+            $normal_list = $this->_getTopicVersion(null, $start_ts, $last_ts);
+            $topics_list = $wait_list + $normal_list;
+        } else {
+            $folder_ids = array_unique($folder_ids);
+            $normal_folder_ids = [];
+            foreach ($folder_ids as $folder_id) {
+                // wait
+                if ($folder_id == -1) {
+                    $wait_list = $this->_getTopicVersion(-1, $start_ts,
+                        $last_ts);
+                    $topics_list = $topics_list + $wait_list;
+                } // normal
+                else {
+                    $normal_folder_ids[] = $folder_id;
+                }
+            }
+            if (count($normal_folder_ids) > 0) {
+                $normal_list = $this->_getTopicVersion($normal_folder_ids,
+                    $start_ts, $last_ts);
+                $topics_list = $topics_list + $normal_list;
+            }
+        }
+
+        return $topics_list;
+    }
+
+    function _getTopicVersion(
+        $folder_id = null,
+        $start_ts = null,
+        $last_ts = null
+    ) {
+        $topics_list = [];
+        $dbconn = $this->_getDBConnection();
+        $now_time = time();
+
+        // wait list
+        if ($folder_id === -1) {
+            $query_wait = sprintf('SELECT _id b_id,col_subject,col_mtime,col_category FROM tab_grn_bulletin_articleentity
+                    WHERE _id!=1 AND col_start_timestamp>%s AND col_mtime>=%s',
+                $now_time, $start_ts->unix_ts);
+            if ($last_ts) {
+                $query_wait .= ' AND col_mtime<=' . $last_ts->unix_ts;
+            }
+
+            $ret = $dbconn->query($query_wait);
+            if ($ret === false) {
+                $dbconn->throwError([
+                    'query' => 'failed query on SELECT: ' . $query_wait
+                ]);
+            }
+            while ($row = $dbconn->fetch_assoc($ret)) {
+                $topic = [];
+                $topic['id'] = $row['b_id'];
+                $topic['name'] = $row['col_subject'];
+                $topic['version'] = $row['col_mtime'];
+                $topic['category'] = $row['col_category'];
+                $topics_list[$row['b_id']] = $topic;
+            }
+            $dbconn->free_result($ret);
+        } // draft list
+        elseif ($folder_id === -2) {
+            $query_draft
+                = 'SELECT _id b_id,col_subject,col_mtime,col_category FROM tab_grn_bulletin_draftentity WHERE col_mtime>='
+                  . $start_ts->unix_ts;
+            if ($last_ts) {
+                $query_draft .= ' AND col_mtime<=' . $last_ts->unix_ts;
+            }
+            $ret = $dbconn->query($query_draft);
+            if ($ret === false) {
+                $dbconn->throwError([
+                    'query' => 'failed query on SELECT: ' . $query_draft
+                ]);
+            }
+            while ($row = $dbconn->fetch_assoc($ret)) {
+                $topic = [];
+                $topic['id'] = $row['b_id'];
+                $topic['name'] = $row['col_subject'];
+                $topic['version'] = $row['col_mtime'];
+                $topic['category'] = $row['col_category'];
+                $topics_list[$row['b_id']] = $topic;
+            }
+            $dbconn->free_result($ret);
+        } // normal bulletin
+        else {
+            $query_normal = sprintf('SELECT bu._id b_id,bu.col_subject,bu.col_mtime,bu.col_category,fo.col_ctime fo_col_ctime,fo._id follow_id FROM tab_grn_bulletin_articleentity bu 
+                     LEFT JOIN tab_grn_bulletin_followentity fo ON bu._id = fo.col_article AND bu.col_last_follow_id=fo._id
+                     WHERE bu._id!=1 AND (bu.col_start_timestamp IS NULL OR bu.col_start_timestamp<=%s) AND (bu.col_end_timestamp IS NULL OR bu.col_end_timestamp>%s) AND bu.col_mtime>=%s',
+                $now_time, $now_time, $start_ts->unix_ts);
+            if ($last_ts) {
+                $query_normal .= ' AND bu.col_mtime<=' . $last_ts->unix_ts;
+            }
+            if (is_array($folder_id) && count($folder_id) > 0) {
+                $query_normal .= ' AND col_category IN (' . implode(',',
+                        $folder_id) . ')';
+            }
+
+            $ret = $dbconn->query($query_normal);
+            if ($ret === false) {
+                $dbconn->throwError([
+                    'query' => 'failed query on SELECT: ' . $query_normal
+                ]);
+            }
+            while ($row = $dbconn->fetch_assoc($ret)) {
+                $mtime = $row['col_mtime'] > $row['fo_col_ctime']
+                    ? $row['col_mtime'] : $row['fo_col_ctime'];
+                if ($mtime < $start_ts->unix_ts) {
+                    continue;
+                }
+                if ($last_ts && $mtime > $last_ts->unix_ts) {
+                    continue;
+                }
+                $topic = [];
+                $topic['id'] = $row['b_id'];
+                $topic['name'] = $row['col_subject'];
+                $topic['version'] = $mtime;
+                $topic['category'] = $row['col_category'];
+                $topics_list[$row['b_id']] = $topic;
+            }
+            $dbconn->free_result($ret);
+        }
+
+        return $topics_list;
+    }
+
+    function getCategoryList()
+    {
+        $dbconn = $this->_getDBConnection();
+        $query
+            = 'SELECT _id fid,col_name,col_description,col_mtime FROM tab_grn_bulletin_categoryentity;';
+        $result = $dbconn->query($query);
+        if ($result === false) {
+            $dbconn->throwError([
+                'query' => 'failed query on SELECT: ' . $query
+            ]);
+        }
+        $folders = [];
+        while ($row = $dbconn->fetch_assoc($result)) {
+            $folder = [];
+            $folder['id'] = $row['fid'];
+            $folder['memo'] = $row['col_description'];
+            $folder['name'] = $row['col_name'];
+            $folder['version'] = $row['col_mtime'];
+            $folders[$row['fid']] = $folder;
+        }
+
+        // 結果の開放
+        $dbconn->free_result($result);
+
+        return $folders;
+    }
+
+    function getSearchItems(
+        $text,
+        $sensitive = false,
+        $start_ts = null,
+        $end_ts = null,
+        $category_id = 0,
+        $sub_category = false,
+        $items
+    ) {
+        $category_id = (int)$category_id;
+        global $G_container_base;
+        $uum = $G_container_base->getInstance('uum');
+        $G_bulletin_login = $uum->getLoginUser();
+
+        require_once('bulletin/include_search.csp');
+        require_once('bulletin/bean/GrnBulletinArticleCondition.csp');
+        $searchArticleCondition = new GrnBulletinArticleCondition();
+        $searchArticleCondition->setUser($G_bulletin_login);
+        $searchArticleCondition->setText($text);
+        $searchArticleCondition->setSensitive($sensitive);
+
+        // start and date
+        // normal
+        if ($category_id >= 0) {
+            if ($start_ts) {
+                $searchArticleCondition->setStartTime($start_ts);
+            }
+            if ($end_ts) {
+                $searchArticleCondition->setEndTime($end_ts);
+            }
+            $searchArticleCondition->setPersonal(false);
+            $searchArticleCondition->setArticleTerm('published');
+        } // wait
+        elseif ($category_id == -1) {
+            $searchArticleCondition->setPersonal(true);
+            $searchArticleCondition->setArticleTerm('before');
+        }
+
+        // set category
+        // normal
+        if ($category_id > 0) {
+            require_once('grn/application.csp');
+            $locator = GRN_ApplicationLocator::instance();
+            $G_bulletin = $locator->getInstance('bulletin');
+            $search_category = $G_bulletin->getCategory($G_bulletin_login,
+                $category_id);
+            $searchArticleCondition->setCategoryId($search_category);
+            $searchArticleCondition->setEnableSubCategory($sub_category);
+        }
+
+        // items
+        // normal
+        if ($category_id >= 0) {
+            $searchArticleCondition->setItems($items);
+        } else// wait and draft
+        {
+            $items_search = [];
+            $items_search['subject'] = $items['subject'];
+            $items_search['data'] = $items['data'];
+            $searchArticleCondition->setItems($items_search);
+        }
+
+        $bu_ids = [];
+        // draft search
+        if ($category_id == -2) {
+            $search_logic = new GRN_Bulletin_DraftSearch($G_bulletin_login,
+                $searchArticleCondition);
+            while ( ! is_null($object = $search_logic->iterate())) {
+                $bu_ids[] = $object->getOID();
+            }
+        } else // normal and wait
+        {
+            $search_logic = new GRN_Bulletin_ArticleSearch($G_bulletin_login,
+                $searchArticleCondition);
+            $resultArticleOrFollowList = $search_logic->searchExecute();
+
+            foreach ($resultArticleOrFollowList as $articleOrFollowRow) {
+                if (is_a($articleOrFollowRow, 'GRN_Bulletin_Follow')) {
+                    $article = $articleOrFollowRow->get('article');
+                    $bu_ids[] = $article->getOID();
+                } else {
+                    $bu_ids[] = $articleOrFollowRow->getOID();
+                }
+            }
+        }
+
+        $bu_ids = array_unique($bu_ids);
+
+        return $bu_ids;
+    }
+}
+
+function convert_datetime_to_local($obj_date)
+{
+    static $timezone = null;
+    if (is_null($timezone)) {
+        $I18N = CB_I18N::getInstance();
+        $timezone = $I18N->getCurrentTimezone();
+    }
+    $timestamp = new CB_TimeStampEx();
+    $timestamp->setTimeZone('UTC');
+    if (is_object($obj_date)) {
+        if (is_a($obj_date, 'CB_DateTime')) {
+            $timestamp->setDateTime($obj_date);
+        }
+    }
+    $timestamp->setTimeZone($timezone);
+
+    return $timestamp->getDateTime();
+}
+
+function convert_datetime_to_timestamp($obj_date)
+{
+    static $timezone = null;
+    if (is_null($timezone)) {
+        $I18N = CB_I18N::getInstance();
+        $timezone = $I18N->getCurrentTimezone();
+    }
+    $timestamp = new CB_TimeStampEx();
+    $timestamp->setTimeZone('UTC');
+    if (is_object($obj_date)) {
+        if (is_a($obj_date, 'CB_DateTime')) {
+            $timestamp->setDateTime($obj_date);
+        }
+    }
+    $timestamp->setTimeZone($timezone);
+
+    return $timestamp;
+}
